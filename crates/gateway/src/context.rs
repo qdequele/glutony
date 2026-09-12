@@ -55,7 +55,11 @@ pub fn envoy_headers_trusted(headers: &HeaderMap, config: &GatewayConfig) -> boo
 
 /// Read an `X-Meili-*` header, but only when the request is trusted.
 pub fn trusted_header(headers: &HeaderMap, config: &GatewayConfig, name: &str) -> Option<String> {
-    if envoy_headers_trusted(headers, config) { header(headers, name) } else { None }
+    if envoy_headers_trusted(headers, config) {
+        header(headers, name)
+    } else {
+        None
+    }
 }
 
 /// Tenant id of the request, if any (honours the Envoy trust rule). Used by routes that
@@ -72,7 +76,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     let token = token.trim();
-    if token.is_empty() { None } else { Some(token.to_string()) }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 /// Resolve the [`MeiliContext`] of a request following SPEC §3.2.
@@ -139,13 +147,25 @@ pub fn resolve_index(
     mime: &str,
     default_index: &str,
 ) -> String {
-    let pattern = pipeline_index_pattern.map(str::trim).filter(|p| !p.is_empty());
-    let resolved = match (pattern, ctx.index.as_deref().map(str::trim).filter(|i| !i.is_empty())) {
+    let pattern = pipeline_index_pattern
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let resolved = match (
+        pattern,
+        ctx.index
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty()),
+    ) {
         (Some(p), _) => p.to_string(),
         (None, Some(existing)) => existing.to_string(),
         (None, None) => {
             let d = mime_to_default_index(mime);
-            if d == "documents" { default_index.to_string() } else { d.to_string() }
+            if d == "documents" {
+                default_index.to_string()
+            } else {
+                d.to_string()
+            }
         }
     };
     ctx.index = Some(resolved.clone());
@@ -170,7 +190,10 @@ mod tests {
     }
 
     fn cfg_secret() -> GatewayConfig {
-        GatewayConfig { envoy_trusted_header: Some("s3cret".into()), ..Default::default() }
+        GatewayConfig {
+            envoy_trusted_header: Some("s3cret".into()),
+            ..Default::default()
+        }
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -254,7 +277,10 @@ mod tests {
 
     #[test]
     fn bearer_is_api_key_fallback() {
-        let h = headers(&[(H_HOST, "http://localhost:7700"), ("authorization", "Bearer masterKey")]);
+        let h = headers(&[
+            (H_HOST, "http://localhost:7700"),
+            ("authorization", "Bearer masterKey"),
+        ]);
         let ctx = resolve_context(&h, None, &cfg()).unwrap();
         assert_eq!(ctx.api_key, "masterKey");
         assert_eq!(ctx.host, "http://localhost:7700");
@@ -273,9 +299,15 @@ mod tests {
         let h = headers(&[(H_HOST, "http://h"), ("authorization", "bearer   k1  ")]);
         assert_eq!(resolve_context(&h, None, &cfg()).unwrap().api_key, "k1");
         let h = headers(&[(H_HOST, "http://h"), ("authorization", "Basic abc")]);
-        assert!(matches!(resolve_context(&h, None, &cfg()), Err(GatewayError::MissingContext(_))));
+        assert!(matches!(
+            resolve_context(&h, None, &cfg()),
+            Err(GatewayError::MissingContext(_))
+        ));
         let h = headers(&[(H_HOST, "http://h"), ("authorization", "Bearer ")]);
-        assert!(matches!(resolve_context(&h, None, &cfg()), Err(GatewayError::MissingContext(_))));
+        assert!(matches!(
+            resolve_context(&h, None, &cfg()),
+            Err(GatewayError::MissingContext(_))
+        ));
     }
 
     // --- step 7: env fallbacks ------------------------------------------------------
@@ -312,7 +344,10 @@ mod tests {
 
     #[test]
     fn env_host_only_with_header_key() {
-        let cfg = GatewayConfig { meili_url: Some("http://env:7700".into()), ..Default::default() };
+        let cfg = GatewayConfig {
+            meili_url: Some("http://env:7700".into()),
+            ..Default::default()
+        };
         let h = headers(&[(H_API_KEY, "k")]);
         let ctx = resolve_context(&h, None, &cfg).unwrap();
         assert_eq!(ctx.host, "http://env:7700");
@@ -380,7 +415,10 @@ mod tests {
         let mut h = envoy_headers();
         h.insert(H_ENVOY_SECRET, HeaderValue::from_static("nope"));
         assert!(!envoy_headers_trusted(&h, &cfg_secret()));
-        assert!(matches!(resolve_context(&h, None, &cfg_secret()), Err(GatewayError::MissingContext(_))));
+        assert!(matches!(
+            resolve_context(&h, None, &cfg_secret()),
+            Err(GatewayError::MissingContext(_))
+        ));
     }
 
     #[test]
@@ -398,7 +436,11 @@ mod tests {
         assert_eq!(ctx.api_key, "envKey");
         assert_eq!(ctx.project_id, None, "tenant header must not be honoured");
         assert_eq!(ctx.region, None);
-        assert_eq!(ctx.index.as_deref(), Some("q"), "query param is not an X-Meili header");
+        assert_eq!(
+            ctx.index.as_deref(),
+            Some("q"),
+            "query param is not an X-Meili header"
+        );
     }
 
     #[test]
@@ -417,11 +459,17 @@ mod tests {
 
     #[test]
     fn resolve_project_id_follows_trust_rule() {
-        assert_eq!(resolve_project_id(&envoy_headers(), &cfg()).as_deref(), Some("xxx"));
+        assert_eq!(
+            resolve_project_id(&envoy_headers(), &cfg()).as_deref(),
+            Some("xxx")
+        );
         assert_eq!(resolve_project_id(&envoy_headers(), &cfg_secret()), None);
         let mut h = envoy_headers();
         h.insert(H_ENVOY_SECRET, HeaderValue::from_static("s3cret"));
-        assert_eq!(resolve_project_id(&h, &cfg_secret()).as_deref(), Some("xxx"));
+        assert_eq!(
+            resolve_project_id(&h, &cfg_secret()).as_deref(),
+            Some("xxx")
+        );
         assert_eq!(resolve_project_id(&HeaderMap::new(), &cfg()), None);
     }
 
@@ -448,9 +496,15 @@ mod tests {
     #[test]
     fn header_or_query_index_kept_without_pattern() {
         let mut ctx = ctx_with_index(Some("mine"));
-        assert_eq!(resolve_index(&mut ctx, None, "video/mp4", "documents"), "mine");
+        assert_eq!(
+            resolve_index(&mut ctx, None, "video/mp4", "documents"),
+            "mine"
+        );
         let mut ctx = ctx_with_index(Some("mine"));
-        assert_eq!(resolve_index(&mut ctx, Some("   "), "video/mp4", "documents"), "mine");
+        assert_eq!(
+            resolve_index(&mut ctx, Some("   "), "video/mp4", "documents"),
+            "mine"
+        );
     }
 
     #[test]
@@ -463,7 +517,11 @@ mod tests {
             ("text/csv", "datasets"),
         ] {
             let mut ctx = ctx_with_index(None);
-            assert_eq!(resolve_index(&mut ctx, None, mime, "fallback"), expected, "{mime}");
+            assert_eq!(
+                resolve_index(&mut ctx, None, mime, "fallback"),
+                expected,
+                "{mime}"
+            );
             assert_eq!(ctx.index.as_deref(), Some(expected));
         }
     }
@@ -471,18 +529,30 @@ mod tests {
     #[test]
     fn global_default_replaces_generic_documents() {
         let mut ctx = ctx_with_index(None);
-        assert_eq!(resolve_index(&mut ctx, None, "application/pdf", "my-docs"), "my-docs");
+        assert_eq!(
+            resolve_index(&mut ctx, None, "application/pdf", "my-docs"),
+            "my-docs"
+        );
         let mut ctx = ctx_with_index(None);
-        assert_eq!(resolve_index(&mut ctx, None, "application/pdf", "documents"), "documents");
+        assert_eq!(
+            resolve_index(&mut ctx, None, "application/pdf", "documents"),
+            "documents"
+        );
         let mut ctx = ctx_with_index(Some(""));
-        assert_eq!(resolve_index(&mut ctx, None, "application/octet-stream", "my-docs"), "my-docs");
+        assert_eq!(
+            resolve_index(&mut ctx, None, "application/octet-stream", "my-docs"),
+            "my-docs"
+        );
     }
 
     #[test]
     fn full_chain_precedence() {
         // pattern > query/header > mime default > global default
         let mut ctx = ctx_with_index(Some("hdr"));
-        assert_eq!(resolve_index(&mut ctx, Some("pat"), "video/mp4", "glob"), "pat");
+        assert_eq!(
+            resolve_index(&mut ctx, Some("pat"), "video/mp4", "glob"),
+            "pat"
+        );
         let mut ctx = ctx_with_index(Some("hdr"));
         assert_eq!(resolve_index(&mut ctx, None, "video/mp4", "glob"), "hdr");
         let mut ctx = ctx_with_index(None);

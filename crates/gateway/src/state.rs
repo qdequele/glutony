@@ -6,16 +6,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use meili_ingest_blob::BlobStore;
-use meili_ingest_plugin_sdk::{JobStatus, PipelineDefinition, PipelineWorkflowInput, PluginManifest, WorkflowProgress};
+use meili_ingest_plugin_sdk::{
+    JobStatus, PipelineDefinition, PipelineWorkflowInput, PluginManifest, WorkflowProgress,
+};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use temporalio_client::{
-    Client, UntypedQuery, UntypedSignal, UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions,
-    WorkflowExecutionStatus, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    Client, UntypedQuery, UntypedSignal, UntypedWorkflow, WorkflowCancelOptions,
+    WorkflowDescribeOptions, WorkflowExecutionStatus, WorkflowQueryOptions, WorkflowSignalOptions,
+    WorkflowStartOptions,
 };
 use temporalio_common::data_converters::{
-    GenericPayloadConverter, PayloadConverter, RawValue, SerializationContext, SerializationContextData,
+    GenericPayloadConverter, PayloadConverter, RawValue, SerializationContext,
+    SerializationContextData,
 };
 use uuid::Uuid;
 
@@ -68,10 +72,16 @@ impl std::fmt::Debug for GatewayConfig {
             .field("temporal_namespace", &self.temporal_namespace)
             .field("control_plane_url", &self.control_plane_url)
             .field("meili_url", &self.meili_url)
-            .field("meili_api_key", &self.meili_api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "meili_api_key",
+                &self.meili_api_key.as_ref().map(|_| "<redacted>"),
+            )
             .field("default_index", &self.default_index)
             .field("max_upload_mb", &self.max_upload_mb)
-            .field("envoy_trusted_header", &self.envoy_trusted_header.as_ref().map(|_| "<redacted>"))
+            .field(
+                "envoy_trusted_header",
+                &self.envoy_trusted_header.as_ref().map(|_| "<redacted>"),
+            )
             .field("blob_store_url", &self.blob_store_url)
             .field("inline_max_bytes", &self.inline_max_bytes)
             .finish()
@@ -122,7 +132,10 @@ impl GatewayConfig {
 }
 
 fn env_opt(name: &str) -> Option<String> {
-    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -134,7 +147,9 @@ where
     T::Err: std::fmt::Display,
 {
     match env_opt(name) {
-        Some(v) => v.parse::<T>().map_err(|e| anyhow::anyhow!("invalid {name}={v:?}: {e}")),
+        Some(v) => v
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("invalid {name}={v:?}: {e}")),
         None => Ok(default),
     }
 }
@@ -188,7 +203,10 @@ impl std::fmt::Debug for TemporalStarter {
 }
 
 /// Decode a [`RawValue`] without panicking (unlike `RawValue::to_value`).
-fn decode_raw<T: DeserializeOwned + 'static>(raw: RawValue, conv: &PayloadConverter) -> Result<T, GatewayError> {
+fn decode_raw<T: DeserializeOwned + 'static>(
+    raw: RawValue,
+    conv: &PayloadConverter,
+) -> Result<T, GatewayError> {
     let payload = raw
         .payloads
         .into_iter()
@@ -204,7 +222,9 @@ pub fn map_execution_status(status: WorkflowExecutionStatus) -> JobStatus {
     match status {
         WorkflowExecutionStatus::Completed => JobStatus::Succeeded,
         WorkflowExecutionStatus::Failed | WorkflowExecutionStatus::TimedOut => JobStatus::Failed,
-        WorkflowExecutionStatus::Canceled | WorkflowExecutionStatus::Terminated => JobStatus::Cancelled,
+        WorkflowExecutionStatus::Canceled | WorkflowExecutionStatus::Terminated => {
+            JobStatus::Cancelled
+        }
         _ => JobStatus::Running,
     }
 }
@@ -228,8 +248,11 @@ impl WorkflowStarter for TemporalStarter {
             .start_workflow(
                 UntypedWorkflow::new(WORKFLOW_TYPE),
                 raw,
-                WorkflowStartOptions::new(WORKFLOW_TASK_QUEUE, PipelineWorkflowInput::workflow_id(input.job_id))
-                    .build(),
+                WorkflowStartOptions::new(
+                    WORKFLOW_TASK_QUEUE,
+                    PipelineWorkflowInput::workflow_id(input.job_id),
+                )
+                .build(),
             )
             .await
             .map_err(|e| GatewayError::Upstream(format!("cannot start workflow: {e}")))?;
@@ -248,10 +271,18 @@ impl WorkflowStarter for TemporalStarter {
         let described = match handle.describe(WorkflowDescribeOptions::default()).await {
             Ok(d) => map_execution_status(d.status()),
             Err(WorkflowInteractionError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(GatewayError::Upstream(format!("cannot describe workflow: {e}"))),
+            Err(e) => {
+                return Err(GatewayError::Upstream(format!(
+                    "cannot describe workflow: {e}"
+                )));
+            }
         };
         let progress = match handle
-            .query(UntypedQuery::new("progress"), RawValue::from_value(&(), &conv), WorkflowQueryOptions::default())
+            .query(
+                UntypedQuery::new("progress"),
+                RawValue::from_value(&(), &conv),
+                WorkflowQueryOptions::default(),
+            )
             .await
         {
             Ok(raw) => match decode_raw::<WorkflowProgress>(raw, &conv) {
@@ -267,7 +298,10 @@ impl WorkflowStarter for TemporalStarter {
                 None
             }
         };
-        Ok(Some(JobSnapshot { status: combine_status(described, progress.as_ref()), progress }))
+        Ok(Some(JobSnapshot {
+            status: combine_status(described, progress.as_ref()),
+            progress,
+        }))
     }
 
     async fn cancel(&self, job_id: Uuid) -> Result<(), GatewayError> {
@@ -277,14 +311,23 @@ impl WorkflowStarter for TemporalStarter {
             .0
             .get_workflow_handle::<UntypedWorkflow>(PipelineWorkflowInput::workflow_id(job_id));
         let map = |e: WorkflowInteractionError| match e {
-            WorkflowInteractionError::NotFound(_) => GatewayError::NotFound(format!("job {job_id} not found")),
+            WorkflowInteractionError::NotFound(_) => {
+                GatewayError::NotFound(format!("job {job_id} not found"))
+            }
             other => GatewayError::Upstream(format!("cannot cancel workflow: {other}")),
         };
         handle
-            .signal(UntypedSignal::new("cancel"), RawValue::from_value(&(), &conv), WorkflowSignalOptions::default())
+            .signal(
+                UntypedSignal::new("cancel"),
+                RawValue::from_value(&(), &conv),
+                WorkflowSignalOptions::default(),
+            )
             .await
             .map_err(map)?;
-        handle.cancel(WorkflowCancelOptions::default()).await.map_err(map)?;
+        handle
+            .cancel(WorkflowCancelOptions::default())
+            .await
+            .map_err(map)?;
         Ok(())
     }
 }
@@ -388,7 +431,10 @@ impl ControlPlaneClient {
     /// Build a client.
     pub fn new(base_url: impl Into<String>, http: reqwest::Client) -> Self {
         let base_url: String = base_url.into();
-        Self { base_url: base_url.trim_end_matches('/').to_string(), http }
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            http,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -396,7 +442,9 @@ impl ControlPlaneClient {
     }
 
     fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
-        project_id.map(|p| vec![("project_id", p.to_string())]).unwrap_or_default()
+        project_id
+            .map(|p| vec![("project_id", p.to_string())])
+            .unwrap_or_default()
     }
 
     /// Turn a non-2xx control plane response into a [`GatewayError`].
@@ -409,7 +457,11 @@ impl ControlPlaneClient {
             .or(parsed.message)
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
-        let msg = if msg.is_empty() { format!("{what} failed with status {status}") } else { msg };
+        let msg = if msg.is_empty() {
+            format!("{what} failed with status {status}")
+        } else {
+            msg
+        };
         match status {
             StatusCode::NOT_FOUND => GatewayError::NotFound(msg),
             StatusCode::FORBIDDEN => GatewayError::Forbidden(msg),
@@ -420,17 +472,25 @@ impl ControlPlaneClient {
         }
     }
 
-    async fn send_json<T: DeserializeOwned>(&self, req: reqwest::RequestBuilder, what: &str) -> Result<T, GatewayError> {
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<T, GatewayError> {
         let resp = req.send().await?;
         if !resp.status().is_success() {
             return Err(Self::error_from(resp, what).await);
         }
-        resp.json::<T>()
-            .await
-            .map_err(|e| GatewayError::Upstream(format!("control plane {what}: invalid response: {e}")))
+        resp.json::<T>().await.map_err(|e| {
+            GatewayError::Upstream(format!("control plane {what}: invalid response: {e}"))
+        })
     }
 
-    async fn send_empty(&self, req: reqwest::RequestBuilder, what: &str) -> Result<(), GatewayError> {
+    async fn send_empty(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<(), GatewayError> {
         let resp = req.send().await?;
         if !resp.status().is_success() {
             return Err(Self::error_from(resp, what).await);
@@ -453,33 +513,64 @@ impl ControlPlaneClient {
             project_id: project_id.map(str::to_string),
             pipeline: pipeline.map(str::to_string),
         };
-        self.send_json(self.http.post(self.url("/internal/resolve")).json(&body), "resolve").await
+        self.send_json(
+            self.http.post(self.url("/internal/resolve")).json(&body),
+            "resolve",
+        )
+        .await
     }
 
     /// `GET /pipelines/{uid}?project_id=`.
-    pub async fn get_pipeline(&self, uid: &str, project_id: Option<&str>) -> Result<PipelineDefinition, GatewayError> {
+    pub async fn get_pipeline(
+        &self,
+        uid: &str,
+        project_id: Option<&str>,
+    ) -> Result<PipelineDefinition, GatewayError> {
         self.send_json(
-            self.http.get(self.url(&format!("/pipelines/{uid}"))).query(&Self::project_query(project_id)),
+            self.http
+                .get(self.url(&format!("/pipelines/{uid}")))
+                .query(&Self::project_query(project_id)),
             "get pipeline",
         )
         .await
     }
 
     /// `GET /pipelines?project_id=`.
-    pub async fn list_pipelines(&self, project_id: Option<&str>) -> Result<Vec<PipelineDefinition>, GatewayError> {
-        self.send_json(self.http.get(self.url("/pipelines")).query(&Self::project_query(project_id)), "list pipelines")
-            .await
+    pub async fn list_pipelines(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<PipelineDefinition>, GatewayError> {
+        self.send_json(
+            self.http
+                .get(self.url("/pipelines"))
+                .query(&Self::project_query(project_id)),
+            "list pipelines",
+        )
+        .await
     }
 
     /// `POST /pipelines` (create or update).
-    pub async fn upsert_pipeline(&self, def: &PipelineDefinition) -> Result<PipelineDefinition, GatewayError> {
-        self.send_json(self.http.post(self.url("/pipelines")).json(def), "upsert pipeline").await
+    pub async fn upsert_pipeline(
+        &self,
+        def: &PipelineDefinition,
+    ) -> Result<PipelineDefinition, GatewayError> {
+        self.send_json(
+            self.http.post(self.url("/pipelines")).json(def),
+            "upsert pipeline",
+        )
+        .await
     }
 
     /// `DELETE /pipelines/{uid}?project_id=`.
-    pub async fn delete_pipeline(&self, uid: &str, project_id: Option<&str>) -> Result<(), GatewayError> {
+    pub async fn delete_pipeline(
+        &self,
+        uid: &str,
+        project_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
         self.send_empty(
-            self.http.delete(self.url(&format!("/pipelines/{uid}"))).query(&Self::project_query(project_id)),
+            self.http
+                .delete(self.url(&format!("/pipelines/{uid}")))
+                .query(&Self::project_query(project_id)),
             "delete pipeline",
         )
         .await
@@ -487,23 +578,41 @@ impl ControlPlaneClient {
 
     /// `GET /plugins`.
     pub async fn list_plugins(&self) -> Result<Vec<PluginManifest>, GatewayError> {
-        self.send_json(self.http.get(self.url("/plugins")), "list plugins").await
+        self.send_json(self.http.get(self.url("/plugins")), "list plugins")
+            .await
     }
 
     /// `POST /internal/jobs`.
     pub async fn create_job(&self, job: &JobRecord) -> Result<(), GatewayError> {
-        self.send_empty(self.http.post(self.url("/internal/jobs")).json(job), "create job").await
+        self.send_empty(
+            self.http.post(self.url("/internal/jobs")).json(job),
+            "create job",
+        )
+        .await
     }
 
     /// `PATCH /internal/jobs/{job_id}`.
-    pub async fn update_job(&self, job_id: Uuid, update: &JobUpdate) -> Result<JobRecord, GatewayError> {
-        self.send_json(self.http.patch(self.url(&format!("/internal/jobs/{job_id}"))).json(update), "update job")
-            .await
+    pub async fn update_job(
+        &self,
+        job_id: Uuid,
+        update: &JobUpdate,
+    ) -> Result<JobRecord, GatewayError> {
+        self.send_json(
+            self.http
+                .patch(self.url(&format!("/internal/jobs/{job_id}")))
+                .json(update),
+            "update job",
+        )
+        .await
     }
 
     /// `GET /internal/jobs/{job_id}`.
     pub async fn get_job(&self, job_id: Uuid) -> Result<JobRecord, GatewayError> {
-        self.send_json(self.http.get(self.url(&format!("/internal/jobs/{job_id}"))), "get job").await
+        self.send_json(
+            self.http.get(self.url(&format!("/internal/jobs/{job_id}"))),
+            "get job",
+        )
+        .await
     }
 }
 
@@ -545,7 +654,13 @@ impl AppState {
         http: reqwest::Client,
     ) -> Self {
         let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone());
-        Self { config: Arc::new(config), temporal, control_plane, blob, http }
+        Self {
+            config: Arc::new(config),
+            temporal,
+            control_plane,
+            blob,
+            http,
+        }
     }
 }
 
@@ -562,7 +677,10 @@ mod tests {
             description: None,
             version: 1,
             trigger: None,
-            steps: vec![meili_ingest_plugin_sdk::StepDefinition::new("index", "meili_indexer")],
+            steps: vec![meili_ingest_plugin_sdk::StepDefinition::new(
+                "index",
+                "meili_indexer",
+            )],
             builtin: true,
             project_id: None,
         }
@@ -570,27 +688,61 @@ mod tests {
 
     #[test]
     fn execution_status_mapping() {
-        assert_eq!(map_execution_status(WorkflowExecutionStatus::Running), JobStatus::Running);
-        assert_eq!(map_execution_status(WorkflowExecutionStatus::Completed), JobStatus::Succeeded);
-        assert_eq!(map_execution_status(WorkflowExecutionStatus::Failed), JobStatus::Failed);
-        assert_eq!(map_execution_status(WorkflowExecutionStatus::TimedOut), JobStatus::Failed);
-        assert_eq!(map_execution_status(WorkflowExecutionStatus::Canceled), JobStatus::Cancelled);
-        assert_eq!(map_execution_status(WorkflowExecutionStatus::Terminated), JobStatus::Cancelled);
+        assert_eq!(
+            map_execution_status(WorkflowExecutionStatus::Running),
+            JobStatus::Running
+        );
+        assert_eq!(
+            map_execution_status(WorkflowExecutionStatus::Completed),
+            JobStatus::Succeeded
+        );
+        assert_eq!(
+            map_execution_status(WorkflowExecutionStatus::Failed),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            map_execution_status(WorkflowExecutionStatus::TimedOut),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            map_execution_status(WorkflowExecutionStatus::Canceled),
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            map_execution_status(WorkflowExecutionStatus::Terminated),
+            JobStatus::Cancelled
+        );
     }
 
     #[test]
     fn combine_status_prefers_progress_while_running() {
-        let p = WorkflowProgress { status: JobStatus::Queued, ..Default::default() };
-        assert_eq!(combine_status(JobStatus::Running, Some(&p)), JobStatus::Queued);
+        let p = WorkflowProgress {
+            status: JobStatus::Queued,
+            ..Default::default()
+        };
+        assert_eq!(
+            combine_status(JobStatus::Running, Some(&p)),
+            JobStatus::Queued
+        );
         assert_eq!(combine_status(JobStatus::Running, None), JobStatus::Running);
-        assert_eq!(combine_status(JobStatus::Succeeded, Some(&p)), JobStatus::Succeeded);
-        assert_eq!(combine_status(JobStatus::Cancelled, Some(&p)), JobStatus::Cancelled);
+        assert_eq!(
+            combine_status(JobStatus::Succeeded, Some(&p)),
+            JobStatus::Succeeded
+        );
+        assert_eq!(
+            combine_status(JobStatus::Cancelled, Some(&p)),
+            JobStatus::Cancelled
+        );
     }
 
     #[test]
     fn raw_value_roundtrip_decodes_without_panic() {
         let conv = PayloadConverter::default();
-        let p = WorkflowProgress { status: JobStatus::Running, total_steps: 3, ..Default::default() };
+        let p = WorkflowProgress {
+            status: JobStatus::Running,
+            total_steps: 3,
+            ..Default::default()
+        };
         let raw = RawValue::from_value(&p, &conv);
         let back: WorkflowProgress = decode_raw(raw, &conv).unwrap();
         assert_eq!(back, p);
@@ -617,15 +769,27 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/internal/resolve"))
             .and(body_json(serde_json::json!({"mime": "video/x-foo"})))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "no pipeline matches video/x-foo"})))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error": "no pipeline matches video/x-foo"})),
+            )
             .mount(&server)
             .await;
         let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new());
-        let err = cp.resolve("video/x-foo", None, None, None).await.unwrap_err();
-        assert_eq!(err, GatewayError::NotFound("no pipeline matches video/x-foo".into()));
+        let err = cp
+            .resolve("video/x-foo", None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            GatewayError::NotFound("no pipeline matches video/x-foo".into())
+        );
 
         let dead = ControlPlaneClient::new("http://127.0.0.1:9", reqwest::Client::new());
-        let err = dead.resolve("application/pdf", None, None, None).await.unwrap_err();
+        let err = dead
+            .resolve("application/pdf", None, None, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, GatewayError::Upstream(_)), "{err:?}");
     }
 
@@ -635,7 +799,11 @@ mod tests {
         let def = sample_pipeline();
         Mock::given(method("POST"))
             .and(path("/internal/resolve"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"pipeline": def, "index_pattern": "contracts"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"pipeline": def, "index_pattern": "contracts"}),
+                ),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -661,19 +829,34 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/plugins"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![PluginManifest::new("chunker", "0.1.0")]))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![PluginManifest::new("chunker", "0.1.0")]),
+            )
             .mount(&server)
             .await;
 
         let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new());
-        let r = cp.resolve("application/pdf", Some("a.pdf"), Some("tenant-a"), None).await.unwrap();
+        let r = cp
+            .resolve("application/pdf", Some("a.pdf"), Some("tenant-a"), None)
+            .await
+            .unwrap();
         assert_eq!(r.pipeline.uid, "builtin.pdf");
         assert_eq!(r.index_pattern.as_deref(), Some("contracts"));
-        assert_eq!(cp.get_pipeline("builtin.pdf", Some("tenant-a")).await.unwrap().uid, "builtin.pdf");
+        assert_eq!(
+            cp.get_pipeline("builtin.pdf", Some("tenant-a"))
+                .await
+                .unwrap()
+                .uid,
+            "builtin.pdf"
+        );
         assert_eq!(cp.list_pipelines(None).await.unwrap().len(), 1);
         assert_eq!(cp.upsert_pipeline(&def).await.unwrap().uid, "builtin.pdf");
         let err = cp.delete_pipeline("builtin.pdf", None).await.unwrap_err();
-        assert_eq!(err, GatewayError::Forbidden("built-in pipelines cannot be deleted".into()));
+        assert_eq!(
+            err,
+            GatewayError::Forbidden("built-in pipelines cannot be deleted".into())
+        );
         assert_eq!(cp.list_plugins().await.unwrap()[0].name, "chunker");
     }
 
@@ -705,16 +888,28 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/internal/jobs/{job_id}")))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({"error": "job not found"})))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error": "job not found"})),
+            )
             .mount(&server)
             .await;
         let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new());
         cp.create_job(&record).await.unwrap();
         let updated = cp
-            .update_job(job_id, &JobUpdate { status: Some(JobStatus::Running), ..Default::default() })
+            .update_job(
+                job_id,
+                &JobUpdate {
+                    status: Some(JobStatus::Running),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.job_id, job_id);
-        assert!(matches!(cp.get_job(job_id).await, Err(GatewayError::NotFound(_))));
+        assert!(matches!(
+            cp.get_job(job_id).await,
+            Err(GatewayError::NotFound(_))
+        ));
     }
 }

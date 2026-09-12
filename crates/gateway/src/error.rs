@@ -8,9 +8,9 @@
 //! control-plane error bodies, or from transport errors that carry URLs but no
 //! credentials.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 /// Errors produced by the gateway. Each variant maps to exactly one HTTP status.
@@ -49,7 +49,9 @@ impl GatewayError {
     /// HTTP status for this error.
     pub fn status(&self) -> StatusCode {
         match self {
-            GatewayError::MissingContext(_) | GatewayError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            GatewayError::MissingContext(_) | GatewayError::BadRequest(_) => {
+                StatusCode::BAD_REQUEST
+            }
             GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -108,7 +110,10 @@ impl IntoResponse for GatewayError {
         } else {
             tracing::debug!(code = self.code(), "{self}");
         }
-        let body = ErrorBody { error: self.to_string(), code: self.code().to_string() };
+        let body = ErrorBody {
+            error: self.to_string(),
+            code: self.code().to_string(),
+        };
         (status, Json(body)).into_response()
     }
 }
@@ -148,22 +153,51 @@ mod tests {
 
     async fn body_of(resp: Response) -> (StatusCode, ErrorBody) {
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let body: ErrorBody = serde_json::from_slice(&bytes).unwrap();
         (status, body)
     }
 
     #[test]
     fn status_mapping() {
-        assert_eq!(GatewayError::MissingContext("x".into()).status(), StatusCode::BAD_REQUEST);
-        assert_eq!(GatewayError::BadRequest("x".into()).status(), StatusCode::BAD_REQUEST);
-        assert_eq!(GatewayError::Forbidden("x".into()).status(), StatusCode::FORBIDDEN);
-        assert_eq!(GatewayError::NotFound("x".into()).status(), StatusCode::NOT_FOUND);
-        assert_eq!(GatewayError::TooLarge("x".into()).status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(GatewayError::Unsupported("x".into()).status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert_eq!(GatewayError::Invalid("x".into()).status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(GatewayError::Upstream("x".into()).status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(GatewayError::Internal("x".into()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            GatewayError::MissingContext("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            GatewayError::BadRequest("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            GatewayError::Forbidden("x".into()).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            GatewayError::NotFound("x".into()).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            GatewayError::TooLarge("x".into()).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            GatewayError::Unsupported("x".into()).status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            GatewayError::Invalid("x".into()).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            GatewayError::Upstream("x".into()).status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            GatewayError::Internal("x".into()).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -182,7 +216,10 @@ mod tests {
         let codes: std::collections::HashSet<&str> = all.iter().map(|e| e.code()).collect();
         assert_eq!(codes.len(), all.len());
         for c in codes {
-            assert!(c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'), "{c}");
+            assert!(
+                c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'),
+                "{c}"
+            );
         }
     }
 
@@ -206,7 +243,9 @@ mod tests {
 
     #[test]
     fn serde_json_error_maps_to_bad_request() {
-        let e: GatewayError = serde_json::from_str::<serde_json::Value>("{").unwrap_err().into();
+        let e: GatewayError = serde_json::from_str::<serde_json::Value>("{")
+            .unwrap_err()
+            .into();
         assert!(matches!(e, GatewayError::BadRequest(_)));
     }
 }

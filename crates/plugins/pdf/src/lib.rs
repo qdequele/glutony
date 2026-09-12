@@ -50,6 +50,21 @@ impl Default for Config {
     }
 }
 
+/// Extract per-page text off the async runtime (`pdf-extract` is synchronous and
+/// CPU-bound; running it inline would block a worker thread and stall heartbeats).
+async fn extract_pages(data: Vec<u8>) -> Result<Vec<String>, PluginError> {
+    run_blocking(move || pdf_extract::extract_text_from_mem_by_pages(&data))
+        .await?
+        .map_err(pdf_error)
+}
+
+/// Extract the whole document's text off the async runtime.
+async fn extract_whole(data: Vec<u8>) -> Result<String, PluginError> {
+    run_blocking(move || pdf_extract::extract_text_from_mem(&data))
+        .await?
+        .map_err(pdf_error)
+}
+
 fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
     if value.is_null() {
         return Ok(Config::default());
@@ -145,8 +160,7 @@ impl Plugin for PdfExtractorPlugin {
         let meta = base_meta(&blob);
 
         if cfg.per_page {
-            let pages =
-                pdf_extract::extract_text_from_mem_by_pages(&blob.data).map_err(pdf_error)?;
+            let pages = extract_pages(blob.data.clone()).await?;
             let mut docs = Vec::with_capacity(pages.len());
             for (idx, text) in pages.into_iter().enumerate() {
                 ctx.check_cancelled()?;
@@ -173,8 +187,7 @@ impl Plugin for PdfExtractorPlugin {
         let text = match cfg.max_pages {
             // Whole-document mode with a page cap: read page by page and join.
             Some(max) => {
-                let pages =
-                    pdf_extract::extract_text_from_mem_by_pages(&blob.data).map_err(pdf_error)?;
+                let pages = extract_pages(blob.data.clone()).await?;
                 let mut parts = Vec::new();
                 for (idx, page) in pages.into_iter().enumerate() {
                     ctx.check_cancelled()?;
@@ -191,9 +204,7 @@ impl Plugin for PdfExtractorPlugin {
                 }
                 parts.join("\n\n")
             }
-            None => normalize_whitespace(
-                &pdf_extract::extract_text_from_mem(&blob.data).map_err(pdf_error)?,
-            ),
+            None => normalize_whitespace(&extract_whole(blob.data.clone()).await?),
         };
         ctx.check_cancelled()?;
         if text.is_empty() {

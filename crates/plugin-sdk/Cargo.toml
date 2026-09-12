@@ -22,10 +22,11 @@ thiserror.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 uuid.workspace = true
-tokio = { version = "1.47", default-features = false, features = ["sync"] }
+tokio = { version = "1.47", default-features = false, features = ["sync", "rt"] }
 extism-pdk = { version = "1", optional = true }
 futures = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.47", features = ["rt", "macros"] }
 serde_yaml.workspace = true

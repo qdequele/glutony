@@ -287,7 +287,9 @@ impl Plugin for DocxExtractorPlugin {
         let base = base_id(&blob);
         let meta = base_meta(&blob);
 
-        let docx = docx_rs::read_docx(&blob.data)
+        let data = blob.data.clone();
+        let docx = run_blocking(move || docx_rs::read_docx(&data))
+            .await?
             .map_err(|e| PluginError::NonRetryable(format!("failed to parse DOCX: {e}")))?;
         let blocks = collect_blocks(&docx);
         let mut title = core_title(&docx);

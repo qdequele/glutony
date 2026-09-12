@@ -132,7 +132,10 @@ impl Document {
         if let Some(t) = &self.title {
             obj.insert("title".into(), serde_json::Value::String(t.clone()));
         }
-        obj.insert("content".into(), serde_json::Value::String(self.content.clone()));
+        obj.insert(
+            "content".into(),
+            serde_json::Value::String(self.content.clone()),
+        );
         for (k, v) in &self.fields {
             if k != "id" && k != "content" && k != "_meta" {
                 obj.insert(k.clone(), v.clone());
@@ -151,7 +154,13 @@ impl Document {
 pub fn sanitize_id(raw: &str) -> String {
     let mut out: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.is_empty() {
         out = Uuid::new_v4().to_string();
@@ -182,7 +191,11 @@ pub struct Blob {
 impl Blob {
     /// Build a blob.
     pub fn new(data: Vec<u8>, mime: impl Into<String>, filename: Option<String>) -> Self {
-        Self { data, mime: mime.into(), filename }
+        Self {
+            data,
+            mime: mime.into(),
+            filename,
+        }
     }
 
     /// Interpret the bytes as UTF-8 text (lossy).
@@ -236,9 +249,9 @@ impl ContentRef {
     /// MIME hint, whichever variant.
     pub fn mime(&self) -> Option<&str> {
         match self {
-            ContentRef::Url { mime, .. } | ContentRef::S3 { mime, .. } | ContentRef::Staged { mime, .. } => {
-                mime.as_deref()
-            }
+            ContentRef::Url { mime, .. }
+            | ContentRef::S3 { mime, .. }
+            | ContentRef::Staged { mime, .. } => mime.as_deref(),
         }
     }
 
@@ -756,7 +769,9 @@ pub enum PipelineError {
     #[error("fan_out step {0:?} must depend on exactly one step")]
     FanOutArity(String),
     /// Unsupported fan-out path.
-    #[error("fan_out path {path:?} on step {step:?} is not supported (use \"$.documents\" or \"$.many\")")]
+    #[error(
+        "fan_out path {path:?} on step {step:?} is not supported (use \"$.documents\" or \"$.many\")"
+    )]
     FanOutPath {
         /// The step.
         step: String,
@@ -849,8 +864,12 @@ impl PipelineDefinition {
             }
         }
         // Kahn
-        let index: HashMap<&str, usize> =
-            self.steps.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
+        let index: HashMap<&str, usize> = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id.as_str(), i))
+            .collect();
         let mut indegree = vec![0usize; self.steps.len()];
         let mut children: Vec<Vec<usize>> = vec![vec![]; self.steps.len()];
         for (i, s) in self.steps.iter().enumerate() {
@@ -860,8 +879,9 @@ impl PipelineDefinition {
                 children[j].push(i);
             }
         }
-        let mut queue: VecDeque<usize> =
-            (0..self.steps.len()).filter(|&i| indegree[i] == 0).collect();
+        let mut queue: VecDeque<usize> = (0..self.steps.len())
+            .filter(|&i| indegree[i] == 0)
+            .collect();
         let mut order = Vec::with_capacity(self.steps.len());
         while let Some(i) = queue.pop_front() {
             order.push(self.steps[i].id.clone());
@@ -926,7 +946,12 @@ fn serde_yaml_from_str(text: &str) -> Result<PipelineDefinition, String> {
 
 /// `type/*` aware MIME match. `type/subtype;params` on the right side is tolerated.
 pub fn mime_matches(pattern: &str, mime: &str) -> bool {
-    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let pattern = pattern.trim().to_ascii_lowercase();
     if pattern == "*/*" || pattern == "*" {
         return true;
@@ -1008,7 +1033,10 @@ impl JobStatus {
     }
     /// Whether no further transitions are possible.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled)
+        matches!(
+            self,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+        )
     }
 }
 
@@ -1229,7 +1257,11 @@ mod tests {
 
     #[test]
     fn cycle_is_rejected() {
-        let p = pipeline(vec![step("a", &["c"]), step("b", &["a"]), step("c", &["b"])]);
+        let p = pipeline(vec![
+            step("a", &["c"]),
+            step("b", &["a"]),
+            step("c", &["b"]),
+        ]);
         assert!(matches!(p.validate(), Err(PipelineError::Cycle(_))));
     }
 
@@ -1238,7 +1270,10 @@ mod tests {
         let p = pipeline(vec![step("a", &[]), step("b", &["zzz"])]);
         assert_eq!(
             p.validate(),
-            Err(PipelineError::UnknownDependency { step: "b".into(), dep: "zzz".into() })
+            Err(PipelineError::UnknownDependency {
+                step: "b".into(),
+                dep: "zzz".into()
+            })
         );
     }
 
@@ -1258,7 +1293,9 @@ mod tests {
         let p = pipeline(vec![
             step("a", &[]),
             step("b", &[]),
-            StepDefinition::new("c", "x").depends_on(["a", "b"]).fan_out("$.documents"),
+            StepDefinition::new("c", "x")
+                .depends_on(["a", "b"])
+                .fan_out("$.documents"),
         ]);
         assert_eq!(p.validate(), Err(PipelineError::FanOutArity("c".into())));
     }
@@ -1313,7 +1350,10 @@ steps:
         assert_eq!(p.steps[0].timeout_secs, Some(120));
         assert_eq!(p.steps[0].retry.as_ref().unwrap().max_attempts, 3);
         assert_eq!(p.steps[2].fan_out.as_deref(), Some("$.documents"));
-        assert_eq!(p.validate().unwrap(), vec!["extract", "chunk", "enrich", "index"]);
+        assert_eq!(
+            p.validate().unwrap(),
+            vec!["extract", "chunk", "enrich", "index"]
+        );
         assert!(p.trigger_matches("application/pdf", Some("contract_2024.pdf")));
         assert!(!p.trigger_matches("application/pdf", Some("invoice.pdf")));
         assert!(!p.trigger_matches("application/pdf", None));
@@ -1344,14 +1384,21 @@ steps:
     #[test]
     fn mime_wildcards() {
         assert!(mime_matches("video/*", "video/mp4"));
-        assert!(mime_matches("application/pdf", "application/pdf; charset=binary"));
+        assert!(mime_matches(
+            "application/pdf",
+            "application/pdf; charset=binary"
+        ));
         assert!(!mime_matches("video/*", "audio/mpeg"));
         assert!(mime_matches("*/*", "anything/at-all"));
     }
 
     #[test]
     fn blob_roundtrips_through_json_as_base64() {
-        let input = PluginInput::Bytes(Blob::new(vec![0, 1, 2, 255], "application/pdf", Some("a.pdf".into())));
+        let input = PluginInput::Bytes(Blob::new(
+            vec![0, 1, 2, 255],
+            "application/pdf",
+            Some("a.pdf".into()),
+        ));
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("\"data\":\"AAEC/w==\""));
         let back: PluginInput = serde_json::from_str(&json).unwrap();
@@ -1362,11 +1409,16 @@ steps:
     fn many_flattens_into_documents() {
         let out = PluginOutput::Many(vec![
             PluginOutput::Documents(vec![Document::with_id("a", "x")]),
-            PluginOutput::Many(vec![PluginOutput::Documents(vec![Document::with_id("b", "y")])]),
+            PluginOutput::Many(vec![PluginOutput::Documents(vec![Document::with_id(
+                "b", "y",
+            )])]),
             PluginOutput::Empty,
         ]);
         let docs = PluginInput::from(out).into_documents().unwrap();
-        assert_eq!(docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 
     #[test]

@@ -72,12 +72,36 @@ pub trait Plugin: Send + Sync + 'static {
     ) -> Result<PluginOutput, PluginError>;
 }
 
+/// Run a CPU-bound, synchronous parsing routine off the async runtime.
+///
+/// Plugins that call blocking libraries (PDF text extraction, spreadsheet parsing,
+/// zip decompression) must wrap that work in this helper. A worker runs many
+/// activities on one tokio runtime; blocking a runtime thread stalls every other
+/// activity on it and can starve Temporal's heartbeats.
+///
+/// ```no_run
+/// # use meili_ingest_plugin_sdk::{run_blocking, PluginError};
+/// # async fn demo(data: Vec<u8>) -> Result<usize, PluginError> {
+/// let parsed = run_blocking(move || data.len()).await?;
+/// # Ok(parsed)
+/// # }
+/// ```
+pub async fn run_blocking<T, F>(f: F) -> Result<T, PluginError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| PluginError::NonRetryable(format!("blocking task failed: {e}")))
+}
+
 /// Convenience re-exports for plugin authors.
 pub mod prelude {
     pub use crate::context::ActivityContext;
     pub use crate::error::PluginError;
     pub use crate::types::*;
-    pub use crate::Plugin;
+    pub use crate::{Plugin, run_blocking};
     pub use async_trait::async_trait;
     pub use serde_json;
 }

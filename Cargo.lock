@@ -2881,6 +2881,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "calamine",
+ "chrono",
  "meili-ingest-plugin-sdk",
  "rust_xlsxwriter",
  "serde",

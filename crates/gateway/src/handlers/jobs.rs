@@ -5,9 +5,9 @@
 //! every read (write-through cache) and used as a fallback when Temporal no longer
 //! knows the workflow.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,11 +49,15 @@ pub struct CancelResponse {
 }
 
 fn parse_job_id(id: &str) -> Result<Uuid, GatewayError> {
-    Uuid::parse_str(id.trim()).map_err(|_| GatewayError::BadRequest(format!("invalid job id {id:?}: expected a UUID")))
+    Uuid::parse_str(id.trim())
+        .map_err(|_| GatewayError::BadRequest(format!("invalid job id {id:?}: expected a UUID")))
 }
 
 /// `GET /jobs/{id}`.
-pub async fn get_job(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<JobResponse>, GatewayError> {
+pub async fn get_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JobResponse>, GatewayError> {
     let job_id = parse_job_id(&id)?;
     match state.temporal.progress(job_id).await? {
         Some(snapshot) => {
@@ -67,13 +71,14 @@ pub async fn get_job(State(state): State<AppState>, Path(id): Path<String>) -> R
                 error: error.clone(),
                 index_name: None,
             };
-            let record: Option<JobRecord> = match state.control_plane.update_job(job_id, &update).await {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::debug!(job_id = %job_id, "could not refresh job cache: {e}");
-                    None
-                }
-            };
+            let record: Option<JobRecord> =
+                match state.control_plane.update_job(job_id, &update).await {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::debug!(job_id = %job_id, "could not refresh job cache: {e}");
+                        None
+                    }
+                };
             Ok(Json(JobResponse {
                 job_id,
                 status: snapshot.status,
@@ -85,10 +90,16 @@ pub async fn get_job(State(state): State<AppState>, Path(id): Path<String>) -> R
             }))
         }
         None => {
-            let record = state.control_plane.get_job(job_id).await.map_err(|e| match e {
-                GatewayError::NotFound(_) => GatewayError::NotFound(format!("job {job_id} not found")),
-                other => other,
-            })?;
+            let record = state
+                .control_plane
+                .get_job(job_id)
+                .await
+                .map_err(|e| match e {
+                    GatewayError::NotFound(_) => {
+                        GatewayError::NotFound(format!("job {job_id} not found"))
+                    }
+                    other => other,
+                })?;
             Ok(Json(JobResponse {
                 job_id,
                 status: record.status,
@@ -110,7 +121,13 @@ pub async fn cancel_job(
     let job_id = parse_job_id(&id)?;
     state.temporal.cancel(job_id).await?;
     tracing::info!(job_id = %job_id, "cancel requested");
-    Ok((StatusCode::ACCEPTED, Json(CancelResponse { job_id, status: "cancelling".into() })))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CancelResponse {
+            job_id,
+            status: "cancelling".into(),
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -164,7 +181,14 @@ mod tests {
                 }),
             },
         );
-        let resp = app.oneshot(Request::get(format!("/jobs/{job_id}")).body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::get(format!("/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = json_body(resp).await;
         assert_eq!(json["job_id"], job_id.to_string());
@@ -173,7 +197,13 @@ mod tests {
         assert_eq!(json["progress"]["completed_steps"], 1);
         assert_eq!(json["pipeline_used"], "builtin.pdf");
         assert_eq!(json["target_index"], "documents");
-        let patch = server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
         assert_eq!(body["status"], "running");
         assert_eq!(body["current_step"], "chunk");
@@ -184,8 +214,21 @@ mod tests {
         let server = MockServer::start().await;
         let job_id = Uuid::new_v4();
         let (app, starter) = test_app(&server, GatewayConfig::default()).await;
-        starter.set_snapshot(job_id, JobSnapshot { status: JobStatus::Succeeded, progress: None });
-        let resp = app.oneshot(Request::get(format!("/jobs/{job_id}")).body(Body::empty()).unwrap()).await.unwrap();
+        starter.set_snapshot(
+            job_id,
+            JobSnapshot {
+                status: JobStatus::Succeeded,
+                progress: None,
+            },
+        );
+        let resp = app
+            .oneshot(
+                Request::get(format!("/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = json_body(resp).await;
         assert_eq!(json["status"], "succeeded");
@@ -212,14 +255,29 @@ mod tests {
             .mount(&server)
             .await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
-        let resp = app.clone().oneshot(Request::get(format!("/jobs/{job_id}")).body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = json_body(resp).await;
         assert_eq!(json["status"], "failed");
         assert_eq!(json["error"], "boom");
         assert_eq!(json["pipeline_used"], "builtin.pdf");
 
-        let resp = app.oneshot(Request::get(format!("/jobs/{other}")).body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::get(format!("/jobs/{other}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -227,7 +285,14 @@ mod tests {
     async fn invalid_uuid_is_400() {
         let server = MockServer::start().await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
-        let resp = app.oneshot(Request::get("/jobs/not-a-uuid").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::get("/jobs/not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -238,7 +303,11 @@ mod tests {
         let (app, starter) = test_app(&server, GatewayConfig::default()).await;
         let resp = app
             .clone()
-            .oneshot(Request::post(format!("/jobs/{job_id}/cancel")).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post(format!("/jobs/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -247,7 +316,14 @@ mod tests {
         assert_eq!(json["job_id"], job_id.to_string());
         assert_eq!(starter.cancelled(), vec![job_id]);
 
-        let resp = app.oneshot(Request::post("/jobs/xyz/cancel").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::post("/jobs/xyz/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

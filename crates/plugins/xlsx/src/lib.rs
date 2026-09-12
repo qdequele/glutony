@@ -311,8 +311,13 @@ impl Plugin for XlsxExtractorPlugin {
         let base = base_id(&blob);
         let meta = base_meta(&blob);
 
-        let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(blob.data))
-            .map_err(|e| PluginError::NonRetryable(format!("failed to open spreadsheet: {e}")))?;
+        let data = blob.data.clone();
+        let mut workbook =
+            run_blocking(move || calamine::open_workbook_auto_from_rs(Cursor::new(data)))
+                .await?
+                .map_err(|e| {
+                    PluginError::NonRetryable(format!("failed to open spreadsheet: {e}"))
+                })?;
 
         let mut docs = Vec::new();
         for (sheet_index, sheet) in workbook.sheet_names().iter().enumerate() {

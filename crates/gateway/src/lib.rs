@@ -34,10 +34,16 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/ingest/batch", post(handlers::ingest::ingest_batch))
-        .route("/ingest/pipeline/{name}", post(handlers::pipeline::ingest_with_pipeline))
+        .route(
+            "/ingest/pipeline/{name}",
+            post(handlers::pipeline::ingest_with_pipeline),
+        )
         .route("/jobs/{id}", get(handlers::jobs::get_job))
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))
-        .route("/pipelines", get(handlers::pipelines::list_pipelines).post(handlers::pipelines::create_pipeline))
+        .route(
+            "/pipelines",
+            get(handlers::pipelines::list_pipelines).post(handlers::pipelines::create_pipeline),
+        )
         .route(
             "/pipelines/{name}",
             get(handlers::pipelines::get_pipeline).delete(handlers::pipelines::delete_pipeline),
@@ -57,23 +63,26 @@ pub mod test_support {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use axum::body::Body;
-    use axum::http::header::CONTENT_TYPE;
-    use axum::http::Request;
-    use axum::response::Response;
     use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::Response;
     use meili_ingest_blob::BlobStore;
-    use meili_ingest_plugin_sdk::{PipelineDefinition, PipelineTrigger, PipelineWorkflowInput, StepDefinition};
+    use meili_ingest_plugin_sdk::{
+        PipelineDefinition, PipelineTrigger, PipelineWorkflowInput, StepDefinition,
+    };
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use crate::GatewayError;
     pub use crate::state::GatewayConfig;
     use crate::state::{AppState, JobSnapshot, StartedWorkflow, WorkflowStarter};
-    use crate::GatewayError;
 
     /// A small but valid PDF header (magic bytes for `infer`).
-    pub const PDF_MAGIC: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+    pub const PDF_MAGIC: &[u8] =
+        b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
 
     /// [`WorkflowStarter`] that records inputs and serves canned snapshots.
     #[derive(Default)]
@@ -105,7 +114,10 @@ pub mod test_support {
 
     #[async_trait]
     impl WorkflowStarter for FakeStarter {
-        async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError> {
+        async fn start(
+            &self,
+            input: &PipelineWorkflowInput,
+        ) -> Result<StartedWorkflow, GatewayError> {
             if *self.fail_start.lock().unwrap() {
                 return Err(GatewayError::Upstream("temporal unavailable".into()));
             }
@@ -125,15 +137,26 @@ pub mod test_support {
     }
 
     /// Router + starter wired to the given control plane URL.
-    pub async fn test_app_with_url(mut config: GatewayConfig, control_plane_url: &str) -> (Router, Arc<FakeStarter>) {
+    pub async fn test_app_with_url(
+        mut config: GatewayConfig,
+        control_plane_url: &str,
+    ) -> (Router, Arc<FakeStarter>) {
         config.control_plane_url = control_plane_url.to_string();
         let starter = Arc::new(FakeStarter::default());
-        let state = AppState::new(config, starter.clone(), BlobStore::memory(), reqwest::Client::new());
+        let state = AppState::new(
+            config,
+            starter.clone(),
+            BlobStore::memory(),
+            reqwest::Client::new(),
+        );
         (crate::router(state), starter)
     }
 
     /// Router + starter wired to a `wiremock` control plane.
-    pub async fn test_app(server: &MockServer, config: GatewayConfig) -> (Router, Arc<FakeStarter>) {
+    pub async fn test_app(
+        server: &MockServer,
+        config: GatewayConfig,
+    ) -> (Router, Arc<FakeStarter>) {
         test_app_with_url(config, &server.uri()).await
     }
 
@@ -178,12 +201,20 @@ pub mod test_support {
     }
 
     /// Build a multipart body with one file part. Returns `(content_type, body)`.
-    pub fn multipart_body(field: &str, filename: &str, content_type: &str, data: &[u8]) -> (String, Vec<u8>) {
+    pub fn multipart_body(
+        field: &str,
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> (String, Vec<u8>) {
         let boundary = "----meiliTestBoundary7MA4YWxk";
         let mut body = Vec::new();
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n").as_bytes(),
+            format!(
+                "Content-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
+            )
+            .as_bytes(),
         );
         body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
         body.extend_from_slice(data);
@@ -192,7 +223,11 @@ pub mod test_support {
     }
 
     /// A POST request carrying standalone credentials (`X-Meili-Host` + bearer key).
-    pub fn standalone_request(uri: &str, content_type: impl AsRef<str>, body: Vec<u8>) -> Request<Body> {
+    pub fn standalone_request(
+        uri: &str,
+        content_type: impl AsRef<str>,
+        body: Vec<u8>,
+    ) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri(uri)
@@ -205,11 +240,18 @@ pub mod test_support {
 
     /// Read a JSON response body.
     pub async fn json_body(resp: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
         if bytes.is_empty() {
             return serde_json::Value::Null;
         }
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("invalid JSON body {:?}: {e}", String::from_utf8_lossy(&bytes)))
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "invalid JSON body {:?}: {e}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
     }
 }
 
@@ -225,7 +267,10 @@ mod tests {
     async fn health_is_ok() {
         let server = MockServer::start().await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
-        let resp = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(json_body(resp).await["status"], "ok");
     }
@@ -234,7 +279,10 @@ mod tests {
     async fn unknown_route_is_404() {
         let server = MockServer::start().await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
-        let resp = app.oneshot(Request::get("/nope").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(Request::get("/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

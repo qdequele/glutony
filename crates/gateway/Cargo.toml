@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "meili-gateway"
+name = "meili-ingest-gateway"
 path = "src/main.rs"
 
 [lib]
