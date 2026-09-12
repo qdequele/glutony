@@ -1,0 +1,125 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gateway",
+    "crates/control-plane",
+    "crates/worker",
+    "crates/router",
+    "crates/blob",
+    "crates/plugin-sdk",
+    "crates/plugin-runtime",
+    "crates/plugins/pdf",
+    "crates/plugins/docx",
+    "crates/plugins/xlsx",
+    "crates/plugins/html",
+    "crates/plugins/markdown",
+    "crates/plugins/csv",
+    "crates/plugins/json",
+    "crates/plugins/chunker",
+    "crates/plugins/meili-indexer",
+    "crates/plugins/llm-enricher",
+    "crates/plugins/image-captioner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/meilisearch/meili-ingest"
+rust-version = "1.92"
+
+[workspace.dependencies]
+# internal
+meili-ingest-plugin-sdk = { path = "crates/plugin-sdk", version = "0.1.0" }
+meili-ingest-router = { path = "crates/router" }
+meili-ingest-blob = { path = "crates/blob" }
+meili-ingest-plugin-runtime = { path = "crates/plugin-runtime" }
+meili-ingest-plugin-pdf = { path = "crates/plugins/pdf" }
+meili-ingest-plugin-docx = { path = "crates/plugins/docx" }
+meili-ingest-plugin-xlsx = { path = "crates/plugins/xlsx" }
+meili-ingest-plugin-html = { path = "crates/plugins/html" }
+meili-ingest-plugin-markdown = { path = "crates/plugins/markdown" }
+meili-ingest-plugin-csv = { path = "crates/plugins/csv" }
+meili-ingest-plugin-json = { path = "crates/plugins/json" }
+meili-ingest-plugin-chunker = { path = "crates/plugins/chunker" }
+meili-ingest-plugin-meili-indexer = { path = "crates/plugins/meili-indexer" }
+meili-ingest-plugin-llm-enricher = { path = "crates/plugins/llm-enricher" }
+meili-ingest-plugin-image-captioner = { path = "crates/plugins/image-captioner" }
+
+# async / runtime
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+
+# http
+axum = { version = "0.8", features = ["multipart", "macros", "json", "query"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors", "limit", "timeout", "request-id"] }
+http = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "multipart", "rustls"] }
+url = "2"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+base64 = "0.23"
+bytes = "1"
+
+# temporal
+temporalio-sdk = "1.0"
+temporalio-client = "1.0"
+temporalio-common = "1.0"
+temporalio-macros = "1.0"
+
+# database
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+
+# storage
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+
+# search
+meilisearch-sdk = "0.33"
+
+# detection / parsing
+infer = "0.22"
+mime_guess = "2"
+globset = "0.4"
+regex = "1"
+serde_json_path = "0.7"
+pdf-extract = "0.12"
+lopdf = "0.45"
+docx-rs = { version = "0.4", default-features = false }
+calamine = "0.36"
+scraper = "0.27"
+pulldown-cmark = "0.13"
+csv = "1.4"
+
+# plugin runtime
+extism = "1.30"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# misc
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+
+# testing
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

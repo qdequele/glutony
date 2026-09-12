@@ -1,0 +1,30 @@
+[package]
+name = "meili-ingest-plugin-sdk"
+description = "Plugin SDK for meili-ingest: the Plugin trait, shared types (MeiliContext, PipelineDefinition, Document, PluginInput/Output) and the ActivityContext."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Helpers for authoring WASM plugins with extism-pdk. Compile with `--target wasm32-wasip1`.
+wasm = ["dep:extism-pdk"]
+# Parse pipeline definitions written in YAML (pulls in serde_yaml).
+yaml = ["dep:serde_yaml"]
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+uuid.workspace = true
+tokio = { version = "1.47", default-features = false, features = ["sync"] }
+extism-pdk = { version = "1", optional = true }
+serde_yaml = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_yaml.workspace = true
