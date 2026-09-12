@@ -202,3 +202,126 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod builtin_pipeline_compat {
+    //! Every built-in pipeline must be runnable by a worker that has the built-in
+    //! plugins: auto-routing always hands the first step raw bytes (an upload, or a
+    //! URL/S3 reference the activity resolves into bytes), and each step's output kind
+    //! must be acceptable to the next one. These are contract checks between
+    //! `meili-ingest-router`'s pipeline table and the plugins' manifests.
+
+    use super::PluginRegistry;
+    use meili_ingest_plugin_sdk::{InputKind, OutputKind};
+    use meili_ingest_router::builtin_pipelines;
+    use std::sync::Arc;
+
+    /// Registry holding every in-repo plugin, including the LLM-backed ones that
+    /// `PluginRegistry::builtin()` marks unavailable when no API key is configured.
+    /// Their manifests are still the contract these tests check.
+    fn registry_with_all_manifests() -> PluginRegistry {
+        let mut reg = PluginRegistry::builtin();
+        reg.register(Arc::new(
+            meili_ingest_plugin_llm_enricher::LlmEnricherPlugin::new(),
+        ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::new(),
+        ));
+        reg
+    }
+
+    /// Plugins provided by external gRPC containers, not by this binary.
+    const EXTERNAL: &[&str] = &[
+        "pptx_extractor",
+        "whisper_transcriber",
+        "video_audio_extractor",
+        "ocr",
+        "s3_downloader",
+    ];
+
+    fn output_satisfies(produced: OutputKind, accepts: &[InputKind]) -> bool {
+        if accepts.is_empty() {
+            return true;
+        }
+        let equivalent = match produced {
+            OutputKind::Bytes => InputKind::Bytes,
+            OutputKind::Ref => InputKind::Bytes, // resolved by the activity before dispatch
+            OutputKind::Documents => InputKind::Documents,
+            OutputKind::Many => InputKind::Many,
+            OutputKind::Indexed | OutputKind::Empty => InputKind::Empty,
+        };
+        if accepts.contains(&equivalent) {
+            return true;
+        }
+        // A `Many` of documents is flattened for plugins that take documents.
+        equivalent == InputKind::Many && accepts.contains(&InputKind::Documents)
+    }
+
+    #[test]
+    fn first_step_of_every_builtin_pipeline_accepts_raw_bytes() {
+        let reg = registry_with_all_manifests();
+        for pipeline in builtin_pipelines() {
+            let first = &pipeline.steps[0];
+            if EXTERNAL.contains(&first.plugin.as_str()) {
+                continue;
+            }
+            let plugin = reg.get(&first.plugin).unwrap_or_else(|| {
+                panic!("{}: plugin {} not registered", pipeline.uid, first.plugin)
+            });
+            let accepts = plugin.manifest().accepts;
+            assert!(
+                accepts.is_empty() || accepts.contains(&InputKind::Bytes),
+                "{}: first step {:?} ({}) does not accept Bytes but auto-routing always \
+                 delivers an uploaded/fetched file; accepts={:?}",
+                pipeline.uid,
+                first.id,
+                first.plugin,
+                accepts
+            );
+        }
+    }
+
+    #[test]
+    fn every_builtin_pipeline_step_accepts_its_predecessor_output() {
+        let reg = registry_with_all_manifests();
+        for pipeline in builtin_pipelines() {
+            for window in pipeline.steps.windows(2) {
+                let (prev, next) = (&window[0], &window[1]);
+                if EXTERNAL.contains(&prev.plugin.as_str())
+                    || EXTERNAL.contains(&next.plugin.as_str())
+                {
+                    continue;
+                }
+                let (Some(p), Some(n)) = (reg.get(&prev.plugin), reg.get(&next.plugin)) else {
+                    continue;
+                };
+                let produced = p.manifest().produces;
+                let accepts = n.manifest().accepts;
+                assert!(
+                    output_satisfies(produced, &accepts),
+                    "{}: step {:?} ({}) produces {:?} which step {:?} ({}) does not accept ({:?})",
+                    pipeline.uid,
+                    prev.id,
+                    prev.plugin,
+                    produced,
+                    next.id,
+                    next.plugin,
+                    accepts
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_builtin_pipeline_ends_in_the_indexer() {
+        for pipeline in builtin_pipelines() {
+            let last = pipeline.steps.last().expect("pipeline has steps");
+            assert_eq!(
+                last.plugin,
+                meili_ingest_plugin_sdk::INDEXER_PLUGIN,
+                "{} does not end in the indexer",
+                pipeline.uid
+            );
+        }
+    }
+}
