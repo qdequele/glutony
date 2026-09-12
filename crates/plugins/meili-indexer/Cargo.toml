@@ -1,5 +1,6 @@
 [package]
 name = "meili-ingest-plugin-meili-indexer"
+description = "meili-ingest built-in plugin: pushes documents to Meilisearch using the tenant MeiliContext injected into its config."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+meilisearch-sdk.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
