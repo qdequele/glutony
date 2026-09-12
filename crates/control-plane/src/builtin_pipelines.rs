@@ -18,17 +18,14 @@ pub const IN_REPO_PLUGINS: &[&str] = &[
     "meili_indexer",
     "llm_enricher",
     "image_captioner",
-];
-
-/// Plugins referenced by built-in pipelines or task-queue routing that are expected to
-/// be provided by external gRPC containers (not implemented in this repository).
-pub const EXTERNAL_PLUGINS: &[&str] = &[
     "pptx_extractor",
     "whisper_transcriber",
     "video_audio_extractor",
-    "s3_downloader",
-    "ocr",
 ];
+
+/// Plugins referenced by task-queue routing that are expected to be provided by
+/// external gRPC containers (not implemented in this repository).
+pub const EXTERNAL_PLUGINS: &[&str] = &["s3_downloader", "ocr"];
 
 const ALL_KNOWN: &[&str] = &[
     "pdf_extractor",
@@ -50,7 +47,7 @@ const ALL_KNOWN: &[&str] = &[
 ];
 
 /// Every plugin name the control plane accepts in a user pipeline without a worker
-/// having registered it first: the 11 in-repo plugins plus the known gRPC plugins.
+/// having registered it first: the 14 in-repo plugins plus the known gRPC plugins.
 pub fn builtin_plugin_names() -> &'static [&'static str] {
     ALL_KNOWN
 }
@@ -83,7 +80,7 @@ mod tests {
         let mut expected: Vec<&str> = IN_REPO_PLUGINS.to_vec();
         expected.extend_from_slice(EXTERNAL_PLUGINS);
         assert_eq!(builtin_plugin_names(), expected.as_slice());
-        assert_eq!(IN_REPO_PLUGINS.len(), 11);
+        assert_eq!(IN_REPO_PLUGINS.len(), 14);
         assert_eq!(builtin_plugin_names().len(), 16);
     }
 

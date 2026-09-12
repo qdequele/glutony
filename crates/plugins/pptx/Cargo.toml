@@ -1,0 +1,22 @@
+[package]
+name = "meili-ingest-plugin-pptx"
+description = "meili-ingest built-in plugin: extracts slide text and speaker notes from PowerPoint (.pptx) files."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# A .pptx is an OOXML zip; we read the slide parts ourselves rather than shelling
+# out to LibreOffice (see SPEC §18 question 5).
+zip.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

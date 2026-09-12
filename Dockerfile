@@ -15,7 +15,7 @@
 # Dependencies are compiled in a separate cargo-chef layer so that editing
 # source code does not invalidate the (slow) dependency build.
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.94
 
 # ---------------------------------------------------------------------------
 # Stage 1: tooling

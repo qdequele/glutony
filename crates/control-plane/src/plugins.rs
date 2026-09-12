@@ -94,7 +94,14 @@ mod tests {
         assert_eq!(names, builtin_plugin_names());
         let by_name = |n: &str| list.iter().find(|m| m.name == n).map(|m| m.kind);
         assert_eq!(by_name("pdf_extractor"), Some(PluginKind::Builtin));
-        assert_eq!(by_name("whisper_transcriber"), Some(PluginKind::Grpc));
+        // The media plugins are compiled into the worker now (pure Rust: OOXML zip
+        // parsing, symphonia decoding and an HTTP transcription client).
+        assert_eq!(by_name("pptx_extractor"), Some(PluginKind::Builtin));
+        assert_eq!(by_name("whisper_transcriber"), Some(PluginKind::Builtin));
+        assert_eq!(by_name("video_audio_extractor"), Some(PluginKind::Builtin));
+        // These two are still expected from external gRPC containers.
+        assert_eq!(by_name("ocr"), Some(PluginKind::Grpc));
+        assert_eq!(by_name("s3_downloader"), Some(PluginKind::Grpc));
         // Round-trips through JSON (what the gateway receives).
         let json = serde_json::to_string(&list).unwrap();
         let back: Vec<PluginManifest> = serde_json::from_str(&json).unwrap();

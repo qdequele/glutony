@@ -27,6 +27,9 @@ meili-ingest-plugin-chunker.workspace = true
 meili-ingest-plugin-meili-indexer.workspace = true
 meili-ingest-plugin-llm-enricher.workspace = true
 meili-ingest-plugin-image-captioner.workspace = true
+meili-ingest-plugin-pptx.workspace = true
+meili-ingest-plugin-audio-transcriber.workspace = true
+meili-ingest-plugin-video-audio.workspace = true
 
 temporalio-sdk.workspace = true
 temporalio-client.workspace = true

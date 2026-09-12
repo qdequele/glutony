@@ -60,6 +60,42 @@ pub mod mime {
     pub const YAML: &str = "application/yaml";
     /// Zip archive.
     pub const ZIP: &str = "application/zip";
+    /// WAV audio, canonical spelling.
+    pub const WAV: &str = "audio/wav";
+    /// MP3 audio, canonical spelling.
+    pub const MP3: &str = "audio/mpeg";
+    /// MP4/M4A audio, canonical spelling.
+    pub const M4A: &str = "audio/mp4";
+    /// Ogg audio.
+    pub const OGG: &str = "audio/ogg";
+    /// FLAC audio.
+    pub const FLAC: &str = "audio/flac";
+    /// Matroska video.
+    pub const MKV: &str = "video/x-matroska";
+}
+
+/// Collapse the common spellings of a media type onto one canonical name.
+///
+/// Detection libraries, browsers and CLI tools disagree: `infer` reports a RIFF/WAVE
+/// file as `audio/x-wav`, `mime_guess` maps `.m4a` to `audio/m4a`, and callers send
+/// `audio/mp3`. Pipelines declare one spelling in `trigger.content_types`, so without
+/// canonicalisation an ordinary `.wav` upload matches nothing and the gateway answers
+/// 415. Everything downstream sees the canonical name.
+pub fn canonical_mime(mime: &str) -> &str {
+    match mime {
+        "audio/x-wav" | "audio/wave" | "audio/vnd.wave" | "audio/x-pn-wav" | "audio/wav-x" => {
+            mime::WAV
+        }
+        "audio/mp3" | "audio/x-mpeg" | "audio/mpeg3" | "audio/x-mp3" => mime::MP3,
+        "audio/m4a" | "audio/x-m4a" | "audio/mp4a-latm" | "audio/aac" | "audio/x-aac" => mime::M4A,
+        "audio/x-flac" => mime::FLAC,
+        "audio/vorbis" | "audio/x-ogg" | "application/ogg" => mime::OGG,
+        "video/x-quicktime" => "video/quicktime",
+        "video/matroska" | "video/x-mkv" => mime::MKV,
+        "image/jpg" => "image/jpeg",
+        "text/x-csv" | "application/csv" => mime::CSV,
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +260,16 @@ pub fn plugin_task_queue(plugin: &str) -> &'static str {
 /// 4. `content_type_hint`, only when it is a real type (not
 ///    `application/octet-stream`, not `multipart/*`).
 /// 5. `application/octet-stream`.
+///
+/// The result is passed through [`canonical_mime`], so `audio/x-wav` becomes
+/// `audio/wav` and `.m4a` becomes `audio/mp4` before any pipeline trigger is matched.
 pub fn detect_mime(data: &[u8], filename: Option<&str>, content_type_hint: Option<&str>) -> String {
+    canonical_mime(&detect_mime_raw(data, filename, content_type_hint)).to_owned()
+}
+
+/// [`detect_mime`] before alias canonicalisation. Exposed for tests that need to see
+/// exactly what the detection chain produced.
+fn detect_mime_raw(data: &[u8], filename: Option<&str>, content_type_hint: Option<&str>) -> String {
     let from_ext = filename.and_then(mime_from_extension);
 
     if let Some(kind) = infer::get(data) {
@@ -487,7 +532,13 @@ pub fn builtin_pipelines() -> Vec<PipelineDefinition> {
             "audio",
             "Audio",
             "Transcribe audio with Whisper, index.",
-            &["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4"],
+            &[
+                "audio/mpeg",
+                "audio/wav",
+                "audio/ogg",
+                "audio/mp4",
+                "audio/flac",
+            ],
             vec![
                 step("transcribe", "whisper_transcriber").timeout_secs(3600),
                 index_step(),
@@ -497,7 +548,12 @@ pub fn builtin_pipelines() -> Vec<PipelineDefinition> {
             "video",
             "Video",
             "Extract the audio track, transcribe with Whisper, index.",
-            &["video/mp4", "video/quicktime", "video/webm"],
+            &[
+                "video/mp4",
+                "video/quicktime",
+                "video/webm",
+                "video/x-matroska",
+            ],
             vec![
                 step("extract_audio", "video_audio_extractor").timeout_secs(1800),
                 step("transcribe", "whisper_transcriber").timeout_secs(3600),
@@ -1323,5 +1379,72 @@ mod tests {
         let round: PipelineRouter =
             serde_json::from_str(&serde_json::to_string(&router).unwrap()).unwrap();
         assert_eq!(round, router);
+    }
+
+    #[test]
+    fn media_type_aliases_are_canonicalised() {
+        // `infer` reports RIFF/WAVE as audio/x-wav and mime_guess maps .m4a to
+        // audio/m4a; SPEC 9's builtin.audio trigger lists audio/wav and audio/mp4, so
+        // without canonicalisation an ordinary upload would 415.
+        assert_eq!(canonical_mime("audio/x-wav"), mime::WAV);
+        assert_eq!(canonical_mime("audio/wave"), mime::WAV);
+        assert_eq!(canonical_mime("audio/mp3"), mime::MP3);
+        assert_eq!(canonical_mime("audio/m4a"), mime::M4A);
+        assert_eq!(canonical_mime("audio/x-flac"), mime::FLAC);
+        assert_eq!(canonical_mime("image/jpg"), "image/jpeg");
+        // Anything already canonical is untouched.
+        assert_eq!(canonical_mime(mime::PDF), mime::PDF);
+        assert_eq!(canonical_mime("video/mp4"), "video/mp4");
+    }
+
+    #[test]
+    fn a_real_wav_file_routes_to_the_audio_pipeline() {
+        // Minimal RIFF/WAVE header, which is what `infer` matches on.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+
+        let detected = detect_mime(&wav, Some("clip.wav"), None);
+        assert_eq!(
+            detected,
+            mime::WAV,
+            "raw detection was {:?}",
+            detect_mime_raw(&wav, Some("clip.wav"), None)
+        );
+
+        let router = PipelineRouter::new(builtin_pipelines());
+        let m = router
+            .resolve(RouteRequest {
+                mime: &detected,
+                filename: Some("clip.wav"),
+                project_id: None,
+            })
+            .expect("a wav upload must route somewhere");
+        assert_eq!(m.pipeline.uid, "builtin.audio");
+    }
+
+    #[test]
+    fn an_m4a_file_routes_to_the_audio_pipeline() {
+        let detected = detect_mime(b"\x00\x00", Some("voice.m4a"), None);
+        assert_eq!(detected, mime::M4A);
+        let router = PipelineRouter::new(builtin_pipelines());
+        let m = router
+            .resolve(RouteRequest {
+                mime: &detected,
+                filename: Some("voice.m4a"),
+                project_id: None,
+            })
+            .expect("an m4a upload must route somewhere");
+        assert_eq!(m.pipeline.uid, "builtin.audio");
     }
 }

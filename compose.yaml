@@ -222,6 +222,31 @@ services:
       control-plane:
         condition: service_started
 
+  # Media pool. The task queue is named workers-gpu because SPEC 8.3 routes
+  # whisper_transcriber, video_audio_extractor and ocr there; the in-repo media
+  # plugins are pure Rust and need no GPU, so this service runs the same image as
+  # every other worker. A production GPU pool (see k8s/workers.yaml) adds gRPC
+  # plugin sidecars for local inference.
+  worker-gpu:
+    <<: *rust-dev
+    command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]
+    environment:
+      <<: *worker-env
+      TASK_QUEUE: workers-gpu
+      TRANSCRIBE_API_KEY: ${TRANSCRIBE_API_KEY:-${LLM_API_KEY:-}}
+      TRANSCRIBE_BASE_URL: ${TRANSCRIBE_BASE_URL:-${LLM_BASE_URL:-https://api.openai.com/v1}}
+      TRANSCRIBE_MODEL: ${TRANSCRIBE_MODEL:-whisper-1}
+    volumes:
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+      - blobs:/data/blobs
+    depends_on:
+      temporal:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+
   worker-io:
     <<: *rust-dev
     command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]

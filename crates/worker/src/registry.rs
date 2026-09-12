@@ -56,6 +56,12 @@ impl PluginRegistry {
         reg.register(Arc::new(
             meili_ingest_plugin_meili_indexer::MeiliIndexerPlugin::new(),
         ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_pptx::PptxExtractorPlugin::new(),
+        ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_video_audio::VideoAudioExtractorPlugin::new(),
+        ));
         match meili_ingest_plugin_llm_enricher::LlmEnricherPlugin::from_env() {
             Ok(p) => reg.register(Arc::new(p)),
             Err(e) => reg.mark_unavailable(meili_ingest_plugin_llm_enricher::NAME, e.to_string()),
@@ -64,6 +70,12 @@ impl PluginRegistry {
             Ok(p) => reg.register(Arc::new(p)),
             Err(e) => {
                 reg.mark_unavailable(meili_ingest_plugin_image_captioner::NAME, e.to_string())
+            }
+        }
+        match meili_ingest_plugin_audio_transcriber::WhisperTranscriberPlugin::from_env() {
+            Ok(p) => reg.register(Arc::new(p)),
+            Err(e) => {
+                reg.mark_unavailable(meili_ingest_plugin_audio_transcriber::NAME, e.to_string())
             }
         }
         reg
@@ -193,11 +205,13 @@ mod tests {
             "json_flattener",
             "chunker",
             "meili_indexer",
+            "pptx_extractor",
+            "video_audio_extractor",
         ] {
             assert!(r.get(name).is_some(), "missing {name}");
         }
         // llm plugins are either available or explicitly unavailable
-        for name in ["llm_enricher", "image_captioner"] {
+        for name in ["llm_enricher", "image_captioner", "whisper_transcriber"] {
             assert!(r.get(name).is_some() || r.unavailable().contains_key(name));
         }
     }
@@ -227,17 +241,14 @@ mod builtin_pipeline_compat {
         reg.register(Arc::new(
             meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::new(),
         ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_audio_transcriber::WhisperTranscriberPlugin::new(),
+        ));
         reg
     }
 
     /// Plugins provided by external gRPC containers, not by this binary.
-    const EXTERNAL: &[&str] = &[
-        "pptx_extractor",
-        "whisper_transcriber",
-        "video_audio_extractor",
-        "ocr",
-        "s3_downloader",
-    ];
+    const EXTERNAL: &[&str] = &["ocr", "s3_downloader"];
 
     fn output_satisfies(produced: OutputKind, accepts: &[InputKind]) -> bool {
         if accepts.is_empty() {

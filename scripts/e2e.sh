@@ -71,6 +71,48 @@ PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
 TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
 PIDS+=($!)
+
+# Mock OpenAI-compatible transcription endpoint so the audio pipeline can be tested
+# without an API key. Returns a fixed transcript plus segments.
+cat > "${WORK}/mock_transcribe.py" <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+TRANSCRIPT = "Meilisearch ingests audio through the whisper transcriber plugin."
+SEGMENTS = [
+    {"id": 0, "start": 0.0, "end": 1.8, "text": "Meilisearch ingests audio"},
+    {"id": 1, "start": 1.8, "end": 3.4, "text": "through the whisper transcriber plugin."},
+]
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        if not self.path.endswith("/audio/transcriptions"):
+            self.send_response(404); self.end_headers(); return
+        body = json.dumps({
+            "text": TRANSCRIPT, "language": "english", "duration": 3.4,
+            "segments": SEGMENTS,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PYEOF
+python3 "${WORK}/mock_transcribe.py" "${TRANSCRIBE_PORT:-58111}" >"${WORK}/mock.log" 2>&1 &
+PIDS+=($!)
+
+TASK_QUEUE=workers-gpu \
+  TRANSCRIBE_API_KEY=test-key \
+  TRANSCRIBE_BASE_URL="http://localhost:${TRANSCRIBE_PORT:-58111}/v1" \
+  ./target/debug/meili-ingest-worker >"${WORK}/worker-gpu.log" 2>&1 &
+PIDS+=($!)
 sleep 3
 
 GW="http://localhost:${GW_PORT}"
@@ -242,6 +284,87 @@ sleep 1
 CH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_from_trigger/stats" | jq .numberOfDocuments)
 echo "e2e_from_trigger documents: $CH"; [ "$CH" -eq 2 ] || { echo "expected 2 csv rows" >&2; exit 1; }
 curl -fsS -X DELETE "${GW}/pipelines/e2e-csv-datasets" -o /dev/null -w "delete pipeline → %{http_code}\n"
+
+echo "--- pptx deck (pure-Rust OOXML extractor)"
+python3 - "${WORK}/deck.pptx" <<'PYEOF'
+import sys, zipfile
+path = sys.argv[1]
+NS = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"'
+def slide(title, body):
+    return f"""<?xml version="1.0"?><p:sld {NS}><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
+<p:txBody><a:p><a:r><a:t>{title}</a:t></a:r></a:p></p:txBody></p:sp>
+<p:sp><p:nvSpPr><p:nvPr/></p:nvSpPr>
+<p:txBody><a:p><a:r><a:t>{body}</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sld>"""
+slides = [
+    ("Roadmap", "Vector search ships this quarter"),
+    ("Ingestion", "meili-ingest handles pdf docx pptx and audio"),
+]
+with zipfile.ZipFile(path, "w") as z:
+    z.writestr("[Content_Types].xml",
+        '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/></Types>')
+    for i, (t, b) in enumerate(slides, 1):
+        z.writestr(f"ppt/slides/slide{i}.xml", slide(t, b))
+PYEOF
+RESP7=$(curl -fsS -F "file=@${WORK}/deck.pptx" -F "index=e2e_slides" "${GW}/ingest")
+echo "$RESP7" | jq -c .
+[ "$(echo "$RESP7" | jq -r .pipeline_used)" = "builtin.powerpoint" ] || { echo "pptx did not route to builtin.powerpoint" >&2; exit 1; }
+JOB7=$(echo "$RESP7" | jq -r .job_id)
+for _ in $(seq 1 60); do S=$(curl -fsS "${GW}/jobs/${JOB7}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB7}" | jq .; tail -30 "${WORK}/worker.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "pptx job ended $S" >&2; exit 1; }
+sleep 1
+PH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_slides/search" -H 'Content-Type: application/json' -d '{"q":"vector search"}' | jq '.estimatedTotalHits')
+echo "e2e_slides hits for 'vector search': $PH"; [ "$PH" -ge 1 ] || exit 1
+
+echo "--- audio transcription (builtin.audio on the workers-gpu pool)"
+python3 - "${WORK}/clip.wav" <<'PYEOF'
+import math, struct, sys, wave
+path = sys.argv[1]
+rate, secs, freq = 44100, 1.0, 440.0
+with wave.open(path, "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
+    frames = bytearray()
+    for i in range(int(rate * secs)):
+        v = int(20000 * math.sin(2 * math.pi * freq * i / rate))
+        frames += struct.pack("<hh", v, v)
+    w.writeframes(bytes(frames))
+PYEOF
+RESP8=$(curl -fsS -F "file=@${WORK}/clip.wav" -F "index=e2e_audio" "${GW}/ingest")
+echo "$RESP8" | jq -c .
+[ "$(echo "$RESP8" | jq -r .pipeline_used)" = "builtin.audio" ] || { echo "wav did not route to builtin.audio" >&2; exit 1; }
+JOB8=$(echo "$RESP8" | jq -r .job_id)
+for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB8}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB8}" | jq .; tail -30 "${WORK}/worker-gpu.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "audio job ended $S" >&2; tail -30 "${WORK}/worker-gpu.log"; exit 1; }
+sleep 1
+AH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_audio/search" -H 'Content-Type: application/json' -d '{"q":"whisper transcriber"}' | jq '.estimatedTotalHits')
+echo "e2e_audio hits for 'whisper transcriber': $AH"; [ "$AH" -ge 1 ] || exit 1
+
+echo "--- video_audio_extractor decode path (pure Rust, no ffmpeg)"
+cat > "${WORK}/media.yaml" <<'YAML'
+uid: e2e-media
+name: "Decode audio then transcribe"
+steps:
+  - id: extract_audio
+    plugin: video_audio_extractor
+    config: { sample_rate: 16000, mono: true }
+  - id: transcribe
+    plugin: whisper_transcriber
+    config: { segment_documents: true }
+  - id: index
+    plugin: meili_indexer
+YAML
+curl -fsS -X POST -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/media.yaml" "${GW}/pipelines" | jq -r .uid
+RESP9=$(curl -fsS -F "file=@${WORK}/clip.wav" "${GW}/ingest/pipeline/e2e-media?index=e2e_media")
+echo "$RESP9" | jq -c .
+JOB9=$(echo "$RESP9" | jq -r .job_id)
+for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB9}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB9}" | jq .; tail -40 "${WORK}/worker-gpu.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "media job ended $S" >&2; tail -40 "${WORK}/worker-gpu.log"; exit 1; }
+sleep 1
+MD=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_media/stats" | jq .numberOfDocuments)
+echo "e2e_media documents (one per transcript segment): $MD"; [ "$MD" -ge 2 ] || { echo "expected segment documents" >&2; exit 1; }
+curl -fsS -X DELETE "${GW}/pipelines/e2e-media" -o /dev/null -w "delete pipeline → %{http_code}\n"
 
 echo "--- cancel a running job"
 RESP5=$(curl -fsS -F "file=@${WORK}/sample.pdf" -F "index=e2e_cancel" "${GW}/ingest")

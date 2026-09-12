@@ -7,7 +7,7 @@
 # Cargo caches (registry, git, target) are mounted as named volumes by
 # compose.yaml so rebuilds are incremental.
 
-FROM rust:1.92-bookworm
+FROM rust:1.94-bookworm
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler pkg-config libssl-dev curl \

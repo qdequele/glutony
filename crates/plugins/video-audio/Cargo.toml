@@ -1,0 +1,22 @@
+[package]
+name = "meili-ingest-plugin-video-audio"
+description = "Extracts the audio track of a video (or re-encodes an audio file) into 16 kHz mono WAV, in pure Rust, for speech-to-text steps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# 100% Rust demuxing/decoding: no ffmpeg subprocess anywhere in the pipeline.
+symphonia.workspace = true
+rubato.workspace = true
+hound.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
