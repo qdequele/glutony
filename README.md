@@ -220,6 +220,18 @@ pub trait Plugin: Send + Sync + 'static {
 `crates/plugins/llm-enricher` is the canonical example. See
 `docs/plugins/authoring-builtin.mdx`, `authoring-wasm.mdx`, `authoring-grpc.mdx`.
 
+## Usage & metering
+
+Every job records per-tenant usage — documents, bytes, LLM tokens, transcription
+seconds, pages — into Tinybird (managed ClickHouse). Reporting runs as a Temporal
+activity, so it is retried until it lands and survives worker crashes, and rows carry
+deterministic ids so a redelivery replaces rather than double-counts. Bill from
+`usage_daily_billing`; see [docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
+[tinybird/README.md](tinybird/README.md).
+
+Without `TINYBIRD_TOKEN` the reporting step is a no-op, so self-hosted deployments need
+no analytics account.
+
 ## Deployment
 
 - **Local / dev:** `docker compose watch` (see [`compose.yaml`](compose.yaml)).

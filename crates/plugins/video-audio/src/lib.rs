@@ -18,6 +18,13 @@
 //! 16 kHz by default. That is what speech-to-text endpoints want, and it keeps the
 //! payload roughly 5.5× smaller than 44.1 kHz stereo, which matters because the next
 //! step uploads it over HTTP.
+//!
+//! # Usage reporting
+//!
+//! The step reports the decoded length as `UsageUnits::audio_seconds` with no
+//! `external_requests`: the decode is local and costs no third-party money. Those
+//! seconds are reported anyway because they are the input a billable transcription
+//! step consumes, and because capacity planning needs media minutes per tenant.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -232,12 +239,20 @@ impl Plugin for VideoAudioExtractorPlugin {
         ctx.check_cancelled()?;
 
         let source_frames = decoded.samples.len() / decoded.channels.max(1);
+        let decoded_seconds = source_frames as f64 / f64::from(decoded.rate.max(1));
+        // These seconds were decoded locally by symphonia — nothing was purchased, so
+        // `external_requests` stays 0 and this must not be billed as a service call.
+        // They are still worth reporting: this is the audio a transcription step
+        // downstream *will* be billed for, and capacity planning wants the figure.
+        ctx.record_usage(UsageUnits {
+            audio_seconds: decoded_seconds,
+            ..Default::default()
+        });
+
         let target_channels = if cfg.mono { 1 } else { decoded.channels };
         ctx.heartbeat(format!(
-            "decoded {:.1}s at {} Hz, resampling to {} Hz",
-            source_frames as f64 / decoded.rate.max(1) as f64,
-            decoded.rate,
-            cfg.sample_rate
+            "decoded {decoded_seconds:.1}s at {} Hz, resampling to {} Hz",
+            decoded.rate, cfg.sample_rate
         ));
 
         let cancelled = ctx.cancellation_flag();
@@ -717,6 +732,53 @@ mod tests {
         let secs = samples.len() as f64 / 16_000.0;
         assert!(secs <= 1.05, "expected about 1s, got {secs}s");
         assert!(secs > 0.9, "truncated too aggressively: {secs}s");
+    }
+
+    #[tokio::test]
+    async fn decoded_seconds_are_reported_without_an_external_request() {
+        let ctx = ActivityContext::noop();
+        VideoAudioExtractorPlugin::new()
+            .execute(
+                &ctx,
+                PluginInput::Bytes(Blob::new(
+                    wav(440.0, 0.75, 44_100, 2),
+                    "audio/wav",
+                    Some("meeting.wav".into()),
+                )),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("extraction succeeds");
+
+        let usage = ctx.usage();
+        assert!(
+            (usage.audio_seconds - 0.75).abs() < 0.005,
+            "recorded {}s for a 0.75s clip",
+            usage.audio_seconds
+        );
+        // Decoding is local: nothing was bought from anyone.
+        assert_eq!(usage.external_requests, 0);
+        assert_eq!(usage.llm_requests, 0);
+        assert_eq!(usage.pages, 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_audio_actually_decoded_is_reported() {
+        let ctx = ActivityContext::noop();
+        VideoAudioExtractorPlugin::new()
+            .execute(
+                &ctx,
+                PluginInput::Bytes(Blob::new(
+                    wav(440.0, 2.0, 44_100, 1),
+                    "audio/wav",
+                    Some("long.wav".into()),
+                )),
+                serde_json::json!({"max_duration_secs": 1}),
+            )
+            .await
+            .expect("extraction succeeds");
+        let secs = ctx.usage().audio_seconds;
+        assert!((secs - 1.0).abs() < 0.005, "recorded {secs}s for a 1s cap");
     }
 
     #[tokio::test]

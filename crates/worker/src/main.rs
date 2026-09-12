@@ -54,7 +54,16 @@ async fn main() -> anyhow::Result<()> {
         ClientOptions::new(config.temporal_namespace.clone()).build(),
     )?;
 
-    let activities = StepActivities::new(registry, blob, config.payload_spill_bytes);
+    // Usage reporting is optional: without TINYBIRD_TOKEN the activity is a no-op.
+    let usage = meili_ingest_usage::UsageClient::from_env()
+        .context("invalid usage analytics configuration")?;
+    match &usage {
+        Some(c) => tracing::info!(datasource = c.datasource(), "usage analytics enabled"),
+        None => tracing::warn!("usage analytics disabled (TINYBIRD_TOKEN is not set)"),
+    }
+
+    let activities =
+        StepActivities::new(registry, blob, config.payload_spill_bytes).with_usage(usage);
     let tuner = TunerHolder::builder()
         .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(50))
         .activity_task_slot_supplier(FixedSizeSlotSupplier::new(config.max_concurrent_activities))

@@ -15,6 +15,7 @@ use meili_ingest_plugin_sdk::{
     ActivityContext as PluginContext, PluginError, PluginInput, PluginOutput, StepActivityInput,
     StepActivityOutput,
 };
+use meili_ingest_usage::{JobUsageInput, UsageClient, events_for_job};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::ApplicationFailure;
@@ -60,6 +61,8 @@ pub struct StepActivities {
     pub http: reqwest::Client,
     /// Outputs larger than this are spilled.
     pub spill_threshold: usize,
+    /// Analytics client, absent when usage reporting is not configured.
+    pub usage: Option<UsageClient>,
 }
 
 impl StepActivities {
@@ -70,7 +73,14 @@ impl StepActivities {
             blob,
             http: reqwest::Client::new(),
             spill_threshold,
+            usage: None,
         }
+    }
+
+    /// Attach the analytics client used by [`StepActivities::record_usage`].
+    pub fn with_usage(mut self, usage: Option<UsageClient>) -> Self {
+        self.usage = usage;
+        self
     }
 
     /// Run one plugin invocation without Temporal (used by tests and the CLI).
@@ -103,12 +113,14 @@ impl StepActivities {
                 )));
             }
         }
+        let input_bytes = input_size_bytes(&resolved);
         tracing::info!(
             job_id = %input.job_id,
             step = %input.step_id,
             plugin = %input.plugin,
             branch = ?input.branch,
             input_kind = ?resolved.kind(),
+            input_bytes,
             "executing step"
         );
         let output = plugin.execute(plugin_ctx, resolved, input.config).await?;
@@ -125,18 +137,26 @@ impl StepActivities {
             .await
             .map_err(|e| PluginError::Retryable(format!("failed to spill step output: {e}")))?;
         let duration_ms = started.elapsed().as_millis() as u64;
+        // Whatever the plugin spent on external services during `execute`.
+        let usage = plugin_ctx.usage();
         tracing::info!(
             job_id = %input.job_id,
             step = %input.step_id,
             plugin = %input.plugin,
             documents = doc_count,
+            input_bytes,
             duration_ms,
+            llm_tokens = usage.llm_input_tokens + usage.llm_output_tokens,
+            audio_seconds = usage.audio_seconds,
             "step finished"
         );
         Ok(StepActivityOutput {
             step_id: input.step_id,
             output,
             duration_ms,
+            usage,
+            input_bytes,
+            documents_out: doc_count as u64,
         })
     }
 
@@ -186,6 +206,17 @@ impl StepActivities {
             out.push(PluginInput::from(spilled));
         }
         Ok(FanOutActivityOutput { branches: out })
+    }
+}
+
+/// Bytes a step actually consumed, for per-tenant metering.
+///
+/// Raw uploads report their true length; document inputs report the text and fields
+/// they carry, which is what a tenant is charged for processing.
+fn input_size_bytes(input: &PluginInput) -> u64 {
+    match input {
+        PluginInput::Bytes(b) => b.data.len() as u64,
+        other => other.approx_size() as u64,
     }
 }
 
@@ -266,6 +297,37 @@ impl StepActivities {
         input: FanOutActivityInput,
     ) -> Result<FanOutActivityOutput, ActivityError> {
         self.run_fan_out(input).await.map_err(to_activity_error)
+    }
+
+    /// Ship one job's usage rows to the analytics store.
+    ///
+    /// Runs as an activity so Temporal retries it: that is what turns best-effort
+    /// telemetry into billing-grade metering. Rows carry deterministic ids, so a
+    /// retry that partially succeeded does not double-count.
+    #[activity]
+    pub async fn record_usage(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: JobUsageInput,
+    ) -> Result<(), ActivityError> {
+        let Some(client) = &self.usage else {
+            // Usage reporting is not configured; nothing to do and nothing to retry.
+            return Ok(());
+        };
+        let events = events_for_job(&input);
+        let job_id = input.job_id;
+        match client.send(&events).await {
+            Ok(()) => {
+                tracing::info!(job_id = %job_id, events = events.len(), "usage recorded");
+                Ok(())
+            }
+            Err(e) if e.is_retryable() => Err(ActivityError::application(ApplicationFailure::new(
+                anyhow::anyhow!("usage store unavailable: {e}"),
+            ))),
+            Err(e) => Err(ActivityError::application(
+                ApplicationFailure::non_retryable(anyhow::anyhow!("usage rejected: {e}")),
+            )),
+        }
     }
 }
 

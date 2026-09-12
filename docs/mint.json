@@ -48,7 +48,8 @@
         "concepts/multi-tenancy",
         "concepts/pipelines",
         "concepts/plugins",
-        "concepts/jobs"
+        "concepts/jobs",
+        "concepts/usage"
       ]
     },
     {

@@ -523,6 +523,11 @@ fn extract(ctx: &ActivityContext, blob: Blob, cfg: &Config) -> Result<Vec<Docume
         slides.push(slide);
     }
 
+    // A slide is the natural billable unit of a deck, the way a page is for a PDF.
+    // Every slide whose XML was read counts, blank ones included: parsing the slide is
+    // the work, whether or not `skip_empty_slides` then drops its document.
+    ctx.record_usage(UsageUnits::pages(slides.len() as u64));
+
     let docs = if cfg.per_slide {
         slides
             .iter()
@@ -760,6 +765,61 @@ mod tests {
             .unwrap()
             .into_documents()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn records_one_page_unit_per_extracted_slide() {
+        // Four slides, one of them blank: `skip_empty_slides` drops its document, but
+        // the slide was still parsed and is still billed.
+        let bytes = deck(&[
+            ("Agenda", "Numbers"),
+            ("", ""),
+            ("Numbers", "Revenue up 12%"),
+            ("Wrap up", "Thanks"),
+        ]);
+        let ctx = ActivityContext::noop();
+        let out = PptxExtractorPlugin::new()
+            .execute(&ctx, input(bytes.clone()), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out.document_count(), 3);
+        assert_eq!(ctx.usage().pages, 4);
+        assert_eq!(ctx.usage().llm_requests, 0);
+        assert_eq!(ctx.usage().audio_seconds, 0.0);
+
+        // Whole-deck mode reports the same slides.
+        let ctx = ActivityContext::noop();
+        PptxExtractorPlugin::new()
+            .execute(
+                &ctx,
+                input(bytes.clone()),
+                serde_json::json!({"per_slide": false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.usage().pages, 4);
+
+        // Capped: only the slides actually read.
+        let ctx = ActivityContext::noop();
+        PptxExtractorPlugin::new()
+            .execute(&ctx, input(bytes), serde_json::json!({"max_slides": 2}))
+            .await
+            .unwrap();
+        assert_eq!(ctx.usage().pages, 2);
+    }
+
+    #[tokio::test]
+    async fn a_deck_that_cannot_be_read_records_nothing() {
+        let ctx = ActivityContext::noop();
+        PptxExtractorPlugin::new()
+            .execute(
+                &ctx,
+                input(b"not a zip at all".to_vec()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(ctx.usage().is_empty());
     }
 
     #[test]

@@ -577,6 +577,94 @@ impl PluginManifest {
 }
 
 // ---------------------------------------------------------------------------
+// Usage / metering
+// ---------------------------------------------------------------------------
+
+/// Billable work a step performed, reported by the plugin itself.
+///
+/// Document and byte counts are observed by the worker, but only the plugin knows
+/// what it spent on an external service: tokens burnt on an LLM, seconds of audio
+/// sent to a transcription endpoint, pages rendered. Plugins accumulate these through
+/// [`crate::ActivityContext::record_usage`]; the worker reads them back after
+/// `execute` and ships them with the step's usage event.
+///
+/// Every field is additive so units merge cleanly across fan-out branches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageUnits {
+    /// Prompt tokens billed by an LLM or VLM provider.
+    #[serde(default)]
+    pub llm_input_tokens: u64,
+    /// Completion tokens billed by an LLM or VLM provider.
+    #[serde(default)]
+    pub llm_output_tokens: u64,
+    /// Calls made to an LLM-compatible endpoint.
+    #[serde(default)]
+    pub llm_requests: u64,
+    /// Seconds of audio submitted to (or decoded for) a speech-to-text endpoint.
+    #[serde(default)]
+    pub audio_seconds: f64,
+    /// Pages, slides or sheets extracted.
+    #[serde(default)]
+    pub pages: u64,
+    /// Images processed.
+    #[serde(default)]
+    pub images: u64,
+    /// Any other billable call to a third-party service.
+    #[serde(default)]
+    pub external_requests: u64,
+}
+
+impl UsageUnits {
+    /// Nothing consumed.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether anything at all was recorded (used to skip empty usage rows).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Add another set of units into this one.
+    pub fn merge(&mut self, other: UsageUnits) {
+        self.llm_input_tokens += other.llm_input_tokens;
+        self.llm_output_tokens += other.llm_output_tokens;
+        self.llm_requests += other.llm_requests;
+        self.audio_seconds += other.audio_seconds;
+        self.pages += other.pages;
+        self.images += other.images;
+        self.external_requests += other.external_requests;
+    }
+
+    /// One LLM call with its token counts.
+    pub fn llm(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            llm_input_tokens: input_tokens,
+            llm_output_tokens: output_tokens,
+            llm_requests: 1,
+            ..Default::default()
+        }
+    }
+
+    /// One transcription call over `seconds` of audio.
+    pub fn transcription(seconds: f64) -> Self {
+        Self {
+            audio_seconds: seconds,
+            external_requests: 1,
+            ..Default::default()
+        }
+    }
+
+    /// `count` pages, slides or sheets extracted.
+    pub fn pages(count: u64) -> Self {
+        Self {
+            pages: count,
+            ..Default::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline definition
 // ---------------------------------------------------------------------------
 
@@ -1058,6 +1146,15 @@ pub struct StepResult {
     /// Error message when failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Plugin name for the queue this ran on, for usage attribution.
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// Bytes fed into the step, summed across branches.
+    #[serde(default)]
+    pub input_bytes: u64,
+    /// Billable units summed across branches.
+    #[serde(default)]
+    pub usage: UsageUnits,
 }
 
 fn one_usize() -> usize {
@@ -1140,6 +1237,15 @@ pub struct StepActivityOutput {
     /// Wall time in milliseconds.
     #[serde(default)]
     pub duration_ms: u64,
+    /// Billable units the plugin reported (see [`UsageUnits`]).
+    #[serde(default)]
+    pub usage: UsageUnits,
+    /// Size of the resolved input in bytes, as the plugin saw it.
+    #[serde(default)]
+    pub input_bytes: u64,
+    /// Documents the step produced.
+    #[serde(default)]
+    pub documents_out: u64,
 }
 
 /// The `meili_indexer` plugin's config, once the workflow merged the tenant context in.
@@ -1463,5 +1569,36 @@ steps:
             region: None,
         };
         assert!(!ctx.redacted().contains("SECRET"));
+    }
+
+    #[test]
+    fn usage_units_merge_additively() {
+        let mut total = UsageUnits::none();
+        assert!(total.is_empty());
+        total.merge(UsageUnits::llm(100, 20));
+        total.merge(UsageUnits::llm(50, 10));
+        total.merge(UsageUnits::transcription(12.5));
+        total.merge(UsageUnits::pages(3));
+        assert_eq!(total.llm_input_tokens, 150);
+        assert_eq!(total.llm_output_tokens, 30);
+        assert_eq!(total.llm_requests, 2);
+        assert_eq!(total.audio_seconds, 12.5);
+        assert_eq!(total.external_requests, 1);
+        assert_eq!(total.pages, 3);
+        assert!(!total.is_empty());
+    }
+
+    #[test]
+    fn usage_units_survive_a_json_round_trip() {
+        // Units travel through Temporal payloads, so the wire form must be stable.
+        let units = UsageUnits::llm(7, 3);
+        let json = serde_json::to_string(&units).unwrap();
+        assert_eq!(serde_json::from_str::<UsageUnits>(&json).unwrap(), units);
+        // Older payloads without the field still deserialize.
+        let old =
+            r#"{"step_id":"s","plugin":"p","status":"succeeded","document_count":2,"branches":1}"#;
+        let step: StepResult = serde_json::from_str(old).unwrap();
+        assert!(step.usage.is_empty());
+        assert_eq!(step.duration_ms, 0);
     }
 }

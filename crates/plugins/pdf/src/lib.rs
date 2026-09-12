@@ -10,6 +10,10 @@
 //!
 //! Extracted text is whitespace-normalised: runs of blanks collapse into one space,
 //! lines are trimmed and at most one blank line separates blocks.
+//!
+//! Every page whose text is extracted is reported as one `UsageUnits::pages` unit,
+//! blank pages included: extracting a page is the work, whether or not it yields a
+//! document.
 
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
@@ -58,11 +62,27 @@ async fn extract_pages(data: Vec<u8>) -> Result<Vec<String>, PluginError> {
         .map_err(pdf_error)
 }
 
-/// Extract the whole document's text off the async runtime.
-async fn extract_whole(data: Vec<u8>) -> Result<String, PluginError> {
-    run_blocking(move || pdf_extract::extract_text_from_mem(&data))
-        .await?
-        .map_err(pdf_error)
+/// Extract the whole document's text off the async runtime, with the number of pages
+/// it came from (see [`count_pages`]).
+async fn extract_whole(data: Vec<u8>) -> Result<(String, u64), PluginError> {
+    run_blocking(move || {
+        let text = pdf_extract::extract_text_from_mem(&data).map_err(pdf_error)?;
+        Ok((text, count_pages(&data)))
+    })
+    .await?
+}
+
+/// Number of pages in the document.
+///
+/// Whole-document extraction returns one string with no page markers, so in that mode
+/// the count has to come from the page tree instead. This is a structural read of the
+/// same `lopdf` parser `pdf-extract` uses (it re-exports it), not a second text
+/// extraction. Returns 0 when the page tree cannot be read: the extracted text is
+/// still good, and reporting no pages is better than billing a guess.
+fn count_pages(data: &[u8]) -> u64 {
+    pdf_extract::Document::load_mem(data)
+        .map(|doc| doc.get_pages().len() as u64)
+        .unwrap_or(0)
 }
 
 fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
@@ -162,12 +182,16 @@ impl Plugin for PdfExtractorPlugin {
         if cfg.per_page {
             let pages = extract_pages(blob.data.clone()).await?;
             let mut docs = Vec::with_capacity(pages.len());
+            // Pages whose text was extracted. Counted even when the page turns out to
+            // be blank and produces no document: rendering it is the billable work.
+            let mut pages_read = 0u64;
             for (idx, text) in pages.into_iter().enumerate() {
                 ctx.check_cancelled()?;
                 let page = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
                 if cfg.max_pages.is_some_and(|max| page > max) {
                     break;
                 }
+                pages_read += 1;
                 if page.is_multiple_of(HEARTBEAT_EVERY) {
                     ctx.heartbeat(format!("page {page}"));
                 }
@@ -180,6 +204,7 @@ impl Plugin for PdfExtractorPlugin {
                 doc.meta.page = Some(page);
                 docs.push(doc);
             }
+            ctx.record_usage(UsageUnits::pages(pages_read));
             tracing::debug!(plugin = NAME, pages = docs.len(), "extracted pdf pages");
             return Ok(PluginOutput::Documents(docs));
         }
@@ -189,11 +214,13 @@ impl Plugin for PdfExtractorPlugin {
             Some(max) => {
                 let pages = extract_pages(blob.data.clone()).await?;
                 let mut parts = Vec::new();
+                let mut pages_read = 0u64;
                 for (idx, page) in pages.into_iter().enumerate() {
                     ctx.check_cancelled()?;
                     if idx >= max as usize {
                         break;
                     }
+                    pages_read += 1;
                     if (idx + 1).is_multiple_of(HEARTBEAT_EVERY as usize) {
                         ctx.heartbeat(format!("page {}", idx + 1));
                     }
@@ -202,9 +229,14 @@ impl Plugin for PdfExtractorPlugin {
                         parts.push(page);
                     }
                 }
+                ctx.record_usage(UsageUnits::pages(pages_read));
                 parts.join("\n\n")
             }
-            None => normalize_whitespace(&extract_whole(blob.data.clone()).await?),
+            None => {
+                let (text, pages) = extract_whole(blob.data.clone()).await?;
+                ctx.record_usage(UsageUnits::pages(pages));
+                normalize_whitespace(&text)
+            }
         };
         ctx.check_cancelled()?;
         if text.is_empty() {
@@ -367,6 +399,71 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert!(docs[0].content.contains("Alpha"));
         assert!(!docs[0].content.contains("Beta"));
+    }
+
+    #[tokio::test]
+    async fn records_one_page_unit_per_extracted_page() {
+        let pdf = make_pdf(&["Alpha page", "Beta page", "Gamma page"]);
+        let plugin = PdfExtractorPlugin::new();
+
+        // Per page (the default): one unit per page of the real document.
+        let ctx = ActivityContext::noop();
+        let out = plugin
+            .execute(&ctx, input(pdf.clone()), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out.document_count(), 3);
+        assert_eq!(ctx.usage().pages, 3);
+        assert_eq!(ctx.usage().llm_requests, 0);
+
+        // Capped: only the pages actually read are billed.
+        let ctx = ActivityContext::noop();
+        plugin
+            .execute(
+                &ctx,
+                input(pdf.clone()),
+                serde_json::json!({"max_pages": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.usage().pages, 2);
+
+        // Whole-document mode still knows how many pages it consumed.
+        let ctx = ActivityContext::noop();
+        plugin
+            .execute(
+                &ctx,
+                input(pdf.clone()),
+                serde_json::json!({"per_page": false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.usage().pages, 3);
+
+        let ctx = ActivityContext::noop();
+        plugin
+            .execute(
+                &ctx,
+                input(pdf),
+                serde_json::json!({"per_page": false, "max_pages": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.usage().pages, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_extraction_records_no_pages() {
+        let ctx = ActivityContext::noop();
+        PdfExtractorPlugin::new()
+            .execute(
+                &ctx,
+                input(b"%PDF-1.4 this is not really a pdf".to_vec()),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(ctx.usage().is_empty());
     }
 
     #[tokio::test]

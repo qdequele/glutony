@@ -6,6 +6,7 @@
 #   kubectl -n meili-ingest create secret generic meili-ingest-secrets \
 #     --from-literal=DATABASE_URL='postgres://user:pass@postgres:5432/meili_ingest' \
 #     --from-literal=LLM_API_KEY='sk-...' \
+#     --from-literal=TINYBIRD_TOKEN='p.ey...' \
 #     --from-literal=ENVOY_TRUSTED_HEADER='<shared secret agreed with the Envoy team>' \
 #     --dry-run=client -o yaml | kubectl apply -f -
 ---
@@ -33,6 +34,11 @@ data:
   MAX_UPLOAD_MB: "500"
   LLM_BASE_URL: "https://api.openai.com/v1"
   LLM_MODEL: "gpt-4o-mini"
+  TRANSCRIBE_MODEL: "whisper-1"
+  # Per-tenant usage analytics (Tinybird). Use the base URL of your workspace's
+  # region: api.tinybird.co, api.eu-central-1.aws.tinybird.co, and so on.
+  TINYBIRD_BASE_URL: "https://api.tinybird.co"
+  TINYBIRD_DATASOURCE: "meili_ingest_usage"
 ---
 apiVersion: v1
 kind: Secret
@@ -46,6 +52,11 @@ stringData:
   # --- placeholders: override with your own values ---
   DATABASE_URL: "postgres://postgres:CHANGE_ME@postgres:5432/meili_ingest"
   LLM_API_KEY: "CHANGE_ME"
+  # Tinybird append token for the usage data source. Omit the key entirely to run
+  # without usage analytics: the worker logs it once and the reporting step no-ops.
+  TINYBIRD_TOKEN: "CHANGE_ME"
+  # Speech-to-text endpoint key for whisper_transcriber; falls back to LLM_API_KEY.
+  TRANSCRIBE_API_KEY: "CHANGE_ME"
   # Shared secret Envoy must send in `X-Meili-Envoy-Secret` for X-Meili-*
   # headers to be honoured. Leave empty to trust headers unconditionally (dev only).
   ENVOY_TRUSTED_HEADER: "CHANGE_ME"

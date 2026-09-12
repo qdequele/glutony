@@ -3,9 +3,13 @@
 #
 #   workers-general  pdf/docx/xlsx/html/markdown/csv/json/chunker/meili_indexer
 #   workers-llm      llm_enricher, image_captioner        (needs LLM_API_KEY)
-#   workers-gpu      whisper_transcriber, video_audio_extractor, ocr
-#                    These plugins are NOT compiled into the worker: they run
-#                    as gRPC sidecar/containers declared in EXTERNAL_PLUGINS.
+#   workers-gpu      whisper_transcriber, video_audio_extractor  (compiled in),
+#                    plus ocr and any other heavy plugin supplied as a gRPC
+#                    sidecar via EXTERNAL_PLUGINS. The in-repo media plugins are
+#                    pure Rust and need no GPU: whisper_transcriber calls an
+#                    OpenAI-compatible endpoint (TRANSCRIBE_API_KEY) and
+#                    video_audio_extractor decodes with symphonia. Keep the GPU
+#                    request only if you run local inference in a sidecar.
 #
 # Scaling metric
 # --------------
@@ -59,6 +63,13 @@ spec:
               value: workers-general
             - name: MAX_CONCURRENT_ACTIVITIES
               value: "20"
+            # Usage analytics. Optional: without the key the reporting step no-ops.
+            - name: TINYBIRD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: TINYBIRD_TOKEN
+                  optional: true
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -159,6 +170,13 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: LLM_API_KEY
+            # Usage analytics. Optional: without the key the reporting step no-ops.
+            - name: TINYBIRD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: TINYBIRD_TOKEN
+                  optional: true
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -258,6 +276,21 @@ spec:
             # manifest (name, accepts, produces); WASM files are loaded via extism.
             - name: EXTERNAL_PLUGINS
               value: "grpc:http://localhost:50051,grpc:http://localhost:50052"
+            # whisper_transcriber posts to an OpenAI-compatible endpoint. Falls back
+            # to LLM_API_KEY when TRANSCRIBE_API_KEY is absent.
+            - name: TRANSCRIBE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: TRANSCRIBE_API_KEY
+                  optional: true
+            # Usage analytics. Optional: without the key the reporting step no-ops.
+            - name: TINYBIRD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: TINYBIRD_TOKEN
+                  optional: true
           envFrom:
             - configMapRef:
                 name: meili-ingest-config

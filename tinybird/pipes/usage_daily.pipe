@@ -1,0 +1,53 @@
+#
+# usage_daily — MATERIALIZED pipe: meili_ingest_usage → usage_daily.
+#
+# Rolls the raw event rows into one row per (project, day, pipeline, plugin) so a
+# billing period is a handful of rows per tenant instead of one row per step.
+#
+# Billable units (tokens, audio seconds, pages, images, external requests, documents,
+# bytes) are summed from `kind = 'step'` rows ONLY. The job row repeats the same units
+# as a per-job total, so counting both would double every number. Job counters come
+# from `kind = 'job'` rows, which is also where `duration_ms` would double-count, hence
+# the same filter there (step durations are the billable compute).
+#
+# CAVEAT — materialized views and ReplacingMergeTree: an MV is a trigger on INSERT. It
+# sees the rows as they arrive, not the deduplicated state of the source table, so a
+# Temporal redelivery of the same events increments these aggregates twice even though
+# `meili_ingest_usage` correctly keeps a single row. Duplicates should be rare
+# (`wait=true` + retry only on genuinely retryable errors), but for an invoice read the
+# raw table with FINAL rather than this rollup:
+#
+#   SELECT sum(llm_input_tokens) FROM meili_ingest_usage FINAL
+#   WHERE project_id = {...} AND kind = 'step' AND ts >= {...} AND ts < {...}
+#
+
+NODE usage_daily_rollup
+DESCRIPTION >
+    Daily aggregate states per tenant / pipeline / plugin.
+
+SQL >
+    SELECT
+        project_id,
+        toDate(ts) AS day,
+        pipeline_uid,
+        plugin,
+        countState() AS rows_count,
+        sumState(toUInt64(kind = 'step')) AS steps,
+        sumState(toUInt64(kind = 'job')) AS jobs,
+        sumState(toUInt64(kind = 'job' AND status = 'succeeded')) AS jobs_succeeded,
+        sumState(toUInt64(kind = 'job' AND status = 'failed')) AS jobs_failed,
+        sumState(if(kind = 'step', documents_out, toUInt64(0))) AS documents_out,
+        sumState(if(kind = 'step', input_bytes, toUInt64(0))) AS input_bytes,
+        sumState(if(kind = 'step', duration_ms, toUInt64(0))) AS duration_ms,
+        sumState(if(kind = 'step', llm_input_tokens, toUInt64(0))) AS llm_input_tokens,
+        sumState(if(kind = 'step', llm_output_tokens, toUInt64(0))) AS llm_output_tokens,
+        sumState(if(kind = 'step', llm_requests, toUInt64(0))) AS llm_requests,
+        sumState(if(kind = 'step', audio_seconds, toFloat64(0))) AS audio_seconds,
+        sumState(if(kind = 'step', pages, toUInt64(0))) AS pages,
+        sumState(if(kind = 'step', images, toUInt64(0))) AS images,
+        sumState(if(kind = 'step', external_requests, toUInt64(0))) AS external_requests
+    FROM meili_ingest_usage
+    GROUP BY project_id, day, pipeline_uid, plugin
+
+TYPE MATERIALIZED
+DATASOURCE usage_daily

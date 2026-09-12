@@ -1,0 +1,92 @@
+---
+title: "Usage & metering"
+description: "Per-tenant usage data: what is recorded, how it reaches Tinybird, and which table to bill from."
+---
+
+Every job records what it consumed, per tenant, so you can bill for it and chart it.
+The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse) and is
+written by the worker, never by the gateway.
+
+## What is recorded
+
+One row per pipeline step, plus one row per job.
+
+| Group | Fields |
+|---|---|
+| Identity | `job_id`, `workflow_id`, `project_id`, `region`, `pipeline_uid`, `index_name` |
+| Shape | `kind` (`job` / `step`), `step_id`, `plugin`, `task_queue`, `branches` |
+| Outcome | `status`, `error_kind`, `error`, `duration_ms` |
+| Volume | `input_bytes`, `input_mime`, `documents_out` |
+| Cost | `llm_input_tokens`, `llm_output_tokens`, `llm_requests`, `audio_seconds`, `pages`, `images`, `external_requests` |
+
+Volume is observed by the worker. Cost units come from the plugins themselves, because
+only the plugin knows what it spent on an external service: the enricher reports the
+token counts the provider returned, the transcriber reports the audio seconds it was
+billed for, the extractors report pages. Plugins report through
+`ActivityContext::record_usage`, and the accumulator is shared across clones so a
+plugin fanning out concurrently is not undercounted.
+
+The Meilisearch API key never appears in an event. Only `project_id` and `region` do.
+
+## How it gets there
+
+Reporting is a Temporal activity, not a fire-and-forget HTTP call. The workflow invokes
+it on every terminal path, so a failed or cancelled job is metered too. It consumed
+tokens and CPU, and that has to be billed.
+
+<Note>
+The reporting activity is deliberately detached from the workflow's cancellation
+token. Activities inherit workflow cancellation, so without that a cancelled job would
+be killed before it could report anything.
+</Note>
+
+Temporal retries the activity until it succeeds, which makes delivery at-least-once and
+survives a worker crash. If it exhausts its retries the job's own result is unchanged:
+losing a usage row must never turn a successful ingest into a failure.
+
+At-least-once is safe here because every row carries a deterministic `event_id`
+(`{job_id}:{step_id}:{attempt}`, or `{job_id}:job`), and the data source is a
+`ReplacingMergeTree`. A redelivery replaces the stored row instead of double-counting
+it. Timestamps are deterministic too: every row of a job is stamped with the job's
+finish time rather than "now", because `ReplacingMergeTree` deduplicates on the whole
+sorting key.
+
+## Which table to bill from
+
+| Table | Freshness | Deduplicated | Use for |
+|---|---|---|---|
+| `meili_ingest_usage` | real time | with `FINAL` | drill-down, audits |
+| `usage_daily` | real time | **no** | dashboards, live estimates |
+| `usage_daily_billing` | hourly | yes | **invoices** |
+
+A materialized view is a trigger on `INSERT` and never sees deduplication, so
+`usage_daily` can over-count a redelivered event. `usage_daily_billing` is a scheduled
+copy that re-reads the raw table with `FINAL`, trading an hour of freshness for
+correctness. The `tenant_usage` endpoint reads it.
+
+```bash
+curl "https://api.tinybird.co/v0/pipes/tenant_usage.json?\
+project_id=acme&date_from=2026-09-01&date_to=2026-09-30&token=$READ_TOKEN"
+```
+
+## Configuration
+
+Set these on the workers. Without `TINYBIRD_TOKEN` usage reporting is simply off: the
+worker logs that once at startup and the reporting step becomes a no-op, so self-hosted
+deployments need no analytics account.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TINYBIRD_TOKEN` | — | Append token for the usage data source. Absent disables reporting. |
+| `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
+| `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |
+
+Push the schema and pipes with the Tinybird CLI from the `tinybird/` directory; see
+`tinybird/README.md`.
+
+## Usage data is not monitoring
+
+These two answer different questions and must stay separate. Prometheus answers "is the
+system healthy" and its labels must stay low-cardinality, so `project_id` must never
+become one. Per-tenant usage is inherently high-cardinality and belongs in a columnar
+store.

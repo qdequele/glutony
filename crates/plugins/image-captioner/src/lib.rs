@@ -290,7 +290,12 @@ impl Plugin for ImageCaptionerPlugin {
             body["response_format"] = serde_json::json!({ "type": "json_object" });
         }
 
-        let raw = chat_completion(&client.http, &client.base_url, &client.api_key, &body).await?;
+        // A failed call records nothing: `?` returns before `record_usage`.
+        let (raw, mut units) =
+            chat_completion(&client.http, &client.base_url, &client.api_key, &body).await?;
+        // One image went to the vision model, and its tokens are billed on top.
+        units.images = 1;
+        ctx.record_usage(units);
 
         let mut doc = match blob.filename.as_deref() {
             Some(name) if !name.is_empty() => Document::with_id(name, ""),
@@ -347,6 +352,9 @@ pub fn apply_reply(doc: &mut Document, raw: &str, json: bool) {
 struct ChatCompletion {
     #[serde(default)]
     choices: Vec<Choice>,
+    /// Absent on gateways that do not report token accounting.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 #[derive(Deserialize)]
 struct Choice {
@@ -358,14 +366,29 @@ struct ChatMessage {
     content: Option<String>,
 }
 
-/// POST `{base_url}/chat/completions` and return `choices[0].message.content`.
+/// The `usage` object of an OpenAI-compatible chat completion.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct ApiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
+/// POST `{base_url}/chat/completions` and return `choices[0].message.content` plus the
+/// units the call cost.
+///
+/// The `usage` object is optional — some gateways omit it — and when it is missing the
+/// returned units still count one request, with the token counts left at zero rather
+/// than estimated.
+///
 /// 429 / 5xx / transport → `Retryable`; 401 / 403 / 400 / others → `NonRetryable`.
 async fn chat_completion(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
-) -> Result<String, PluginError> {
+) -> Result<(String, UsageUnits), PluginError> {
     let url = format!("{base_url}/chat/completions");
     let resp = http
         .post(&url)
@@ -402,14 +425,22 @@ async fn chat_completion(
             truncate_chars(&text, 512)
         ))
     })?;
-    parsed
+    let usage = match parsed.usage {
+        Some(u) => UsageUnits::llm(u.prompt_tokens, u.completion_tokens),
+        None => UsageUnits {
+            llm_requests: 1,
+            ..Default::default()
+        },
+    };
+    let content = parsed
         .choices
         .into_iter()
         .next()
         .and_then(|c| c.message.content)
         .ok_or_else(|| {
             PluginError::non_retryable("vision response has no choices[0].message.content")
-        })
+        })?;
+    Ok((content, usage))
 }
 
 fn parse_json_object(raw: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -634,6 +665,67 @@ mod tests {
             "{err:?}"
         );
         assert!(!err.to_string().contains("test-key"));
+    }
+
+    #[tokio::test]
+    async fn usage_records_tokens_and_one_image() {
+        let server = MockServer::start().await;
+        let mut reply = chat_reply(r#"{"caption":"A cat on a sofa"}"#);
+        reply["usage"] = serde_json::json!({
+            "prompt_tokens": 1105, "completion_tokens": 37, "total_tokens": 1142
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let usage = ctx.usage();
+        assert_eq!(usage.llm_input_tokens, 1105);
+        assert_eq!(usage.llm_output_tokens, 37);
+        assert_eq!(usage.llm_requests, 1);
+        assert_eq!(usage.images, 1);
+    }
+
+    #[tokio::test]
+    async fn usage_without_tokens_still_counts_the_image_and_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("a caption")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap();
+        let usage = ctx.usage();
+        assert_eq!(usage.images, 1);
+        assert_eq!(usage.llm_requests, 1);
+        assert_eq!(usage.llm_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_records_no_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(ctx.usage().is_empty());
     }
 
     #[tokio::test]

@@ -1,0 +1,70 @@
+#
+# meili_ingest_usage — raw per-job / per-step usage rows (billing + dashboards).
+#
+# Written by `meili-ingest-usage` (crates/usage) through the Events API:
+#   POST {base_url}/v0/events?name=meili_ingest_usage&wait=true
+# body = newline-delimited JSON, one `UsageEvent` per line. Column names, order and
+# types mirror the `UsageEvent` struct field for field; every column is fed by
+# `json:$.<column>`. A field added on one side and not the other lands in
+# `meili_ingest_usage_quarantine` and the client turns that into a loud, permanent
+# error — the two definitions must be changed together.
+#
+# ── Deduplication ───────────────────────────────────────────────────────────────
+# Usage reporting is a Temporal activity, so delivery is at-least-once: the same rows
+# can arrive twice. `event_id` is deterministic —
+#   step rows: {job_id}:{step_id}:{attempt}      job rows: {job_id}:job
+# — and the engine is a ReplacingMergeTree, so a redelivered row REPLACES the stored
+# one on merge instead of double-counting it. ENGINE_VER is `ts`: of two rows with the
+# same key the newest timestamp wins (they are identical anyway).
+#
+# ReplacingMergeTree deduplicates rows sharing the SORTING KEY, not just `event_id`,
+# which is why `ts` must be deterministic too: the client stamps every row of a job
+# with the job's `finished_at`, never with "now". Deduplication also only happens on
+# merge, so exact reads use `FROM meili_ingest_usage FINAL` (or `GROUP BY event_id`).
+#
+# ── Sorting key ─────────────────────────────────────────────────────────────────
+# `project_id, ts, event_id` leads with the tenant because every billing and dashboard
+# query filters by tenant first ("what did project X consume between two dates"), so
+# ClickHouse can skip whole granules for other tenants before it looks at the time
+# range. `ts` second serves the date range, `event_id` last makes the key unique.
+#
+# Partitioned by month, and dropped after 180 days: invoices are issued monthly and
+# the daily rollup (usage_daily) keeps the long-term aggregate.
+#
+
+SCHEMA >
+    `event_id` String `json:$.event_id`,
+    `kind` LowCardinality(String) `json:$.kind`,
+    `ts` DateTime64(3) `json:$.ts`,
+    `job_id` String `json:$.job_id`,
+    `workflow_id` String `json:$.workflow_id`,
+    `project_id` LowCardinality(String) `json:$.project_id`,
+    `region` LowCardinality(String) `json:$.region`,
+    `pipeline_uid` LowCardinality(String) `json:$.pipeline_uid`,
+    `pipeline_builtin` UInt8 `json:$.pipeline_builtin`,
+    `index_name` String `json:$.index_name`,
+    `step_id` String `json:$.step_id`,
+    `plugin` LowCardinality(String) `json:$.plugin`,
+    `task_queue` LowCardinality(String) `json:$.task_queue`,
+    `status` LowCardinality(String) `json:$.status`,
+    `attempt` UInt32 `json:$.attempt`,
+    `branches` UInt32 `json:$.branches`,
+    `duration_ms` UInt64 `json:$.duration_ms`,
+    `input_bytes` UInt64 `json:$.input_bytes`,
+    `input_mime` LowCardinality(String) `json:$.input_mime`,
+    `documents_out` UInt64 `json:$.documents_out`,
+    `llm_input_tokens` UInt64 `json:$.llm_input_tokens`,
+    `llm_output_tokens` UInt64 `json:$.llm_output_tokens`,
+    `llm_requests` UInt64 `json:$.llm_requests`,
+    `audio_seconds` Float64 `json:$.audio_seconds`,
+    `pages` UInt64 `json:$.pages`,
+    `images` UInt64 `json:$.images`,
+    `external_requests` UInt64 `json:$.external_requests`,
+    `error_kind` LowCardinality(String) `json:$.error_kind`,
+    `error` String `json:$.error`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_SORTING_KEY "project_id, ts, event_id"
+ENGINE_PARTITION_KEY "toYYYYMM(ts)"
+ENGINE_VER "ts"
+ENGINE_TTL "toDateTime(ts) + INTERVAL 180 DAY"

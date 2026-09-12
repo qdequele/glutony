@@ -69,6 +69,9 @@ wait_for "${CONTROL_PLANE_URL}/health" control-plane
 BIND="0.0.0.0:${GW_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" ./target/debug/meili-ingest-gateway >"${WORK}/gw.log" 2>&1 &
 PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
+export TINYBIRD_TOKEN=e2e-tinybird-token
+export TINYBIRD_BASE_URL="http://localhost:${TINYBIRD_PORT:-58122}"
+export TINYBIRD_DATASOURCE=meili_ingest_usage
 TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
 PIDS+=($!)
 
@@ -106,6 +109,44 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 PYEOF
 python3 "${WORK}/mock_transcribe.py" "${TRANSCRIBE_PORT:-58111}" >"${WORK}/mock.log" 2>&1 &
+PIDS+=($!)
+
+# Mock Tinybird Events API. Appends every posted NDJSON row to usage.ndjson so the
+# test can assert what the pipeline actually meters.
+cat > "${WORK}/mock_tinybird.py" <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+OUT = sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if "/v0/events" not in self.path:
+            self.send_response(404); self.end_headers(); return
+        if self.headers.get("Authorization") != "Bearer e2e-tinybird-token":
+            self.send_response(403); self.end_headers(); return
+        rows = 0
+        with open(OUT, "a") as fh:
+            for line in body.decode().splitlines():
+                if line.strip():
+                    json.loads(line)  # reject malformed NDJSON loudly
+                    fh.write(line + "\n")
+                    rows += 1
+        ack = json.dumps({"successful_rows": rows, "quarantined_rows": 0}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(ack)))
+        self.end_headers()
+        self.wfile.write(ack)
+
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PYEOF
+: > "${WORK}/usage.ndjson"
+python3 "${WORK}/mock_tinybird.py" "${TINYBIRD_PORT:-58122}" "${WORK}/usage.ndjson" >"${WORK}/tinybird.log" 2>&1 &
 PIDS+=($!)
 
 TASK_QUEUE=workers-gpu \
@@ -366,6 +407,81 @@ MD=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_me
 echo "e2e_media documents (one per transcript segment): $MD"; [ "$MD" -ge 2 ] || { echo "expected segment documents" >&2; exit 1; }
 curl -fsS -X DELETE "${GW}/pipelines/e2e-media" -o /dev/null -w "delete pipeline → %{http_code}\n"
 
+echo "--- usage events reached the analytics store"
+sleep 2
+USAGE="${WORK}/usage.ndjson"
+ROWS=$(wc -l < "$USAGE" | tr -d ' ')
+echo "usage rows recorded: $ROWS"
+[ "$ROWS" -gt 0 ] || { echo "no usage rows were sent" >&2; tail -20 "${WORK}/worker.log"; exit 1; }
+
+python3 - "$USAGE" "$JOB" "$JOB6" "$JOB8" <<'PYEOF'
+import json, sys, collections
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+pdf_job, csv_job, audio_job = sys.argv[2], sys.argv[3], sys.argv[4]
+by_job = collections.defaultdict(list)
+for r in rows:
+    by_job[r["job_id"]].append(r)
+
+def fail(msg):
+    print("USAGE ASSERTION FAILED:", msg); sys.exit(1)
+
+# Every job emits exactly one job row plus one row per step.
+pdf = by_job.get(pdf_job) or fail("no rows for the pdf job")
+kinds = collections.Counter(r["kind"] for r in pdf)
+if kinds["job"] != 1:
+    fail(f"expected exactly one job row for the pdf job, got {kinds['job']}")
+if kinds["step"] != 3:
+    fail(f"expected 3 step rows (extract, chunk, index), got {kinds['step']}")
+
+# Deterministic ids, so an at-least-once redelivery is replaceable not additive.
+ids = [r["event_id"] for r in rows]
+if len(ids) != len(set(ids)):
+    dupes = [i for i, c in collections.Counter(ids).items() if c > 1]
+    fail(f"event ids are not unique: {dupes[:3]}")
+job_row = next(r for r in pdf if r["kind"] == "job")
+if job_row["event_id"] != f"{pdf_job}:job":
+    fail(f"unexpected job event_id {job_row['event_id']}")
+
+# The tenant, pipeline and index are attributed.
+if job_row["pipeline_uid"] != "builtin.pdf":
+    fail(f"pipeline not attributed: {job_row['pipeline_uid']}")
+if job_row["index_name"] != "e2e_docs":
+    fail(f"index not attributed: {job_row['index_name']}")
+if job_row["status"] != "succeeded":
+    fail(f"job status was {job_row['status']}")
+
+# Volume is metered: the extractor read bytes and the pipeline produced documents.
+extract = next((r for r in pdf if r["plugin"] == "pdf_extractor"), None) or fail("no pdf_extractor row")
+if extract["input_bytes"] <= 0:
+    fail("pdf_extractor reported zero input bytes")
+if extract["pages"] < 2:
+    fail(f"pdf_extractor should report 2 pages, got {extract['pages']}")
+index_row = next((r for r in pdf if r["plugin"] == "meili_indexer"), None) or fail("no indexer row")
+if index_row["documents_out"] < 1 and job_row["documents_out"] < 1:
+    fail("no documents were metered")
+
+# The Envoy-authenticated tenant is attributed to its project, not blank.
+tenant_rows = [r for r in rows if r["project_id"] == "acme"]
+if not tenant_rows:
+    fail("no rows carried the project_id sent via trusted Envoy headers")
+
+# Transcription seconds are billed on the audio job.
+audio = by_job.get(audio_job) or fail("no rows for the audio job")
+secs = sum(r["audio_seconds"] for r in audio if r["kind"] == "step")
+if secs <= 0:
+    fail(f"audio job billed {secs} seconds of transcription")
+
+# No credential ever reaches the analytics store.
+blob = json.dumps(rows)
+for secret in ("masterKey", "e2e-envoy-secret", "test-key"):
+    if secret in blob:
+        fail(f"secret {secret!r} leaked into usage events")
+
+print(f"usage assertions passed over {len(rows)} rows across {len(by_job)} jobs")
+print(f"  pdf job: {kinds['step']} steps, {extract['pages']} pages, {extract['input_bytes']} bytes")
+print(f"  audio job: {secs}s transcribed")
+PYEOF
+
 echo "--- cancel a running job"
 RESP5=$(curl -fsS -F "file=@${WORK}/sample.pdf" -F "index=e2e_cancel" "${GW}/ingest")
 JOB5=$(echo "$RESP5" | jq -r .job_id)
@@ -377,5 +493,19 @@ for _ in $(seq 1 30); do
 done
 echo "cancelled job final status: $S"
 case "$S" in cancelled|succeeded) ;; *) echo "unexpected status $S" >&2; exit 1;; esac
+
+echo "--- a cancelled job is still metered"
+sleep 2
+python3 - "${WORK}/usage.ndjson" "$JOB5" <<'PYEOF'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+job = [r for r in rows if r["job_id"] == sys.argv[2] and r["kind"] == "job"]
+if not job:
+    print("USAGE ASSERTION FAILED: cancelled job emitted no usage row"); sys.exit(1)
+status = job[0]["status"]
+if status not in ("cancelled", "succeeded"):
+    print(f"USAGE ASSERTION FAILED: cancelled job reported status {status}"); sys.exit(1)
+print(f"cancelled job metered with status {status}")
+PYEOF
 
 echo "=== E2E PASSED ==="

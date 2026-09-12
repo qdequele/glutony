@@ -49,6 +49,15 @@
 //!
 //! `meta.source` / `meta.filename` / `meta.mime` come from the blob and `meta.language`
 //! from the response (falling back to the configured `language`).
+//!
+//! ## Usage reporting
+//!
+//! Every successful call reports one `external_requests`. The seconds of audio it was
+//! billed for come from the response's `duration` (`verbose_json` only), or — when the
+//! response format does not carry one — from the exact header of an uncompressed WAV
+//! payload. For a compressed payload with no `duration` the seconds are genuinely
+//! unknowable and are reported as zero rather than guessed from the byte length; see
+//! `transcription_usage`.
 
 #![forbid(unsafe_code)]
 
@@ -343,7 +352,10 @@ impl Plugin for WhisperTranscriberPlugin {
             text,
             segments,
             language: detected,
+            duration,
         } = parsed;
+        // The endpoint bills per second of audio, so report what it actually got.
+        ctx.record_usage(transcription_usage(duration, &blob.data));
         let language = detected
             .filter(|l| !l.trim().is_empty())
             .or_else(|| cfg.language.clone());
@@ -531,6 +543,9 @@ struct TranscriptionResponse {
     segments: Vec<TranscriptionSegment>,
     #[serde(default)]
     language: Option<String>,
+    /// Length of the audio in seconds. Only `verbose_json` carries it.
+    #[serde(default)]
+    duration: Option<f64>,
 }
 
 /// One timestamped segment of a `verbose_json` response.
@@ -542,6 +557,104 @@ struct TranscriptionSegment {
     end: Option<f64>,
     #[serde(default)]
     text: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+
+/// Billable units for one transcription call.
+///
+/// `verbose_json` reports the audio length as a top-level `duration`, which is the
+/// figure the provider bills on, so it is used verbatim when present. The plain `json`
+/// response format does not carry it; the only honest fallback is an *uncompressed*
+/// payload, whose header states the byte rate exactly (see [`wav_duration_secs`]) —
+/// and that is the common case here, since `video_audio_extractor` upstream emits
+/// 16 kHz WAV.
+///
+/// For anything else — MP3, AAC, Opus, a WAV whose header we cannot read — the number
+/// of seconds is genuinely unknown: a compressed file's duration cannot be derived
+/// from its byte length (variable bitrate makes any such figure wrong, and a wrong
+/// figure would silently misbill). Those calls report `external_requests: 1` with
+/// zero seconds, so the request is still counted and the seconds are visibly absent
+/// rather than invented.
+fn transcription_usage(duration: Option<f64>, data: &[u8]) -> UsageUnits {
+    let seconds = duration
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .or_else(|| wav_duration_secs(data));
+    match seconds {
+        Some(secs) => UsageUnits::transcription(secs),
+        None => UsageUnits {
+            external_requests: 1,
+            ..Default::default()
+        },
+    }
+}
+
+/// Exact duration of an uncompressed RIFF/WAVE payload, read from its header.
+///
+/// This is not an estimate: for PCM and IEEE-float WAV the `fmt ` chunk states the
+/// byte rate, so `data chunk length / byte rate` is the true length of the audio.
+/// Returns `None` for anything that is not such a file — in particular for every
+/// compressed format, where byte length says nothing reliable about duration.
+fn wav_duration_secs(data: &[u8]) -> Option<f64> {
+    /// Uncompressed formats whose `fmt ` byte rate is exact.
+    const PCM: u16 = 1;
+    const IEEE_FLOAT: u16 = 3;
+    const EXTENSIBLE: u16 = 0xFFFE;
+
+    let le_u16 = |b: &[u8]| -> Option<u16> { Some(u16::from_le_bytes([*b.first()?, *b.get(1)?])) };
+    let le_u32 = |b: &[u8]| -> Option<u32> {
+        Some(u32::from_le_bytes([
+            *b.first()?,
+            *b.get(1)?,
+            *b.get(2)?,
+            *b.get(3)?,
+        ]))
+    };
+
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return None;
+    }
+
+    let mut byte_rate: Option<u32> = None;
+    let mut data_len: Option<u64> = None;
+    let mut pos = 12usize;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let declared = le_u32(&data[pos + 4..])? as usize;
+        let body = &data[pos + 8..];
+        // A stream-written WAV can declare a length past what is actually there;
+        // clamp so a truncated upload still yields the length of the bytes we hold.
+        let len = declared.min(body.len());
+        match id {
+            b"fmt " if len >= 16 => {
+                let format: u16 = le_u16(body)?;
+                let uncompressed = match format {
+                    PCM | IEEE_FLOAT => true,
+                    // WAVE_FORMAT_EXTENSIBLE names its real format in the GUID that
+                    // starts 24 bytes into the chunk.
+                    EXTENSIBLE if len >= 26 => {
+                        matches!(le_u16(&body[24..])?, PCM | IEEE_FLOAT)
+                    }
+                    _ => false,
+                };
+                if !uncompressed {
+                    return None;
+                }
+                byte_rate = le_u32(&body[8..]);
+            }
+            b"data" => data_len = Some(len as u64),
+            _ => {}
+        }
+        // Chunks are word-aligned: an odd length is followed by a pad byte.
+        pos += 8 + len + (len & 1);
+    }
+
+    match (byte_rate, data_len) {
+        (Some(rate), Some(len)) if rate > 0 => Some(len as f64 / f64::from(rate)),
+        _ => None,
+    }
 }
 
 fn parse_transcription(body: &str) -> Result<TranscriptionResponse, PluginError> {
@@ -983,6 +1096,134 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidConfig(_)), "{err:?}");
+    }
+
+    /// A 16 kHz mono 16-bit PCM WAV of `secs` seconds (silence: only the header and
+    /// the data length matter here).
+    fn wav_bytes(secs: f64) -> Vec<u8> {
+        const RATE: u32 = 16_000;
+        const BLOCK_ALIGN: u32 = 2; // mono, 16-bit
+        let byte_rate = RATE * BLOCK_ALIGN;
+        let data_len = (secs * f64::from(byte_rate)) as u32;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // channels
+        out.extend_from_slice(&RATE.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&(BLOCK_ALIGN as u16).to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        out
+    }
+
+    async fn usage_for(
+        response: serde_json::Value,
+        blob: Blob,
+        cfg: serde_json::Value,
+    ) -> UsageUnits {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, PluginInput::Bytes(blob), cfg)
+            .await
+            .unwrap();
+        ctx.usage()
+    }
+
+    #[tokio::test]
+    async fn duration_in_the_response_is_recorded_as_audio_seconds() {
+        let usage = usage_for(
+            serde_json::json!({
+                "text": "Hello there. General Kenobi.",
+                "language": "en",
+                "duration": 137.25,
+                "segments": [{ "id": 0, "start": 0.0, "end": 137.25, "text": "Hello there." }]
+            }),
+            Blob::new(MP3.to_vec(), "audio/mpeg", Some("call.mp3".into())),
+            serde_json::json!({ "segment_documents": true }),
+        )
+        .await;
+        assert_eq!(usage.audio_seconds, 137.25);
+        assert_eq!(usage.external_requests, 1);
+        assert_eq!(usage.llm_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn a_wav_upload_without_a_duration_is_measured_from_its_header() {
+        // `json` responses carry no duration, but an uncompressed payload states its
+        // own byte rate, so the seconds are exact rather than estimated.
+        let wav = wav_bytes(3.5);
+        let usage = usage_for(
+            serde_json::json!({ "text": "three and a half seconds" }),
+            Blob::new(wav, "audio/wav", Some("clip.wav".into())),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            (usage.audio_seconds - 3.5).abs() < 1e-9,
+            "got {}",
+            usage.audio_seconds
+        );
+        assert_eq!(usage.external_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_compressed_upload_without_a_duration_counts_the_request_only() {
+        // MP3 byte length says nothing about duration under variable bitrate, so the
+        // seconds stay at zero instead of being invented.
+        let usage = usage_for(
+            serde_json::json!({ "text": "some words" }),
+            Blob::new(MP3.to_vec(), "audio/mpeg", Some("x.mp3".into())),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(usage.audio_seconds, 0.0);
+        assert_eq!(usage.external_requests, 1);
+    }
+
+    #[test]
+    fn wav_duration_is_read_only_from_uncompressed_headers() {
+        assert_eq!(wav_duration_secs(&wav_bytes(1.0)), Some(1.0));
+        assert_eq!(wav_duration_secs(&wav_bytes(0.25)), Some(0.25));
+        // Not a RIFF/WAVE file at all.
+        assert_eq!(wav_duration_secs(MP3), None);
+        assert_eq!(wav_duration_secs(b"RIFF____WAVE"), None);
+        assert_eq!(wav_duration_secs(&[]), None);
+        // A compressed payload wrapped in RIFF (format 0x0055 = MP3) is refused.
+        let mut compressed = wav_bytes(1.0);
+        compressed[20..22].copy_from_slice(&0x0055u16.to_le_bytes());
+        assert_eq!(wav_duration_secs(&compressed), None);
+        // A truncated upload reports the audio it actually holds, never more.
+        let mut truncated = wav_bytes(2.0);
+        truncated.truncate(44 + 16_000);
+        assert_eq!(wav_duration_secs(&truncated), Some(0.5));
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_records_no_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, audio(), serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(ctx.usage().is_empty());
     }
 
     #[tokio::test]

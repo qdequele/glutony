@@ -62,6 +62,10 @@ x-worker-env: &worker-env
   BLOB_STORE_URL: file:///data/blobs
   PAYLOAD_SPILL_BYTES: "1048576"
   MAX_CONCURRENT_ACTIVITIES: "20"
+  # Per-tenant usage analytics. Unset means usage reporting is simply off.
+  TINYBIRD_TOKEN: ${TINYBIRD_TOKEN:-}
+  TINYBIRD_BASE_URL: ${TINYBIRD_BASE_URL:-https://api.tinybird.co}
+  TINYBIRD_DATASOURCE: ${TINYBIRD_DATASOURCE:-meili_ingest_usage}
 
 services:
   # ---------------------------------------------------------------------------

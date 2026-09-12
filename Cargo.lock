@@ -2990,11 +2990,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "meili-ingest-usage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "meili-ingest-plugin-sdk",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "meili-ingest-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "dotenvy",
  "futures",
  "meili-ingest-blob",
@@ -3015,6 +3032,7 @@ dependencies = [
  "meili-ingest-plugin-video-audio",
  "meili-ingest-plugin-xlsx",
  "meili-ingest-router",
+ "meili-ingest-usage",
  "reqwest 0.13.5",
  "serde",
  "serde_json",

@@ -1,0 +1,48 @@
+#
+# tenant_usage — ENDPOINT: the billing API over the daily rollup.
+#
+#   GET {base_url}/v0/pipes/tenant_usage.json
+#       ?project_id=acme&date_from=2026-04-01&date_to=2026-04-30&token=<READ token>
+#
+# Returns one row per (day, pipeline_uid, plugin). `plugin = ''` rows are the
+# job-level counters.
+#
+# Reads `usage_daily_billing`, the hourly COPY that reads the raw table with FINAL, so
+# these totals are deduplicated and safe to invoice from. They lag by up to an hour;
+# for a real-time view (which can double-count a redelivered event) read the
+# materialized `usage_daily` instead. Add `&format=csv` / `.csv` for a billing export.
+#
+
+NODE tenant_usage_daily
+DESCRIPTION >
+    Merged daily usage for one tenant over a closed date range.
+
+SQL >
+    %
+    SELECT
+        day,
+        pipeline_uid,
+        plugin,
+        sum(steps) AS steps,
+        sum(jobs) AS jobs,
+        sum(jobs_succeeded) AS jobs_succeeded,
+        sum(jobs_failed) AS jobs_failed,
+        sum(documents_out) AS documents_out,
+        sum(input_bytes) AS input_bytes,
+        sum(duration_ms) AS duration_ms,
+        sum(llm_input_tokens) AS llm_input_tokens,
+        sum(llm_output_tokens) AS llm_output_tokens,
+        sum(llm_requests) AS llm_requests,
+        sum(audio_seconds) AS audio_seconds,
+        sum(pages) AS pages,
+        sum(images) AS images,
+        sum(external_requests) AS external_requests
+    FROM usage_daily_billing
+    WHERE
+        project_id = {{ String(project_id, required=True, description="Tenant id, as sent in X-Meili-Project-Id") }}
+        AND day >= {{ Date(date_from, required=True, description="First day of the period, inclusive (YYYY-MM-DD)") }}
+        AND day <= {{ Date(date_to, required=True, description="Last day of the period, inclusive (YYYY-MM-DD)") }}
+    GROUP BY day, pipeline_uid, plugin
+    ORDER BY day ASC, pipeline_uid ASC, plugin ASC
+
+TYPE ENDPOINT

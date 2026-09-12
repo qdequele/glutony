@@ -1,11 +1,13 @@
-//! [`ActivityContext`]: what a plugin can do with the activity it runs inside of
-//! (heartbeat and observe cancellation).
+//! [`ActivityContext`]: what a plugin can do with the activity it runs inside of —
+//! heartbeat, observe cancellation, and report billable usage.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+use crate::types::UsageUnits;
 
 /// Handle a plugin uses to heartbeat and observe cancellation.
 ///
@@ -20,6 +22,7 @@ pub struct ActivityContext {
     attempt: u32,
     heartbeat_tx: Option<mpsc::UnboundedSender<String>>,
     cancelled: Arc<AtomicBool>,
+    usage: Arc<Mutex<UsageUnits>>,
 }
 
 impl ActivityContext {
@@ -37,6 +40,7 @@ impl ActivityContext {
             attempt,
             heartbeat_tx: Some(heartbeat_tx),
             cancelled,
+            usage: Arc::new(Mutex::new(UsageUnits::default())),
         }
     }
 
@@ -48,6 +52,7 @@ impl ActivityContext {
             attempt: 1,
             heartbeat_tx: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            usage: Arc::new(Mutex::new(UsageUnits::default())),
         }
     }
 
@@ -92,5 +97,58 @@ impl ActivityContext {
     /// Shared cancellation flag (the worker flips it when Temporal cancels the activity).
     pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
+    }
+
+    /// Report billable work: tokens spent, audio transcribed, pages rendered.
+    ///
+    /// Only the plugin knows what it spent on an external service, so anything that
+    /// calls one should record it. Units accumulate across calls, so a plugin looping
+    /// over documents can record each response as it arrives. The worker reads the
+    /// total back after `execute` returns and ships it with the step's usage event.
+    ///
+    /// This never blocks and never fails: if the accumulator is poisoned by a panic in
+    /// another thread the units are dropped rather than propagating the panic into an
+    /// unrelated plugin.
+    pub fn record_usage(&self, units: UsageUnits) {
+        if units.is_empty() {
+            return;
+        }
+        if let Ok(mut total) = self.usage.lock() {
+            total.merge(units);
+        }
+    }
+
+    /// Total units recorded so far.
+    pub fn usage(&self) -> UsageUnits {
+        self.usage.lock().map(|u| *u).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_accumulates_across_calls() {
+        let ctx = ActivityContext::noop();
+        assert!(ctx.usage().is_empty());
+        ctx.record_usage(UsageUnits::llm(10, 4));
+        ctx.record_usage(UsageUnits::llm(6, 2));
+        // Empty reports are ignored rather than counted as activity.
+        ctx.record_usage(UsageUnits::none());
+        let total = ctx.usage();
+        assert_eq!(total.llm_input_tokens, 16);
+        assert_eq!(total.llm_output_tokens, 6);
+        assert_eq!(total.llm_requests, 2);
+    }
+
+    #[test]
+    fn usage_is_shared_by_clones() {
+        // Plugins clone the context into concurrent tasks; every clone must report
+        // into the same accumulator or fan-out usage would be undercounted.
+        let ctx = ActivityContext::noop();
+        let clone = ctx.clone();
+        clone.record_usage(UsageUnits::transcription(2.0));
+        assert_eq!(ctx.usage().audio_seconds, 2.0);
     }
 }

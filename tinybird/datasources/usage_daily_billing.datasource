@@ -1,0 +1,40 @@
+#
+# usage_daily_billing — invoice-grade daily rollup of meili_ingest_usage.
+#
+# Written only by `pipes/usage_daily_billing.pipe`, a scheduled COPY that reads the
+# raw table with FINAL, so it reflects ReplacingMergeTree deduplication. This is the
+# table to bill from.
+#
+# Why this exists alongside `usage_daily`: a materialized view is a trigger on INSERT
+# and never sees deduplication, so a Temporal redelivery inflates the MV while the raw
+# table stays correct. The MV stays for real-time dashboards; this table trades
+# freshness (hourly) for correctness (exactly-once), which is the right trade for an
+# invoice.
+#
+# Columns are plain numbers, not aggregate states: the copy has already merged them,
+# so reads are ordinary sums and need no `-Merge` combinators.
+#
+
+SCHEMA >
+    `project_id` LowCardinality(String),
+    `day` Date,
+    `pipeline_uid` LowCardinality(String),
+    `plugin` LowCardinality(String),
+    `steps` UInt64,
+    `jobs` UInt64,
+    `jobs_succeeded` UInt64,
+    `jobs_failed` UInt64,
+    `documents_out` UInt64,
+    `input_bytes` UInt64,
+    `duration_ms` UInt64,
+    `llm_input_tokens` UInt64,
+    `llm_output_tokens` UInt64,
+    `llm_requests` UInt64,
+    `audio_seconds` Float64,
+    `pages` UInt64,
+    `images` UInt64,
+    `external_requests` UInt64
+
+ENGINE "MergeTree"
+ENGINE_SORTING_KEY "project_id, day, pipeline_uid, plugin"
+ENGINE_PARTITION_KEY "toYYYYMM(day)"

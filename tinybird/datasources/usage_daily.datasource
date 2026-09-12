@@ -1,0 +1,42 @@
+#
+# usage_daily — daily per-tenant rollup of meili_ingest_usage.
+#
+# Target of the materialized pipe `pipes/usage_daily.pipe`; never written directly.
+# Columns hold aggregate STATES, so every read must merge them
+# (`sumMerge`, `countMerge`) — see `pipes/tenant_usage.pipe`.
+#
+# Sorting key `project_id, day, pipeline_uid, plugin` matches the rollup's GROUP BY and,
+# like the raw table, leads with the tenant: billing reads one project at a time.
+# Job-level rows (kind = 'job') carry no plugin, so their counters land in the
+# `plugin = ''` bucket.
+#
+# CAVEAT (see pipes/usage_daily.pipe): a materialized view fires per INSERT and does not
+# see the ReplacingMergeTree deduplication of the source, so a redelivered event would
+# be counted twice HERE while the raw table stays correct. The raw data source remains
+# the source of truth for an invoice; this rollup is for dashboards and estimates.
+#
+
+SCHEMA >
+    `project_id` LowCardinality(String),
+    `day` Date,
+    `pipeline_uid` LowCardinality(String),
+    `plugin` LowCardinality(String),
+    `rows_count` AggregateFunction(count),
+    `steps` AggregateFunction(sum, UInt64),
+    `jobs` AggregateFunction(sum, UInt64),
+    `jobs_succeeded` AggregateFunction(sum, UInt64),
+    `jobs_failed` AggregateFunction(sum, UInt64),
+    `documents_out` AggregateFunction(sum, UInt64),
+    `input_bytes` AggregateFunction(sum, UInt64),
+    `duration_ms` AggregateFunction(sum, UInt64),
+    `llm_input_tokens` AggregateFunction(sum, UInt64),
+    `llm_output_tokens` AggregateFunction(sum, UInt64),
+    `llm_requests` AggregateFunction(sum, UInt64),
+    `audio_seconds` AggregateFunction(sum, Float64),
+    `pages` AggregateFunction(sum, UInt64),
+    `images` AggregateFunction(sum, UInt64),
+    `external_requests` AggregateFunction(sum, UInt64)
+
+ENGINE "AggregatingMergeTree"
+ENGINE_SORTING_KEY "project_id, day, pipeline_uid, plugin"
+ENGINE_PARTITION_KEY "toYYYYMM(day)"

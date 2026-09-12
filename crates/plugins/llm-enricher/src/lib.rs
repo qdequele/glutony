@@ -17,6 +17,9 @@
 //! 4. Bounded concurrency with `futures::stream::...buffer_unordered(n)` while keeping
 //!    the output in input order.
 //! 5. `ctx.heartbeat(..)` every 10 documents and `ctx.check_cancelled()?` in the loop.
+//!    Every successful completion also reports its tokens with
+//!    [`ActivityContext::record_usage`]; the accumulator is shared by clones, so the
+//!    concurrent tasks below sum into one total.
 //! 6. Precise error mapping: transient upstream failures → [`PluginError::Retryable`],
 //!    everything the operator must fix → `NonRetryable` / `InvalidConfig` /
 //!    `InvalidInput`. Never leak secrets into errors or logs.
@@ -319,7 +322,7 @@ impl Plugin for LlmEnricherPlugin {
         let mut stream = futures::stream::iter(docs.into_iter().enumerate())
             .map(|(i, doc)| {
                 let cfg = &cfg;
-                async move { (i, client.enrich(cfg, doc).await) }
+                async move { (i, client.enrich(ctx, cfg, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
@@ -354,6 +357,9 @@ impl Plugin for LlmEnricherPlugin {
 struct ChatCompletion {
     #[serde(default)]
     choices: Vec<Choice>,
+    /// Absent on gateways that do not report token accounting.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 #[derive(Deserialize)]
 struct Choice {
@@ -365,10 +371,43 @@ struct ChatMessage {
     content: Option<String>,
 }
 
+/// The `usage` object of an OpenAI-compatible chat completion.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct ApiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
+/// One completion: the reply text and what the call cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    /// `choices[0].message.content`.
+    pub content: String,
+    /// Units billed by the provider for this one call.
+    pub usage: UsageUnits,
+}
+
+/// Units for a call whose `usage` object the gateway omitted: the request happened
+/// and is billable as such, but its token counts are genuinely unknown, so they stay
+/// at zero rather than being estimated from the prompt.
+fn request_without_token_counts() -> UsageUnits {
+    UsageUnits {
+        llm_requests: 1,
+        ..Default::default()
+    }
+}
+
 impl LlmClient {
     /// Ask the model about one document and merge the reply into it.
+    ///
+    /// Records the call's usage on `ctx` before returning. This runs inside the
+    /// `buffer_unordered` fan-out of [`Plugin::execute`], and the accumulator behind
+    /// `ctx` is shared by clones, so concurrent documents sum into one total.
     async fn enrich(
         &self,
+        ctx: &ActivityContext,
         cfg: &LlmEnricherConfig,
         mut doc: Document,
     ) -> Result<Document, PluginError> {
@@ -391,23 +430,44 @@ impl LlmClient {
             body["max_tokens"] = serde_json::json!(max);
         }
 
-        let raw = chat_completion(&self.http, &self.base_url, &self.api_key, &body).await?;
-        apply_reply(&mut doc, &raw, cfg.merge_strategy);
+        // A failed call records nothing: `?` returns before `record_usage`.
+        let completion =
+            chat_completion_with_usage(&self.http, &self.base_url, &self.api_key, &body).await?;
+        ctx.record_usage(completion.usage);
+        apply_reply(&mut doc, &completion.content, cfg.merge_strategy);
         Ok(doc)
     }
 }
 
 /// POST `{base_url}/chat/completions` and return `choices[0].message.content`.
 ///
-/// Shared error mapping for OpenAI-compatible APIs:
-/// 429 / 5xx / transport errors → `Retryable`; 401 / 403 → `NonRetryable`
-/// (credentials); 400 → `NonRetryable` with the body; other statuses → `NonRetryable`.
+/// See [`chat_completion_with_usage`] when the caller also needs the token counts.
 pub async fn chat_completion(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<String, PluginError> {
+    Ok(chat_completion_with_usage(http, base_url, api_key, body)
+        .await?
+        .content)
+}
+
+/// POST `{base_url}/chat/completions` and return the reply plus its billable units.
+///
+/// The `usage` object is optional — some gateways omit it — and when it is missing the
+/// returned units still count one [`UsageUnits::llm_requests`] so request counts stay
+/// accurate; only the token counts are lost.
+///
+/// Shared error mapping for OpenAI-compatible APIs:
+/// 429 / 5xx / transport errors → `Retryable`; 401 / 403 → `NonRetryable`
+/// (credentials); 400 → `NonRetryable` with the body; other statuses → `NonRetryable`.
+pub async fn chat_completion_with_usage(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<Completion, PluginError> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = http
         .post(&url)
@@ -432,12 +492,19 @@ pub async fn chat_completion(
             truncate_chars(&text, 512)
         ))
     })?;
-    parsed
+    let usage = match parsed.usage {
+        Some(u) => UsageUnits::llm(u.prompt_tokens, u.completion_tokens),
+        None => request_without_token_counts(),
+    };
+    let content = parsed
         .choices
         .into_iter()
         .next()
         .and_then(|c| c.message.content)
-        .ok_or_else(|| PluginError::non_retryable("LLM response has no choices[0].message.content"))
+        .ok_or_else(|| {
+            PluginError::non_retryable("LLM response has no choices[0].message.content")
+        })?;
+    Ok(Completion { content, usage })
 }
 
 fn map_http_failure(code: u16, body: &str) -> PluginError {
@@ -906,6 +973,107 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput(_)));
         assert!(!format!("{p:?}").contains("test-key"));
+    }
+
+    /// Replies with a `usage` object derived from the document index, so a test can
+    /// assert the exact sum over several concurrent documents. Early documents answer
+    /// last, so usage is merged out of input order.
+    struct UsagePerDocument;
+    impl Respond for UsagePerDocument {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            let content = user.rsplit("\n\n").next().unwrap();
+            let idx: u64 = content.trim_start_matches("doc number ").parse().unwrap();
+            let mut reply = chat_reply(r#"{"summary":"s"}"#);
+            reply["usage"] = serde_json::json!({
+                "prompt_tokens": 10 + idx,
+                "completion_tokens": idx,
+                "total_tokens": 10 + 2 * idx,
+            });
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis((5 - idx) * 4))
+                .set_body_json(reply)
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_from_concurrent_documents_sums_into_one_total() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(UsagePerDocument)
+            .expect(5)
+            .mount(&server)
+            .await;
+
+        let docs: Vec<Document> = (0..5)
+            .map(|i| Document::with_id(format!("doc-{i}"), format!("doc number {i}")))
+            .collect();
+        let ctx = ActivityContext::noop();
+        let out = plugin(&server)
+            .execute(
+                &ctx,
+                PluginInput::Documents(docs),
+                serde_json::json!({"max_concurrent": 5}),
+            )
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out.len(), 5);
+
+        let usage = ctx.usage();
+        // prompt: 10+11+12+13+14, completion: 0+1+2+3+4, one request per document.
+        assert_eq!(usage.llm_input_tokens, 60);
+        assert_eq!(usage.llm_output_tokens, 10);
+        assert_eq!(usage.llm_requests, 5);
+        assert_eq!(usage.images, 0);
+        assert_eq!(usage.audio_seconds, 0.0);
+    }
+
+    #[tokio::test]
+    async fn missing_usage_object_still_counts_the_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let docs: Vec<Document> = (0..3)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, PluginInput::Documents(docs), serde_json::json!({}))
+            .await
+            .unwrap();
+        let usage = ctx.usage();
+        assert_eq!(
+            usage.llm_requests, 3,
+            "requests are billable even untokened"
+        );
+        assert_eq!(usage.llm_input_tokens, 0, "tokens are unknown, not guessed");
+        assert_eq!(usage.llm_output_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_records_no_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![Document::with_id("a", "x")]),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(ctx.usage().is_empty());
     }
 
     #[test]

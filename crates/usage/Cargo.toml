@@ -1,0 +1,22 @@
+[package]
+name = "meili-ingest-usage"
+description = "meili-ingest usage metering: builds per-job / per-step billing events and ships them to Tinybird (managed ClickHouse) with at-least-once, deduplicated delivery."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+meili-ingest-plugin-sdk.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
