@@ -285,13 +285,6 @@ paths:
                 $ref: "#/components/schemas/JobStatusResponse"
         "404":
           $ref: "#/components/responses/JobNotFound"
-        "409":
-          description: The job already reached a terminal state.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-              example: { "error": "job already finished with status succeeded", "code": "job_terminal" }
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
@@ -377,7 +370,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example: { "error": "builtin pipelines are read-only", "code": "builtin_pipeline" }
+              example: { "error": "builtin pipelines are read-only", "code": "forbidden" }
         "422":
           description: Invalid pipeline (unknown plugin, cycle, duplicate step, unsupported `fan_out`).
           content:
@@ -425,7 +418,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example: { "error": "builtin pipelines cannot be deleted", "code": "builtin_pipeline" }
+              example: { "error": "builtin pipelines cannot be deleted", "code": "forbidden" }
         "404":
           $ref: "#/components/responses/PipelineNotFound"
         "502":
@@ -567,28 +560,28 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example: { "error": "no pipeline matches application/x-msdownload", "code": "no_pipeline" }
+          example: { "error": "no pipeline matches application/x-msdownload", "code": "unsupported_media_type" }
     PipelineNotFound:
       description: Unknown pipeline.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example: { "error": "pipeline \"nope\" not found", "code": "pipeline_not_found" }
+          example: { "error": "pipeline \"nope\" not found", "code": "not_found" }
     JobNotFound:
       description: Unknown job.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example: { "error": "job 550e8400-e29b-41d4-a716-446655440000 not found", "code": "job_not_found" }
+          example: { "error": "job 550e8400-e29b-41d4-a716-446655440000 not found", "code": "not_found" }
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example: { "error": "control plane unreachable", "code": "upstream_unavailable" }
+          example: { "error": "control plane unreachable", "code": "upstream_error" }
 
   schemas:
     Error:
@@ -601,7 +594,7 @@ components:
         code:
           type: string
           description: Stable snake_case error code.
-          examples: [missing_context, no_pipeline, pipeline_not_found, job_not_found, payload_too_large, invalid_pipeline, builtin_pipeline, upstream_unavailable]
+          examples: [missing_context, bad_request, forbidden, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, internal_error]
 
     JobStatus:
       type: string

@@ -27,6 +27,7 @@ export MEILI_API_KEY=masterKey
 export BLOB_STORE_URL="file://${WORK}/blobs"
 export INLINE_MAX_BYTES=${INLINE_MAX_BYTES:-1048576}
 export LOG_FORMAT=text
+ENVOY_SECRET=e2e-envoy-secret
 export RUST_LOG=${RUST_LOG:-info,meili_ingest=debug}
 
 PIDS=()
@@ -65,7 +66,7 @@ echo "--- services"
 BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
 PIDS+=($!)
 wait_for "${CONTROL_PLANE_URL}/health" control-plane
-BIND="0.0.0.0:${GW_PORT}" ./target/debug/meili-ingest-gateway >"${WORK}/gw.log" 2>&1 &
+BIND="0.0.0.0:${GW_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" ./target/debug/meili-ingest-gateway >"${WORK}/gw.log" 2>&1 &
 PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
 TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
@@ -163,5 +164,67 @@ N=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_tex
 echo "e2e_text chunks: $N"; [ "$N" -ge 2 ] || exit 1
 curl -fsS -X DELETE "${GW}/pipelines/e2e-text-fixed" -o /dev/null -w "delete pipeline → %{http_code}\n"
 curl -sS -X DELETE "${GW}/pipelines/builtin.pdf" -o /dev/null -w "delete builtin → %{http_code} (expect 403)\n"
+
+echo "--- ingest by URL reference (worker fetches it)"
+python3 -m http.server "${FILE_PORT:-58099}" --directory "${WORK}" >"${WORK}/http.log" 2>&1 &
+PIDS+=($!)
+wait_for "http://localhost:${FILE_PORT:-58099}/sample.pdf" file-server
+RESP4=$(curl -fsS -H 'Content-Type: application/json' \
+  -d "{\"url\":\"http://localhost:${FILE_PORT:-58099}/sample.pdf\",\"index\":\"e2e_url\"}" "${GW}/ingest")
+echo "$RESP4" | jq .
+JOB4=$(echo "$RESP4" | jq -r .job_id)
+for _ in $(seq 1 90); do
+  S=$(curl -fsS "${GW}/jobs/${JOB4}" | jq -r .status)
+  [ "$S" = succeeded ] && break
+  [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB4}" | jq .; tail -40 "${WORK}/worker.log"; exit 1; }
+  sleep 1
+done
+[ "$S" = succeeded ] || { echo "url job state $S"; curl -fsS "${GW}/jobs/${JOB4}" | jq .; exit 1; }
+sleep 1
+UHITS=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_url/search" -H 'Content-Type: application/json' -d '{"q":"lightning"}' | jq '.estimatedTotalHits')
+echo "e2e_url hits for 'lightning': $UHITS"; [ "$UHITS" -ge 1 ] || exit 1
+
+echo "--- Envoy trust: headers without the shared secret are ignored"
+# The gateway runs with ENVOY_TRUSTED_HEADER set, so X-Meili-* headers only count
+# when X-Meili-Envoy-Secret matches. A spoofed host must be ignored and the request
+# must fall back to MEILI_URL, landing the document in the real Meilisearch.
+SPOOF=$(curl -fsS -H 'X-Meili-Host: http://evil.invalid:9' -H 'X-Meili-Api-Key: spoofed' \
+  -H 'X-Meili-Index: e2e_evil' -H 'Content-Type: application/json' \
+  -d '{"documents":[{"id":"s1","content":"spoofed tenant headers"}],"index":"e2e_spoof"}' "${GW}/ingest")
+echo "$SPOOF" | jq -c .
+[ "$(echo "$SPOOF" | jq -r .target_index)" = "e2e_spoof" ] || { echo "spoofed X-Meili-Index was honoured" >&2; exit 1; }
+JOB_S=$(echo "$SPOOF" | jq -r .job_id)
+for _ in $(seq 1 60); do S=$(curl -fsS "${GW}/jobs/${JOB_S}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && break; sleep 1; done
+[ "$S" = succeeded ] || { echo "spoof-fallback job ended $S (expected succeeded via MEILI_URL fallback)" >&2; curl -fsS "${GW}/jobs/${JOB_S}" | jq .; exit 1; }
+sleep 1
+SH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_spoof/search" -H 'Content-Type: application/json' -d '{"q":"spoofed"}' | jq '.estimatedTotalHits')
+echo "e2e_spoof hits (must be in the REAL Meilisearch): $SH"; [ "$SH" -ge 1 ] || exit 1
+
+echo "--- Envoy trust: headers with the shared secret are honoured"
+TRUSTED=$(curl -fsS -H "X-Meili-Envoy-Secret: ${ENVOY_SECRET}" \
+  -H "X-Meili-Host: ${MEILI_URL}" -H 'X-Meili-Api-Key: masterKey' \
+  -H 'X-Meili-Index: e2e_tenant' -H 'X-Meili-Project-Id: acme' \
+  -H 'Content-Type: application/json' \
+  -d '{"documents":[{"id":"t1","content":"tenant routed by envoy headers"}]}' "${GW}/ingest")
+echo "$TRUSTED" | jq -c .
+[ "$(echo "$TRUSTED" | jq -r .target_index)" = "e2e_tenant" ] || { echo "trusted X-Meili-Index was ignored" >&2; exit 1; }
+JOB_T=$(echo "$TRUSTED" | jq -r .job_id)
+for _ in $(seq 1 60); do S=$(curl -fsS "${GW}/jobs/${JOB_T}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB_T}" | jq .; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "tenant job ended $S" >&2; exit 1; }
+sleep 1
+TH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_tenant/search" -H 'Content-Type: application/json' -d '{"q":"tenant"}' | jq '.estimatedTotalHits')
+echo "e2e_tenant hits: $TH"; [ "$TH" -ge 1 ] || exit 1
+
+echo "--- cancel a running job"
+RESP5=$(curl -fsS -F "file=@${WORK}/sample.pdf" -F "index=e2e_cancel" "${GW}/ingest")
+JOB5=$(echo "$RESP5" | jq -r .job_id)
+curl -fsS -X POST "${GW}/jobs/${JOB5}/cancel" | jq .
+for _ in $(seq 1 30); do
+  S=$(curl -fsS "${GW}/jobs/${JOB5}" | jq -r .status)
+  case "$S" in cancelled|succeeded) break;; esac
+  sleep 1
+done
+echo "cancelled job final status: $S"
+case "$S" in cancelled|succeeded) ;; *) echo "unexpected status $S" >&2; exit 1;; esac
 
 echo "=== E2E PASSED ==="

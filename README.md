@@ -243,6 +243,17 @@ cargo fmt --all --check
 Requires Rust 1.92+ and `protoc`. DB-backed control-plane tests run when
 `DATABASE_URL` is set.
 
+For a full-stack check, `scripts/e2e.sh` starts Postgres, Meilisearch and a
+Temporal dev server, runs the gateway, control plane and a worker from your
+working tree, ingests a PDF, inline JSON documents and raw text, then asserts
+the documents are searchable and tears everything down.
+
+```bash
+./scripts/e2e.sh
+```
+
+It needs Docker, the `temporal` CLI, `jq` and `python3`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
