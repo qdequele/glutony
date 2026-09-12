@@ -19,6 +19,7 @@ use meili_ingest_plugin_sdk::{
 };
 use meili_ingest_router::plugin_task_queue;
 use temporalio_common::RetryPolicy;
+use temporalio_common::protos::temporal::api::failure::v1::Failure;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::workflows::join_all;
 use temporalio_sdk::{
@@ -170,6 +171,44 @@ impl PipelineWorkflow {
     }
 }
 
+/// Human-readable reason an activity failed.
+///
+/// Temporal's own `Display` is always "Activity task failed"; the message a plugin
+/// produced sits in the failure's cause chain. Walk it and return the deepest
+/// non-empty message so `GET /jobs/{id}` shows something actionable.
+fn describe_activity_failure(err: &ActivityExecutionError) -> String {
+    err.failure()
+        .and_then(deepest_failure_message)
+        .unwrap_or_else(|| err.to_string())
+}
+
+/// Deepest non-generic message in a failure's cause chain.
+fn deepest_failure_message(failure: &Failure) -> Option<String> {
+    {
+        fn deepest(failure: &Failure) -> Option<String> {
+            let mut best = non_empty(&failure.message);
+            let mut current = failure.cause.as_deref();
+            while let Some(f) = current {
+                if let Some(m) = non_empty(&f.message) {
+                    best = Some(m);
+                }
+                current = f.cause.as_deref();
+            }
+            best
+        }
+        fn non_empty(s: &str) -> Option<String> {
+            let s = s.trim();
+            (!s.is_empty() && s != "Activity task failed").then(|| s.to_string())
+        }
+        deepest(failure)
+    }
+}
+
+#[cfg(test)]
+fn describe_failure_for_test(failure: &Failure) -> String {
+    deepest_failure_message(failure).unwrap_or_default()
+}
+
 /// Why a step did not complete.
 enum StepFailure {
     Cancelled,
@@ -216,7 +255,7 @@ impl PipelineWorkflow {
     fn map_activity_error(e: ActivityExecutionError) -> StepFailure {
         match e {
             ActivityExecutionError::Cancelled(_) => StepFailure::Cancelled,
-            other => StepFailure::Failed(other.to_string()),
+            other => StepFailure::Failed(describe_activity_failure(&other)),
         }
     }
 
@@ -325,5 +364,48 @@ impl PipelineWorkflow {
             return Err(StepFailure::Cancelled);
         }
         Ok((PluginOutput::Many(outputs), total))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use temporalio_common::protos::temporal::api::failure::v1::Failure;
+
+    fn failure(message: &str, cause: Option<Failure>) -> Failure {
+        Failure {
+            message: message.to_string(),
+            cause: cause.map(Box::new),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deepest_cause_message_is_reported() {
+        // Temporal wraps the plugin's message two levels down.
+        let inner = failure(
+            "plugin \"chunker\" received bytes that are not valid UTF-8 text",
+            None,
+        );
+        let middle = failure("activity error", Some(inner));
+        let top = failure("Activity task failed", Some(middle));
+        assert_eq!(
+            super::describe_failure_for_test(&top),
+            "plugin \"chunker\" received bytes that are not valid UTF-8 text"
+        );
+    }
+
+    #[test]
+    fn generic_wrapper_alone_is_not_reported_as_the_reason() {
+        let top = failure("Activity task failed", None);
+        assert_eq!(super::describe_failure_for_test(&top), "");
+    }
+
+    #[test]
+    fn single_message_is_kept() {
+        let top = failure("meilisearch rejected the batch", None);
+        assert_eq!(
+            super::describe_failure_for_test(&top),
+            "meilisearch rejected the batch"
+        );
     }
 }

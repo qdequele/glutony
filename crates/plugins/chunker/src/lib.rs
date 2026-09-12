@@ -386,6 +386,35 @@ fn chunk_document(parent: &Document, cfg: &Config) -> Vec<Document> {
         .collect()
 }
 
+/// Turn a raw UTF-8 text blob into a single document to chunk.
+///
+/// Non-UTF-8 input is rejected rather than silently mangled: a binary file reaching
+/// the chunker means the pipeline is missing an extractor step.
+fn document_from_text(blob: meili_ingest_plugin_sdk::Blob) -> Result<Document, PluginError> {
+    let content = String::from_utf8(blob.data).map_err(|_| {
+        PluginError::InvalidInput(
+            "chunker received bytes that are not valid UTF-8 text; add an extractor step \
+             (pdf_extractor, docx_extractor, ...) before the chunker"
+                .to_string(),
+        )
+    })?;
+    let stem = blob
+        .filename
+        .as_deref()
+        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
+        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
+        .filter(|s| !s.is_empty())
+        .map(meili_ingest_plugin_sdk::sanitize_id);
+    let mut doc = match stem {
+        Some(id) => Document::with_id(id, content),
+        None => Document::new(content),
+    };
+    doc.meta.source = blob.filename.clone();
+    doc.meta.filename = blob.filename;
+    doc.meta.mime = Some(blob.mime);
+    Ok(doc)
+}
+
 #[async_trait]
 impl Plugin for ChunkerPlugin {
     fn manifest(&self) -> PluginManifest {
@@ -394,7 +423,7 @@ impl Plugin for ChunkerPlugin {
                 "Splits document content into overlapping chunks (sentence, fixed or paragraph \
                  strategy) sized in characters; sets chunk_index/chunk_total/parent_id metadata.",
             )
-            .accepts([InputKind::Documents, InputKind::Many])
+            .accepts([InputKind::Documents, InputKind::Many, InputKind::Bytes])
             .produces(OutputKind::Documents)
             .config_schema(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -441,7 +470,12 @@ impl Plugin for ChunkerPlugin {
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
-        let docs = input.into_documents()?;
+        // Raw text (`builtin.text` sends `text/plain` straight to the chunker) becomes a
+        // single document before chunking; everything else must already be documents.
+        let docs = match input {
+            PluginInput::Bytes(blob) => vec![document_from_text(blob)?],
+            other => other.into_documents()?,
+        };
         let mut out = Vec::with_capacity(docs.len());
         for (i, doc) in docs.iter().enumerate() {
             ctx.check_cancelled()?;
@@ -547,7 +581,10 @@ mod tests {
     fn manifest_is_correct() {
         let m = ChunkerPlugin.manifest();
         assert_eq!(m.name, NAME);
-        assert_eq!(m.accepts, vec![InputKind::Documents, InputKind::Many]);
+        assert_eq!(
+            m.accepts,
+            vec![InputKind::Documents, InputKind::Many, InputKind::Bytes]
+        );
         assert_eq!(m.produces, OutputKind::Documents);
         let props = m.config_schema["properties"].as_object().unwrap();
         for key in [
@@ -824,18 +861,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_bytes_input_and_honours_cancellation() {
+    async fn honours_cancellation() {
         let plugin = ChunkerPlugin::new();
-        let err = plugin
-            .execute(
-                &ActivityContext::noop(),
-                PluginInput::Bytes(Blob::new(vec![1], "text/plain", None)),
-                json!({}),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, PluginError::InvalidInput(_)));
-
         let ctx = ActivityContext::noop();
         ctx.cancellation_flag()
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -844,5 +871,55 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn chunks_raw_utf8_text_bytes() {
+        // builtin.text feeds text/plain straight into the chunker.
+        let blob = meili_ingest_plugin_sdk::Blob::new(
+            "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs."
+                .as_bytes()
+                .to_vec(),
+            "text/plain",
+            Some("notes.txt".to_string()),
+        );
+        let out = ChunkerPlugin
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(blob),
+                serde_json::json!({"strategy": "fixed", "chunk_size": 40, "overlap": 5}),
+            )
+            .await
+            .expect("chunk raw text");
+        let docs = out.into_documents().expect("documents");
+        assert!(
+            docs.len() >= 2,
+            "expected several chunks, got {}",
+            docs.len()
+        );
+        assert!(docs.iter().all(|d| d.id.starts_with("notes")));
+        assert_eq!(docs[0].meta.mime.as_deref(), Some("text/plain"));
+        assert_eq!(docs[0].meta.chunk_total, Some(docs.len()));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_utf8_bytes_with_a_helpful_message() {
+        let blob = meili_ingest_plugin_sdk::Blob::new(
+            vec![0xff, 0xfe, 0x00, 0x01],
+            "application/octet-stream",
+            None,
+        );
+        let err = ChunkerPlugin
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(blob),
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("must reject binary input");
+        match err {
+            PluginError::InvalidInput(m) => assert!(m.contains("extractor step"), "{m}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
