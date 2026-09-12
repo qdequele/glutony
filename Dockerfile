@@ -22,7 +22,7 @@ ARG RUST_VERSION=1.94
 # ---------------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-bookworm AS chef
 RUN apt-get update \
- && apt-get install -y --no-install-recommends protobuf-compiler pkg-config libssl-dev \
+ && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/* \
  && cargo install cargo-chef --locked
 WORKDIR /app
