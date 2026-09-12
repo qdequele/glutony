@@ -1,0 +1,47 @@
+/*
+ * Series colours for the usage charts.
+ *
+ * Everything structural on these charts (grid, axes, tooltip surface) uses the
+ * shared tokens from `globals.css` — `--border`, `--muted-foreground`,
+ * `--popover`, `--foreground` — so it tracks the theme toggle for free.
+ *
+ * The series colours cannot: the shared `--chart-1 … --chart-5` ramp in
+ * `globals.css` is monochrome and, more importantly, identical in both themes.
+ * Its darkest stops (`oklch(0.269 0 0)`) sit on top of the dark background
+ * (`oklch(0.145 0 0)`) and are effectively invisible, and six stacked bands of
+ * grey are unreadable in either theme. So the usage charts define their own
+ * ramp here, scoped to the element that carries `.palette` — nothing outside
+ * this screen is affected, and `globals.css` stays owned by the scaffold.
+ *
+ * Both ramps are OKLCH with a constant lightness so the bands read as equal
+ * weight, and the hues are spaced far enough apart to survive being adjacent in
+ * a stack. Dark mode lifts lightness and drops chroma, which is what keeps the
+ * bands from glowing on a near-black background.
+ */
+
+.palette {
+  --usage-1: oklch(0.55 0.16 258);
+  --usage-2: oklch(0.58 0.13 175);
+  --usage-3: oklch(0.62 0.15 60);
+  --usage-4: oklch(0.55 0.17 320);
+  --usage-5: oklch(0.58 0.16 20);
+  --usage-6: oklch(0.62 0.02 260);
+
+  /* Charts that mean something specific by a colour, rather than "series N". */
+  --usage-tokens-in: var(--usage-1);
+  --usage-tokens-out: oklch(0.7 0.11 258);
+  --usage-audio: var(--usage-3);
+}
+
+:global(.dark) .palette {
+  --usage-1: oklch(0.72 0.13 258);
+  --usage-2: oklch(0.75 0.11 175);
+  --usage-3: oklch(0.79 0.13 75);
+  --usage-4: oklch(0.72 0.14 320);
+  --usage-5: oklch(0.72 0.14 20);
+  --usage-6: oklch(0.68 0.02 260);
+
+  --usage-tokens-in: var(--usage-1);
+  --usage-tokens-out: oklch(0.55 0.11 258);
+  --usage-audio: var(--usage-3);
+}

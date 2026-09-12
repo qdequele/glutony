@@ -53,6 +53,14 @@ sorting key.
 
 ## Which table to bill from
 
+<Note>
+`documents_out` on a step row counts a document once per stage, so a pipeline that
+extracts then chunks then indexes reports it three times. That measures work done,
+not corpus size. The rollups expose `documents_indexed` for the number that actually
+reached Meilisearch, taken from the job row's final-step count — that is the figure
+to bill on.
+</Note>
+
 | Table | Freshness | Deduplicated | Use for |
 |---|---|---|---|
 | `meili_ingest_usage` | real time | with `FINAL` | drill-down, audits |

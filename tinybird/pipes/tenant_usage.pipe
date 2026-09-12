@@ -28,6 +28,7 @@ SQL >
         sum(jobs_succeeded) AS jobs_succeeded,
         sum(jobs_failed) AS jobs_failed,
         sum(documents_out) AS documents_out,
+        sum(documents_indexed) AS documents_indexed,
         sum(input_bytes) AS input_bytes,
         sum(duration_ms) AS duration_ms,
         sum(llm_input_tokens) AS llm_input_tokens,

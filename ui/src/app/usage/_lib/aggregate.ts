@@ -29,6 +29,9 @@
  *
  * ## One number this endpoint genuinely cannot give us
  *
+ * `documents_indexed` comes from job rows and is the number that reached
+ * Meilisearch, which is the one to bill on.
+ *
  * `documents_out` is summed over *step* rows, so a pipeline whose extractor,
  * chunker and indexer each report documents counts the same document once per
  * stage. The job row holds the accurate "documents indexed" figure (the final
@@ -57,6 +60,8 @@ export interface UsageTotals {
   steps: number;
   /** Documents emitted across all steps — see the note in the module docs. */
   documentsOut: number;
+  /** Documents that reached Meilisearch, from the job row's final-step count. */
+  documentsIndexed: number;
   /** Bytes fed into steps. */
   inputBytes: number;
   /** Summed step wall time. */
@@ -85,6 +90,7 @@ const ZERO_TOTALS: UsageTotals = {
   jobsFailed: 0,
   steps: 0,
   documentsOut: 0,
+  documentsIndexed: 0,
   inputBytes: 0,
   durationMs: 0,
   llmInputTokens: 0,
@@ -110,6 +116,8 @@ export function aggregateTotals(rows: readonly UsageRow[]): UsageTotals {
   for (const row of rows) {
     if (isJobRow(row)) {
       totals.jobs += metricValue(row, "jobs");
+      // Job rows carry the final step's output: the corpus that actually landed.
+      totals.documentsIndexed += metricValue(row, "documents_indexed");
       totals.jobsSucceeded += metricValue(row, "jobs_succeeded");
       totals.jobsFailed += metricValue(row, "jobs_failed");
       continue;

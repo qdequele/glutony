@@ -37,6 +37,9 @@ SQL >
         sumState(toUInt64(kind = 'job' AND status = 'succeeded')) AS jobs_succeeded,
         sumState(toUInt64(kind = 'job' AND status = 'failed')) AS jobs_failed,
         sumState(if(kind = 'step', documents_out, toUInt64(0))) AS documents_out,
+        -- See usage_daily_billing.pipe: step rows count a document once per stage,
+        -- the job row carries the count that actually reached Meilisearch.
+        sumState(if(kind = 'job', documents_out, toUInt64(0))) AS documents_indexed,
         sumState(if(kind = 'step', input_bytes, toUInt64(0))) AS input_bytes,
         sumState(if(kind = 'step', duration_ms, toUInt64(0))) AS duration_ms,
         sumState(if(kind = 'step', llm_input_tokens, toUInt64(0))) AS llm_input_tokens,

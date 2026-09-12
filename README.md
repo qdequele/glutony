@@ -220,6 +220,24 @@ pub trait Plugin: Send + Sync + 'static {
 `crates/plugins/llm-enricher` is the canonical example. See
 `docs/plugins/authoring-builtin.mdx`, `authoring-wasm.mdx`, `authoring-grpc.mdx`.
 
+## Admin UI
+
+The gateway can serve a built-in admin UI at `/ui`: a pipeline editor whose config
+forms are generated from each plugin's JSON Schema, job monitoring with a per-step
+timeline and cancellation, an ingest playground that shows which pipeline auto-routed
+a file, and a per-tenant usage dashboard.
+
+It is a Next.js static export compiled into the binary, so production stays one
+container with no Node runtime and the browser talks to the API same-origin. The
+feature is off by default; `cargo build` needs no Node toolchain.
+
+```bash
+cd ui && NEXT_PUBLIC_BASE_PATH=/ui pnpm install && pnpm build
+cd .. && cargo run --features meili-ingest-gateway/ui --bin meili-ingest-gateway
+```
+
+The published image builds it automatically.
+
 ## Usage & metering
 
 Every job records per-tenant usage — documents, bytes, LLM tokens, transcription

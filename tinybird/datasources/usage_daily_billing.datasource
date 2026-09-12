@@ -25,6 +25,7 @@ SCHEMA >
     `jobs_succeeded` UInt64,
     `jobs_failed` UInt64,
     `documents_out` UInt64,
+    `documents_indexed` UInt64,
     `input_bytes` UInt64,
     `duration_ms` UInt64,
     `llm_input_tokens` UInt64,

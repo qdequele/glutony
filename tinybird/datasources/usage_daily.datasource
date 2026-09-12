@@ -27,6 +27,7 @@ SCHEMA >
     `jobs_succeeded` AggregateFunction(sum, UInt64),
     `jobs_failed` AggregateFunction(sum, UInt64),
     `documents_out` AggregateFunction(sum, UInt64),
+    `documents_indexed` AggregateFunction(sum, UInt64),
     `input_bytes` AggregateFunction(sum, UInt64),
     `duration_ms` AggregateFunction(sum, UInt64),
     `llm_input_tokens` AggregateFunction(sum, UInt64),

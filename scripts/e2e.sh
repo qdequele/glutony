@@ -49,7 +49,15 @@ wait_for() { # url, name
 }
 
 echo "--- building"
-cargo build -q --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
+# Embed the admin UI when it has been exported (pnpm build in ui/). Without it the
+# gateway is API-only and the UI assertions below are skipped.
+UI_FEATURES=""
+if [ -f ui/out/index.html ]; then
+  UI_FEATURES="--features meili-ingest-gateway/ui"
+  echo "admin UI export found; building the gateway with it embedded"
+fi
+# shellcheck disable=SC2086
+cargo build -q $UI_FEATURES --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
 
 echo "--- infra"
 docker rm -f mi-e2e-pg mi-e2e-meili >/dev/null 2>&1 || true
@@ -507,5 +515,30 @@ if status not in ("cancelled", "succeeded"):
     print(f"USAGE ASSERTION FAILED: cancelled job reported status {status}"); sys.exit(1)
 print(f"cancelled job metered with status {status}")
 PYEOF
+
+if [ -n "$UI_FEATURES" ]; then
+  echo "--- admin UI is served from the gateway binary"
+  UI_HTML=$(curl -fsS "${GW}/ui")
+  echo "$UI_HTML" | grep -q "/ui/_next/" || { echo "UI shell did not reference its assets" >&2; exit 1; }
+  # A hashed bundle referenced by the shell must actually resolve.
+  ASSET=$(echo "$UI_HTML" | grep -o '/ui/_next/static/[^"]*\.js' | head -1)
+  [ -n "$ASSET" ] || { echo "no js bundle referenced by the shell" >&2; exit 1; }
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}${ASSET}")
+  echo "asset ${ASSET} → ${code}"
+  [ "$code" = "200" ] || { echo "hashed asset did not resolve" >&2; exit 1; }
+  # Client-side routes survive a refresh.
+  for route in pipelines jobs playground usage; do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/${route}/")
+    echo "/ui/${route}/ → ${code}"
+    [ "$code" = "200" ] || { echo "route ${route} did not serve" >&2; exit 1; }
+  done
+  # And the API is not shadowed by the UI despite sharing names.
+  curl -fsS "${GW}/pipelines" | jq -e 'type == "array"' >/dev/null \
+    || { echo "GET /pipelines no longer returns the API payload" >&2; exit 1; }
+  echo "UI served and API intact"
+fi
+
+echo "--- health advertises the tenant and enabled features"
+curl -fsS "${GW}/health" | jq -c .
 
 echo "=== E2E PASSED ==="
