@@ -215,6 +215,34 @@ sleep 1
 TH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_tenant/search" -H 'Content-Type: application/json' -d '{"q":"tenant"}' | jq '.estimatedTotalHits')
 echo "e2e_tenant hits: $TH"; [ "$TH" -ge 1 ] || exit 1
 
+echo "--- user pipeline with a trigger wins over the builtin and sets the index"
+cat > "${WORK}/trigger.yaml" <<'YAML'
+uid: e2e-csv-datasets
+name: "CSV rows into a fixed index"
+trigger:
+  content_types: [text/csv]
+  index_pattern: e2e_from_trigger
+steps:
+  - id: parse
+    plugin: csv_parser
+  - id: index
+    plugin: meili_indexer
+YAML
+curl -fsS -X POST -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/trigger.yaml" "${GW}/pipelines" | jq -r .uid
+printf 'sku,label\nA1,widget alpha\nB2,widget beta\n' > "${WORK}/rows.csv"
+# No ?index= and no X-Meili-Index: the pipeline trigger's index_pattern must decide.
+RESP6=$(curl -fsS -F "file=@${WORK}/rows.csv" "${GW}/ingest")
+echo "$RESP6" | jq -c .
+[ "$(echo "$RESP6" | jq -r .pipeline_used)" = "e2e-csv-datasets" ] || { echo "user pipeline did not win over builtin.csv" >&2; exit 1; }
+[ "$(echo "$RESP6" | jq -r .target_index)" = "e2e_from_trigger" ] || { echo "trigger index_pattern was not applied" >&2; exit 1; }
+JOB6=$(echo "$RESP6" | jq -r .job_id)
+for _ in $(seq 1 60); do S=$(curl -fsS "${GW}/jobs/${JOB6}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB6}" | jq .; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "csv job ended $S" >&2; exit 1; }
+sleep 1
+CH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_from_trigger/stats" | jq .numberOfDocuments)
+echo "e2e_from_trigger documents: $CH"; [ "$CH" -eq 2 ] || { echo "expected 2 csv rows" >&2; exit 1; }
+curl -fsS -X DELETE "${GW}/pipelines/e2e-csv-datasets" -o /dev/null -w "delete pipeline → %{http_code}\n"
+
 echo "--- cancel a running job"
 RESP5=$(curl -fsS -F "file=@${WORK}/sample.pdf" -F "index=e2e_cancel" "${GW}/ingest")
 JOB5=$(echo "$RESP5" | jq -r .job_id)
