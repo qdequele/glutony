@@ -108,7 +108,7 @@ step immediately.
 |---|---|---|---|
 | **Built-in** | compiled into `meili-ingest-worker` | fast pure-Rust steps; the default | [Authoring a built-in plugin](/plugins/authoring-builtin) |
 | **WASM** | `.wasm` loaded at runtime via [extism](https://extism.org) | community plugins in any language, sandboxed | [Authoring a WASM plugin](/plugins/authoring-wasm) |
-| **gRPC** | separate container implementing `proto/plugin.proto` | GPU / heavy runtimes (Whisper, OCR, ffmpeg) | [Authoring a gRPC plugin](/plugins/authoring-grpc) |
+| **gRPC** | separate container implementing `proto/plugin.proto` | GPU / heavy runtimes (local Whisper inference, OCR) | [Authoring a gRPC plugin](/plugins/authoring-grpc) |
 
 External plugins are declared on a worker with
 `EXTERNAL_PLUGINS=wasm:/plugins/foo.wasm,grpc:http://whisper:50051`. The worker

@@ -138,16 +138,67 @@ the workflow injects — never from env vars and never from your config.
 
 Returns `Indexed { index, document_count, task_uids }`.
 
+## `pptx_extractor`
+
+`Bytes → Documents`. Parses the OOXML zip directly with `zip` + `quick-xml`, so
+there is no LibreOffice subprocess. Slide parts are ordered numerically, and the
+title comes from the shape carrying a `title` / `ctrTitle` placeholder, falling
+back to the slide's first non-empty line.
+
+| Key | Default | Description |
+|---|---|---|
+| `per_slide` | `true` | One document per slide with `meta.page`, else one per deck. |
+| `include_notes` | `true` | Speaker notes into `fields.notes`. |
+| `notes_in_content` | `false` | Also append notes to `content`. |
+| `skip_empty_slides` | `true` | Drop slides with no text and no notes. |
+| `max_slides` | `null` | Stop after this many slides. |
+
+Decompression is bounded at 64 MiB per part and 256 MiB per deck. Uploads come
+from untrusted tenants and deflate reaches ~1000:1, so an unbounded read would
+let a small crafted file exhaust a worker.
+
+## `whisper_transcriber`
+
+`Bytes → Documents`. Posts the audio to an OpenAI-compatible
+`/audio/transcriptions` endpoint, so it works against OpenAI, Groq or a
+self-hosted whisper.cpp / faster-whisper server. Reads `TRANSCRIBE_API_KEY`,
+`TRANSCRIBE_BASE_URL` and `TRANSCRIBE_MODEL`, each falling back to the `LLM_*`
+equivalent. Runs on the `workers-gpu` queue.
+
+| Key | Default | Description |
+|---|---|---|
+| `model` | `whisper-1` | Overrides `TRANSCRIBE_MODEL`. |
+| `language` | `null` | ISO-639-1 hint. |
+| `prompt` | `null` | Biasing prompt for names and jargon. |
+| `temperature` | `null` | Sampling temperature. |
+| `segment_documents` | `false` | One document per segment with `fields.start` / `fields.end`, else one for the whole file. |
+| `timeout_secs` | `600` | Per-request timeout. |
+| `max_bytes` | `26214400` | Reject larger uploads (the OpenAI limit). |
+
+## `video_audio_extractor`
+
+`Bytes → Bytes`. Demuxes and decodes with `symphonia`, resamples with `rubato`
+and encodes 16 kHz mono 16-bit WAV with `hound` — 100% Rust, no ffmpeg. Feeds
+`whisper_transcriber`. Runs on the `workers-gpu` queue.
+
+| Key | Default | Description |
+|---|---|---|
+| `sample_rate` | `16000` | Output rate in Hz. |
+| `mono` | `true` | Downmix all channels to one. |
+| `max_duration_secs` | `null` | Stop decoding after this many seconds. |
+| `track` | `null` | Decode this track id instead of the default audio track. |
+
+Supported: MP4/MOV, MKV/WebM, OGG, WAV, FLAC, AIFF and CAF containers with
+AAC-LC, MP1/MP2/MP3, ALAC, FLAC, Vorbis, PCM and ADPCM. AC-3, E-AC-3 and
+Opus-in-MP4 are not decodable; those files fail with a message naming the codec,
+and you can transcode them or register a gRPC plugin under the same name.
+
 ## Not compiled in
 
 | Plugin | Queue | Status |
 |---|---|---|
-| `pptx_extractor` | `workers-general` | Provide as a gRPC or WASM plugin. |
-| `whisper_transcriber` | `workers-gpu` | gRPC plugin (GPU container). |
-| `video_audio_extractor` | `workers-gpu` | gRPC plugin (ffmpeg). |
-| `ocr` | `workers-gpu` | gRPC plugin. |
+| `ocr` | `workers-gpu` | Provide as a gRPC plugin. |
 | `s3_downloader` | `workers-io` | Reserved name; the worker already resolves `s3://` inputs itself. |
 
-Built-in pipelines referencing these exist so routing is complete; until the
-plugin is registered on the right pool the step fails with
+A step naming an unregistered plugin fails with
 `plugin X is not registered on this worker; deploy a gRPC plugin`.

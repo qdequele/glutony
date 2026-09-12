@@ -39,6 +39,9 @@ inside plugins or workflow code.
 | `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-llm` pool). Without it those plugins register as unavailable. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
 | `LLM_MODEL` | `gpt-4o-mini` | Default model when a step's `config.model` is absent. |
+| `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-gpu` pool). |
+| `TRANSCRIBE_BASE_URL` | falls back to `LLM_BASE_URL`, then `https://api.openai.com/v1` | OpenAI-compatible endpoint exposing `/audio/transcriptions`. |
+| `TRANSCRIBE_MODEL` | `whisper-1` | Default transcription model. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 Workers **never** read `MEILI_URL` / `MEILI_API_KEY`: Meilisearch credentials

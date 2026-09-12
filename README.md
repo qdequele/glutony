@@ -215,7 +215,7 @@ pub trait Plugin: Send + Sync + 'static {
 |---|---|---|
 | Built-in | compiled into the worker (`crates/plugins/*`) | fast, pure-Rust steps |
 | WASM | `.wasm` loaded at runtime via extism | community plugins in any language |
-| gRPC | separate container implementing `proto/plugin.proto` | GPU / heavy runtimes (Whisper, OCR, ffmpeg) |
+| gRPC | separate container implementing `proto/plugin.proto` | GPU / heavy runtimes (local Whisper inference, OCR) |
 
 `crates/plugins/llm-enricher` is the canonical example. See
 `docs/plugins/authoring-builtin.mdx`, `authoring-wasm.mdx`, `authoring-grpc.mdx`.

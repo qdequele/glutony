@@ -119,10 +119,13 @@ Default chunker config: `strategy: sentence, chunk_size: 512, overlap: 64`.
 Default retry: `max_attempts: 3, backoff: exponential`.
 
 <Note>
-`pptx_extractor`, `whisper_transcriber` and `video_audio_extractor` are not
-compiled into the worker. Their pipelines exist so routing is complete; the
-step fails with a clear message until you deploy them as
-[gRPC plugins](/plugins/authoring-grpc).
+Every plugin these pipelines reference is compiled into the worker, including
+`pptx_extractor`, `video_audio_extractor` and `whisper_transcriber`. The audio
+and video pipelines run on the `workers-gpu` queue, and `whisper_transcriber`
+needs `TRANSCRIBE_API_KEY` (or `LLM_API_KEY`) pointing at an OpenAI-compatible
+`/audio/transcriptions` endpoint; without it that step fails with a clear
+message. `ocr` is the one routed name still expecting a
+[gRPC plugin](/plugins/authoring-grpc).
 </Note>
 
 ## Managing pipelines
