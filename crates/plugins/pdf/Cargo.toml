@@ -1,5 +1,6 @@
 [package]
 name = "meili-ingest-plugin-pdf"
+description = "meili-ingest built-in plugin: extracts text from PDF files (per page or whole document)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +8,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+pdf-extract.workspace = true
+
+[dev-dependencies]
+lopdf.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
