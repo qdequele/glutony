@@ -246,16 +246,10 @@ export interface IngestResponse {
   status: JobStatus;
 }
 
-/** `JobStatusResponse` — 200 body of `GET /jobs/{job_id}`. */
-export interface JobResponse {
-  job_id: string;
-  status: JobStatus;
-  current_step?: string | null;
-  progress: WorkflowProgress;
-  pipeline_used: string;
-  target_index?: string | null;
-  error?: string | null;
-}
+// The body of `GET /jobs/{job_id}` is typed as `JobDetail` in `./jobs`, next to the
+// hooks that consume it. It is deliberately not duplicated here: `progress` is null
+// whenever the gateway answers from its cached row rather than from Temporal, and a
+// second definition of the same endpoint drifted from that within a day.
 
 // ---------------------------------------------------------------------------
 // Errors and validation

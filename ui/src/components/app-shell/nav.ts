@@ -10,8 +10,7 @@ export interface NavItem {
 }
 
 /**
- * The four screens of the admin UI. Jobs, Playground and Usage are owned by
- * other agents; their pages currently render a placeholder.
+ * The four screens of the admin UI.
  */
 export const NAV_ITEMS: NavItem[] = [
   {

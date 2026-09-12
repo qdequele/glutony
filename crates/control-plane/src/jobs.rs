@@ -228,6 +228,10 @@ pub struct JobList {
     pub limit: i64,
     /// Offset that was applied.
     pub offset: i64,
+    /// Total rows matching the filters, ignoring paging. Lets a client show a page
+    /// count and disable "next" on the real last page instead of guessing from
+    /// whether the page came back full.
+    pub total: i64,
 }
 
 /// `GET /jobs?project_id=&status=&pipeline_uid=&limit=&offset=` → newest first.
@@ -268,10 +272,24 @@ pub async fn list_jobs(
         .into_iter()
         .map(JobRecord::try_from)
         .collect::<Result<Vec<_>, _>>()?;
+
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM jobs \
+         WHERE ($1::text IS NULL OR project_id = $1) \
+           AND ($2::text IS NULL OR status = $2) \
+           AND ($3::text IS NULL OR pipeline_uid = $3)",
+    )
+    .bind(project_id.as_deref())
+    .bind(q.status.as_deref())
+    .bind(q.pipeline_uid.as_deref())
+    .fetch_one(&state.pool)
+    .await?;
+
     Ok(Json(JobList {
         jobs,
         limit,
         offset,
+        total,
     }))
 }
 

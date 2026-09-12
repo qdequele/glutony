@@ -49,11 +49,21 @@ export interface JobRecord {
   updated_at: string;
 }
 
-/** Envelope of `GET /jobs` — the control plane pages with limit/offset only. */
+/** Envelope of `GET /jobs`. */
 export interface JobListResponse {
   jobs: JobRecord[];
   limit: number;
   offset: number;
+  /** Rows matching the filters ignoring paging, so "next" is exact. */
+  total: number;
+}
+
+/** Whether another page exists after the one described by `page`. */
+export function hasNextPage(page: JobListResponse | undefined): boolean {
+  if (!page) return false;
+  // Fall back to the full-page heuristic if an older gateway omits `total`.
+  if (typeof page.total !== "number") return page.jobs.length === page.limit;
+  return page.offset + page.jobs.length < page.total;
 }
 
 /**

@@ -16,6 +16,7 @@ import {
   type JobDetail,
   type JobListResponse,
   type JobRecord,
+  hasNextPage,
 } from "./jobs";
 
 function job(status: JobStatus, jobId = "j1"): JobRecord {
@@ -34,6 +35,7 @@ function page(...statuses: JobStatus[]): JobListResponse {
     jobs: statuses.map((status, index) => job(status, `j${index}`)),
     limit: 25,
     offset: 0,
+    total: statuses.length,
   };
 }
 
@@ -160,5 +162,32 @@ describe("progress percentage", () => {
     expect(progressPercent(undefined)).toBe(0);
     expect(progressPercent(null)).toBe(0);
     expect(progressPercent(progress(0, 0))).toBe(0);
+  });
+});
+
+describe("hasNextPage", () => {
+  const base = { jobs: [], limit: 25, offset: 0, total: 0 };
+
+  it("is false on the last page even when it is exactly full", () => {
+    // The old heuristic ("a full page means there may be more") lit up Next on a
+    // result set that happened to be a multiple of the page size.
+    const jobs = Array.from({ length: 25 }, () => ({}) as never);
+    expect(hasNextPage({ ...base, jobs, total: 25 })).toBe(false);
+  });
+
+  it("is true while rows remain", () => {
+    const jobs = Array.from({ length: 25 }, () => ({}) as never);
+    expect(hasNextPage({ ...base, jobs, total: 40 })).toBe(true);
+    expect(hasNextPage({ ...base, jobs, offset: 25, total: 40 })).toBe(false);
+  });
+
+  it("falls back to the full-page heuristic when total is absent", () => {
+    const jobs = Array.from({ length: 25 }, () => ({}) as never);
+    const legacy = { jobs, limit: 25, offset: 0 } as never;
+    expect(hasNextPage(legacy)).toBe(true);
+  });
+
+  it("is false with no data", () => {
+    expect(hasNextPage(undefined)).toBe(false);
   });
 });
