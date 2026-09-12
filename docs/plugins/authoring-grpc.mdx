@@ -1,0 +1,151 @@
+---
+title: Authoring a gRPC plugin
+description: Run heavy or GPU plugins as separate containers called over gRPC
+---
+
+gRPC plugins are **separate processes** — typically a container with a GPU,
+ffmpeg, Tesseract or a Python ML stack — that implement the service in
+`proto/plugin.proto`. The worker's `plugin-runtime` crate dispatches to them
+with `tonic`. This is how `whisper_transcriber`, `video_audio_extractor` and
+`ocr` are meant to be provided.
+
+## The service
+
+```protobuf
+syntax = "proto3";
+package meili_ingest.plugin.v1;
+
+service Plugin {
+  // Static description: name, version, accepts, produces, config_schema.
+  rpc Manifest(Empty) returns (ManifestResponse);
+  // Run one step invocation.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
+
+message Empty {}
+
+message ManifestResponse {
+  string manifest_json = 1;   // PluginManifest as JSON
+}
+
+message ExecuteRequest {
+  string job_id      = 1;
+  string step_id     = 2;
+  string input_json  = 3;     // PluginInput as JSON (never a `ref`)
+  string config_json = 4;     // step config block
+  optional uint32 branch       = 5;
+  optional uint32 branch_total = 6;
+}
+
+message ExecuteResponse {
+  string output_json = 1;     // PluginOutput as JSON
+}
+```
+
+Payloads are the SDK's JSON shapes (see [Plugins](/concepts/plugins)); bytes
+are base64 inside `input_json`. Errors are gRPC statuses: use
+`UNAVAILABLE` / `RESOURCE_EXHAUSTED` / `DEADLINE_EXCEEDED` for retryable
+failures and `INVALID_ARGUMENT` / `FAILED_PRECONDITION` / `INTERNAL` for
+permanent ones — the worker maps them to `PluginError::Retryable` /
+`NonRetryable` accordingly.
+
+<Note>
+The exact `.proto` shipped in the repository is authoritative:
+[`proto/plugin.proto`](https://github.com/meilisearch/meili-ingest/blob/main/proto/plugin.proto).
+</Note>
+
+## Python example (Whisper)
+
+```python
+# server.py
+import json, base64, grpc, whisper
+from concurrent import futures
+import plugin_pb2, plugin_pb2_grpc   # generated from proto/plugin.proto
+
+MODEL = whisper.load_model("large-v3")
+
+MANIFEST = {
+    "name": "whisper_transcriber",
+    "version": "0.1.0",
+    "description": "Speech-to-text with OpenAI Whisper",
+    "accepts": ["bytes"],
+    "produces": "documents",
+    "kind": "grpc",
+    "content_types": ["audio/*"],
+    "config_schema": {"type": "object", "properties": {
+        "model": {"type": "string", "default": "large-v3"},
+        "language": {"type": "string", "default": "auto"},
+        "segment_seconds": {"type": "integer", "default": 60}}},
+}
+
+class Plugin(plugin_pb2_grpc.PluginServicer):
+    def Manifest(self, request, context):
+        return plugin_pb2.ManifestResponse(manifest_json=json.dumps(MANIFEST))
+
+    def Execute(self, request, context):
+        inp = json.loads(request.input_json)
+        if inp["type"] != "bytes":
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "expected bytes")
+        blob = inp["value"]
+        audio = base64.b64decode(blob["data"])
+        cfg = json.loads(request.config_json or "{}")
+        result = MODEL.transcribe(audio, language=None if cfg.get("language", "auto") == "auto" else cfg["language"])
+        docs = [{
+            "id": f"{blob.get('filename', 'audio')}_seg{i}",
+            "content": seg["text"].strip(),
+            "fields": {"start": seg["start"], "end": seg["end"]},
+            "meta": {"source": blob.get("filename"), "mime": blob["mime"], "language": result.get("language")},
+        } for i, seg in enumerate(result["segments"])]
+        return plugin_pb2.ExecuteResponse(output_json=json.dumps({"type": "documents", "value": docs}))
+
+server = grpc.server(futures.ThreadPoolExecutor(max_workers=2),
+                     options=[("grpc.max_receive_message_length", 512 * 1024 * 1024)])
+plugin_pb2_grpc.add_PluginServicer_to_server(Plugin(), server)
+server.add_insecure_port("[::]:50051")
+server.start(); server.wait_for_termination()
+```
+
+Raise the gRPC max message size on both sides for media: the worker resolves
+`s3://` and staged references into bytes before calling you, so a 200 MB video
+arrives as a 270 MB base64 string. For very large media, have your plugin
+accept a `ref` input instead (`"accepts": ["ref"]`) and fetch the object
+itself; the worker then passes the reference through untouched.
+
+## Deploy
+
+Run the server next to the worker of the right pool and declare it:
+
+```yaml
+containers:
+  - name: worker
+    image: ghcr.io/meilisearch/meili-ingest:latest
+    command: ["/usr/local/bin/meili-ingest-worker"]
+    env:
+      - name: TASK_QUEUE
+        value: workers-gpu
+      - name: EXTERNAL_PLUGINS
+        value: "grpc:http://localhost:50051,grpc:http://localhost:50052"
+  - name: whisper-plugin
+    image: my-org/whisper-plugin:latest
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+```
+
+Sidecar (as above) is simplest; a separate Deployment + Service works too
+(`grpc:http://whisper.meili-ingest.svc:50051`). The worker calls `Manifest` at
+boot, registers the plugin under `manifest.name`, and publishes it to the
+control plane. Because `whisper_transcriber` and `video_audio_extractor` map to
+`workers-gpu` in the routing table, declare them on that pool; custom names run
+on whichever pool declares them (default `workers-general`).
+
+See `k8s/workers.yaml` for the full GPU pool manifest with a KEDA
+`ScaledObject` that scales it to zero when the queue is empty.
+
+## Timeouts and heartbeats
+
+The worker heartbeats to Temporal while the gRPC call is in flight, so a long
+transcription does not trip the 60 s heartbeat timeout. It does have to finish
+within the step's `timeout_secs` — set it generously for media
+(`timeout_secs: 3600`) and use `retry.backoff: exponential` with a large
+`initial_interval_secs` so a crashed GPU pod has time to reschedule.

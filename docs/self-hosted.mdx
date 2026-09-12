@@ -1,0 +1,72 @@
+---
+title: Self-hosted
+description: Running meili-ingest against your own Meilisearch, without Envoy
+---
+
+meili-ingest was designed for Meilisearch Cloud, where an Envoy gateway injects
+the tenant context into each request. Nothing in it depends on that: when the
+`X-Meili-*` headers are absent the gateway falls back to **standalone mode**.
+
+## Where the Meilisearch credentials come from
+
+The gateway resolves host and API key in this order (SPEC §3.2):
+
+1. `X-Meili-Host` / `X-Meili-Api-Key` headers (Envoy)
+2. `Authorization: Bearer <key>` header → `api_key`
+3. `MEILI_URL` / `MEILI_API_KEY` environment variables
+
+If none yields both a host and a key the request is rejected with `400
+missing_context`.
+
+<Tabs>
+  <Tab title="Option A — env vars">
+    Simplest. Every request targets the same instance.
+
+    ```bash
+    MEILI_URL=http://localhost:7700 MEILI_API_KEY=masterKey meili-ingest-gateway
+    ```
+  </Tab>
+  <Tab title="Option B — per-request headers">
+    Lets one gateway serve several instances without Envoy.
+
+    ```bash
+    curl -H "Authorization: Bearer masterKey" \
+         -H "X-Meili-Host: http://localhost:7700" \
+         -F file=@doc.pdf \
+         http://localhost:8080/ingest
+    ```
+
+    <Warning>
+    Only do this on a trusted network or set `ENVOY_TRUSTED_HEADER` and send
+    `X-Meili-Envoy-Secret` alongside; otherwise anyone who can reach the gateway
+    can make it write to any Meilisearch host they name.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Index selection
+
+```
+X-Meili-Index header
+  → ?index= query param (or multipart `index` field) overrides it
+  → pipeline trigger's index_pattern overrides it
+  → MIME default: video/* → videos, audio/* → audio, image/* → images,
+                  text/html → pages, text/csv → datasets
+  → DEFAULT_INDEX (documents)
+```
+
+## Minimal production layout
+
+| Component | Count | Notes |
+|---|---|---|
+| Gateway | 2+ | stateless; put a load balancer in front |
+| Control plane | 1–2 | needs Postgres (`DATABASE_URL`) |
+| Worker `workers-general` | 1+ | CPU-bound parsing |
+| Worker `workers-llm` | 0+ | only if pipelines use `llm_enricher` / `image_captioner` |
+| Worker `workers-gpu` | 0+ | only for gRPC media plugins |
+| Temporal | — | dev server for tests; Temporal Cloud or the Helm chart in prod |
+| Blob store | — | `file://` for a single node, `s3://` / `gs://` / `az://` otherwise |
+
+See [Docker Compose](/deployment/docker-compose) and
+[Kubernetes](/deployment/kubernetes) for ready-made layouts, and
+[Environment variables](/deployment/environment-variables) for every knob.

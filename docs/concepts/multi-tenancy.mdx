@@ -1,0 +1,107 @@
+---
+title: Multi-tenancy
+description: How one deployment serves every Meilisearch project through MeiliContext
+---
+
+meili-ingest serves **many Meilisearch projects from one shared deployment**.
+Each project has its own Meilisearch host, API key and possibly its own
+pipelines. The design goal: tenants never put credentials in request bodies,
+and workers never hold credentials in their environment.
+
+## MeiliContext
+
+Every operation is scoped to a `MeiliContext`:
+
+```rust
+pub struct MeiliContext {
+    pub project_id: Option<String>, // tenant id
+    pub host:       String,         // https://xxx.us-west.meilisearch.io
+    pub api_key:    String,         // write-capable key
+    pub index:      Option<String>, // fully resolved before the workflow starts
+    pub region:     Option<String>, // observability
+}
+```
+
+It is **resolved once** at the gateway, stored in `PipelineWorkflowInput`, and
+carried immutably through the Temporal workflow. When the workflow schedules
+the `meili_indexer` step it flattens the context into that step's `config`;
+the indexer plugin deserialises it and talks to Meilisearch. No other plugin
+ever sees the key, and logs print `MeiliContext::redacted()`.
+
+## Envoy header injection (Meilisearch Cloud)
+
+Meilisearch Cloud's Envoy gateway (project *glutony*) sits in front of all
+traffic. For a request to `xxx.us-west.meilisearch.com/ingest` it:
+
+1. Extracts the project id from the subdomain (`xxx`).
+2. Looks up the project's Meilisearch host and API key.
+3. Optionally extracts an index name from the path.
+4. Injects headers and forwards to meili-ingest:
+
+```
+X-Meili-Project-Id:   xxx
+X-Meili-Host:         https://xxx.us-west.meilisearch.io
+X-Meili-Api-Key:      <master_or_ingest_key>
+X-Meili-Index:        <index_name>          # optional
+X-Meili-Region:       us-west
+X-Meili-Envoy-Secret: <shared secret>
+```
+
+### Trusting the headers
+
+If the gateway runs with `ENVOY_TRUSTED_HEADER=<secret>`, `X-Meili-*` headers
+are honoured **only** when the request also carries
+`X-Meili-Envoy-Secret: <secret>`. Otherwise they are ignored and the request
+is treated as standalone. If `ENVOY_TRUSTED_HEADER` is unset, headers are
+trusted unconditionally and a warning is logged at startup — fine for local
+development, never for an exposed deployment.
+
+## Resolution order
+
+```
+1. X-Meili-Host                      → host
+2. X-Meili-Api-Key                   → api_key
+3. X-Meili-Project-Id                → project_id
+4. X-Meili-Index                     → index (starting point)
+5. ?index= query param               → index (overrides header)
+6. Authorization: Bearer <key>       → api_key (self-hosted fallback)
+7. MEILI_URL / MEILI_API_KEY env     → host / api_key (self-hosted fallback)
+```
+
+Nothing found → `400 {"error": "...", "code": "missing_context"}`.
+
+## Index resolution
+
+```
+X-Meili-Index header
+  → ?index= query param
+  → pipeline trigger's index_pattern
+  → MIME default (video/* → videos, audio/* → audio, image/* → images,
+                  text/html → pages, text/csv → datasets)
+  → DEFAULT_INDEX env (documents)
+```
+
+The final name is written into `MeiliContext.index` before the workflow
+starts; the indexer never has to guess.
+
+## Tenant-scoped pipelines
+
+User pipelines carry an optional `project_id`. When a request has a project id
+the resolver considers `project_id = <id> OR project_id IS NULL` and applies
+this precedence:
+
+1. tenant-scoped user pipeline
+2. global user pipeline
+3. built-in pipeline
+
+Within a tier, a trigger with a matching `filename_pattern` beats a MIME-only
+trigger. `POST /pipelines` behind Envoy stores the pipeline under the calling
+project; `GET /pipelines/:uid` returns the tenant's version when it shadows a
+global one.
+
+## Jobs
+
+Job rows in the control plane record `project_id`, so status endpoints can be
+filtered per tenant. Temporal workflow ids are `ingest-<job_id>` (UUID v4),
+which are unguessable but not tenant-checked by themselves — front them with
+Envoy in multi-tenant deployments.

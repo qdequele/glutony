@@ -1,0 +1,137 @@
+# Control plane: pipeline registry + routing API (internal, port 9000).
+#
+# This file also carries the ConfigMap and Secret shared by every meili-ingest
+# component (gateway, workers). Replace the Secret placeholders before applying:
+#
+#   kubectl -n meili-ingest create secret generic meili-ingest-secrets \
+#     --from-literal=DATABASE_URL='postgres://user:pass@postgres:5432/meili_ingest' \
+#     --from-literal=LLM_API_KEY='sk-...' \
+#     --from-literal=ENVOY_TRUSTED_HEADER='<shared secret agreed with the Envoy team>' \
+#     --dry-run=client -o yaml | kubectl apply -f -
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meili-ingest-config
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: meili-ingest
+data:
+  RUST_LOG: "info"
+  # Temporal frontend. Use your Temporal Cloud endpoint in production
+  # (e.g. https://<namespace>.<account>.tmprl.cloud:7233) together with mTLS.
+  TEMPORAL_URL: "http://temporal-frontend:7233"
+  TEMPORAL_NAMESPACE: "default"
+  CONTROL_PLANE_URL: "http://meili-control-plane:9000"
+  # Shared blob store for staged uploads / spilled step outputs. Pods do not
+  # share a disk, so use an object store (s3://, gs://, az://). Credentials come
+  # from the standard provider env vars / workload identity (IRSA, GKE WI, ...).
+  BLOB_STORE_URL: "s3://meili-ingest-blobs"
+  INLINE_MAX_BYTES: "1048576"
+  PAYLOAD_SPILL_BYTES: "1048576"
+  DEFAULT_INDEX: "documents"
+  MAX_UPLOAD_MB: "500"
+  LLM_BASE_URL: "https://api.openai.com/v1"
+  LLM_MODEL: "gpt-4o-mini"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: meili-ingest-secrets
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: meili-ingest
+type: Opaque
+stringData:
+  # --- placeholders: override with your own values ---
+  DATABASE_URL: "postgres://postgres:CHANGE_ME@postgres:5432/meili_ingest"
+  LLM_API_KEY: "CHANGE_ME"
+  # Shared secret Envoy must send in `X-Meili-Envoy-Secret` for X-Meili-*
+  # headers to be honoured. Leave empty to trust headers unconditionally (dev only).
+  ENVOY_TRUSTED_HEADER: "CHANGE_ME"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meili-control-plane
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: meili-control-plane
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: meili-control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: meili-control-plane
+        app.kubernetes.io/component: control-plane
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: control-plane
+          image: ghcr.io/meilisearch/meili-ingest:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/meili-ingest-control-plane"]
+          ports:
+            - name: http
+              containerPort: 9000
+          env:
+            - name: BIND
+              value: "0.0.0.0:9000"
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: meili-ingest-config
+                  key: RUST_LOG
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: DATABASE_URL
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meili-control-plane
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: meili-control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: meili-control-plane
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http

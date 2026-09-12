@@ -1,0 +1,249 @@
+# meili-ingest — local development stack.
+#
+#   docker compose watch          # build, start, and hot-reload on source changes
+#   docker compose up --watch     # same, with logs attached
+#   docker compose down -v        # stop and wipe volumes
+#
+# Requires Docker Compose v2.22+ (develop.watch). Docker is managed by OrbStack,
+# which gives every container a DNS name under *.meili-ingest.orb.local:
+#
+#   Gateway        http://gateway.meili-ingest.orb.local:8080
+#   Control plane  http://control-plane.meili-ingest.orb.local:9000
+#   Temporal UI    http://temporal.meili-ingest.orb.local:8233
+#   Meilisearch    http://meilisearch.meili-ingest.orb.local:7700   (master key: masterKey)
+#   Postgres       postgres://postgres:dev-password@postgres.meili-ingest.orb.local:5432/postgres
+#
+# The same ports are also published on localhost (8080, 9000, 7233, 8233, 7700, 5432).
+#
+# Smoke test once everything is up:
+#   curl -F "file=@report.pdf" http://gateway.meili-ingest.orb.local:8080/ingest
+#
+# Notes
+# - Source changes under ./crates are synced into the containers; cargo-watch
+#   rebuilds the affected binary. Cargo.toml / Cargo.lock changes trigger an
+#   image rebuild.
+# - All Rust services share one `target-cache` volume so dependencies are built
+#   once. Cargo serialises concurrent builds with a file lock, so the very first
+#   `watch` can take several minutes.
+# - LLM_API_KEY is read from your shell environment (or a .env file) and is only
+#   needed by worker-llm.
+
+name: meili-ingest
+
+x-rust-dev: &rust-dev
+  build:
+    context: .
+    dockerfile: Dockerfile.dev
+  volumes:
+    - cargo-registry:/usr/local/cargo/registry
+    - cargo-git:/usr/local/cargo/git
+    - target-cache:/app/target
+  develop:
+    watch:
+      - action: sync
+        path: ./crates
+        target: /app/crates
+      - action: sync
+        path: ./proto
+        target: /app/proto
+      - action: sync
+        path: ./migrations
+        target: /app/migrations
+      - action: rebuild
+        path: ./Cargo.toml
+      - action: rebuild
+        path: ./Cargo.lock
+
+x-worker-env: &worker-env
+  RUST_LOG: info,meili_ingest=debug
+  TEMPORAL_URL: http://temporal:7233
+  TEMPORAL_NAMESPACE: default
+  CONTROL_PLANE_URL: http://control-plane:9000
+  BLOB_STORE_URL: file:///data/blobs
+  PAYLOAD_SPILL_BYTES: "1048576"
+  MAX_CONCURRENT_ACTIVITIES: "20"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev-password
+      POSTGRES_DB: postgres
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  temporal:
+    image: temporalio/temporal:latest
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --db-filename
+      - /data/temporal.db
+      - --ui-port
+      - "8233"
+    ports:
+      - "7233:7233"   # gRPC frontend
+      - "8233:8233"   # Web UI
+    volumes:
+      - temporal_data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.15
+    ports:
+      - "7700:7700"
+    environment:
+      MEILI_MASTER_KEY: masterKey
+      MEILI_ENV: development
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # meili-ingest services (hot-reloaded from ./crates)
+  # ---------------------------------------------------------------------------
+  control-plane:
+    <<: *rust-dev
+    command: ["cargo", "watch", "-x", "run --bin meili-ingest-control-plane", "-w", "crates", "-w", "migrations"]
+    ports:
+      - "9000:9000"
+    environment:
+      RUST_LOG: info,meili_ingest=debug
+      BIND: 0.0.0.0:9000
+      DATABASE_URL: postgres://postgres:dev-password@postgres:5432/postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 900s   # first cargo build can be slow
+
+  gateway:
+    <<: *rust-dev
+    command: ["cargo", "watch", "-x", "run --bin meili-ingest-gateway", "-w", "crates"]
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_LOG: info,meili_ingest=debug
+      BIND: 0.0.0.0:8080
+      TEMPORAL_URL: http://temporal:7233
+      TEMPORAL_NAMESPACE: default
+      CONTROL_PLANE_URL: http://control-plane:9000
+      # Standalone-mode fallback (SPEC §3.3): every request without X-Meili-*
+      # headers targets the local Meilisearch.
+      MEILI_URL: http://meilisearch:7700
+      MEILI_API_KEY: masterKey
+      DEFAULT_INDEX: documents
+      MAX_UPLOAD_MB: "500"
+      # Uploads above INLINE_MAX_BYTES are staged in the blob store instead of
+      # travelling inside the Temporal payload.
+      BLOB_STORE_URL: file:///data/blobs
+      INLINE_MAX_BYTES: "1048576"
+      # ENVOY_TRUSTED_HEADER is intentionally unset: X-Meili-* headers are trusted (dev mode).
+    volumes:
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+      - blobs:/data/blobs
+    depends_on:
+      temporal:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 900s
+
+  worker-general:
+    <<: *rust-dev
+    command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]
+    environment:
+      <<: *worker-env
+      TASK_QUEUE: workers-general
+    volumes:
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+      - blobs:/data/blobs
+    depends_on:
+      temporal:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+
+  worker-llm:
+    <<: *rust-dev
+    command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]
+    environment:
+      <<: *worker-env
+      TASK_QUEUE: workers-llm
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+    volumes:
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+      - blobs:/data/blobs
+    depends_on:
+      temporal:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+
+  worker-io:
+    <<: *rust-dev
+    command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]
+    environment:
+      <<: *worker-env
+      TASK_QUEUE: workers-io
+    volumes:
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/app/target
+      - blobs:/data/blobs
+    depends_on:
+      temporal:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  target-cache:
+  pg_data:
+  temporal_data:
+  meili_data:
+  blobs:

@@ -1,0 +1,26 @@
+# kubectl apply -k k8s/
+#
+# Everything is deployed into the `meili-ingest` namespace from the single
+# image ghcr.io/meilisearch/meili-ingest. Override the tag with:
+#   kustomize edit set image ghcr.io/meilisearch/meili-ingest=ghcr.io/meilisearch/meili-ingest:v0.1.0
+#
+# temporal.yaml is a non-production reference (single-pod auto-setup). Remove
+# it and point TEMPORAL_URL at Temporal Cloud / your own cluster in production.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: meili-ingest
+
+resources:
+  - namespace.yaml
+  - control-plane.yaml
+  - gateway.yaml
+  - workers.yaml
+  - temporal.yaml
+
+images:
+  - name: ghcr.io/meilisearch/meili-ingest
+    newTag: latest
+
+commonLabels:
+  app.kubernetes.io/part-of: meili-ingest

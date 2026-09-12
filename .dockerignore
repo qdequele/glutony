@@ -1,0 +1,17 @@
+# Build artefacts and VCS
+target/
+**/target/
+.git/
+.gitignore
+
+# Not needed inside the image
+docs/
+k8s/
+.github/
+blobs/
+
+# Local env
+.env
+.env.local
+*.log
+.DS_Store

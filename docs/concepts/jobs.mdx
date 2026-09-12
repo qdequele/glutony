@@ -1,0 +1,104 @@
+---
+title: Jobs
+description: Job lifecycle, status, progress and cancellation
+---
+
+Every ingest request creates one **job** = one Temporal `PipelineWorkflow`
+execution with id `ingest-<job_id>`.
+
+## Lifecycle
+
+```
+queued ──► running ──► succeeded
+                  ├──► failed
+                  └──► cancelled
+```
+
+| Status | Meaning |
+|---|---|
+| `queued` | Accepted by the gateway; the workflow has not been picked up yet. |
+| `running` | At least one step is executing. |
+| `succeeded` | Every step finished. |
+| `failed` | A step exhausted its retries or returned a non-retryable error. |
+| `cancelled` | Cancelled via `POST /jobs/:id/cancel`. |
+
+The same enum is used for each step in `progress.steps[]`.
+
+## Status endpoint
+
+```bash
+curl $INGEST/jobs/550e8400-e29b-41d4-a716-446655440000
+```
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "running",
+  "current_step": "enrich",
+  "progress": {
+    "status": "running",
+    "current_step": "enrich",
+    "completed_steps": 2,
+    "total_steps": 4,
+    "steps": [
+      { "step_id": "extract", "plugin": "pdf_extractor", "status": "succeeded", "document_count": 12, "branches": 1 },
+      { "step_id": "chunk",   "plugin": "chunker",       "status": "succeeded", "document_count": 87, "branches": 1 },
+      { "step_id": "enrich",  "plugin": "llm_enricher",  "status": "running",   "document_count": 0,  "branches": 87 }
+    ],
+    "cancel_requested": false
+  },
+  "pipeline_used": "my-pdf-with-enrichment",
+  "target_index": "contracts",
+  "error": null
+}
+```
+
+- `progress` is the workflow's live `progress` query.
+- `branches` is the number of parallel activities of a fanned-out step.
+- `document_count` is the number of documents the step produced (0 for binary
+  outputs such as extracted audio).
+- `error` carries the failure message when `status` is `failed`.
+
+### Source of truth
+
+Temporal is the source of truth. The gateway writes a row to the control
+plane's `jobs` table when it starts a job and refreshes it each time
+`GET /jobs/:id` is served. When Temporal no longer knows the workflow
+(retention expired, typically after days) the cached row is returned instead,
+so status never 404s for a job that existed.
+
+## Cancellation
+
+```bash
+curl -X POST $INGEST/jobs/550e8400-e29b-41d4-a716-446655440000/cancel
+```
+
+Sends the `cancel` signal. Running activities receive cancellation (plugins
+observe it through `ctx.check_cancelled()`), no new step is scheduled and the
+job ends as `cancelled`. Documents already written by an earlier indexer step
+remain in the index.
+
+## Retries and timeouts
+
+Per step, from the pipeline definition:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `timeout_secs` | 300 | Temporal start-to-close timeout of the activity. |
+| `retry.max_attempts` | 3 | Attempts including the first. |
+| `retry.backoff` | `exponential` | `exponential` (×2), `linear` (constant), `none` (immediate). |
+| `retry.initial_interval_secs` | 1 | First backoff interval. |
+| heartbeat timeout | 60 s | Fixed. Plugins must heartbeat during long loops. |
+
+Retryable errors (network, rate limits, transient upstream failures) go through
+this policy. Non-retryable ones (`InvalidInput`, `InvalidConfig`,
+`NonRetryable`) fail the step at once.
+
+## Observability
+
+- **Temporal UI** shows every job (`ingest-<job_id>`), its activities, retries
+  and payloads.
+- **Logs** are structured JSON (`tracing`) with `job_id`, `step_id`, `plugin`
+  and `project_id` fields. API keys are never logged.
+- **Metrics**: worker pools scale on Temporal task-queue backlog; see
+  [Kubernetes](/deployment/kubernetes).

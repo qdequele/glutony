@@ -1,0 +1,335 @@
+# Worker pools: one Deployment per Temporal task queue, each scaled by KEDA on
+# the queue backlog.
+#
+#   workers-general  pdf/docx/xlsx/html/markdown/csv/json/chunker/meili_indexer
+#   workers-llm      llm_enricher, image_captioner        (needs LLM_API_KEY)
+#   workers-gpu      whisper_transcriber, video_audio_extractor, ocr
+#                    These plugins are NOT compiled into the worker: they run
+#                    as gRPC sidecar/containers declared in EXTERNAL_PLUGINS.
+#
+# Scaling metric
+# --------------
+# The ScaledObjects below use KEDA's `prometheus` trigger against the backlog
+# gauge exported by the Temporal *server* (matching service):
+#
+#     approximate_backlog_count{taskqueue="workers-general"}
+#
+# Metric and label names depend on your Temporal server version and on how
+# Prometheus scrapes it (the label may be `task_queue` or `taskqueue`, some
+# setups prefix metrics with `temporal_`). Check `/metrics` on the matching
+# service and adjust the `query`. Two alternatives are documented in comments:
+#   * SDK-side schedule-to-start latency (`temporal_activity_schedule_to_start_latency`),
+#     which every worker exports itself;
+#   * KEDA's native `temporal` scaler (KEDA >= 2.15), which reads the backlog
+#     straight from Temporal's DescribeTaskQueue API and needs no Prometheus.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workers-general
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: workers-general
+    app.kubernetes.io/component: worker
+    meili-ingest/task-queue: workers-general
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workers-general
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workers-general
+        app.kubernetes.io/component: worker
+        meili-ingest/task-queue: workers-general
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: worker
+          image: ghcr.io/meilisearch/meili-ingest:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/meili-ingest-worker"]
+          env:
+            - name: TASK_QUEUE
+              value: workers-general
+            - name: MAX_CONCURRENT_ACTIVITIES
+              value: "20"
+          envFrom:
+            - configMapRef:
+                name: meili-ingest-config
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: workers-general
+  namespace: meili-ingest
+spec:
+  scaleTargetRef:
+    name: workers-general
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  pollingInterval: 15
+  cooldownPeriod: 120
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        # Activities waiting in the queue. Scale so that each replica handles ~10.
+        query: sum(approximate_backlog_count{taskqueue="workers-general"})
+        threshold: "10"
+        activationThreshold: "0"
+    # Alternative: SDK-exported schedule-to-start latency (p95 over 2 min, in seconds).
+    # - type: prometheus
+    #   metadata:
+    #     serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+    #     query: histogram_quantile(0.95, sum(rate(temporal_activity_schedule_to_start_latency_bucket{task_queue="workers-general"}[2m])) by (le))
+    #     threshold: "5"
+    # Alternative: KEDA native Temporal scaler (KEDA >= 2.15), no Prometheus needed.
+    # - type: temporal
+    #   metadata:
+    #     endpoint: temporal-frontend.meili-ingest.svc.cluster.local:7233
+    #     namespace: default
+    #     taskQueue: workers-general
+    #     queueTypes: activity
+    #     targetQueueSize: "10"
+    #     activationTargetQueueSize: "0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workers-llm
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: workers-llm
+    app.kubernetes.io/component: worker
+    meili-ingest/task-queue: workers-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workers-llm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workers-llm
+        app.kubernetes.io/component: worker
+        meili-ingest/task-queue: workers-llm
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: worker
+          image: ghcr.io/meilisearch/meili-ingest:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/meili-ingest-worker"]
+          env:
+            - name: TASK_QUEUE
+              value: workers-llm
+            # LLM calls are I/O bound: allow more in flight per pod.
+            - name: MAX_CONCURRENT_ACTIVITIES
+              value: "50"
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LLM_API_KEY
+          envFrom:
+            - configMapRef:
+                name: meili-ingest-config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: workers-llm
+  namespace: meili-ingest
+spec:
+  scaleTargetRef:
+    name: workers-llm
+  minReplicaCount: 0
+  maxReplicaCount: 30
+  pollingInterval: 15
+  cooldownPeriod: 180
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        query: sum(approximate_backlog_count{taskqueue="workers-llm"})
+        threshold: "20"
+        activationThreshold: "0"
+    # - type: temporal
+    #   metadata:
+    #     endpoint: temporal-frontend.meili-ingest.svc.cluster.local:7233
+    #     namespace: default
+    #     taskQueue: workers-llm
+    #     queueTypes: activity
+    #     targetQueueSize: "20"
+---
+# GPU pool. The worker binary itself needs no GPU: it forwards
+# whisper_transcriber / video_audio_extractor / ocr to gRPC plugin servers
+# (see EXTERNAL_PLUGINS). Co-locating those servers as sidecars in this pod is
+# the simplest layout; the GPU request below is for the sidecar.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workers-gpu
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: workers-gpu
+    app.kubernetes.io/component: worker
+    meili-ingest/task-queue: workers-gpu
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: workers-gpu
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: workers-gpu
+        app.kubernetes.io/component: worker
+        meili-ingest/task-queue: workers-gpu
+    spec:
+      nodeSelector:
+        # Adjust to your cluster's GPU node label (GKE: cloud.google.com/gke-accelerator,
+        # EKS: karpenter.k8s.aws/instance-gpu-count, generic NFD: nvidia.com/gpu.present).
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      runtimeClassName: nvidia
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: worker
+          image: ghcr.io/meilisearch/meili-ingest:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/meili-ingest-worker"]
+          env:
+            - name: TASK_QUEUE
+              value: workers-gpu
+            - name: MAX_CONCURRENT_ACTIVITIES
+              value: "2"
+            # Comma-separated list of external plugins to register on this worker.
+            # gRPC servers implement proto/plugin.proto and announce their own
+            # manifest (name, accepts, produces); WASM files are loaded via extism.
+            - name: EXTERNAL_PLUGINS
+              value: "grpc:http://localhost:50051,grpc:http://localhost:50052"
+          envFrom:
+            - configMapRef:
+                name: meili-ingest-config
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+        # Example gRPC plugin sidecar (replace with your Whisper / ffmpeg image).
+        - name: whisper-plugin
+          image: ghcr.io/meilisearch/meili-ingest-plugin-whisper:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50051
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              memory: 16Gi
+            requests:
+              cpu: "2"
+              memory: 8Gi
+        - name: ffmpeg-plugin
+          image: ghcr.io/meilisearch/meili-ingest-plugin-ffmpeg:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50052
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: workers-gpu
+  namespace: meili-ingest
+spec:
+  scaleTargetRef:
+    name: workers-gpu
+  minReplicaCount: 0          # GPU nodes are expensive: scale to zero when idle
+  maxReplicaCount: 4
+  pollingInterval: 30
+  cooldownPeriod: 600
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        query: sum(approximate_backlog_count{taskqueue="workers-gpu"})
+        threshold: "2"
+        activationThreshold: "0"
+    # - type: temporal
+    #   metadata:
+    #     endpoint: temporal-frontend.meili-ingest.svc.cluster.local:7233
+    #     namespace: default
+    #     taskQueue: workers-gpu
+    #     queueTypes: activity
+    #     targetQueueSize: "2"

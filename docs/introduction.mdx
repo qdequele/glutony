@@ -1,0 +1,68 @@
+---
+title: Introduction
+description: What meili-ingest is and when to use it
+---
+
+**meili-ingest** is an open-source (MIT), Kubernetes-native ingestion pipeline
+for [Meilisearch](https://www.meilisearch.com). You send it any content — PDF,
+Word, Excel, HTML, Markdown, CSV, JSON, images, audio, video — and it detects
+what it is, runs it through a configurable processing pipeline (extraction,
+chunking, transcription, LLM enrichment, …) and pushes the resulting documents
+into a Meilisearch index.
+
+```bash
+curl -F "file=@report.pdf" https://my-project.us-west.meilisearch.com/ingest
+```
+
+```json
+{ "job_id": "550e8400-…", "pipeline_used": "builtin.pdf", "target_index": "documents", "status": "queued" }
+```
+
+## Why
+
+Getting real-world content into a search engine is mostly plumbing: parse this
+format, split that text, call a model, batch the writes, retry, resume. Every
+team rebuilds it. meili-ingest makes that plumbing a service:
+
+<CardGroup cols={2}>
+  <Card title="Batteries included" icon="battery-full">
+    Twelve built-in pipelines cover the common formats. `POST /ingest` picks the
+    right one from the content itself.
+  </Card>
+  <Card title="Fully programmable" icon="diagram-project">
+    Pipelines are YAML DAGs of plugin steps with fan-out, timeouts and retry
+    policies. `POST /ingest/pipeline/:name` runs exactly what you defined.
+  </Card>
+  <Card title="Durable by design" icon="shield-check">
+    Every job is a [Temporal](https://temporal.io) workflow: steps retry, resume
+    after crashes, and report progress. Large payloads are staged in object storage.
+  </Card>
+  <Card title="Multi-tenant" icon="building">
+    One deployment serves every Meilisearch Cloud project: the tenant context is
+    injected by Envoy and carried through the whole pipeline. Runs standalone too.
+  </Card>
+</CardGroup>
+
+## How it works, in one paragraph
+
+The **gateway** (axum) receives the request, resolves a `MeiliContext`
+(which Meilisearch host / key / index this is for), detects the MIME type,
+asks the **control plane** (axum + Postgres) which pipeline applies, and starts
+a `PipelineWorkflow` on **Temporal**. **Workers** poll typed task queues
+(`workers-general`, `workers-llm`, `workers-gpu`, `workers-io`) and run one
+activity per step through a plugin registry. The last step, `meili_indexer`,
+is the only code that talks to Meilisearch.
+
+## Where to next
+
+<CardGroup cols={3}>
+  <Card title="Quickstart" href="/quickstart" icon="rocket">
+    Run the whole stack locally in five minutes.
+  </Card>
+  <Card title="Pipelines" href="/concepts/pipelines" icon="sitemap">
+    Author your own processing DAG.
+  </Card>
+  <Card title="Plugins" href="/plugins/built-in" icon="puzzle-piece">
+    Reference for every built-in plugin, and how to write yours.
+  </Card>
+</CardGroup>

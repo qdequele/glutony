@@ -1,0 +1,125 @@
+---
+title: Meilisearch Cloud & Envoy
+description: Running meili-ingest as a shared multi-tenant service behind Envoy (glutony)
+---
+
+On Meilisearch Cloud, meili-ingest runs **once per region** and serves every
+project. Tenant isolation is provided by the Envoy gateway (project *glutony*)
+that fronts all Cloud traffic and injects the tenant context into each request.
+
+```
+xxx.us-west.meilisearch.com/ingest
+        │
+        ▼
+   Envoy (glutony)
+     - project id  ← subdomain
+     - host, key   ← project store
+     - index       ← path (optional)
+     - injects X-Meili-* + X-Meili-Envoy-Secret
+        │
+        ▼
+   meili-ingest gateway (ENVOY_TRUSTED_HEADER set)
+        │
+        ▼
+   Temporal → workers → https://xxx.us-west.meilisearch.io
+```
+
+## Headers Envoy injects
+
+| Header | Value |
+|---|---|
+| `X-Meili-Project-Id` | tenant identifier (`xxx`) |
+| `X-Meili-Host` | full Meilisearch URL, `https://xxx.us-west.meilisearch.io` |
+| `X-Meili-Api-Key` | a key with documents write permission (master or a dedicated ingest key) |
+| `X-Meili-Index` | optional, when the path or query names an index |
+| `X-Meili-Region` | `us-west` — observability only |
+| `X-Meili-Envoy-Secret` | the shared secret configured as `ENVOY_TRUSTED_HEADER` |
+
+Envoy **must strip** any `X-Meili-*` header sent by the client before injecting
+its own, so a tenant cannot impersonate another.
+
+## Gateway configuration
+
+```yaml
+# k8s/gateway.yaml (excerpt)
+env:
+  - name: ENVOY_TRUSTED_HEADER
+    valueFrom:
+      secretKeyRef:
+        name: meili-ingest-secrets
+        key: ENVOY_TRUSTED_HEADER
+```
+
+With `ENVOY_TRUSTED_HEADER` set, a request whose `X-Meili-Envoy-Secret` does
+not match has its `X-Meili-*` headers ignored and falls back to standalone
+resolution — which, with no `MEILI_URL` configured on the Cloud gateway, means
+`400 missing_context`. Rotate the secret by updating both Envoy and the
+Kubernetes secret, then rolling the gateway.
+
+Leave `MEILI_URL` / `MEILI_API_KEY` **unset** on Cloud gateways: a fallback
+host would silently receive traffic whenever trust fails.
+
+## Envoy route sketch
+
+```yaml
+# Illustrative — the real configuration lives in glutony.
+routes:
+  - match:
+      prefix: /ingest
+    route:
+      cluster: meili-ingest-gateway
+      timeout: 600s                     # large uploads
+    request_headers_to_remove:
+      - x-meili-project-id
+      - x-meili-host
+      - x-meili-api-key
+      - x-meili-index
+      - x-meili-region
+      - x-meili-envoy-secret
+    request_headers_to_add:
+      - header: { key: x-meili-envoy-secret, value: "%ENVIRONMENT(MEILI_INGEST_SECRET)%" }
+      # x-meili-project-id / host / api-key / index / region are added by the
+      # glutony Lua/ext_authz filter after looking the project up.
+  - match: { prefix: /jobs }
+    route: { cluster: meili-ingest-gateway }
+  - match: { prefix: /pipelines }
+    route: { cluster: meili-ingest-gateway }
+  - match: { prefix: /plugins }
+    route: { cluster: meili-ingest-gateway }
+```
+
+Set Envoy's per-route body limits at or above the gateway's `MAX_UPLOAD_MB`.
+
+## Tenant-scoped resources
+
+- **Pipelines** created through `POST /pipelines` are stored with the
+  project's id and only visible to that project. They shadow global pipelines
+  and built-in triggers for that tenant only.
+- **Jobs** record `project_id`. Status URLs use unguessable UUIDs; Envoy should
+  still only route `/jobs/*` for authenticated project traffic.
+- **Credentials** live only in the workflow input for the duration of the job
+  and in Temporal's history (encrypt payloads with a Temporal data converter /
+  codec server if your compliance posture requires it).
+
+## Capacity
+
+Because all tenants share the worker pools, size KEDA `maxReplicaCount` and
+`MAX_CONCURRENT_ACTIVITIES` per region, and consider per-tenant rate limiting
+at Envoy (`/ingest` requests per minute) so one bulk import cannot starve
+others. Fan-out steps (`llm_enricher` on thousands of chunks) are the usual
+source of bursts; `max_concurrent` in the step config bounds each activity.
+
+## Developing against Cloud semantics locally
+
+Simulate Envoy with curl:
+
+```bash
+export SECRET=dev-secret
+# gateway started with ENVOY_TRUSTED_HEADER=$SECRET
+curl -H "X-Meili-Envoy-Secret: $SECRET" \
+     -H "X-Meili-Project-Id: demo" \
+     -H "X-Meili-Host: http://localhost:7700" \
+     -H "X-Meili-Api-Key: masterKey" \
+     -H "X-Meili-Region: local" \
+     -F file=@report.pdf http://localhost:8080/ingest
+```

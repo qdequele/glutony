@@ -1,0 +1,90 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "meili-ingest",
+  "colors": {
+    "primary": "#FF5CAA",
+    "light": "#FF8FC8",
+    "dark": "#E3006B",
+    "anchors": {
+      "from": "#FF5CAA",
+      "to": "#7C3AED"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "Meilisearch",
+      "url": "https://www.meilisearch.com"
+    }
+  ],
+  "topbarCtaButton": {
+    "type": "github",
+    "url": "https://github.com/meilisearch/meili-ingest"
+  },
+  "anchors": [
+    {
+      "name": "GitHub",
+      "icon": "github",
+      "url": "https://github.com/meilisearch/meili-ingest"
+    },
+    {
+      "name": "Plugin SDK on crates.io",
+      "icon": "rust",
+      "url": "https://crates.io/crates/meili-ingest-plugin-sdk"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "introduction",
+        "quickstart",
+        "self-hosted"
+      ]
+    },
+    {
+      "group": "Concepts",
+      "pages": [
+        "concepts/architecture",
+        "concepts/multi-tenancy",
+        "concepts/pipelines",
+        "concepts/plugins",
+        "concepts/jobs"
+      ]
+    },
+    {
+      "group": "Plugins",
+      "pages": [
+        "plugins/built-in",
+        "plugins/authoring-builtin",
+        "plugins/authoring-wasm",
+        "plugins/authoring-grpc"
+      ]
+    },
+    {
+      "group": "Deployment",
+      "pages": [
+        "deployment/docker-compose",
+        "deployment/kubernetes",
+        "deployment/environment-variables",
+        "deployment/meilisearch-cloud"
+      ]
+    },
+    {
+      "group": "API Reference",
+      "openapi": "openapi.yaml"
+    }
+  ],
+  "api": {
+    "baseUrl": "http://localhost:8080",
+    "auth": {
+      "method": "bearer"
+    },
+    "playground": {
+      "mode": "show"
+    }
+  },
+  "footerSocials": {
+    "github": "https://github.com/meilisearch/meili-ingest",
+    "discord": "https://discord.meilisearch.com"
+  }
+}

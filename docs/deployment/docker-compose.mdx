@@ -1,0 +1,110 @@
+---
+title: Docker Compose
+description: Local development stack with hot reload
+---
+
+`compose.yaml` at the repository root brings up the full stack with Docker
+Compose **v2.22+** and hot-reloads the Rust services from your working tree.
+
+```bash
+docker compose watch          # build, start, sync + rebuild on changes
+docker compose up --watch     # same, with logs attached
+docker compose logs -f gateway worker-general
+docker compose down -v        # stop and wipe volumes
+```
+
+## Services
+
+| Service | Image | Ports | Notes |
+|---|---|---|---|
+| `postgres` | `postgres:17-alpine` | 5432 | control plane database, `postgres`/`dev-password` |
+| `temporal` | `temporalio/temporal:latest` | 7233 gRPC, 8233 UI | `temporal server start-dev`, SQLite on a volume |
+| `meilisearch` | `getmeili/meilisearch:v1.15` | 7700 | master key `masterKey` |
+| `control-plane` | `Dockerfile.dev` | 9000 | `cargo watch -x "run --bin meili-ingest-control-plane"` |
+| `gateway` | `Dockerfile.dev` | 8080 | standalone mode → local Meilisearch |
+| `worker-general` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-general` |
+| `worker-llm` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-llm`, needs `LLM_API_KEY` |
+| `worker-io` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-io` |
+
+With OrbStack every container also answers on
+`<service>.meili-ingest.orb.local` (for example
+`http://gateway.meili-ingest.orb.local:8080`).
+
+## How hot reload works
+
+Each Rust service is built from `Dockerfile.dev` (`rust:1.92-bookworm` +
+`protobuf-compiler` + `cargo-watch`) and declares:
+
+```yaml
+develop:
+  watch:
+    - action: sync            # source edits → synced into the container,
+      path: ./crates          #   cargo-watch recompiles the binary
+      target: /app/crates
+    - action: rebuild         # dependency changes → image rebuild
+      path: ./Cargo.toml
+    - action: rebuild
+      path: ./Cargo.lock
+```
+
+`proto/` and `migrations/` are synced too (they are compiled in by
+`tonic-prost-build` and `sqlx::migrate!`).
+
+Named volumes `cargo-registry`, `cargo-git` and `target-cache` are shared by
+all Rust services so dependencies compile once. Cargo serialises concurrent
+builds on the shared target directory, which is why the first `watch` can take
+several minutes; later cycles only rebuild the crate you touched.
+
+## Configuration
+
+Environment variables are set inline in `compose.yaml`. The ones you may want
+to change:
+
+| Variable | Service | Default | Purpose |
+|---|---|---|---|
+| `LLM_API_KEY` | worker-llm | `${LLM_API_KEY:-}` from your shell / `.env` | required for `llm_enricher` / `image_captioner` |
+| `LLM_BASE_URL` | worker-llm | `https://api.openai.com/v1` | any OpenAI-compatible endpoint (Ollama, vLLM, …) |
+| `LLM_MODEL` | worker-llm | `gpt-4o-mini` | default model |
+| `MEILI_URL` / `MEILI_API_KEY` | gateway | local Meilisearch | standalone fallback |
+| `INLINE_MAX_BYTES` | gateway | 1 MiB | above this, uploads are staged in the blob store |
+| `PAYLOAD_SPILL_BYTES` | workers | 1 MiB | above this, step outputs are spilled |
+| `RUST_LOG` | all | `info,meili_ingest=debug` | tracing filter |
+
+Create a `.env` file next to `compose.yaml` for secrets:
+
+```
+LLM_API_KEY=sk-...
+```
+
+The blob store is a shared `blobs` volume mounted at `/data/blobs` on the
+gateway and every worker (`BLOB_STORE_URL=file:///data/blobs`).
+
+## Running the production image locally
+
+```bash
+docker build -t meili-ingest:local .
+docker run --rm -p 8080:8080 \
+  -e TEMPORAL_URL=http://host.docker.internal:7233 \
+  -e CONTROL_PLANE_URL=http://host.docker.internal:9000 \
+  -e MEILI_URL=http://host.docker.internal:7700 -e MEILI_API_KEY=masterKey \
+  meili-ingest:local                                   # gateway (default entrypoint)
+
+docker run --rm --entrypoint /usr/local/bin/meili-ingest-worker \
+  -e TEMPORAL_URL=http://host.docker.internal:7233 -e TASK_QUEUE=workers-general \
+  meili-ingest:local
+```
+
+The production `Dockerfile` is multi-stage (cargo-chef dependency layer,
+`debian:bookworm-slim` runtime, non-root user) and contains all three binaries
+under `/usr/local/bin/`.
+
+## Troubleshooting
+
+- **`gateway` restarts with connection refused** — the control plane is still
+  compiling. `docker compose logs -f control-plane`.
+- **Uploads fail with 413** — raise `MAX_UPLOAD_MB` on the gateway.
+- **LLM steps fail with `plugin llm_enricher unavailable`** — `LLM_API_KEY`
+  is not set in the `worker-llm` environment.
+- **Reset everything** — `docker compose down -v` also deletes the Postgres,
+  Temporal, Meilisearch and blob volumes (not the cargo caches unless you
+  `docker volume rm meili-ingest_target-cache`).

@@ -1,0 +1,172 @@
+---
+title: Kubernetes
+description: Deploy meili-ingest with kustomize, HPA and KEDA
+---
+
+The `k8s/` directory is a kustomize base deploying everything into the
+`meili-ingest` namespace from the single image
+`ghcr.io/meilisearch/meili-ingest`.
+
+```bash
+kubectl apply -k k8s/
+kubectl -n meili-ingest get pods
+```
+
+| File | Contents |
+|---|---|
+| `namespace.yaml` | `meili-ingest` namespace |
+| `control-plane.yaml` | shared `ConfigMap` + `Secret`, control plane `Deployment` + `Service` (9000) |
+| `gateway.yaml` | gateway `Deployment` (2 replicas), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
+| `workers.yaml` | `workers-general`, `workers-llm`, `workers-gpu` `Deployment`s, each with a KEDA `ScaledObject` |
+| `temporal.yaml` | **reference only** single-pod Temporal (`auto-setup`) + Postgres + UI |
+| `kustomization.yaml` | ties it together; pin the image tag here |
+
+## Prerequisites
+
+- Kubernetes 1.27+.
+- [KEDA](https://keda.sh) 2.12+ for worker autoscaling (`helm install keda kedacore/keda -n keda --create-namespace`).
+  Without KEDA, delete the `ScaledObject`s and set `replicas` by hand.
+- Prometheus scraping the Temporal server (for the default trigger), or KEDA ≥ 2.15 for the native `temporal` scaler.
+- A Postgres database for the control plane.
+- An object store bucket for the blob store (pods do not share a disk).
+- Temporal: Temporal Cloud or your own cluster. `temporal.yaml` is for dev/staging.
+- For `workers-gpu`: the NVIDIA device plugin and GPU nodes.
+
+## 1. Configure
+
+Edit the `ConfigMap` in `k8s/control-plane.yaml`:
+
+```yaml
+TEMPORAL_URL: "http://temporal-frontend:7233"    # or your Temporal Cloud endpoint
+TEMPORAL_NAMESPACE: "default"
+BLOB_STORE_URL: "s3://meili-ingest-blobs"        # gs:// and az:// work too
+LLM_BASE_URL: "https://api.openai.com/v1"
+LLM_MODEL: "gpt-4o-mini"
+```
+
+Create the secret (do not commit real values; the manifest ships `CHANGE_ME`
+placeholders):
+
+```bash
+kubectl -n meili-ingest create secret generic meili-ingest-secrets \
+  --from-literal=DATABASE_URL='postgres://user:pass@postgres:5432/meili_ingest' \
+  --from-literal=LLM_API_KEY='sk-...' \
+  --from-literal=ENVOY_TRUSTED_HEADER="$(openssl rand -hex 32)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Object-store credentials follow the provider's conventions
+(`AWS_ACCESS_KEY_ID` / IRSA, `GOOGLE_APPLICATION_CREDENTIALS` / Workload
+Identity, `AZURE_STORAGE_ACCOUNT_*`); add them to the worker and gateway pods
+as env vars or a service account annotation.
+
+## 2. Gateway
+
+- 2 replicas, `RollingUpdate` with `maxUnavailable: 0`, spread across nodes.
+- Readiness and liveness on `GET /health`.
+- `HorizontalPodAutoscaler` 2–10 replicas at 70 % CPU.
+- `PodDisruptionBudget` `minAvailable: 1`.
+- Envoy trust: `ENVOY_TRUSTED_HEADER` from the secret. For a standalone
+  deployment uncomment `MEILI_URL` / `MEILI_API_KEY` instead.
+
+Expose it with your ingress controller or, on Meilisearch Cloud, as an Envoy
+upstream (see [Meilisearch Cloud](/deployment/meilisearch-cloud)).
+
+## 3. Workers and KEDA
+
+Each pool is a `Deployment` running `meili-ingest-worker` with `TASK_QUEUE`
+set, plus a `ScaledObject`:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: workers-general
+spec:
+  scaleTargetRef:
+    name: workers-general
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+        query: sum(approximate_backlog_count{taskqueue="workers-general"})
+        threshold: "10"       # ~10 pending activities per replica
+```
+
+<Warning>
+**The metric name is environment-specific.** `approximate_backlog_count` is the
+backlog gauge emitted by the Temporal *server's* matching service (Temporal
+1.24+); depending on version and scrape configuration the task-queue label is
+`taskqueue` or `task_queue`, and some setups prefix the metric with
+`temporal_`. Check `/metrics` on the matching service and adjust `query`.
+</Warning>
+
+Alternatives, documented as comments in `workers.yaml`:
+
+- **SDK latency** — every worker exports
+  `temporal_activity_schedule_to_start_latency`; scale when the p95 exceeds a
+  few seconds. Works without access to server metrics.
+- **Native `temporal` scaler** (KEDA ≥ 2.15) — reads the backlog from
+  Temporal's `DescribeTaskQueue` API, no Prometheus needed:
+
+  ```yaml
+  - type: temporal
+    metadata:
+      endpoint: temporal-frontend.meili-ingest.svc.cluster.local:7233
+      namespace: default
+      taskQueue: workers-general
+      queueTypes: activity
+      targetQueueSize: "10"
+  ```
+
+Pool defaults:
+
+| Pool | min | max | Notes |
+|---|---|---|---|
+| `workers-general` | 1 | 20 | CPU-bound parsing; `MAX_CONCURRENT_ACTIVITIES=20` |
+| `workers-llm` | 0 | 30 | I/O-bound; `MAX_CONCURRENT_ACTIVITIES=50`, `LLM_API_KEY` from the secret |
+| `workers-gpu` | 0 | 4 | `nvidia.com/gpu: 1` on the plugin sidecar, `nodeSelector` + toleration for GPU nodes, long cooldown |
+
+Give workers a generous `terminationGracePeriodSeconds` (the manifests use
+120–600 s) so in-flight activities finish on scale-down; Temporal retries
+anything that does not.
+
+### GPU pool and gRPC plugins
+
+The worker binary has no GPU code. `workers-gpu` runs the worker with
+`EXTERNAL_PLUGINS=grpc:http://localhost:50051,...` next to plugin sidecars
+(Whisper, ffmpeg, OCR) that request the GPU. Replace the example sidecar images
+in `workers.yaml` with yours; see [Authoring a gRPC plugin](/plugins/authoring-grpc).
+
+## 4. Temporal
+
+`temporal.yaml` deploys `temporalio/auto-setup` with a single Postgres
+`StatefulSet` and the Temporal UI. It exists so `kubectl apply -k` produces a
+working cluster; **it is not HA and not for production**. For production:
+
+- [Temporal Cloud](https://temporal.io/cloud): set `TEMPORAL_URL` to your
+  namespace endpoint and mount the mTLS client certificate.
+- Self-managed: the [official Helm chart](https://github.com/temporalio/helm-charts)
+  with Cassandra/Postgres and Elasticsearch.
+
+Then remove `temporal.yaml` from `kustomization.yaml`.
+
+## 5. Verify
+
+```bash
+kubectl -n meili-ingest port-forward svc/meili-gateway 8080:8080
+curl -H "X-Meili-Host: http://meilisearch.default.svc:7700" \
+     -H "Authorization: Bearer <key>" \
+     -F file=@report.pdf http://localhost:8080/ingest
+kubectl -n meili-ingest get scaledobjects
+```
+
+## Upgrades
+
+Pin the image tag in `kustomization.yaml` (`newTag: v0.2.0`) and
+`kubectl apply -k k8s/`. Control-plane migrations run automatically at boot
+(`sqlx::migrate!`); roll the control plane first, then the gateway and workers.
+Workflows in flight keep running: the workflow code is versioned by Temporal
+and activities are retried on the new workers.

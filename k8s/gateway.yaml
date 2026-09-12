@@ -1,0 +1,152 @@
+# Gateway: public HTTP entry point (POST /ingest, /jobs, /pipelines, /plugins).
+#
+# Behind Meilisearch Cloud's Envoy (glutony) the gateway receives X-Meili-*
+# headers; ENVOY_TRUSTED_HEADER (from the Secret) is the shared secret Envoy
+# must present. Self-hosted deployments can instead set MEILI_URL /
+# MEILI_API_KEY here as a standalone fallback (SPEC §3.3).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meili-gateway
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: meili-gateway
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: meili-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: meili-gateway
+        app.kubernetes.io/component: gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: meili-gateway
+      containers:
+        - name: gateway
+          image: ghcr.io/meilisearch/meili-ingest:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/meili-ingest-gateway"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: BIND
+              value: "0.0.0.0:8080"
+            - name: ENVOY_TRUSTED_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: ENVOY_TRUSTED_HEADER
+                  optional: true
+            # Uncomment for a standalone (non-Envoy) deployment:
+            # - name: MEILI_URL
+            #   value: "http://meilisearch:7700"
+            # - name: MEILI_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: meili-ingest-secrets
+            #       key: MEILI_API_KEY
+          envFrom:
+            - configMapRef:
+                name: meili-ingest-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meili-gateway
+  namespace: meili-ingest
+  labels:
+    app.kubernetes.io/name: meili-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: meili-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: meili-gateway
+  namespace: meili-ingest
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: meili-gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: meili-gateway
+  namespace: meili-ingest
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: meili-gateway

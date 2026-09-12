@@ -1,0 +1,85 @@
+# Video ingestion with transcription and LLM enrichment.
+#
+# video_audio_extractor and whisper_transcriber are GPU plugins that run as
+# gRPC containers on the `workers-gpu` pool (they are not compiled into the
+# worker binary). llm_enricher runs on `workers-llm`, everything else on
+# `workers-general`. The workflow routes each step to the right queue.
+#
+# Auto-selected for any video/* upload (overrides builtin.video). The
+# trigger's index_pattern sends every document to the `videos` index, taking
+# precedence over X-Meili-Index and ?index= (SPEC §3.4).
+uid: video-ingest
+name: "Video ingest (transcribe + enrich)"
+description: "Extract the audio track, transcribe it with Whisper, chunk the transcript, enrich each chunk with an LLM and index it."
+version: 1
+
+trigger:
+  content_types: ["video/*"]
+  index_pattern: videos
+
+steps:
+  # 1. Demux the audio track (ffmpeg). Bytes → Bytes (audio/wav).
+  - id: extract_audio
+    plugin: video_audio_extractor
+    config:
+      format: wav
+      sample_rate: 16000
+      mono: true
+    timeout_secs: 900
+    retry:
+      max_attempts: 2
+      backoff: linear
+      initial_interval_secs: 10
+
+  # 2. Speech to text. Bytes → Documents (one per segment).
+  - id: transcribe
+    plugin: whisper_transcriber
+    depends_on: [extract_audio]
+    config:
+      model: large-v3
+      language: auto
+      segment_seconds: 60
+      word_timestamps: false
+    timeout_secs: 3600
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      initial_interval_secs: 30
+
+  # 3. Re-chunk the transcript into search-sized passages.
+  - id: chunk
+    plugin: chunker
+    depends_on: [transcribe]
+    config:
+      strategy: sentence
+      chunk_size: 512
+      overlap: 64
+      min_chunk_size: 32
+
+  # 4. One LLM call per chunk, fanned out in parallel; fan-in is automatic.
+  - id: enrich
+    plugin: llm_enricher
+    depends_on: [chunk]
+    fan_out: "$.documents"
+    config:
+      model: gpt-4o-mini
+      max_concurrent: 20
+      temperature: 0
+      prompt: |
+        You receive the transcript of a video segment.
+        Return a JSON object with: title, summary (2 sentences), keywords (array), language (BCP-47).
+    timeout_secs: 120
+    retry:
+      max_attempts: 5
+      backoff: exponential
+      initial_interval_secs: 2
+
+  # 5. Push to Meilisearch. Target index / credentials come from MeiliContext.
+  - id: index
+    plugin: meili_indexer
+    depends_on: [enrich]
+    config:
+      primary_key: id
+      batch_size: 500
+      auto_create_index: true
+      wait_for_completion: true

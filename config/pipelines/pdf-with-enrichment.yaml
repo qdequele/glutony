@@ -1,0 +1,50 @@
+# PDF with LLM enrichment — the example from SPEC §5.
+#
+# Auto-selected by POST /ingest for application/pdf uploads whose filename
+# matches contract_*.pdf (user pipelines beat builtin.pdf). Also callable
+# explicitly: POST /ingest/pipeline/my-pdf-with-enrichment
+uid: my-pdf-with-enrichment
+name: "PDF with LLM enrichment"
+version: 1
+
+# Optional: auto-select this pipeline when MIME/filename matches
+trigger:
+  content_types: [application/pdf]
+  filename_pattern: "contract_*.pdf"   # glob, optional
+
+steps:
+  # Sequential by default (no depends_on = runs after previous step)
+  - id: extract
+    plugin: pdf_extractor
+    config:
+      per_page: true
+      extract_images: false
+    timeout_secs: 120
+    retry:
+      max_attempts: 3
+      backoff: exponential
+
+  - id: chunk
+    plugin: chunker
+    depends_on: [extract]
+    config:
+      strategy: sentence
+      chunk_size: 512
+      overlap: 64
+
+  # Fan-out: one LLM call per chunk, in parallel
+  - id: enrich
+    plugin: llm_enricher
+    depends_on: [chunk]
+    fan_out: "$.documents"    # JSONPath into previous step output
+    config:
+      model: gpt-4o-mini
+      max_concurrent: 20
+      prompt: |
+        Extract as JSON: title, summary, keywords, language.
+
+  # Fan-in is automatic when depends_on references a fan_out step
+  - id: index
+    plugin: meili_indexer
+    depends_on: [enrich]
+    # No index config here — resolved from MeiliContext at runtime

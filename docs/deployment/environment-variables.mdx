@@ -1,0 +1,79 @@
+---
+title: Environment variables
+description: Every configuration knob of the gateway, workers and control plane
+---
+
+Configuration is environment-only. Variables are read once at startup
+(`from_env()` constructors and `main.rs`); nothing is read from the environment
+inside plugins or workflow code.
+
+## Gateway (`meili-ingest-gateway`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `BIND` | `0.0.0.0:8080` | Listen address. |
+| `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
+| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
+| `CONTROL_PLANE_URL` | `http://meili-control-plane:9000` | Internal control plane. |
+| `MEILI_URL` | — | Standalone fallback Meilisearch host (used when no `X-Meili-Host`). |
+| `MEILI_API_KEY` | — | Standalone fallback API key (used when no `X-Meili-Api-Key` / bearer). |
+| `DEFAULT_INDEX` | `documents` | Last resort of the index resolution chain. |
+| `MAX_UPLOAD_MB` | `500` | Maximum request body; larger → `413`. |
+| `ENVOY_TRUSTED_HEADER` | — | Shared secret. When set, `X-Meili-*` headers are honoured only if `X-Meili-Envoy-Secret` matches. Unset = trust headers (dev mode, warned at startup). |
+| `BLOB_STORE_URL` | `file://./blobs` | Where uploads above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
+| `INLINE_MAX_BYTES` | `1048576` | Uploads up to this size travel inside the Temporal payload; larger ones are staged. |
+| `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
+
+## Worker (`meili-ingest-worker`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
+| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
+| `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general`, `workers-llm`, `workers-gpu`, `workers-io`. |
+| `CONTROL_PLANE_URL` | — | If set, plugin manifests are published there at boot (`POST /internal/plugins`). |
+| `BLOB_STORE_URL` | `file://./blobs` | Same store as the gateway. |
+| `PAYLOAD_SPILL_BYTES` | `1048576` | Step outputs larger than this are spilled to the blob store. |
+| `MAX_CONCURRENT_ACTIVITIES` | `20` | Activities executed concurrently by this process. |
+| `EXTERNAL_PLUGINS` | — | Comma-separated external plugins: `wasm:/path/plugin.wasm`, `grpc:http://host:50051`. |
+| `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-llm` pool). Without it those plugins register as unavailable. |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
+| `LLM_MODEL` | `gpt-4o-mini` | Default model when a step's `config.model` is absent. |
+| `RUST_LOG` | `info` | Tracing filter. |
+
+Workers **never** read `MEILI_URL` / `MEILI_API_KEY`: Meilisearch credentials
+arrive in the workflow input as `MeiliContext`.
+
+## Control plane (`meili-ingest-control-plane`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | — (required) | Postgres connection string. Migrations run at boot. |
+| `BIND` | `0.0.0.0:9000` | Internal listen address. Do not expose publicly. |
+| `RUST_LOG` | `info` | Tracing filter. |
+
+## Object store credentials
+
+`BLOB_STORE_URL` schemes other than `file://` use the standard provider
+variables read by `object_store`:
+
+| Scheme | Variables |
+|---|---|
+| `s3://bucket/prefix` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, optional `AWS_ENDPOINT` (MinIO), or IRSA / instance profile |
+| `gs://bucket/prefix` | `GOOGLE_SERVICE_ACCOUNT` / `GOOGLE_APPLICATION_CREDENTIALS`, or Workload Identity |
+| `az://container/prefix` | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY` or SAS / managed identity |
+
+## Temporal Cloud
+
+Point `TEMPORAL_URL` at `https://<namespace>.<account>.tmprl.cloud:7233` and set
+`TEMPORAL_NAMESPACE=<namespace>.<account>`. Temporal Cloud requires mTLS (or an
+API key); the client certificate and key must be provided to the gateway and
+every worker. The exact variable names are those supported by the Temporal
+client configuration in `crates/gateway/src/main.rs` and
+`crates/worker/src/main.rs` in your build — check them before deploying.
+
+## Where they are set
+
+- **Compose**: inline in `compose.yaml`; secrets via `.env`.
+- **Kubernetes**: `ConfigMap meili-ingest-config` and `Secret meili-ingest-secrets`
+  in `k8s/control-plane.yaml`, mounted with `envFrom` / `secretKeyRef`.

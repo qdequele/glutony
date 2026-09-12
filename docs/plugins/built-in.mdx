@@ -1,0 +1,153 @@
+---
+title: Built-in plugins
+description: Reference for every plugin compiled into the worker, with config keys and defaults
+---
+
+All built-in plugins live under `crates/plugins/<name>` and are registered by
+`PluginRegistry::builtin()`. Config keys below go in the step's `config:`
+block; every key is optional unless stated otherwise.
+
+<Note>
+Documents produced by extractors set `meta.source`, `meta.filename` and
+`meta.mime` from the input blob, and derive ids from the sanitised filename
+plus a page/row suffix (`report_pdf_p3`, `data_csv_r42`).
+</Note>
+
+## Extractors (bytes → documents)
+
+### `pdf_extractor`
+
+Text extraction from PDF (`pdf-extract`). Queue: `workers-general`.
+
+| Key | Default | Description |
+|---|---|---|
+| `per_page` | `true` | One document per page (`meta.page` set); `false` → one document for the whole file. |
+| `extract_images` | `false` | Reserved; accepted for forward compatibility. |
+
+### `docx_extractor`
+
+Word `.docx` (`docx-rs`). One document; paragraphs joined by `\n\n`, tables
+rendered as tab-separated rows. No config keys.
+
+### `xlsx_extractor`
+
+Excel `.xlsx` / `.xls` (`calamine`).
+
+| Key | Default | Description |
+|---|---|---|
+| `mode` | `"row"` | `row` → one document per row with header → cell pairs in `fields`, `meta.section` = sheet name. `sheet` → one document per sheet. |
+
+### `html_extractor`
+
+HTML (`scraper`). One document: `title` from `<title>`, `content` from
+`<body>` minus `script`/`style`/`nav`/`footer`.
+
+| Key | Default | Description |
+|---|---|---|
+| `extract_links` | `false` | Also collect `<a href>` targets into `fields.links`. |
+
+### `markdown_extractor`
+
+Markdown (`pulldown-cmark`).
+
+| Key | Default | Description |
+|---|---|---|
+| `split_on_headings` | `true` | One document per top-level heading section, `meta.section` = heading text; `false` → one document. |
+
+### `csv_parser`
+
+CSV (`csv`). One document per row: header → `fields`, `content` = values
+joined by a space.
+
+| Key | Default | Description |
+|---|---|---|
+| `delimiter` | `","` | Single-character field delimiter. |
+| `has_headers` | `true` | First row is the header. Without headers, fields are `col_0`, `col_1`, … |
+| `id_column` | — | Column whose value becomes the document id. Otherwise `<filename>_r<row>`. |
+
+### `json_flattener`
+
+Accepts **bytes or documents**. Top-level array → one document per element;
+object with a `documents`, `items` or `data` array → those; anything else →
+one document. Nested objects are flattened to dotted keys (`a.b.c`) in
+`fields`; `content` = concatenated string values.
+
+| Key | Default | Description |
+|---|---|---|
+| `id_field` | `"id"` | Field used as document id; generated when missing. |
+
+### `image_captioner`
+
+Vision captioning through an OpenAI-compatible chat endpoint. One document
+whose `content` is the caption. Queue: `workers-llm`. Requires `LLM_API_KEY`
+on the worker (`LLM_BASE_URL`, `LLM_MODEL` optional).
+
+| Key | Default | Description |
+|---|---|---|
+| `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Vision-capable chat model. |
+| `prompt` | built-in caption prompt | Instruction sent with the image. |
+| `detail` | `"auto"` | Image detail hint (`low`, `high`, `auto`). |
+
+## Transformers (documents → documents)
+
+### `chunker`
+
+Splits each document into overlapping chunks. Sets `meta.chunk_index`,
+`meta.chunk_total`, `meta.parent_id`; chunk id = `<parent_id>_<index>`.
+Accepts `documents` and `many`.
+
+| Key | Default | Description |
+|---|---|---|
+| `strategy` | `"sentence"` | `sentence` (split on `.!?`), `fixed` (N chars), `paragraph` (split on `\n\n`). |
+| `chunk_size` | `512` | Target chunk size in characters. |
+| `overlap` | `64` | Characters shared between consecutive chunks. |
+| `min_chunk_size` | `32` | Trailing fragments shorter than this are merged into the previous chunk. |
+
+### `llm_enricher`
+
+Calls an OpenAI-compatible `/chat/completions` endpoint with
+`response_format: {type: json_object}` for each document and merges the JSON
+reply into the document. Accepts `documents` and `many`; usually used with
+`fan_out: "$.documents"`. Queue: `workers-llm`. Requires `LLM_API_KEY`.
+
+| Key | Default | Description |
+|---|---|---|
+| `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Chat model. |
+| `prompt` | built-in extraction prompt | System instruction. The document content is the user message. Ask for JSON. |
+| `max_concurrent` | `8` | Parallel requests inside one activity (`buffer_unordered`). |
+| `temperature` | `0` | Sampling temperature. |
+| `fields_to_merge` | all keys | Restrict which keys of the reply are merged into `fields`. |
+
+Reply keys are merged into `fields`; `title` → `title`, `summary` →
+`fields.summary`, `keywords` → `fields.keywords`, `language` → `meta.language`.
+
+## Sink (documents → indexed)
+
+### `meili_indexer`
+
+The only plugin that talks to Meilisearch (`meilisearch-sdk`). Accepts
+`documents` and `many`. Host, API key and index come from the `MeiliContext`
+the workflow injects — never from env vars and never from your config.
+
+| Key | Default | Description |
+|---|---|---|
+| `primary_key` | `"id"` | Primary key declared when creating the index. |
+| `auto_create_index` | `true` | Create the index when it does not exist. |
+| `batch_size` | `1000` | Documents per `addDocuments` request. |
+| `wait_for_completion` | `true` | Wait for Meilisearch tasks before finishing the step. |
+
+Returns `Indexed { index, document_count, task_uids }`.
+
+## Not compiled in
+
+| Plugin | Queue | Status |
+|---|---|---|
+| `pptx_extractor` | `workers-general` | Provide as a gRPC or WASM plugin. |
+| `whisper_transcriber` | `workers-gpu` | gRPC plugin (GPU container). |
+| `video_audio_extractor` | `workers-gpu` | gRPC plugin (ffmpeg). |
+| `ocr` | `workers-gpu` | gRPC plugin. |
+| `s3_downloader` | `workers-io` | Reserved name; the worker already resolves `s3://` inputs itself. |
+
+Built-in pipelines referencing these exist so routing is complete; until the
+plugin is registered on the right pool the step fails with
+`plugin X is not registered on this worker; deploy a gRPC plugin`.

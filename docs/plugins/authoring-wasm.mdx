@@ -1,0 +1,130 @@
+---
+title: Authoring a WASM plugin
+description: Ship a sandboxed plugin in any language, loaded at runtime with extism
+---
+
+WASM plugins let the community extend meili-ingest **without forking or
+recompiling the worker**. The worker loads `.wasm` files at startup through
+[extism](https://extism.org) and exposes them under the name in their manifest.
+
+Good fit: lightweight transforms — custom parsers for niche formats, field
+mapping, language detection, redaction. Not a fit: GPU work or huge native
+dependencies — use a [gRPC plugin](/plugins/authoring-grpc).
+
+## Contract
+
+A module exports two functions. Both take and return JSON strings through the
+extism plugin-input / plugin-output buffers.
+
+| Export | Input | Output |
+|---|---|---|
+| `manifest` | — | `PluginManifest` JSON (`kind` is set to `wasm` by the host) |
+| `execute` | `{ "input": PluginInput, "config": object }` | `PluginOutput` JSON, or an extism error whose message starts with `retryable:` / `non_retryable:` |
+
+`PluginInput` / `PluginOutput` use the tagged JSON shape from the SDK:
+
+```json
+{ "type": "documents", "value": [ { "id": "a", "content": "..." } ] }
+{ "type": "bytes", "value": { "data": "<base64>", "mime": "application/pdf", "filename": "a.pdf" } }
+```
+
+The host resolves `Ref` inputs before calling you and spills large outputs
+after, so the module only ever sees `bytes`, `documents`, `many` or `empty`.
+
+Heartbeats: the host heartbeats on your behalf while the call runs. Keep
+single calls under the step's `timeout_secs`; for big inputs prefer
+`fan_out: "$.documents"` in the pipeline so each call handles one document.
+
+## Rust example (`extism-pdk`)
+
+```toml
+[package]
+name = "meili-ingest-plugin-uppercase"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+meili-ingest-plugin-sdk = { version = "0.1", features = ["wasm"] }  # types only, no tokio
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+```rust
+use extism_pdk::*;
+use meili_ingest_plugin_sdk::types::{InputKind, OutputKind, PluginInput, PluginManifest, PluginOutput};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Call { input: PluginInput, #[serde(default)] config: serde_json::Value }
+
+#[plugin_fn]
+pub fn manifest() -> FnResult<Json<PluginManifest>> {
+    Ok(Json(
+        PluginManifest::new("uppercase", "0.1.0")
+            .description("Upper-cases document content")
+            .accepts([InputKind::Documents, InputKind::Many])
+            .produces(OutputKind::Documents),
+    ))
+}
+
+#[plugin_fn]
+pub fn execute(Json(call): Json<Call>) -> FnResult<Json<PluginOutput>> {
+    let docs = call.input.into_documents()
+        .map_err(|e| Error::msg(format!("non_retryable: {e}")))?;
+    let out = docs.into_iter().map(|mut d| { d.content = d.content.to_uppercase(); d }).collect();
+    Ok(Json(PluginOutput::Documents(out)))
+}
+```
+
+```bash
+rustup target add wasm32-wasip1
+cargo build --release --target wasm32-wasip1
+# → target/wasm32-wasip1/release/meili_ingest_plugin_uppercase.wasm
+```
+
+Any language with an extism PDK (Go, JS/TS, Python, C, Zig, .NET, …) works the
+same way: export `manifest` and `execute`, exchange JSON.
+
+## Deploy
+
+Mount the file into the worker pods of the pool that should run it and list it
+in `EXTERNAL_PLUGINS`:
+
+```yaml
+env:
+  - name: EXTERNAL_PLUGINS
+    value: "wasm:/plugins/uppercase.wasm"
+volumeMounts:
+  - name: plugins
+    mountPath: /plugins
+    readOnly: true
+```
+
+Several entries are comma-separated and may mix kinds:
+`wasm:/plugins/a.wasm,wasm:/plugins/b.wasm,grpc:http://ocr:50051`.
+
+At boot the worker calls `manifest`, registers the plugin under that name and
+publishes it to the control plane, so `GET /plugins` lists it with
+`"kind": "wasm"` and pipelines can reference it immediately:
+
+```yaml
+steps:
+  - id: extract
+    plugin: pdf_extractor
+  - id: shout
+    plugin: uppercase
+  - id: index
+    plugin: meili_indexer
+```
+
+## Limits and sandboxing
+
+- No network or filesystem unless you grant it through extism's manifest
+  (`allowed_hosts`, `allowed_paths`) — the host runs modules with none by default.
+- Memory is bounded by the wasm linear memory; keep per-call inputs small
+  (fan out per document).
+- The module runs on the worker's task queue; the name → queue table only
+  knows the built-in names, so a WASM plugin runs wherever it is declared.

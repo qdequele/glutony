@@ -1,0 +1,164 @@
+---
+title: Authoring a built-in plugin
+description: Add a Rust plugin compiled into the worker
+---
+
+Built-in plugins are Rust crates under `crates/plugins/<name>` linked into
+`meili-ingest-worker`. `crates/plugins/llm-enricher` is the canonical example;
+this page walks through the pattern.
+
+## 1. Create the crate
+
+```
+crates/plugins/my-plugin/
+  Cargo.toml
+  src/lib.rs
+```
+
+```toml
+[package]
+name = "meili-ingest-plugin-my-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+```
+
+Add it to the root `Cargo.toml` (`[workspace] members` and
+`[workspace.dependencies]`).
+
+## 2. Implement `Plugin`
+
+```rust
+use async_trait::async_trait;
+use meili_ingest_plugin_sdk::{
+    ActivityContext, Document, InputKind, OutputKind, Plugin, PluginError,
+    PluginInput, PluginManifest, PluginOutput,
+};
+use serde::Deserialize;
+
+pub const NAME: &str = "my_plugin";
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    #[serde(default = "default_prefix")]
+    prefix: String,
+}
+fn default_prefix() -> String { "» ".into() }
+
+#[derive(Debug, Default, Clone)]
+pub struct MyPlugin;
+
+impl MyPlugin {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait]
+impl Plugin for MyPlugin {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest::new(NAME, env!("CARGO_PKG_VERSION"))
+            .description("Prefixes every document's content")
+            .accepts([InputKind::Documents, InputKind::Many])
+            .produces(OutputKind::Documents)
+            .config_schema(serde_json::json!({
+                "type": "object",
+                "properties": { "prefix": { "type": "string", "default": "» " } },
+                "additionalProperties": false
+            }))
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ActivityContext,
+        input: PluginInput,
+        config: serde_json::Value,
+    ) -> Result<PluginOutput, PluginError> {
+        let cfg: Config = serde_json::from_value(config)
+            .map_err(|e| PluginError::InvalidConfig(e.to_string()))?;
+        let docs = input.into_documents()?;           // flattens Many, errors on Bytes
+
+        let mut out = Vec::with_capacity(docs.len());
+        for (i, mut doc) in docs.into_iter().enumerate() {
+            if i % 10 == 0 {
+                ctx.heartbeat(format!("{i} documents"));  // keep Temporal informed
+                ctx.check_cancelled()?;                    // honour POST /jobs/:id/cancel
+            }
+            doc.content = format!("{}{}", cfg.prefix, doc.content);
+            out.push(doc);
+        }
+        Ok(PluginOutput::Documents(out))
+    }
+}
+```
+
+Conventions (enforced by clippy `-D warnings` in CI):
+
+- `pub const NAME`, `pub struct <Camel>Plugin`, `new()` + `Default`.
+- No `unwrap()` / `expect()` outside tests; `thiserror`-style errors via `PluginError`.
+- `ctx.heartbeat(..)` roughly every 10 items and `ctx.check_cancelled()?` in loops.
+- Return `PluginError::Retryable` for transient upstream failures and
+  `NonRetryable` / `InvalidInput` / `InvalidConfig` for permanent ones.
+- Never read environment variables inside `execute`. Plugins that need
+  credentials expose `pub fn from_env() -> Result<Self, PluginError>` (see
+  `llm_enricher`: `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`) and a
+  `with_client(..)` constructor for tests.
+- Log with structured fields: `tracing::info!(plugin = NAME, count = out.len(), "done")`.
+
+## 3. Register it
+
+In `crates/worker/src/registry.rs`, `PluginRegistry::builtin()` registers every
+built-in:
+
+```rust
+reg.register(Arc::new(meili_ingest_plugin_my_plugin::MyPlugin::new()));
+```
+
+Add the dependency to `crates/worker/Cargo.toml`. If the plugin should run on a
+dedicated pool, add its name to `plugin_task_queue` in `crates/router`.
+Otherwise it runs on `workers-general`.
+
+The control plane validates pipelines against the set of known plugin names;
+if it keeps a static list of built-ins, add yours there too.
+
+## 4. Test
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meili_ingest_plugin_sdk::ActivityContext;
+
+    #[tokio::test]
+    async fn prefixes_content() {
+        let p = MyPlugin::new();
+        let ctx = ActivityContext::noop();
+        let input = PluginInput::Documents(vec![Document::with_id("a", "hello")]);
+        let out = p.execute(&ctx, input, serde_json::json!({"prefix": "> "})).await.unwrap();
+        let docs = out.into_documents().unwrap();
+        assert_eq!(docs[0].content, "> hello");
+    }
+}
+```
+
+For plugins calling HTTP services, use `wiremock` (see the `llm_enricher` tests).
+Run `cargo test -p meili-ingest-plugin-my-plugin` and
+`cargo clippy -p meili-ingest-plugin-my-plugin -- -D warnings`.
+
+## 5. Use it
+
+```yaml
+steps:
+  - id: extract
+    plugin: pdf_extractor
+  - id: prefix
+    plugin: my_plugin
+    config: { prefix: ">> " }
+  - id: index
+    plugin: meili_indexer
+```

@@ -1,0 +1,140 @@
+---
+title: Plugins
+description: The Plugin trait, inputs and outputs, and the three plugin kinds
+---
+
+Every processing step is a **plugin**. Built-in extractors, the chunker, the
+LLM enricher and the Meilisearch indexer are all plugins implementing the same
+trait from the `meili-ingest-plugin-sdk` crate.
+
+## The trait
+
+```rust
+#[async_trait]
+pub trait Plugin: Send + Sync + 'static {
+    fn manifest(&self) -> PluginManifest;
+
+    async fn execute(
+        &self,
+        ctx:    &ActivityContext,   // heartbeat + cancellation
+        input:  PluginInput,
+        config: serde_json::Value,  // the step's `config:` block
+    ) -> Result<PluginOutput, PluginError>;
+}
+```
+
+### Manifest
+
+```json
+{
+  "name": "llm_enricher",
+  "version": "0.1.0",
+  "description": "Enrich documents with an OpenAI-compatible chat model",
+  "accepts": ["documents", "many"],
+  "produces": "documents",
+  "config_schema": { "type": "object", "properties": { "model": { "type": "string" } } },
+  "kind": "builtin",
+  "content_types": []
+}
+```
+
+Workers publish their manifests to the control plane at boot; `GET /plugins`
+lists them and the control plane uses the names to validate pipelines.
+
+## Inputs and outputs
+
+```rust
+pub enum PluginInput  { Bytes(Blob), Ref(ContentRef), Documents(Vec<Document>), Many(Vec<PluginOutput>), Empty }
+pub enum PluginOutput { Bytes(Blob), Ref(ContentRef), Documents(Vec<Document>), Many(Vec<PluginOutput>), Indexed(IndexReport), Empty }
+```
+
+- `Bytes` — a `Blob { data, mime, filename? }` (base64 in JSON).
+- `Documents` — the unit of data between steps and into Meilisearch.
+- `Many` — outputs of a fanned-out step; `input.into_documents()` flattens it.
+- `Ref` — content still to be fetched. **Plugins never see `Ref`**: the worker
+  resolves URL / S3 / staged references before calling `execute`, and rewrites
+  oversized outputs into refs after.
+- `Indexed` — the indexer's terminal report `{ index, document_count, task_uids }`.
+
+### Document
+
+```json
+{
+  "id": "report_p3_1",
+  "title": "Optional",
+  "content": "Main text",
+  "fields": { "any": "structured attributes" },
+  "meta": {
+    "source": "report.pdf", "filename": "report.pdf", "mime": "application/pdf",
+    "page": 3, "section": null, "chunk_index": 1, "chunk_total": 8,
+    "parent_id": "report_p3", "language": "en", "extra": {}
+  }
+}
+```
+
+When indexed it is flattened to `{ id, title?, content, ...fields, _meta: {...} }`.
+Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes).
+
+## ActivityContext
+
+Long-running plugins must cooperate with Temporal:
+
+```rust
+ctx.heartbeat("page 12/300");   // every ~10 items; resets the 60 s heartbeat timeout
+ctx.check_cancelled()?;         // returns PluginError::Cancelled after POST /jobs/:id/cancel
+```
+
+## Errors
+
+```rust
+pub enum PluginError {
+    Retryable(String),      // retried per the step's retry policy
+    NonRetryable(String),   // fails the step immediately
+    InvalidConfig(String),  // never retried
+    InvalidInput(String),   // never retried
+    Cancelled,              // never retried
+    Io(std::io::Error),     // retried
+    Serde(serde_json::Error), // never retried
+    Other(anyhow::Error),   // retried (assumed transient)
+}
+```
+
+`is_retryable()` decides whether Temporal retries the activity or fails the
+step immediately.
+
+## Plugin kinds
+
+| Kind | How it runs | Use case | Guide |
+|---|---|---|---|
+| **Built-in** | compiled into `meili-ingest-worker` | fast pure-Rust steps; the default | [Authoring a built-in plugin](/plugins/authoring-builtin) |
+| **WASM** | `.wasm` loaded at runtime via [extism](https://extism.org) | community plugins in any language, sandboxed | [Authoring a WASM plugin](/plugins/authoring-wasm) |
+| **gRPC** | separate container implementing `proto/plugin.proto` | GPU / heavy runtimes (Whisper, OCR, ffmpeg) | [Authoring a gRPC plugin](/plugins/authoring-grpc) |
+
+External plugins are declared on a worker with
+`EXTERNAL_PLUGINS=wasm:/plugins/foo.wasm,grpc:http://whisper:50051`. The worker
+asks each for its manifest, registers it under `manifest.name`, and publishes
+it to the control plane like any built-in.
+
+## Task queues
+
+A plugin's name decides which worker pool runs it:
+
+```rust
+match plugin {
+    "whisper_transcriber" | "ocr" | "video_audio_extractor" => "workers-gpu",
+    "llm_enricher" | "image_captioner"                      => "workers-llm",
+    "s3_downloader"                                          => "workers-io",
+    _                                                        => "workers-general",
+}
+```
+
+Deploy your external plugin on the pool whose worker declares it in
+`EXTERNAL_PLUGINS`; names not in the table run on `workers-general`.
+
+## The indexer is special
+
+`meili_indexer` is the **only** plugin that talks to Meilisearch. It reads the
+`MeiliContext` (host, api_key, index) that the workflow flattened into its
+config, creates the index if needed (`auto_create_index`, `primary_key`),
+batches `addDocuments` calls (`batch_size`) and waits for the tasks
+(`wait_for_completion`). It never reads environment variables.

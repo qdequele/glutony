@@ -1,0 +1,120 @@
+---
+title: Architecture
+description: Gateway, control plane, Temporal and worker pools
+---
+
+```
+                        ┌──────────────────────────────────────────────┐
+                        │              Meilisearch Cloud               │
+  User request          │   Envoy (glutony)                            │
+  xxx.us-west           │   - extracts tenant context from request     │
+  .meilisearch.com  ───►│   - injects X-Meili-* headers               │
+  /ingest               │   - forwards to meili-ingest gateway         │
+                        └──────────────┬───────────────────────────────┘
+                                       │  (enriched request)
+                        ┌──────────────▼───────────────────────────────┐
+                        │         meili-ingest GATEWAY (axum)          │
+                        │  POST /ingest                → auto-route    │
+                        │  POST /ingest/pipeline/:name → explicit      │
+                        │  GET  /jobs/:id              → status        │
+                        │  CRUD /pipelines             → mgmt          │
+                        └──────────────┬───────────────────────────────┘
+                                       │  starts Temporal workflow
+                        ┌──────────────▼───────────────────────────────┐
+                        │              Temporal Server                 │
+                        └──────────────┬───────────────────────────────┘
+                                       │  dispatches activities
+                     ┌─────────────────┼──────────────────┐
+                     ▼                 ▼                  ▼
+              workers-general    workers-llm        workers-gpu
+              (pdf,docx,xlsx,    (llm_enricher)     (whisper,ocr)
+               chunker,indexer)
+                     └─────────────────┼──────────────────┘
+                        ┌──────────────▼───────────────────────────────┐
+                        │            Meilisearch instance              │
+                        └──────────────────────────────────────────────┘
+```
+
+## Components
+
+### Gateway (`meili-ingest-gateway`)
+
+Public HTTP API (port 8080). For each ingest request it:
+
+1. Resolves the [`MeiliContext`](/concepts/multi-tenancy) from headers / query / env.
+2. Parses the payload (multipart, JSON `url` / `s3` / `documents`, or raw body).
+3. Detects the MIME type: magic bytes (`infer`) → file extension → UTF-8 sniff →
+   `application/octet-stream`. The `Content-Type` header is only a last-resort hint.
+4. Asks the control plane to resolve a pipeline (`POST /internal/resolve`) or
+   loads the named one.
+5. Resolves the target index and writes it into the context.
+6. Stages the payload: bytes ≤ `INLINE_MAX_BYTES` travel inside the workflow
+   input; larger ones go to the blob store as a `Staged` reference.
+7. Starts the `PipelineWorkflow` (id `ingest-<job_id>`) and records the job in
+   the control plane.
+
+The gateway never links the worker crate: it starts the workflow by name with
+untyped payloads and reads progress via the `progress` query.
+
+### Control plane (`meili-ingest-control-plane`)
+
+Internal JSON API (port 9000) backed by Postgres:
+
+- **Pipelines** — the 12 built-ins (compiled in) plus user pipelines, global or
+  tenant-scoped. Validation (cycles, unknown plugins, `fan_out` arity) happens here.
+- **Resolver** — MIME + filename + project → pipeline, with precedence
+  tenant user > global user > builtin.
+- **Plugins** — manifests published by workers at boot; served by `GET /plugins`.
+- **Jobs** — a write-through cache of job status so `GET /jobs/:id` still
+  answers after Temporal's retention expires.
+
+### Temporal
+
+Each job is one `PipelineWorkflow` execution. The workflow is deterministic:
+it walks the DAG in topological order, resolves each step's input from its
+dependencies, fans out when asked, and schedules one `execute_step` activity
+per branch on the task queue for that plugin:
+
+| Plugin | Task queue |
+|---|---|
+| `whisper_transcriber`, `ocr`, `video_audio_extractor` | `workers-gpu` |
+| `llm_enricher`, `image_captioner` | `workers-llm` |
+| `s3_downloader` | `workers-io` |
+| everything else | `workers-general` |
+
+Activity options come from the step: `start_to_close = timeout_secs`
+(default 300 s), heartbeat 60 s, retry policy from `retry`. Non-retryable
+plugin errors fail the step (and the job) immediately.
+
+### Workers (`meili-ingest-worker`)
+
+A worker polls one task queue (`TASK_QUEUE`). The `execute_step` activity:
+
+1. Resolves `Ref` inputs (URL, S3, staged) into bytes, and hydrates spilled outputs.
+2. Builds an `ActivityContext` forwarding heartbeats and cancellation.
+3. Dispatches to the plugin from the `PluginRegistry` (built-in, WASM or gRPC).
+4. Spills outputs larger than `PAYLOAD_SPILL_BYTES` back to the blob store so
+   they stay under Temporal's 2 MB payload limit.
+
+### Blob store
+
+`object_store`-backed (`file://`, `s3://`, `gs://`, `az://`, `memory://`).
+Holds staged uploads and spilled step outputs under `jobs/<job_id>/…`.
+Gateway and all workers must point at the same store.
+
+## Repository layout
+
+```
+crates/
+  gateway/          axum HTTP server
+  control-plane/    registry + resolver + Postgres
+  worker/           Temporal workflow, activity, plugin registry
+  router/           pipeline resolution, MIME detection, builtin table
+  blob/             object_store wrapper (stage / spill / hydrate)
+  plugin-sdk/       THE public contract (Plugin trait + types) — on crates.io
+  plugin-runtime/   WASM (extism) and gRPC (tonic) plugin hosts
+  plugins/          built-in plugins
+config/pipelines/   example pipeline YAML
+k8s/                Kubernetes manifests (+ KEDA)
+docs/               this site
+```

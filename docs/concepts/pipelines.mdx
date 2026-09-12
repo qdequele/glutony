@@ -1,0 +1,143 @@
+---
+title: Pipelines
+description: Authoring pipeline DAGs in YAML or JSON
+---
+
+A pipeline is a DAG of plugin steps. Pipelines are authored as YAML or JSON,
+stored as JSONB by the control plane, and snapshotted into each job at
+submission time — editing a pipeline never changes a running job.
+
+## Anatomy
+
+```yaml
+uid: my-pdf-with-enrichment            # [a-zA-Z0-9._-]+ ; builtin.* is reserved
+name: "PDF with LLM enrichment"
+description: "Optional free text"
+version: 1                             # bumped automatically on update
+
+# Optional: auto-select this pipeline on POST /ingest
+trigger:
+  content_types: [application/pdf]     # exact or type/* wildcards
+  filename_pattern: "contract_*.pdf"   # glob (* and ?), case-insensitive, optional
+  index_pattern: contracts             # target index, overrides header/query, optional
+
+steps:
+  - id: extract
+    plugin: pdf_extractor
+    config:                            # validated against the plugin's config_schema
+      per_page: true
+    timeout_secs: 120                  # start-to-close, default 300
+    retry:
+      max_attempts: 3                  # default 3
+      backoff: exponential             # exponential | linear | none
+      initial_interval_secs: 1         # default 1
+
+  - id: chunk
+    plugin: chunker
+    depends_on: [extract]
+
+  - id: enrich
+    plugin: llm_enricher
+    depends_on: [chunk]
+    fan_out: "$.documents"             # one parallel activity per document
+
+  - id: index
+    plugin: meili_indexer
+    depends_on: [enrich]               # fan-in is automatic
+```
+
+### Fields
+
+| Field | Required | Description |
+|---|---|---|
+| `uid` | yes | Stable id used in URLs and `pipeline_used`. |
+| `name`, `description` | no | Display metadata. `name` defaults to `uid`. |
+| `version` | no | Managed by the control plane. |
+| `trigger` | no | Without a trigger the pipeline is only reachable via `POST /ingest/pipeline/:uid`. |
+| `steps[]` | yes, ≥ 1 | The DAG. |
+| `steps[].id` | yes | Unique within the pipeline. |
+| `steps[].plugin` | yes | A registered plugin name; unknown → `422`. |
+| `steps[].depends_on` | no | Steps to wait for. |
+| `steps[].fan_out` | no | `$.documents`, `$.many` or `$`. Requires exactly one dependency. |
+| `steps[].config` | no | Plugin config block (object). |
+| `steps[].timeout_secs` | no | Activity start-to-close timeout. |
+| `steps[].retry` | no | Retry policy. |
+
+## Execution rules
+
+- **Implicit sequencing.** A step without `depends_on` (other than the first)
+  depends on the step listed right before it. Linear pipelines therefore never
+  need `depends_on`. In a DAG, write `depends_on` on every non-root step and
+  list root steps first.
+- **Parallelism.** Steps whose dependencies are all satisfied and that do not
+  depend on each other run concurrently.
+- **Input resolution.** No dependency → the job's initial input (bytes, a
+  reference, or inline documents). One dependency → that step's output.
+  Several → `PluginInput::Many` with one entry per dependency.
+- **Fan-out.** `fan_out: "$.documents"` runs one activity per document of the
+  upstream output; `$.many` one per element of a `Many` output; `$` no split
+  (useful to force the step to run on the raw output). Branch results are
+  collected into a `Many` output; the next step receives it as its input
+  (fan-in). Plugins that accept `documents` flatten `Many` automatically.
+- **Routing.** Each activity is scheduled on the task queue of its plugin
+  (`workers-general` / `workers-llm` / `workers-gpu` / `workers-io`), so GPU
+  and LLM work never blocks parsing.
+- **Failure.** A step that exhausts its retries, or returns a non-retryable
+  error, fails the job with `status: failed` and the message in `error`.
+  Already-completed steps are not rolled back (documents indexed by an
+  earlier indexer step stay indexed).
+- **Cancellation.** `POST /jobs/:id/cancel` sets `cancel_requested`; running
+  activities are cancelled, no new step starts, status becomes `cancelled`.
+- **Validation** at creation time: unique ids, known dependencies, no cycles
+  (Kahn's algorithm), `fan_out` arity/path, known plugins.
+
+## Payload sizes
+
+Temporal payloads are capped at 2 MB, so meili-ingest never relies on them for
+content: uploads above `INLINE_MAX_BYTES` (1 MiB) are staged in the blob store
+and step outputs above `PAYLOAD_SPILL_BYTES` (1 MiB) are spilled there. This is
+invisible to plugins and to pipeline authors.
+
+## Built-in pipelines
+
+| UID | Triggers on | Steps |
+|---|---|---|
+| `builtin.pdf` | `application/pdf` | pdf_extractor → chunker → meili_indexer |
+| `builtin.word` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/msword` | docx_extractor → chunker → meili_indexer |
+| `builtin.excel` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `application/vnd.ms-excel` | xlsx_extractor → meili_indexer |
+| `builtin.powerpoint` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | pptx_extractor → meili_indexer |
+| `builtin.html` | `text/html` | html_extractor → chunker → meili_indexer |
+| `builtin.text` | `text/plain` | chunker → meili_indexer |
+| `builtin.markdown` | `text/markdown`, `text/x-markdown` | markdown_extractor → meili_indexer |
+| `builtin.csv` | `text/csv` | csv_parser → meili_indexer |
+| `builtin.json` | `application/json` | json_flattener → meili_indexer |
+| `builtin.image` | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | image_captioner → meili_indexer |
+| `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4` | whisper_transcriber → meili_indexer |
+| `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm` | video_audio_extractor → whisper_transcriber → meili_indexer |
+
+Default chunker config: `strategy: sentence, chunk_size: 512, overlap: 64`.
+Default retry: `max_attempts: 3, backoff: exponential`.
+
+<Note>
+`pptx_extractor`, `whisper_transcriber` and `video_audio_extractor` are not
+compiled into the worker. Their pipelines exist so routing is complete; the
+step fails with a clear message until you deploy them as
+[gRPC plugins](/plugins/authoring-grpc).
+</Note>
+
+## Managing pipelines
+
+```bash
+# create / update (YAML or JSON)
+curl -X POST --data-binary @pipeline.yaml -H 'Content-Type: application/x-yaml' $INGEST/pipelines
+# list, get, delete
+curl $INGEST/pipelines
+curl $INGEST/pipelines/my-pdf-with-enrichment
+curl -X DELETE $INGEST/pipelines/my-pdf-with-enrichment     # 403 for builtin.*
+```
+
+Upserts are keyed by `(uid, project_id)`. Behind Meilisearch Cloud the project
+id comes from Envoy, so each tenant has its own namespace of uids and can shadow
+a global pipeline (or a built-in's trigger) without affecting others.
+
+Examples: [`config/pipelines/`](https://github.com/meilisearch/meili-ingest/tree/main/config/pipelines).

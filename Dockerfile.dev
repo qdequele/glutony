@@ -1,0 +1,28 @@
+# meili-ingest — development image (used by compose.yaml with `docker compose watch`).
+#
+# cargo-watch recompiles and restarts the selected binary whenever Compose
+# syncs a changed file into /app/crates. The compose service overrides CMD to
+# pick the binary (`--bin meili-ingest-control-plane`, `--bin meili-ingest-worker`).
+#
+# Cargo caches (registry, git, target) are mounted as named volumes by
+# compose.yaml so rebuilds are incremental.
+
+FROM rust:1.92-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler pkg-config libssl-dev curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && cargo install cargo-watch --locked
+
+WORKDIR /app
+COPY . .
+
+# Pre-build so the first `cargo watch` cycle is fast. Allowed to fail while the
+# workspace is still being written; the watch loop reports real errors.
+RUN cargo build --workspace --bins || true
+
+EXPOSE 8080 9000
+ENV RUST_LOG=info,meili_ingest=debug \
+    CARGO_TERM_COLOR=always
+
+CMD ["cargo", "watch", "-x", "run --bin meili-ingest-gateway", "-w", "crates"]

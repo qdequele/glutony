@@ -1,9 +1,57 @@
 [package]
 name = "meili-ingest-gateway"
+description = "HTTP gateway for meili-ingest: resolves the tenant context, detects content, picks a pipeline and starts the Temporal workflow."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "meili-gateway"
+path = "src/main.rs"
+
+[lib]
+name = "meili_ingest_gateway"
+path = "src/lib.rs"
+
 [dependencies]
+# internal
+meili-ingest-plugin-sdk.workspace = true
+meili-ingest-router.workspace = true
+meili-ingest-blob.workspace = true
+
+# http
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+reqwest = { workspace = true, features = ["query"] }
+
+# async
+tokio.workspace = true
+async-trait.workspace = true
+
+# serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+bytes.workspace = true
+
+# temporal
+temporalio-client.workspace = true
+temporalio-common.workspace = true
+
+# misc
+uuid.workspace = true
+chrono.workspace = true
+mime_guess.workspace = true
+
+# errors / logging
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tower = { workspace = true, features = ["util"] }
