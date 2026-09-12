@@ -1,9 +1,36 @@
 [package]
 name = "meili-ingest-plugin-runtime"
+description = "meili-ingest plugin runtime: loads external plugins shipped as WASM modules (extism) or gRPC containers (tonic) and exposes them through the plugin-sdk `Plugin` trait."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["wasm", "grpc"]
+# WASM plugins loaded with extism/wasmtime (`WasmPlugin`).
+wasm = ["dep:extism"]
+# Remote plugin containers called over gRPC (`GrpcPlugin`, `proto/plugin.proto`).
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tonic-prost-build"]
+
 [dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+extism = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+uuid.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "meili-ingest-plugin-llm-enricher"
+description = "meili-ingest built-in plugin: enriches documents (title, summary, keywords, language, custom fields) through an OpenAI-compatible chat completions API. The canonical example of a built-in plugin."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+meili-ingest-plugin-sdk.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
+uuid.workspace = true

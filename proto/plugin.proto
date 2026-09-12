@@ -1,0 +1,153 @@
+// meili-ingest external plugin protocol (gRPC).
+//
+// A "gRPC plugin" is a container (any language) that implements `PluginService`.
+// The meili-ingest worker connects to it with `GrpcPlugin::connect(endpoint)` from the
+// `meili-ingest-plugin-runtime` crate and treats it exactly like a built-in plugin.
+// Register it with the worker through the `EXTERNAL_PLUGINS` env var, e.g.
+// `EXTERNAL_PLUGINS="grpc:http://whisper:50051"`.
+//
+// Design: all payloads are JSON carried in `bytes` fields. The JSON shapes are the
+// serde representations of the Rust types in `crates/plugin-sdk/src/types.rs`:
+//
+//   manifest_json  -> PluginManifest
+//                     {"name":"whisper_transcriber","version":"1.0.0","description":"...",
+//                      "accepts":["bytes"],"produces":"documents",
+//                      "config_schema":{"type":"object"},"kind":"grpc",
+//                      "content_types":["audio/*"]}
+//
+//   input_json     -> PluginInput (externally tagged: {"type": ..., "value": ...})
+//                     {"type":"bytes","value":{"data":"<base64>","mime":"audio/mpeg","filename":"a.mp3"}}
+//                     {"type":"documents","value":[{"id":"d1","content":"...","fields":{},"meta":{}}]}
+//                     {"type":"many","value":[<PluginOutput>, ...]}
+//                     {"type":"empty"}
+//
+//   config_json    -> the step's `config:` block, an arbitrary JSON object.
+//
+//   output_json    -> PluginOutput (same tagging as PluginInput)
+//                     {"type":"documents","value":[{"id":"d1","title":"T","content":"...",
+//                                                   "fields":{"k":"v"},"meta":{"language":"en"}}]}
+//                     {"type":"bytes","value":{"data":"<base64>","mime":"audio/wav"}}
+//                     {"type":"empty"}
+//
+// Keeping the schema JSON-in-bytes means the proto never changes when the SDK types
+// gain fields, and implementers can reuse any JSON library.
+//
+// Error semantics: return `ExecuteResponse.error` for failures the plugin understands
+// (`retryable = true` for transient ones such as an upstream 429/timeout, `false` for
+// bad input or configuration). Transport-level gRPC statuses are also mapped by the
+// worker: UNAVAILABLE / DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / ABORTED / UNKNOWN /
+// INTERNAL are retried, INVALID_ARGUMENT / UNAUTHENTICATED / PERMISSION_DENIED /
+// UNIMPLEMENTED / NOT_FOUND / FAILED_PRECONDITION are not.
+//
+// Message size: the worker allows 64 MiB per message in both directions. Large inputs
+// are usually spilled to blob storage by the worker before the plugin is called, so
+// most `input_json` payloads are well below that.
+//
+// ---------------------------------------------------------------------------------
+// Implementing the service in Python (grpcio):
+//
+//   python -m grpc_tools.protoc -I proto --python_out=. --grpc_python_out=. proto/plugin.proto
+//
+//   class Plugin(plugin_pb2_grpc.PluginServiceServicer):
+//       def GetManifest(self, request, context):
+//           manifest = {"name": "whisper_transcriber", "version": "1.0.0",
+//                       "accepts": ["bytes"], "produces": "documents",
+//                       "config_schema": {"type": "object"}, "kind": "grpc",
+//                       "content_types": ["audio/*"]}
+//           return plugin_pb2.GetManifestResponse(manifest_json=json.dumps(manifest).encode())
+//
+//       def Execute(self, request, context):
+//           inp = json.loads(request.input_json); cfg = json.loads(request.config_json)
+//           if inp["type"] != "bytes":
+//               return plugin_pb2.ExecuteResponse(error=plugin_pb2.ExecuteError(
+//                   message="expected bytes", retryable=False))
+//           audio = base64.b64decode(inp["value"]["data"])
+//           text = transcribe(audio, model=cfg.get("model", "base"))
+//           out = {"type": "documents", "value": [{"id": request.job_id, "content": text,
+//                  "meta": {"mime": inp["value"]["mime"], "filename": inp["value"].get("filename")}}]}
+//           return plugin_pb2.ExecuteResponse(output_json=json.dumps(out).encode())
+//
+//   server = grpc.server(futures.ThreadPoolExecutor(max_workers=4),
+//                        options=[("grpc.max_receive_message_length", 64 * 1024 * 1024),
+//                                 ("grpc.max_send_message_length", 64 * 1024 * 1024)])
+//   plugin_pb2_grpc.add_PluginServiceServicer_to_server(Plugin(), server)
+//   server.add_insecure_port("[::]:50051"); server.start(); server.wait_for_termination()
+//
+// ---------------------------------------------------------------------------------
+// Implementing the service in Go:
+//
+//   protoc -I proto --go_out=. --go-grpc_out=. proto/plugin.proto
+//
+//   type server struct{ pb.UnimplementedPluginServiceServer }
+//
+//   func (s *server) GetManifest(ctx context.Context, _ *pb.GetManifestRequest) (*pb.GetManifestResponse, error) {
+//       m, _ := json.Marshal(map[string]any{"name": "ocr", "version": "1.0.0",
+//           "accepts": []string{"bytes"}, "produces": "documents", "kind": "grpc"})
+//       return &pb.GetManifestResponse{ManifestJson: m}, nil
+//   }
+//
+//   func (s *server) Execute(ctx context.Context, req *pb.ExecuteRequest) (*pb.ExecuteResponse, error) {
+//       var in struct{ Type string `json:"type"`; Value json.RawMessage `json:"value"` }
+//       if err := json.Unmarshal(req.InputJson, &in); err != nil {
+//           return &pb.ExecuteResponse{Result: &pb.ExecuteResponse_Error{Error: &pb.ExecuteError{
+//               Message: err.Error(), Retryable: false}}}, nil
+//       }
+//       out, _ := json.Marshal(map[string]any{"type": "documents", "value": []any{
+//           map[string]any{"id": req.JobId, "content": "..."}}})
+//       return &pb.ExecuteResponse{Result: &pb.ExecuteResponse_OutputJson{OutputJson: out}}, nil
+//   }
+//
+//   lis, _ := net.Listen("tcp", ":50051")
+//   srv := grpc.NewServer(grpc.MaxRecvMsgSize(64<<20), grpc.MaxSendMsgSize(64<<20))
+//   pb.RegisterPluginServiceServer(srv, &server{}); srv.Serve(lis)
+
+syntax = "proto3";
+
+package meili_ingest.plugin.v1;
+
+// One external plugin container. Exactly one plugin per service endpoint.
+service PluginService {
+  // Describe the plugin. Called once when the worker loads the plugin (unless the
+  // operator supplied a manifest override in `EXTERNAL_PLUGINS` configuration).
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+
+  // Run the plugin on one input. Called once per pipeline step invocation (once per
+  // fan-out branch when the step fans out). Must be safe to call concurrently.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
+
+message GetManifestRequest {}
+
+message GetManifestResponse {
+  // JSON-encoded `PluginManifest` (see header comment).
+  bytes manifest_json = 1;
+}
+
+message ExecuteRequest {
+  // Ingest job id (UUID string). Useful for logging and for deriving document ids.
+  string job_id = 1;
+  // Pipeline step id being executed.
+  string step_id = 2;
+  // JSON-encoded `PluginInput`.
+  bytes input_json = 3;
+  // JSON-encoded step `config:` object.
+  bytes config_json = 4;
+  // 1-based attempt number (increments on retries).
+  uint32 attempt = 5;
+}
+
+message ExecuteResponse {
+  oneof result {
+    // JSON-encoded `PluginOutput` on success.
+    bytes output_json = 1;
+    // Structured failure.
+    ExecuteError error = 2;
+  }
+}
+
+message ExecuteError {
+  // Human-readable message, surfaced in the job status.
+  string message = 1;
+  // `true` → the worker retries the step according to the step's retry policy.
+  bool retryable = 2;
+}

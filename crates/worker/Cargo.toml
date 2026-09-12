@@ -1,9 +1,49 @@
 [package]
 name = "meili-ingest-worker"
+description = "Temporal worker: runs the PipelineWorkflow and dispatches execute_step activities to plugins."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "meili-ingest-worker"
+path = "src/main.rs"
+
 [dependencies]
+meili-ingest-plugin-sdk.workspace = true
+meili-ingest-router.workspace = true
+meili-ingest-blob.workspace = true
+meili-ingest-plugin-runtime.workspace = true
+meili-ingest-plugin-pdf.workspace = true
+meili-ingest-plugin-docx.workspace = true
+meili-ingest-plugin-xlsx.workspace = true
+meili-ingest-plugin-html.workspace = true
+meili-ingest-plugin-markdown.workspace = true
+meili-ingest-plugin-csv.workspace = true
+meili-ingest-plugin-json.workspace = true
+meili-ingest-plugin-chunker.workspace = true
+meili-ingest-plugin-meili-indexer.workspace = true
+meili-ingest-plugin-llm-enricher.workspace = true
+meili-ingest-plugin-image-captioner.workspace = true
+
+temporalio-sdk.workspace = true
+temporalio-client.workspace = true
+temporalio-common.workspace = true
+temporalio-macros.workspace = true
+temporalio-workflow.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+url.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true

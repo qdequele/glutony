@@ -290,7 +290,13 @@ impl BlobStore {
         http: &reqwest::Client,
     ) -> Result<PluginInput, BlobError> {
         match input {
-            PluginInput::Ref(r) => Ok(PluginInput::Bytes(self.fetch_ref(&r, http).await?)),
+            PluginInput::Ref(r) => {
+                // A staged reference may point at a *spilled step output* (JSON encoding
+                // of a `PluginOutput`) rather than at raw content: hydrate it back into
+                // documents instead of handing the plugin a blob of JSON bytes.
+                let resolved = self.resolve_output(PluginOutput::Ref(r), http).await?;
+                Ok(PluginInput::from(resolved))
+            }
             PluginInput::Many(outputs) => {
                 let mut resolved = Vec::with_capacity(outputs.len());
                 for output in outputs {
@@ -438,6 +444,34 @@ fn guess_mime(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn resolve_input_hydrates_a_spilled_output_reference() {
+        // A fan-out branch that was spilled comes back as PluginInput::Ref; resolving it
+        // must yield the original documents, not the JSON bytes of the spilled file.
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let docs = vec![
+            meili_ingest_plugin_sdk::Document::with_id("a", "x".repeat(200)),
+            meili_ingest_plugin_sdk::Document::with_id("b", "y".repeat(200)),
+        ];
+        let spilled = store
+            .spill_output(
+                job,
+                "step",
+                Some(0),
+                PluginOutput::Documents(docs.clone()),
+                16,
+            )
+            .await
+            .expect("spill");
+        assert!(matches!(spilled, PluginOutput::Ref(_)));
+        let resolved = store
+            .resolve_input(PluginInput::from(spilled), &reqwest::Client::new())
+            .await
+            .expect("resolve");
+        assert_eq!(resolved, PluginInput::Documents(docs));
+    }
+
     use super::*;
     use meili_ingest_plugin_sdk::Document;
     use wiremock::matchers::{method, path};

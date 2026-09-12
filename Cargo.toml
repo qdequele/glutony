@@ -73,6 +73,7 @@ temporalio-sdk = "1.0"
 temporalio-client = "1.0"
 temporalio-common = "1.0"
 temporalio-macros = "1.0"
+temporalio-workflow = "1.0"
 
 # database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }

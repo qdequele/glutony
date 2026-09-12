@@ -10,7 +10,7 @@ rust-version.workspace = true
 [features]
 default = []
 # Helpers for authoring WASM plugins with extism-pdk. Compile with `--target wasm32-wasip1`.
-wasm = ["dep:extism-pdk"]
+wasm = ["dep:extism-pdk", "dep:futures"]
 # Parse pipeline definitions written in YAML (pulls in serde_yaml).
 yaml = ["dep:serde_yaml"]
 
@@ -24,6 +24,7 @@ base64.workspace = true
 uuid.workspace = true
 tokio = { version = "1.47", default-features = false, features = ["sync"] }
 extism-pdk = { version = "1", optional = true }
+futures = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
