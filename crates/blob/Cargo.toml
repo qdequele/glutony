@@ -1,5 +1,6 @@
 [package]
 name = "meili-ingest-blob"
+description = "Blob store for meili-ingest: stages large uploads and spills oversized step outputs to object storage (S3, GCS, Azure, local FS, memory)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +8,19 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+meili-ingest-plugin-sdk.workspace = true
+object_store.workspace = true
+reqwest.workspace = true
+url.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+mime_guess.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock.workspace = true
+tempfile.workspace = true
