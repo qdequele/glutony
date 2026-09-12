@@ -22,7 +22,9 @@ mod embedded {
 
     /// The exported site. `ui/out` is produced by `pnpm build` in `ui/`.
     #[derive(Embed)]
-    #[folder = "$CARGO_MANIFEST_DIR/../../ui/out"]
+    // Relative to this crate's manifest directory, which is where rust-embed roots
+    // a non-absolute path.
+    #[folder = "../../ui/out"]
     struct Assets;
 
     /// Mount the UI at `/ui`, with a catch-all that falls back to the exported

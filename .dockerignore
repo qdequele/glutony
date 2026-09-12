@@ -15,3 +15,7 @@ blobs/
 .env.local
 *.log
 .DS_Store
+# UI build artefacts: the image builds the export itself.
+ui/node_modules
+ui/.next
+ui/out

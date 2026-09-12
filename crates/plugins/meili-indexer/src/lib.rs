@@ -231,29 +231,41 @@ impl Plugin for MeiliIndexerPlugin {
             .config_schema(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["host", "api_key", "index"],
+                // `host`, `api_key`, `index`, `project_id` and `region` are NOT listed
+                // as required and are marked `readOnly`: the workflow injects them from
+                // the tenant's MeiliContext just before the step runs. A pipeline author
+                // must never type them, least of all the API key, and a schema-driven
+                // editor is expected to skip `readOnly` properties rather than render an
+                // empty required field for a secret.
+                "required": [],
                 "properties": {
                     "host": {
                         "type": "string",
-                        "description": "Meilisearch base URL. Injected from the tenant MeiliContext; never read from env."
+                        "readOnly": true,
+                        "description": "Injected: Meilisearch base URL from the tenant MeiliContext. Never set this by hand."
                     },
                     "api_key": {
                         "type": "string",
-                        "description": "Meilisearch API key with documents.add / indexes.create rights. Injected from the tenant MeiliContext."
+                        "readOnly": true,
+                        "writeOnly": true,
+                        "description": "Injected: Meilisearch API key from the tenant MeiliContext. Never set this by hand."
                     },
                     "index": {
                         "type": "string",
-                        "description": "Target index uid, fully resolved by the gateway (SPEC §3.4)."
+                        "readOnly": true,
+                        "description": "Injected: target index uid, resolved by the gateway (SPEC §3.4). Set `trigger.index_pattern` on the pipeline instead."
                     },
                     "project_id": {
                         "type": ["string", "null"],
                         "default": null,
-                        "description": "Tenant id, for logging only."
+                        "readOnly": true,
+                        "description": "Injected: tenant id, for logging only."
                     },
                     "region": {
                         "type": ["string", "null"],
                         "default": null,
-                        "description": "Region tag, for logging only."
+                        "readOnly": true,
+                        "description": "Injected: region tag, for logging only."
                     },
                     "primary_key": {
                         "type": "string",
@@ -896,5 +908,38 @@ mod tests {
                 .iter()
                 .all(|r| r.method != "POST")
         );
+    }
+
+    #[test]
+    fn injected_context_fields_are_not_author_editable() {
+        // A pipeline editor generates its form from this schema. host/api_key/index
+        // come from the tenant context at runtime, so they must not be required (the
+        // author cannot know them) and must be flagged readOnly so no editor renders
+        // an input for a secret.
+        let m = MeiliIndexerPlugin::new().manifest();
+        let required = m.config_schema["required"]
+            .as_array()
+            .expect("required array");
+        assert!(
+            required.is_empty(),
+            "no config key should be author-required: {required:?}"
+        );
+        let props = m.config_schema["properties"]
+            .as_object()
+            .expect("properties");
+        for key in ["host", "api_key", "index", "project_id", "region"] {
+            assert_eq!(
+                props[key]["readOnly"],
+                serde_json::json!(true),
+                "{key} must be marked readOnly"
+            );
+        }
+        // Author-controlled knobs stay editable.
+        for key in ["primary_key", "batch_size"] {
+            assert!(
+                props[key].get("readOnly").is_none(),
+                "{key} should remain editable"
+            );
+        }
     }
 }

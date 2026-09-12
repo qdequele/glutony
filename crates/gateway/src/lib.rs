@@ -13,7 +13,7 @@ pub mod handlers;
 pub mod state;
 pub mod ui;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -22,9 +22,25 @@ use tower_http::trace::TraceLayer;
 pub use error::GatewayError;
 pub use state::{AppState, GatewayConfig, WorkflowStarter};
 
-/// `GET /health`.
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
+/// `GET /health` — liveness plus the facts a client needs to render itself.
+///
+/// Reports the tenant resolved from this very request, so the admin UI can show who
+/// it is acting as instead of guessing from the data it happens to have fetched. Also
+/// reports which optional features this deployment has, so the UI can present an
+/// honest "not enabled" state rather than an error.
+async fn health(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "project_id": context::resolve_project_id(&headers, &state.config),
+        "features": {
+            "usage_analytics": state.config.usage_api.is_some(),
+            "embedded_ui": ui::is_embedded(),
+        },
+    }))
 }
 
 /// Build the axum router with every route of SPEC §4 plus `GET /health`, the body
@@ -281,7 +297,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(json_body(resp).await["status"], "ok");
+        let body = json_body(resp).await;
+        assert_eq!(body["status"], "ok");
+        // The UI reads these to render the tenant and to hide features that are off.
+        assert_eq!(body["features"]["usage_analytics"], false);
+        assert!(body["project_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_tenant_from_trusted_headers() {
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            envoy_trusted_header: Some("shhh".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+        let resp = app
+            .oneshot(
+                Request::get("/health")
+                    .header("X-Meili-Envoy-Secret", "shhh")
+                    .header("X-Meili-Project-Id", "acme")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await["project_id"], "acme");
+    }
+
+    #[tokio::test]
+    async fn health_ignores_a_spoofed_tenant_header() {
+        // Same rule as everywhere else: without the shared secret the X-Meili-*
+        // headers are not trusted, so the UI cannot be tricked into showing another
+        // tenant's identity.
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            envoy_trusted_header: Some("shhh".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+        let resp = app
+            .oneshot(
+                Request::get("/health")
+                    .header("X-Meili-Project-Id", "attacker")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(json_body(resp).await["project_id"].is_null());
     }
 
     #[tokio::test]
@@ -293,5 +357,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "ui")]
+    #[tokio::test]
+    async fn embedded_ui_is_served_under_its_own_prefix() {
+        use axum::http::header;
+
+        let server = MockServer::start().await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+
+        // The shell.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("text/html"), "content type was {ct:?}");
+        let body = axum::body::to_bytes(resp.into_body(), 4_000_000)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("/ui/_next/"),
+            "assets must be prefixed with /ui"
+        );
+
+        // A client-side route survives a refresh.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/ui/pipelines/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The API is not shadowed by the UI: /pipelines still reaches the handler,
+        // which without a control plane fails upstream rather than returning HTML.
+        let resp = app
+            .oneshot(Request::get("/pipelines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            !ct.starts_with("text/html"),
+            "API route was shadowed by the UI"
+        );
     }
 }

@@ -14,8 +14,14 @@
 #
 # Dependencies are compiled in a separate cargo-chef layer so that editing
 # source code does not invalidate the (slow) dependency build.
+#
+# The admin UI is a Next.js static export built in its own stage and compiled into
+# the gateway binary (the `ui` cargo feature), so the runtime image carries no Node
+# and the browser talks to the API same-origin. For an API-only binary, build with
+# plain `cargo build` outside Docker: the `ui` feature is off by default.
 
 ARG RUST_VERSION=1.94
+ARG NODE_VERSION=22
 
 # ---------------------------------------------------------------------------
 # Stage 1: tooling
@@ -26,6 +32,21 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && cargo install cargo-chef --locked
 WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# Stage 2a: build the admin UI (static export)
+# ---------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-bookworm-slim AS ui
+WORKDIR /ui
+RUN corepack enable
+# Install from the lockfile first so a source-only change reuses this layer.
+COPY ui/package.json ui/pnpm-lock.yaml* ./
+RUN pnpm install --frozen-lockfile
+COPY ui/ ./
+# Mounted under /ui so the export never shadows the API routes, which share the
+# same names (/pipelines, /jobs, /plugins).
+ENV NEXT_PUBLIC_BASE_PATH=/ui
+RUN pnpm build && test -f out/index.html
 
 # ---------------------------------------------------------------------------
 # Stage 2: compute the dependency recipe
@@ -44,7 +65,10 @@ RUN cargo chef cook --release --workspace --recipe-path recipe.json
 # Now the real sources (proto/ and migrations/ are needed at compile time by
 # tonic-prost-build and sqlx::migrate!).
 COPY . .
-RUN cargo build --release --workspace --bins \
+# The exported UI must exist before cargo builds the gateway with `--features ui`,
+# because rust-embed reads ui/out at compile time.
+COPY --from=ui /ui/out ./ui/out
+RUN cargo build --release --workspace --bins --features meili-ingest-gateway/ui \
  && mkdir -p /out \
  && cp target/release/meili-ingest-gateway \
        target/release/meili-ingest-control-plane \
