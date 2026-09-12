@@ -99,6 +99,9 @@ pub fn app(state: AppState) -> Router {
             "/pipelines",
             get(pipelines::list_pipelines).post(pipelines::create_pipeline),
         )
+        // Registered before `/pipelines/{uid}` so the literal path wins over the
+        // wildcard and a pipeline can never be named "validate".
+        .route("/pipelines/validate", post(pipelines::validate_pipeline))
         .route(
             "/pipelines/{uid}",
             get(pipelines::get_pipeline).delete(pipelines::delete_pipeline),
@@ -106,6 +109,7 @@ pub fn app(state: AppState) -> Router {
         .route("/plugins", get(plugins::list_plugins))
         .route("/internal/plugins", post(plugins::register_plugins))
         .route("/internal/resolve", post(resolver::resolve))
+        .route("/jobs", get(jobs::list_jobs))
         .route("/internal/jobs", post(jobs::create_job))
         .route(
             "/internal/jobs/{job_id}",

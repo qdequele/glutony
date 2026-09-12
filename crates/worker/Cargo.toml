@@ -37,6 +37,7 @@ temporalio-client.workspace = true
 temporalio-common.workspace = true
 temporalio-macros.workspace = true
 temporalio-workflow.workspace = true
+temporalio-protos.workspace = true
 
 tokio.workspace = true
 futures.workspace = true

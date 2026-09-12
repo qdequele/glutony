@@ -34,6 +34,27 @@ pub const WORKFLOW_TYPE: &str = "PipelineWorkflow";
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Configuration of the read-side usage analytics API.
+#[derive(Clone)]
+pub struct UsageApiConfig {
+    /// Tinybird API base URL for the workspace's region.
+    pub base_url: String,
+    /// Read token. Held server-side only; never sent to a browser.
+    pub token: String,
+    /// Endpoint pipe name backing the dashboard.
+    pub pipe: String,
+}
+
+impl std::fmt::Debug for UsageApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageApiConfig")
+            .field("base_url", &self.base_url)
+            .field("pipe", &self.pipe)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Gateway configuration (SPEC §13 "Gateway" plus `BLOB_STORE_URL` and `INLINE_MAX_BYTES`).
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -61,6 +82,9 @@ pub struct GatewayConfig {
     /// Uploads up to this many bytes are inlined into the workflow input; bigger ones are
     /// staged in the blob store (`INLINE_MAX_BYTES`, default 1 MiB).
     pub inline_max_bytes: usize,
+    /// Read-side usage analytics API, when configured. Absent means `GET /usage`
+    /// answers 501 rather than failing.
+    pub usage_api: Option<UsageApiConfig>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -84,6 +108,7 @@ impl std::fmt::Debug for GatewayConfig {
             )
             .field("blob_store_url", &self.blob_store_url)
             .field("inline_max_bytes", &self.inline_max_bytes)
+            .field("usage_api", &self.usage_api)
             .finish()
     }
 }
@@ -102,6 +127,7 @@ impl Default for GatewayConfig {
             envoy_trusted_header: None,
             blob_store_url: "file://./blobs".into(),
             inline_max_bytes: 1_048_576,
+            usage_api: None,
         }
     }
 }
@@ -122,6 +148,15 @@ impl GatewayConfig {
             envoy_trusted_header: env_opt("ENVOY_TRUSTED_HEADER"),
             blob_store_url: env_or("BLOB_STORE_URL", &d.blob_store_url),
             inline_max_bytes: env_parse("INLINE_MAX_BYTES", d.inline_max_bytes)?,
+            // The dashboard proxy needs a READ token, which is a different token from
+            // the append token the workers use to write usage events.
+            usage_api: env_opt("TINYBIRD_READ_TOKEN").map(|token| UsageApiConfig {
+                base_url: env_or("TINYBIRD_BASE_URL", "https://api.tinybird.co")
+                    .trim_end_matches('/')
+                    .to_string(),
+                token,
+                pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
+            }),
         })
     }
 
@@ -559,6 +594,27 @@ impl ControlPlaneClient {
             "upsert pipeline",
         )
         .await
+    }
+
+    /// `POST /pipelines/validate` — dry run, persists nothing.
+    pub async fn validate_pipeline(
+        &self,
+        def: &PipelineDefinition,
+    ) -> Result<serde_json::Value, GatewayError> {
+        self.send_json(
+            self.http.post(self.url("/pipelines/validate")).json(def),
+            "validate pipeline",
+        )
+        .await
+    }
+
+    /// `GET /jobs?...` — one page of the denormalized job list.
+    pub async fn list_jobs(
+        &self,
+        query: &[(String, String)],
+    ) -> Result<serde_json::Value, GatewayError> {
+        self.send_json(self.http.get(self.url("/jobs")).query(query), "list jobs")
+            .await
     }
 
     /// `DELETE /pipelines/{uid}?project_id=`.

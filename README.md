@@ -252,7 +252,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-Requires Rust 1.94+ (the floor comes from `sqlx-postgres`) and `protoc`. DB-backed control-plane tests run when
+Requires Rust 1.94+ (the floor comes from `sqlx-postgres`). No `protoc` needed: the protobuf definitions are compiled in-process by `protox`. DB-backed control-plane tests run when
 `DATABASE_URL` is set.
 
 For a full-stack check, `scripts/e2e.sh` starts Postgres, Meilisearch and a

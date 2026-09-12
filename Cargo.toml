@@ -82,6 +82,9 @@ temporalio-client = "1.0"
 temporalio-common = "1.0"
 temporalio-macros = "1.0"
 temporalio-workflow = "1.0"
+# Pulled in only to turn on `vendored-protox`, which makes Temporal's build compile
+# its protos with the pure-Rust `protox` instead of shelling out to a `protoc` binary.
+temporalio-protos = { version = "0.9", features = ["vendored-protox"] }
 
 # database
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
@@ -95,6 +98,8 @@ meilisearch-sdk = "0.33"
 # detection / parsing
 infer = "0.22"
 mime_guess = "2"
+# Compiles the exported admin UI into the gateway binary (feature `ui`).
+rust-embed = { version = "8", features = ["mime-guess"] }
 globset = "0.4"
 regex = "1"
 serde_json_path = "0.7"
@@ -116,6 +121,9 @@ extism = "1.30"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+# Pure-Rust protobuf compiler: lets build scripts compile .proto files without a
+# `protoc` binary on the machine.
+protox = "0.9"
 prost = "0.14"
 
 # errors / logging

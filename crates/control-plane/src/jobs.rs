@@ -2,8 +2,8 @@
 //! gateway writes through here so status polls do not always hit Temporal.
 
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use meili_ingest_plugin_sdk::JobStatus;
@@ -202,6 +202,77 @@ pub async fn update_job(
         .await?
         .map(Json)
         .ok_or_else(|| CpError::NotFound(format!("job {job_id} not found")))
+}
+
+/// Filters accepted by [`list_jobs`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct JobListQuery {
+    /// Tenant scope. Falls back to the `X-Meili-Project-Id` header.
+    pub project_id: Option<String>,
+    /// Only jobs in this status.
+    pub status: Option<String>,
+    /// Only jobs started by this pipeline.
+    pub pipeline_uid: Option<String>,
+    /// Page size, 1..=200, default 50.
+    pub limit: Option<i64>,
+    /// Rows to skip, for paging.
+    pub offset: Option<i64>,
+}
+
+/// One page of jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobList {
+    /// The jobs, newest first.
+    pub jobs: Vec<JobRecord>,
+    /// Page size that was applied.
+    pub limit: i64,
+    /// Offset that was applied.
+    pub offset: i64,
+}
+
+/// `GET /jobs?project_id=&status=&pipeline_uid=&limit=&offset=` → newest first.
+///
+/// Reads the denormalized `jobs` table rather than Temporal: listing is a browsing
+/// operation and must not fan out gRPC calls per row. Individual job detail still
+/// comes from Temporal, which stays the source of truth for live status.
+pub async fn list_jobs(
+    State(state): State<AppState>,
+    Query(q): Query<JobListQuery>,
+    headers: HeaderMap,
+) -> Result<Json<JobList>, CpError> {
+    let project_id = crate::project_scope(q.project_id.as_deref(), &headers);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    // A single statement with NULL-tolerant predicates keeps the SQL static, which
+    // sqlx 0.9 requires, and lets Postgres use the (project_id, started_at) index.
+    let rows: Vec<JobRow> = sqlx::query_as(
+        "SELECT job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
+                current_step, error, started_at, updated_at \
+         FROM jobs \
+         WHERE ($1::text IS NULL OR project_id = $1) \
+           AND ($2::text IS NULL OR status = $2) \
+           AND ($3::text IS NULL OR pipeline_uid = $3) \
+         ORDER BY started_at DESC \
+         LIMIT $4 OFFSET $5",
+    )
+    .bind(project_id.as_deref())
+    .bind(q.status.as_deref())
+    .bind(q.pipeline_uid.as_deref())
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let jobs = rows
+        .into_iter()
+        .map(JobRecord::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(JobList {
+        jobs,
+        limit,
+        offset,
+    }))
 }
 
 /// `GET /internal/jobs/{job_id}` → `JobRecord` | 404.

@@ -15,6 +15,12 @@ path = "src/main.rs"
 name = "meili_ingest_gateway"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Compile the Next.js static export at `ui/out` into the binary and serve it at /ui.
+# Requires `pnpm build` in `ui/` first; without the feature the gateway is API-only.
+ui = ["dep:rust-embed"]
+
 [dependencies]
 # internal
 meili-ingest-plugin-sdk.workspace = true
@@ -45,6 +51,8 @@ temporalio-common.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 mime_guess.workspace = true
+# Only pulled in with the `ui` feature: embeds the exported admin UI.
+rust-embed = { workspace = true, optional = true }
 
 # errors / logging
 anyhow.workspace = true

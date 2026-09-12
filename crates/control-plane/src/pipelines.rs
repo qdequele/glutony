@@ -205,6 +205,51 @@ pub async fn list_pipelines(
     Ok(Json(out))
 }
 
+/// Result of a dry-run validation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidationResult {
+    /// Always `true`; a rejected pipeline is returned as a 422 error instead.
+    pub valid: bool,
+    /// Topological execution order of the steps.
+    pub order: Vec<String>,
+    /// The definition after normalization, so a caller can see the `depends_on`
+    /// links that the implicit sequential rule filled in.
+    pub normalized: PipelineDefinition,
+}
+
+/// `POST /pipelines/validate` → 200, or 422/403 with the same errors a create would
+/// produce. Persists nothing.
+///
+/// Exists so an editor can tell the author their pipeline has a cycle, an unknown
+/// plugin or a bad fan-out *before* saving. It runs the identical code path as
+/// [`create_pipeline`] so the two can never disagree.
+pub async fn validate_pipeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    JsonBody(mut def): JsonBody<PipelineDefinition>,
+) -> Result<Json<ValidationResult>, CpError> {
+    prepare_definition(&mut def)?;
+    def.project_id = project_scope(def.project_id.as_deref(), &headers);
+
+    let statically_unknown = unknown_plugins(&def, &[]);
+    if !statically_unknown.is_empty() {
+        let registered = state.pipelines().registered_plugin_names().await?;
+        let unknown = unknown_plugins(&def, &registered);
+        if !unknown.is_empty() {
+            return Err(unknown_plugin_error(&unknown));
+        }
+    }
+
+    let order = def
+        .validate()
+        .map_err(|e| CpError::Validation(e.to_string()))?;
+    Ok(Json(ValidationResult {
+        valid: true,
+        order,
+        normalized: def,
+    }))
+}
+
 /// `POST /pipelines` → 201 with the stored definition.
 ///
 /// Normalizes and validates the body (422 `validation`), rejects the `builtin.`

@@ -97,6 +97,24 @@ pub async fn list_pipelines(
     ))
 }
 
+/// `POST /pipelines/validate` — check a definition without saving it.
+///
+/// Accepts the same YAML or JSON body as `POST /pipelines` and returns the control
+/// plane's verdict, so an editor can surface cycles, unknown plugins and bad fan-out
+/// while the author is still typing.
+pub async fn validate_pipeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, GatewayError> {
+    let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
+    let mut def = parse_pipeline(&body, content_type)?;
+    if let Some(project_id) = resolve_project_id(&headers, &state.config) {
+        def.project_id = Some(project_id);
+    }
+    Ok(Json(state.control_plane.validate_pipeline(&def).await?))
+}
+
 /// `GET /pipelines/{name}`.
 pub async fn get_pipeline(
     State(state): State<AppState>,

@@ -11,6 +11,7 @@ pub mod error;
 pub mod extract;
 pub mod handlers;
 pub mod state;
+pub mod ui;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
@@ -38,17 +39,25 @@ pub fn router(state: AppState) -> Router {
             "/ingest/pipeline/{name}",
             post(handlers::pipeline::ingest_with_pipeline),
         )
+        .route("/jobs", get(handlers::jobs::list_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))
         .route(
             "/pipelines",
             get(handlers::pipelines::list_pipelines).post(handlers::pipelines::create_pipeline),
         )
+        // Before the `{name}` route so the literal path wins.
+        .route(
+            "/pipelines/validate",
+            post(handlers::pipelines::validate_pipeline),
+        )
         .route(
             "/pipelines/{name}",
             get(handlers::pipelines::get_pipeline).delete(handlers::pipelines::delete_pipeline),
         )
         .route("/plugins", get(handlers::plugins::list_plugins))
+        .route("/usage", get(handlers::usage::get_usage))
+        .merge(ui::router())
         .layer(DefaultBodyLimit::max(limit))
         .layer(RequestBodyLimitLayer::new(limit))
         .layer(TraceLayer::new_for_http())

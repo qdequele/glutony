@@ -37,6 +37,9 @@ pub enum GatewayError {
     /// A pipeline definition failed validation (422).
     #[error("invalid pipeline: {0}")]
     Invalid(String),
+    /// A feature is not configured on this deployment (501).
+    #[error("{0}")]
+    NotImplemented(String),
     /// Control plane or Temporal unreachable / returned an unexpected error (502).
     #[error("upstream error: {0}")]
     Upstream(String),
@@ -57,6 +60,7 @@ impl GatewayError {
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             GatewayError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             GatewayError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            GatewayError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             GatewayError::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -72,6 +76,7 @@ impl GatewayError {
             GatewayError::TooLarge(_) => "payload_too_large",
             GatewayError::Unsupported(_) => "unsupported_media_type",
             GatewayError::Invalid(_) => "invalid_pipeline",
+            GatewayError::NotImplemented(_) => "not_configured",
             GatewayError::Upstream(_) => "upstream_error",
             GatewayError::Internal(_) => "internal_error",
         }

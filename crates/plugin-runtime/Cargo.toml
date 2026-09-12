@@ -12,7 +12,7 @@ default = ["wasm", "grpc"]
 # WASM plugins loaded with extism/wasmtime (`WasmPlugin`).
 wasm = ["dep:extism"]
 # Remote plugin containers called over gRPC (`GrpcPlugin`, `proto/plugin.proto`).
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tonic-prost-build"]
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tonic-prost-build", "dep:protox"]
 
 [dependencies]
 meili-ingest-plugin-sdk.workspace = true
@@ -29,6 +29,9 @@ prost = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true, optional = true }
+# Compiles plugin.proto in-process, so building this crate needs no `protoc`.
+protox = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

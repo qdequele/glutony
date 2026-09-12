@@ -6,12 +6,13 @@
 //! knows the workflow.
 
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::context::resolve_project_id;
 use crate::error::GatewayError;
 use crate::state::{AppState, JobRecord, JobUpdate};
 
@@ -51,6 +52,27 @@ pub struct CancelResponse {
 fn parse_job_id(id: &str) -> Result<Uuid, GatewayError> {
     Uuid::parse_str(id.trim())
         .map_err(|_| GatewayError::BadRequest(format!("invalid job id {id:?}: expected a UUID")))
+}
+
+/// `GET /jobs?status=&pipeline_uid=&limit=&offset=` — recent jobs, newest first.
+///
+/// Scoped to the caller's tenant: the `project_id` filter is taken from the resolved
+/// context, never from the query string, so one tenant cannot list another's jobs.
+pub async fn list_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, GatewayError> {
+    let mut query: Vec<(String, String)> = Vec::new();
+    for key in ["status", "pipeline_uid", "limit", "offset"] {
+        if let Some(v) = params.get(key) {
+            query.push((key.to_string(), v.clone()));
+        }
+    }
+    if let Some(project_id) = resolve_project_id(&headers, &state.config) {
+        query.push(("project_id".to_string(), project_id));
+    }
+    Ok(Json(state.control_plane.list_jobs(&query).await?))
 }
 
 /// `GET /jobs/{id}`.
