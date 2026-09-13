@@ -321,12 +321,20 @@ Create is not atomic across Postgres and Temporal. The row is written first with
 two leaves a paused source with no schedule, which is visible and repairable, rather
 than a schedule firing against a row that does not exist.
 
-**A source's pipeline may be deleted underneath it.** `DELETE /pipelines/{uid}` returns
-`409` when any source references it, listing the source uids. Forcing the delete is not
-offered in v1 — the alternative, letting every tick fail at `load_source`, turns one
-explicit error into a recurring silent one. `load_source` still handles the missing-
-pipeline case (row deleted directly in SQL, say) by recording a `failed` run with a
-clear message rather than retrying forever.
+**A source's pipeline may be deleted underneath it.** `DELETE /pipelines/{uid}` is
+**never blocked** — its behaviour is unchanged from today. Deleting a pipeline cascades
+to *archive* every source that references it: the Temporal Schedule is deleted so nothing
+fires again, and the row is stamped `archived_at` with its sealed `meili_ctx` and
+`fetch_auth` retained.
+
+Archive rather than cascade-delete because the source row holds credentials a tenant
+supplied by hand; destroying them as a side effect of an unrelated pipeline delete is
+not recoverable, whereas an archived source can be repointed at a new pipeline and
+unarchived. Archived sources are excluded from `GET /sources` unless
+`?include_archived=true`, and never fire.
+
+`load_source` still handles a genuinely missing pipeline (a row deleted directly in SQL,
+say) by recording a `failed` run with a clear message rather than retrying forever.
 
 ## UI
 
