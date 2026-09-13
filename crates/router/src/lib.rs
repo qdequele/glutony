@@ -80,6 +80,8 @@ pub mod mime {
     pub const MKV: &str = "video/x-matroska";
 }
 
+pub mod catalog;
+
 /// Collapse the common spellings of a media type onto one canonical name.
 ///
 /// Detection libraries, browsers and CLI tools disagree: `infer` reports a RIFF/WAVE
