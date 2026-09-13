@@ -442,19 +442,19 @@ pub fn default_retry() -> RetryConfig {
 }
 
 /// A built-in step with the default retry policy.
-fn step(id: &str, plugin: &str) -> StepDefinition {
+pub(crate) fn step(id: &str, plugin: &str) -> StepDefinition {
     let mut s = StepDefinition::new(id, plugin);
     s.retry = Some(default_retry());
     s
 }
 
 /// The `chunk` step with the default chunker config.
-fn chunk_step() -> StepDefinition {
+pub(crate) fn chunk_step() -> StepDefinition {
     step("chunk", "chunker").config(default_chunker_config())
 }
 
 /// The terminal `index` step.
-fn index_step() -> StepDefinition {
+pub(crate) fn index_step() -> StepDefinition {
     step("index", INDEXER_PLUGIN)
 }
 

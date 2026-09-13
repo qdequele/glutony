@@ -359,9 +359,164 @@ fn actions() -> Vec<ActionEntry> {
     ]
 }
 
-/// Replaced by the real table in Task 2.
+/// Terse constructor for a built-in workflow entry. Built-ins never carry an
+/// inline definition — `GET /pipelines` is authoritative for anything deployed.
+fn builtin_workflow(
+    suffix: &str,
+    title: &str,
+    category: WorkflowCategory,
+    summary: &str,
+    when_to_use: &str,
+) -> WorkflowEntry {
+    WorkflowEntry {
+        uid: format!("builtin.{suffix}"),
+        title: title.to_owned(),
+        category,
+        summary: summary.to_owned(),
+        when_to_use: when_to_use.to_owned(),
+        definition: None,
+    }
+}
+
+/// Every workflow the system ships with, in built-in table order.
 fn workflows() -> Vec<WorkflowEntry> {
-    vec![]
+    use WorkflowCategory::*;
+    vec![
+        builtin_workflow(
+            "pdf",
+            "PDF",
+            Documents,
+            "Extract text per page, chunk it, index it.",
+            "The default for any PDF. Page-level extraction keeps hits traceable to a page number.",
+        ),
+        builtin_workflow(
+            "word",
+            "Word",
+            Documents,
+            "Extract text from .doc and .docx, chunk it, index it.",
+            "Word documents of any length; the chunk step keeps long reports retrievable.",
+        ),
+        builtin_workflow(
+            "powerpoint",
+            "PowerPoint",
+            Documents,
+            "Extract slide text and index it.",
+            "Decks, where each slide is short enough that chunking would only add noise.",
+        ),
+        builtin_workflow(
+            "markdown",
+            "Markdown",
+            Documents,
+            "Split on headings and index each section.",
+            "Documentation and READMEs, where headings are better boundaries than a fixed chunk size.",
+        ),
+        builtin_workflow(
+            "text",
+            "Plain text",
+            Documents,
+            "Chunk plain text and index it.",
+            "Logs, transcripts and anything with no structure to exploit.",
+        ),
+        builtin_workflow(
+            "excel",
+            "Excel",
+            Data,
+            "One document per spreadsheet row.",
+            "Tabular data where each row is a thing people search for, like a product or an order.",
+        ),
+        builtin_workflow(
+            "csv",
+            "CSV",
+            Data,
+            "One document per row, delimiter sniffed automatically.",
+            "Exports from another system, when you would rather not convert the file first.",
+        ),
+        builtin_workflow(
+            "json",
+            "JSON",
+            Data,
+            "Flatten nested JSON and index it.",
+            "API dumps, where nested fields need flattening before they can be filtered on.",
+        ),
+        builtin_workflow(
+            "parquet",
+            "Parquet",
+            Data,
+            "Read columnar Parquet rows and index them.",
+            "Analytics and warehouse exports, without a conversion step.",
+        ),
+        builtin_workflow(
+            "avro",
+            "Avro",
+            Data,
+            "Read Avro container files using the embedded schema.",
+            "Archived event streams, where the file carries its own schema.",
+        ),
+        builtin_workflow(
+            "msgpack",
+            "MessagePack",
+            Data,
+            "Decode MessagePack records and index them.",
+            "Compact binary exports from a MessagePack producer.",
+        ),
+        builtin_workflow(
+            "image",
+            "Image",
+            Media,
+            "Caption the image with a vision model, then index the caption.",
+            "Photo and product libraries you want to search with words.",
+        ),
+        builtin_workflow(
+            "audio",
+            "Audio",
+            Media,
+            "Transcribe speech, chunk the transcript, index it.",
+            "Podcasts, calls and any recording where the words are the content.",
+        ),
+        builtin_workflow(
+            "video",
+            "Video",
+            Media,
+            "Demux the audio, transcribe it, chunk and index.",
+            "Recorded meetings and video libraries, searched by what is said in them.",
+        ),
+        builtin_workflow(
+            "html",
+            "HTML",
+            Web,
+            "Strip boilerplate, chunk the readable body, index it.",
+            "Crawled pages and documentation sites, without the navigation polluting results.",
+        ),
+        // The one curated template: a recipe nothing deploys, so it carries its
+        // definition inline. It is what exercises the `Some(definition)` half of
+        // `WorkflowEntry` and the clone path in Task 11.
+        WorkflowEntry {
+            uid: "pdf-with-enrichment".to_owned(),
+            title: "PDF with LLM enrichment".to_owned(),
+            category: Documents,
+            summary: "Extract per page, chunk, enrich each chunk with an LLM, index.".to_owned(),
+            when_to_use:
+                "Contract and report libraries where generated summaries and keywords make search results readable."
+                    .to_owned(),
+            definition: Some(PipelineDefinition {
+                uid: "pdf-with-enrichment".to_owned(),
+                name: "PDF with LLM enrichment".to_owned(),
+                description: Some("Extract, chunk, enrich, index.".to_owned()),
+                version: 1,
+                trigger: None,
+                steps: vec![
+                    crate::step("extract", "pdf_extractor"),
+                    crate::chunk_step(),
+                    crate::step("enrich", "llm_enricher")
+                        .depends_on(["chunk"])
+                        .fan_out("$.documents"),
+                    crate::index_step(),
+                ],
+                builtin: false,
+                project_id: None,
+            }),
+        },
+    ]
 }
 
 /// The curated catalog served by `GET /catalog`.
@@ -414,6 +569,73 @@ mod tests {
                 entry.example_step.contains(&entry.plugin),
                 "{}'s example step does not name the plugin",
                 entry.plugin
+            );
+        }
+    }
+
+    use crate::builtin_pipelines;
+
+    #[test]
+    fn every_builtin_pipeline_has_a_workflow_entry() {
+        let workflows = catalog().workflows;
+        for pipeline in builtin_pipelines() {
+            let count = workflows.iter().filter(|w| w.uid == pipeline.uid).count();
+            assert_eq!(
+                count, 1,
+                "built-in `{}` has {count} catalog entries, want 1",
+                pipeline.uid
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_entries_carry_no_inline_definition() {
+        // `GET /pipelines` stays authoritative for anything deployed; an inline
+        // copy here would be a second source of truth that silently goes stale.
+        for entry in catalog().workflows {
+            if entry.uid.starts_with("builtin.") {
+                assert!(
+                    entry.definition.is_none(),
+                    "{} duplicates a deployed definition",
+                    entry.uid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn template_entries_carry_a_usable_definition() {
+        for entry in catalog().workflows {
+            if entry.uid.starts_with("builtin.") {
+                continue;
+            }
+            let def = entry
+                .definition
+                .as_ref()
+                .unwrap_or_else(|| panic!("template {} has no definition", entry.uid));
+            assert_eq!(def.uid, entry.uid, "{} definition uid disagrees", entry.uid);
+            assert!(!def.steps.is_empty(), "{} has no steps", entry.uid);
+            for step in &def.steps {
+                assert!(
+                    ALL_KNOWN_PLUGINS.contains(&step.plugin.as_str()),
+                    "template {} step `{}` names unknown plugin `{}`",
+                    entry.uid,
+                    step.id,
+                    step.plugin
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_workflow_entry_has_copy() {
+        for entry in catalog().workflows {
+            assert!(!entry.title.is_empty(), "{} has no title", entry.uid);
+            assert!(!entry.summary.is_empty(), "{} has no summary", entry.uid);
+            assert!(
+                !entry.when_to_use.is_empty(),
+                "{} has no when_to_use",
+                entry.uid
             );
         }
     }
