@@ -27,6 +27,25 @@ TINYBIRD_PORT=${TINYBIRD_PORT:-58123}
 WORK="${ROOT}/.dev-stack"
 mkdir -p "$WORK"
 
+# Refuse to run twice. Two instances would fight over the same ports, and — worse —
+# the one shutting down used to delete the containers the other had just created,
+# leaving a stack that looks healthy while every request 502s.
+LOCK="${WORK}/dev-stack.pid"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "another dev stack is already running (pid $(cat "$LOCK")). Stop it first:" >&2
+  echo "  kill $(cat "$LOCK")" >&2
+  exit 1
+fi
+echo $$ > "$LOCK"
+
+# Containers are named per instance and torn down by the id captured at creation,
+# so a stale shutdown can never remove a newer run's infrastructure.
+STAMP="$$"
+PG_NAME="mi-dev-pg-${STAMP}"
+MEILI_NAME="mi-dev-meili-${STAMP}"
+PG_CID=""
+MEILI_CID=""
+
 export DATABASE_URL="postgres://postgres:dev@localhost:${PG_PORT}/postgres"
 export TEMPORAL_URL="http://localhost:${TEMPORAL_PORT}"
 export TEMPORAL_NAMESPACE=default
@@ -48,7 +67,10 @@ cleanup() {
   echo ""
   echo "--- stopping"
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-  docker rm -f mi-dev-pg mi-dev-meili >/dev/null 2>&1
+  # By id, never by name: this instance only removes what it created.
+  [ -n "$PG_CID" ] && docker rm -f "$PG_CID" >/dev/null 2>&1
+  [ -n "$MEILI_CID" ] && docker rm -f "$MEILI_CID" >/dev/null 2>&1
+  [ "$(cat "$LOCK" 2>/dev/null)" = "$$" ] && rm -f "$LOCK"
   echo "stopped. Data in ${WORK} is kept; delete it to start clean."
 }
 trap cleanup EXIT INT TERM
@@ -82,10 +104,10 @@ fi
 cargo build -q $UI_FEATURES --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
 
 echo "--- infrastructure"
-docker rm -f mi-dev-pg mi-dev-meili >/dev/null 2>&1 || true
-docker run -d --rm --name mi-dev-pg -p "${PG_PORT}:5432" -e POSTGRES_PASSWORD=dev postgres:17-alpine >/dev/null
-docker run -d --rm --name mi-dev-meili -p "${MEILI_PORT}:7700" \
-  -e MEILI_MASTER_KEY=masterKey -e MEILI_NO_ANALYTICS=true getmeili/meilisearch:v1.15 >/dev/null
+PG_CID=$(docker run -d --rm --name "$PG_NAME" -p "${PG_PORT}:5432" \
+  -e POSTGRES_PASSWORD=dev postgres:17-alpine)
+MEILI_CID=$(docker run -d --rm --name "$MEILI_NAME" -p "${MEILI_PORT}:7700" \
+  -e MEILI_MASTER_KEY=masterKey -e MEILI_NO_ANALYTICS=true getmeili/meilisearch:v1.15)
 temporal server start-dev --port "${TEMPORAL_PORT}" --ui-port "${TEMPORAL_UI_PORT}" \
   --db-filename "${WORK}/temporal.db" --log-level warn >"${WORK}/temporal.log" 2>&1 &
 PIDS+=($!)
@@ -93,7 +115,7 @@ python3 scripts/fake_tinybird.py "${TINYBIRD_PORT}" >"${WORK}/tinybird.log" 2>&1
 PIDS+=($!)
 
 wait_for "${MEILI_URL}/health" meilisearch
-for _ in $(seq 1 60); do docker exec mi-dev-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 60); do docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
 echo "  postgres ready"
 for _ in $(seq 1 60); do temporal operator cluster health --address "localhost:${TEMPORAL_PORT}" >/dev/null 2>&1 && break; sleep 1; done
 echo "  temporal ready"
@@ -169,5 +191,18 @@ cat <<BANNER
 
 BANNER
 
-# Stay up until interrupted.
-while true; do sleep 3600; done
+# Stay up until interrupted, but notice if something dies underneath us: a stack
+# that has lost its database should say so, not sit there answering 502s.
+while true; do
+  sleep 15
+  for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "a stack process (pid $pid) exited; check ${WORK}/*.log" >&2
+      exit 1
+    fi
+  done
+  if ! docker inspect -f '{{.State.Running}}' "$PG_CID" >/dev/null 2>&1; then
+    echo "the postgres container disappeared; check ${WORK}/*.log" >&2
+    exit 1
+  fi
+done
