@@ -62,8 +62,9 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::warn!("usage analytics disabled (TINYBIRD_TOKEN is not set)"),
     }
 
-    let activities =
-        StepActivities::new(registry, blob, config.payload_spill_bytes).with_usage(usage);
+    let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
+        .with_usage(usage)
+        .with_control_plane(config.control_plane_url.clone());
     let tuner = TunerHolder::builder()
         .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(50))
         .activity_task_slot_supplier(FixedSizeSlotSupplier::new(config.max_concurrent_activities))

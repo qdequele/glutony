@@ -148,10 +148,15 @@ pub async fn update_job_row(
     job_id: Uuid,
     upd: &JobUpdate,
 ) -> Result<Option<JobRecord>, CpError> {
+    // Invariant enforced here rather than trusted from the caller: a job that
+    // succeeded is not "on" a step, so the last running value must not stick and make
+    // the job list read "succeeded, extract". Failed and cancelled jobs keep it,
+    // because where they stopped is exactly what an operator wants to see.
+    let clear_step = upd.status == Some(JobStatus::Succeeded);
     let row: Option<JobRow> = sqlx::query_as(
         "UPDATE jobs SET \
             status = COALESCE($2, status), \
-            current_step = COALESCE($3, current_step), \
+            current_step = CASE WHEN $6 THEN NULL ELSE COALESCE($3, current_step) END, \
             error = COALESCE($4, error), \
             index_name = COALESCE($5, index_name), \
             updated_at = now() \
@@ -164,6 +169,7 @@ pub async fn update_job_row(
     .bind(upd.current_step.as_deref())
     .bind(upd.error.as_deref())
     .bind(upd.index_name.as_deref())
+    .bind(clear_step)
     .fetch_optional(pool)
     .await?;
     row.map(JobRecord::try_from).transpose()

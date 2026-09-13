@@ -367,7 +367,19 @@ mod tests {
         let server = MockServer::start().await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
 
-        // The shell.
+        // The shell, under both spellings a human might type.
+        for path in ["/ui", "/ui/"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} did not serve the shell"
+            );
+        }
         let resp = app
             .clone()
             .oneshot(Request::get("/ui").body(Body::empty()).unwrap())

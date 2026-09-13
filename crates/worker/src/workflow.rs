@@ -31,7 +31,7 @@ use temporalio_sdk::{
     WorkflowTermination,
 };
 
-use crate::activity::{FanOutActivityInput, StepActivities};
+use crate::activity::{FanOutActivityInput, JobStartedInput, StepActivities};
 use crate::dag::{FanOut, fan_out_branches, ready_steps, resolve_input, retry_params};
 
 /// Upper bound on parallel activities scheduled by one fan-out step (keeps the
@@ -79,6 +79,27 @@ impl PipelineWorkflow {
         // Workflow time, not the wall clock: workflow code must stay deterministic on
         // replay, and this is the value Temporal records in history.
         let started_at = ctx.workflow_time();
+
+        // Tell the control plane the job is running, so the job list does not show
+        // "queued" for work that is already under way. Best effort: a failure here
+        // must not fail the ingest.
+        let started_input = JobStartedInput {
+            job_id: input.job_id,
+            current_step: order.first().cloned(),
+        };
+        if let Err(e) = ctx
+            .execute_activity(
+                StepActivities::record_job_started,
+                started_input,
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+                    .task_queue("workers-general".to_string())
+                    .retry_policy(RetryPolicy::builder().maximum_attempts(3).build())
+                    .build(),
+            )
+            .await
+        {
+            tracing::warn!(job_id = %input.job_id, error = %e, "could not mark the job running");
+        }
 
         let mut done: HashMap<String, PluginOutput> = HashMap::new();
         let mut index_report: Option<IndexReport> = None;

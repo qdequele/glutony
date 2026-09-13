@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use meili_ingest_blob::BlobStore;
 use meili_ingest_plugin_sdk::{
-    ActivityContext as PluginContext, PluginError, PluginInput, PluginOutput, StepActivityInput,
-    StepActivityOutput,
+    ActivityContext as PluginContext, JobStatus, PluginError, PluginInput, PluginOutput,
+    StepActivityInput, StepActivityOutput,
 };
 use meili_ingest_usage::{JobUsageInput, UsageClient, events_for_job};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,16 @@ pub struct FanOutActivityInput {
     pub max_branches: usize,
 }
 
+/// Input of the `record_job_started` activity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobStartedInput {
+    /// Job id.
+    pub job_id: Uuid,
+    /// First step about to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<String>,
+}
+
 /// Output of the `expand_fan_out` activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FanOutActivityOutput {
@@ -63,6 +73,8 @@ pub struct StepActivities {
     pub spill_threshold: usize,
     /// Analytics client, absent when usage reporting is not configured.
     pub usage: Option<UsageClient>,
+    /// Control plane base URL, used to keep the job row's status honest.
+    pub control_plane_url: Option<String>,
 }
 
 impl StepActivities {
@@ -74,6 +86,7 @@ impl StepActivities {
             http: reqwest::Client::new(),
             spill_threshold,
             usage: None,
+            control_plane_url: None,
         }
     }
 
@@ -81,6 +94,57 @@ impl StepActivities {
     pub fn with_usage(mut self, usage: Option<UsageClient>) -> Self {
         self.usage = usage;
         self
+    }
+
+    /// Attach the control plane, so the workflow can write the job's status back.
+    pub fn with_control_plane(mut self, url: Option<String>) -> Self {
+        self.control_plane_url = url.map(|u| u.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Patch the cached job row. Returns `Ok(false)` when no control plane is
+    /// configured, and an error only when the request itself failed.
+    async fn patch_job(
+        &self,
+        job_id: Uuid,
+        status: JobStatus,
+        current_step: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool, PluginError> {
+        let Some(base) = &self.control_plane_url else {
+            return Ok(false);
+        };
+        let url = format!("{base}/internal/jobs/{job_id}");
+        let mut body = serde_json::Map::new();
+        body.insert("status".into(), serde_json::json!(status.as_str()));
+        if let Some(step) = current_step {
+            body.insert("current_step".into(), serde_json::json!(step));
+        }
+        if let Some(err) = error {
+            // The column is a summary for operators, not a full stack trace.
+            let truncated: String = err.chars().take(1000).collect();
+            body.insert("error".into(), serde_json::json!(truncated));
+        }
+        let resp = self
+            .http
+            .patch(&url)
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // The gateway failed to insert the row (best effort at submit time).
+            // Nothing to update and retrying will not create it.
+            tracing::warn!(job_id = %job_id, "no cached job row to update");
+            return Ok(false);
+        }
+        if !resp.status().is_success() {
+            return Err(PluginError::Retryable(format!(
+                "control plane rejected the job status update: {}",
+                resp.status()
+            )));
+        }
+        Ok(true)
     }
 
     /// Run one plugin invocation without Temporal (used by tests and the CLI).
@@ -310,12 +374,20 @@ impl StepActivities {
         _ctx: ActivityContext,
         input: JobUsageInput,
     ) -> Result<(), ActivityError> {
+        let job_id = input.job_id;
+
+        // Write the outcome back to the cached job row first. Without this the job
+        // list shows "queued" for finished work until someone opens that job, because
+        // the gateway only refreshes a row when it serves that job's detail.
+        self.patch_job(job_id, input.status, None, input.error.clone())
+            .await
+            .map_err(to_activity_error)?;
+
         let Some(client) = &self.usage else {
-            // Usage reporting is not configured; nothing to do and nothing to retry.
+            // Usage reporting is off; the status write above still happened.
             return Ok(());
         };
         let events = events_for_job(&input);
-        let job_id = input.job_id;
         match client.send(&events).await {
             Ok(()) => {
                 tracing::info!(job_id = %job_id, events = events.len(), "usage recorded");
@@ -328,6 +400,22 @@ impl StepActivities {
                 ApplicationFailure::non_retryable(anyhow::anyhow!("usage rejected: {e}")),
             )),
         }
+    }
+
+    /// Mark a job as running in the cached job row.
+    ///
+    /// Separate from [`StepActivities::record_usage`] because it fires at the start of
+    /// the workflow, when there is nothing to meter yet.
+    #[activity]
+    pub async fn record_job_started(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: JobStartedInput,
+    ) -> Result<(), ActivityError> {
+        self.patch_job(input.job_id, JobStatus::Running, input.current_step, None)
+            .await
+            .map(|_| ())
+            .map_err(to_activity_error)
     }
 }
 

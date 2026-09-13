@@ -31,7 +31,11 @@ mod embedded {
     /// `index.html` so client-side routes survive a refresh.
     pub fn router() -> Router<crate::state::AppState> {
         Router::new()
+            // Both spellings: `{*path}` does not match an empty segment, so without
+            // the explicit "/ui/" route the trailing-slash URL people actually type
+            // (and that the dev banner prints) would 404.
             .route("/ui", get(|| async { serve("index.html") }))
+            .route("/ui/", get(|| async { serve("index.html") }))
             .route(
                 "/ui/{*path}",
                 get(|Path(path): Path<String>| async move { serve(&path) }),

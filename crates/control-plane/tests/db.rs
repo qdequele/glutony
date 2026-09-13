@@ -457,6 +457,7 @@ async fn jobs_insert_patch_get() {
     assert_eq!(status, StatusCode::OK);
     let patched: JobRecord = json(&body);
     assert_eq!(patched.status, JobStatus::Running);
+    // A failed job keeps the step it stopped on: that is the diagnostic.
     assert_eq!(patched.current_step.as_deref(), Some("extract"));
     assert_eq!(patched.index_name.as_deref(), Some("documents"));
     assert!(patched.updated_at >= stored.updated_at);
@@ -475,6 +476,7 @@ async fn jobs_insert_patch_get() {
     let patched: JobRecord = json(&body);
     assert_eq!(patched.status, JobStatus::Failed);
     assert_eq!(patched.error.as_deref(), Some("boom"));
+    // A failed job keeps the step it stopped on: that is the diagnostic.
     assert_eq!(patched.current_step.as_deref(), Some("extract"));
 
     let (status, body) = call(app(state.clone()), get(&format!("/internal/jobs/{id}"))).await;
@@ -501,6 +503,63 @@ async fn jobs_insert_patch_get() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn terminal_status_clears_the_current_step() {
+    // A job that succeeded is not "on" a step. The worker patches the terminal status
+    // without naming one, so this has to hold server-side or the last running value
+    // sticks and the job list reads "succeeded, extract". A failed job is different:
+    // it keeps the step it stopped on, asserted in jobs_insert_patch_get.
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let job = JobRecord {
+        job_id: id,
+        workflow_id: format!("ingest-{id}"),
+        pipeline_uid: "builtin.pdf".into(),
+        project_id: None,
+        index_name: Some("documents".into()),
+        status: JobStatus::Queued,
+        current_step: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+    };
+    let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let running = JobUpdate {
+        status: Some(JobStatus::Running),
+        current_step: Some("extract".into()),
+        ..JobUpdate::default()
+    };
+    let (_, body) = call(
+        app(state.clone()),
+        req_json("PATCH", &format!("/internal/jobs/{id}"), &running),
+    )
+    .await;
+    let stored: JobRecord = json(&body);
+    assert_eq!(stored.current_step.as_deref(), Some("extract"));
+
+    let done = JobUpdate {
+        status: Some(JobStatus::Succeeded),
+        ..JobUpdate::default()
+    };
+    let (_, body) = call(
+        app(state.clone()),
+        req_json("PATCH", &format!("/internal/jobs/{id}"), &done),
+    )
+    .await;
+    let stored: JobRecord = json(&body);
+    assert_eq!(stored.status, JobStatus::Succeeded);
+    assert_eq!(
+        stored.current_step, None,
+        "a finished job must not keep a current step"
+    );
 
     t.drop_schema().await;
 }
