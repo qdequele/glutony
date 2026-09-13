@@ -60,7 +60,7 @@ untyped payloads and reads progress via the `progress` query.
 
 Internal JSON API (port 9000) backed by Postgres:
 
-- **Pipelines** — the 12 built-ins (compiled in) plus user pipelines, global or
+- **Pipelines** — the 15 built-ins (compiled in) plus user pipelines, global or
   tenant-scoped. Validation (cycles, unknown plugins, `fan_out` arity) happens here.
 - **Resolver** — MIME + filename + project → pipeline, with precedence
   tenant user > global user > builtin.

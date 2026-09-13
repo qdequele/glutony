@@ -111,6 +111,9 @@ invisible to plugins and to pipeline authors.
 | `builtin.markdown` | `text/markdown`, `text/x-markdown` | markdown_extractor → meili_indexer |
 | `builtin.csv` | `text/csv` | csv_parser → meili_indexer |
 | `builtin.json` | `application/json` | json_flattener → meili_indexer |
+| `builtin.parquet` | `application/vnd.apache.parquet` | parquet_parser → meili_indexer |
+| `builtin.avro` | `application/vnd.apache.avro` | avro_parser → meili_indexer |
+| `builtin.msgpack` | `application/vnd.msgpack` | msgpack_parser → meili_indexer |
 | `builtin.image` | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | image_captioner → meili_indexer |
 | `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4` | whisper_transcriber → meili_indexer |
 | `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm` | video_audio_extractor → whisper_transcriber → meili_indexer |

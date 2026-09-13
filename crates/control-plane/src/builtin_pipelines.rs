@@ -14,6 +14,9 @@ pub const IN_REPO_PLUGINS: &[&str] = &[
     "markdown_extractor",
     "csv_parser",
     "json_flattener",
+    "msgpack_parser",
+    "avro_parser",
+    "parquet_parser",
     "chunker",
     "meili_indexer",
     "llm_enricher",
@@ -35,6 +38,9 @@ const ALL_KNOWN: &[&str] = &[
     "markdown_extractor",
     "csv_parser",
     "json_flattener",
+    "msgpack_parser",
+    "avro_parser",
+    "parquet_parser",
     "chunker",
     "meili_indexer",
     "llm_enricher",
@@ -47,7 +53,7 @@ const ALL_KNOWN: &[&str] = &[
 ];
 
 /// Every plugin name the control plane accepts in a user pipeline without a worker
-/// having registered it first: the 14 in-repo plugins plus the known gRPC plugins.
+/// having registered it first: the 17 in-repo plugins plus the known gRPC plugins.
 pub fn builtin_plugin_names() -> &'static [&'static str] {
     ALL_KNOWN
 }
@@ -80,14 +86,14 @@ mod tests {
         let mut expected: Vec<&str> = IN_REPO_PLUGINS.to_vec();
         expected.extend_from_slice(EXTERNAL_PLUGINS);
         assert_eq!(builtin_plugin_names(), expected.as_slice());
-        assert_eq!(IN_REPO_PLUGINS.len(), 14);
-        assert_eq!(builtin_plugin_names().len(), 16);
+        assert_eq!(IN_REPO_PLUGINS.len(), 17);
+        assert_eq!(builtin_plugin_names().len(), 19);
     }
 
     #[test]
     fn every_builtin_pipeline_only_uses_known_plugins() {
         let pipelines = builtin_pipelines();
-        assert_eq!(pipelines.len(), 12, "SPEC §9 lists 12 built-in pipelines");
+        assert_eq!(pipelines.len(), 15, "SPEC §9 lists 15 built-in pipelines");
         for p in &pipelines {
             assert!(is_builtin_uid(&p.uid), "{} must start with builtin.", p.uid);
             assert!(p.builtin, "{} must be flagged builtin", p.uid);

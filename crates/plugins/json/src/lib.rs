@@ -46,18 +46,28 @@ impl JsonFlattenerPlugin {
     }
 }
 
-/// Step configuration.
+/// How a decoded value is turned into a [`Document`].
+///
+/// Public because every format that decodes to JSON values — MessagePack, Avro,
+/// Parquet — flattens by exactly these rules. Those plugins declare their own
+/// serde config (so each keeps `deny_unknown_fields` and its own JSON Schema) and
+/// build a `FlattenConfig` from it before calling [`documents_from_values`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct Config {
-    id_field: String,
-    content_fields: Option<Vec<String>>,
-    title_field: Option<String>,
-    flatten_arrays: bool,
-    max_depth: usize,
+pub struct FlattenConfig {
+    /// Flattened key holding the document id.
+    pub id_field: String,
+    /// Flattened keys joined into `content`; every string leaf when `None`.
+    pub content_fields: Option<Vec<String>>,
+    /// Flattened key mapped onto `title`.
+    pub title_field: Option<String>,
+    /// Flatten arrays of objects into `a.0.b` keys.
+    pub flatten_arrays: bool,
+    /// Nesting depth beyond which objects are kept as JSON values.
+    pub max_depth: usize,
 }
 
-impl Default for Config {
+impl Default for FlattenConfig {
     fn default() -> Self {
         Self {
             id_field: "id".into(),
@@ -69,12 +79,13 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    fn parse(value: Value) -> Result<Self, PluginError> {
+impl FlattenConfig {
+    /// Validate a raw `config:` block. `null` yields the defaults.
+    pub fn parse(value: Value) -> Result<Self, PluginError> {
         if value.is_null() {
             return Ok(Self::default());
         }
-        let cfg: Config = serde_json::from_value(value)
+        let cfg: FlattenConfig = serde_json::from_value(value)
             .map_err(|e| PluginError::InvalidConfig(format!("{NAME}: {e}")))?;
         if cfg.id_field.is_empty() {
             return Err(PluginError::InvalidConfig(format!(
@@ -122,7 +133,9 @@ fn parse_payload(data: &[u8]) -> Result<Vec<Value>, PluginError> {
 }
 
 /// Apply the selection rules (array / wrapper object / single value).
-fn select_roots(value: Value) -> Vec<Value> {
+///
+/// Public so binary formats carrying a JSON-shaped payload reuse the same rule.
+pub fn select_roots(value: Value) -> Vec<Value> {
     match value {
         Value::Array(items) => items,
         Value::Object(mut obj) => {
@@ -148,7 +161,7 @@ fn flatten_into(
     prefix: &str,
     value: Value,
     depth: usize,
-    cfg: &Config,
+    cfg: &FlattenConfig,
     out: &mut Map<String, Value>,
 ) {
     let key = |k: &str| {
@@ -185,7 +198,7 @@ fn flatten_into(
 }
 
 /// Flatten one root value into a fields map. Non-object roots land under `value`.
-fn flatten_root(root: Value, cfg: &Config) -> Map<String, Value> {
+fn flatten_root(root: Value, cfg: &FlattenConfig) -> Map<String, Value> {
     let mut out = Map::new();
     match root {
         Value::Object(obj) => {
@@ -243,7 +256,12 @@ struct Fallback {
     meta: DocumentMeta,
 }
 
-fn build_document(root: Value, cfg: &Config, generated_id: String, fallback: Fallback) -> Document {
+fn build_document(
+    root: Value,
+    cfg: &FlattenConfig,
+    generated_id: String,
+    fallback: Fallback,
+) -> Document {
     let mut fields = flatten_root(root, cfg);
 
     let id = fields
@@ -287,13 +305,61 @@ fn build_document(root: Value, cfg: &Config, generated_id: String, fallback: Fal
     }
 }
 
+/// Build documents from `(root, generated id, fallback)` triples.
+fn build_documents(
+    ctx: &ActivityContext,
+    items: Vec<(Value, String, Fallback)>,
+    cfg: &FlattenConfig,
+    label: &str,
+) -> Result<Vec<Document>, PluginError> {
+    let mut docs = Vec::with_capacity(items.len());
+    for (i, (root, generated_id, fallback)) in items.into_iter().enumerate() {
+        ctx.check_cancelled()?;
+        if i > 0 && i.is_multiple_of(HEARTBEAT_EVERY) {
+            ctx.heartbeat(format!("{label}: {i} documents"));
+        }
+        docs.push(build_document(root, cfg, generated_id, fallback));
+    }
+    Ok(docs)
+}
+
+/// Flatten already-decoded values into documents using the `json_flattener` rules.
+///
+/// This is the seam the binary-format plugins hang off: decode your payload to
+/// [`Value`]s, pair each with the id to fall back on when it carries no `id_field`,
+/// and this applies the same flattening, id/title/content selection and
+/// cancellation/heartbeat behaviour as `json_flattener` itself. `label` prefixes
+/// heartbeat messages so the calling plugin's name shows up in worker logs.
+pub fn documents_from_values(
+    ctx: &ActivityContext,
+    items: Vec<(Value, String)>,
+    cfg: &FlattenConfig,
+    meta: &DocumentMeta,
+    label: &str,
+) -> Result<Vec<Document>, PluginError> {
+    let items = items
+        .into_iter()
+        .map(|(root, generated_id)| {
+            let fallback = Fallback {
+                meta: meta.clone(),
+                ..Default::default()
+            };
+            (root, generated_id, fallback)
+        })
+        .collect();
+    build_documents(ctx, items, cfg, label)
+}
+
 /// Filename stem used to build generated ids (`<stem>_<index>`).
-fn id_stem(filename: Option<&str>) -> String {
+///
+/// `fallback` names the format (`json`, `msgpack`, ...) and is used when there is
+/// no filename to derive a stem from.
+pub fn id_stem(filename: Option<&str>, fallback: &str) -> String {
     let stem = filename
         .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
         .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
         .filter(|s| !s.is_empty())
-        .unwrap_or("json");
+        .unwrap_or(fallback);
     sanitize_id(stem)
 }
 
@@ -350,12 +416,12 @@ impl Plugin for JsonFlattenerPlugin {
         input: PluginInput,
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
-        let cfg = Config::parse(config)?;
+        let cfg = FlattenConfig::parse(config)?;
 
         // (root value, generated id, fallbacks)
         let items: Vec<(Value, String, Fallback)> = match input {
             PluginInput::Bytes(blob) => {
-                let stem = id_stem(blob.filename.as_deref());
+                let stem = id_stem(blob.filename.as_deref(), "json");
                 let meta = DocumentMeta {
                     source: blob.filename.clone(),
                     filename: blob.filename.clone(),
@@ -397,15 +463,9 @@ impl Plugin for JsonFlattenerPlugin {
                 .collect(),
         };
 
-        let mut docs = Vec::with_capacity(items.len());
-        for (i, (root, generated_id, fallback)) in items.into_iter().enumerate() {
-            ctx.check_cancelled()?;
-            if i > 0 && i.is_multiple_of(HEARTBEAT_EVERY) {
-                ctx.heartbeat(format!("{NAME}: {i} documents"));
-            }
-            docs.push(build_document(root, &cfg, generated_id, fallback));
-        }
-        Ok(PluginOutput::Documents(docs))
+        Ok(PluginOutput::Documents(build_documents(
+            ctx, items, &cfg, NAME,
+        )?))
     }
 }
 

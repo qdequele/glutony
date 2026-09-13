@@ -5,7 +5,7 @@
 //! * [`PipelineRouter`] — picks the pipeline to run for a MIME type / filename /
 //!   tenant, honouring the precedence *tenant user > global user > builtin* and,
 //!   within a tier, *filename pattern > MIME-only*.
-//! * [`builtin_pipelines`] — the 12 built-in pipelines of SPEC §9.
+//! * [`builtin_pipelines`] — the 15 built-in pipelines of SPEC §9.
 //! * [`detect_mime`] — the MIME detection chain of SPEC §10 (magic bytes →
 //!   extension → UTF-8 sniff → content-type hint → `application/octet-stream`).
 //! * [`mime_to_default_index`] — the default index per MIME family (SPEC §11).
@@ -56,6 +56,12 @@ pub mod mime {
     pub const CSV: &str = "text/csv";
     /// JSON.
     pub const JSON: &str = "application/json";
+    /// Apache Parquet.
+    pub const PARQUET: &str = "application/vnd.apache.parquet";
+    /// Apache Avro object container file.
+    pub const AVRO: &str = "application/vnd.apache.avro";
+    /// MessagePack.
+    pub const MSGPACK: &str = "application/vnd.msgpack";
     /// YAML.
     pub const YAML: &str = "application/yaml";
     /// Zip archive.
@@ -94,6 +100,15 @@ pub fn canonical_mime(mime: &str) -> &str {
         "video/matroska" | "video/x-mkv" => mime::MKV,
         "image/jpg" => "image/jpeg",
         "text/x-csv" | "application/csv" => mime::CSV,
+        "application/x-parquet" | "application/parquet" | "application/vnd.apache.parquet1" => {
+            mime::PARQUET
+        }
+        "application/avro" | "avro/binary" | "application/x-avro" | "application/avro-binary" => {
+            mime::AVRO
+        }
+        "application/x-msgpack" | "application/msgpack" | "application/x-messagepack" => {
+            mime::MSGPACK
+        }
         other => other,
     }
 }
@@ -229,7 +244,7 @@ pub fn mime_to_default_index(mime: &str) -> &'static str {
         m if m.starts_with("audio/") => "audio",
         m if m.starts_with("image/") => "images",
         mime::HTML => "pages",
-        mime::CSV => "datasets",
+        mime::CSV | mime::PARQUET | mime::AVRO => "datasets",
         _ => "documents",
     }
 }
@@ -272,6 +287,10 @@ pub fn detect_mime(data: &[u8], filename: Option<&str>, content_type_hint: Optio
 fn detect_mime_raw(data: &[u8], filename: Option<&str>, content_type_hint: Option<&str>) -> String {
     let from_ext = filename.and_then(mime_from_extension);
 
+    if let Some(magic) = magic_record_format(data) {
+        return magic.to_owned();
+    }
+
     if let Some(kind) = infer::get(data) {
         let magic = kind.mime_type();
         if magic == mime::ZIP
@@ -310,6 +329,9 @@ fn mime_from_extension(filename: &str) -> Option<String> {
         "yaml" | "yml" => Some(mime::YAML),
         "json" => Some(mime::JSON),
         "csv" => Some(mime::CSV),
+        "parquet" => Some(mime::PARQUET),
+        "avro" => Some(mime::AVRO),
+        "msgpack" | "mpk" => Some(mime::MSGPACK),
         "txt" | "text" | "log" => Some(mime::TEXT),
         "htm" | "html" => Some(mime::HTML),
         _ => None,
@@ -317,6 +339,22 @@ fn mime_from_extension(filename: &str) -> Option<String> {
     mapped
         .map(str::to_owned)
         .or_else(|| mime_guess::from_ext(&ext).first_raw().map(str::to_owned))
+}
+
+/// Binary record formats `infer` does not recognise, identified by their own markers.
+///
+/// Parquet brackets the file with `PAR1`, and an Avro object container file opens
+/// with `Obj\x01`. MessagePack is deliberately absent: the format has no signature
+/// of any kind, so it can only be recognised from the filename or an explicit
+/// content type.
+fn magic_record_format(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 8 && data.starts_with(b"PAR1") && data.ends_with(b"PAR1") {
+        return Some(mime::PARQUET);
+    }
+    if data.starts_with(b"Obj\x01") {
+        return Some(mime::AVRO);
+    }
+    None
 }
 
 /// Office formats that are zip containers underneath.
@@ -444,7 +482,7 @@ fn builtin(
     p
 }
 
-/// The 12 built-in pipelines of SPEC §9, in table order. Every one validates.
+/// The 15 built-in pipelines of SPEC §9, in table order. Every one validates.
 pub fn builtin_pipelines() -> Vec<PipelineDefinition> {
     vec![
         builtin(
@@ -517,6 +555,27 @@ pub fn builtin_pipelines() -> Vec<PipelineDefinition> {
             "Flatten JSON into documents, index.",
             &[mime::JSON],
             vec![step("extract", "json_flattener"), index_step()],
+        ),
+        builtin(
+            "parquet",
+            "Parquet",
+            "One document per Parquet row, index.",
+            &[mime::PARQUET],
+            vec![step("extract", "parquet_parser"), index_step()],
+        ),
+        builtin(
+            "avro",
+            "Avro",
+            "One document per Avro record, index.",
+            &[mime::AVRO],
+            vec![step("extract", "avro_parser"), index_step()],
+        ),
+        builtin(
+            "msgpack",
+            "MessagePack",
+            "Decode MessagePack into documents, index.",
+            &[mime::MSGPACK],
+            vec![step("extract", "msgpack_parser"), index_step()],
         ),
         builtin(
             "image",
@@ -597,9 +656,9 @@ mod tests {
     // -- builtin table -------------------------------------------------------
 
     #[test]
-    fn builtin_table_has_twelve_valid_pipelines() {
+    fn builtin_table_has_fifteen_valid_pipelines() {
         let all = builtin_pipelines();
-        assert_eq!(all.len(), 12);
+        assert_eq!(all.len(), 15);
         let expected = [
             "builtin.pdf",
             "builtin.word",
@@ -610,6 +669,9 @@ mod tests {
             "builtin.markdown",
             "builtin.csv",
             "builtin.json",
+            "builtin.parquet",
+            "builtin.avro",
+            "builtin.msgpack",
             "builtin.image",
             "builtin.audio",
             "builtin.video",
@@ -699,6 +761,15 @@ mod tests {
         );
         assert_eq!(plugins("builtin.csv"), ["csv_parser", "meili_indexer"]);
         assert_eq!(plugins("builtin.json"), ["json_flattener", "meili_indexer"]);
+        assert_eq!(
+            plugins("builtin.parquet"),
+            ["parquet_parser", "meili_indexer"]
+        );
+        assert_eq!(plugins("builtin.avro"), ["avro_parser", "meili_indexer"]);
+        assert_eq!(
+            plugins("builtin.msgpack"),
+            ["msgpack_parser", "meili_indexer"]
+        );
         assert_eq!(
             plugins("builtin.image"),
             ["image_captioner", "meili_indexer"]
@@ -1028,22 +1099,22 @@ mod tests {
         let router = PipelineRouter::new(pipelines);
 
         let acme = router.all(Some("acme"));
-        assert_eq!(acme.len(), 13);
+        assert_eq!(acme.len(), 16);
         let shared: Vec<_> = acme.iter().filter(|p| p.uid == "shared").collect();
         assert_eq!(shared.len(), 1);
         assert_eq!(shared[0].project_id.as_deref(), Some("acme"));
         assert!(acme.iter().all(|p| p.uid != "globex-only"));
 
         let anon = router.all(None);
-        assert_eq!(anon.len(), 13);
+        assert_eq!(anon.len(), 16);
         assert!(
             anon.iter()
                 .any(|p| p.uid == "shared" && p.project_id.is_none())
         );
 
         let globex = router.all(Some("globex"));
-        assert_eq!(globex.len(), 14);
-        assert_eq!(router.pipelines().len(), 15);
+        assert_eq!(globex.len(), 17);
+        assert_eq!(router.pipelines().len(), 18);
     }
 
     // -- mime_to_default_index / plugin_task_queue -------------------------
@@ -1058,6 +1129,19 @@ mod tests {
         assert_eq!(mime_to_default_index("text/html"), "pages");
         assert_eq!(mime_to_default_index("text/html; charset=utf-8"), "pages");
         assert_eq!(mime_to_default_index("text/csv"), "datasets");
+        assert_eq!(
+            mime_to_default_index("application/vnd.apache.parquet"),
+            "datasets"
+        );
+        assert_eq!(
+            mime_to_default_index("application/vnd.apache.avro"),
+            "datasets"
+        );
+        assert_eq!(
+            mime_to_default_index("application/vnd.msgpack"),
+            "documents",
+            "MessagePack is JSON-shaped, not tabular"
+        );
         assert_eq!(mime_to_default_index("application/pdf"), "documents");
         assert_eq!(mime_to_default_index("text/plain"), "documents");
         assert_eq!(mime_to_default_index("application/json"), "documents");
@@ -1214,6 +1298,56 @@ mod tests {
             detect_mime(b"<note><to>x</to></note>", None, None),
             "text/plain"
         );
+    }
+
+    #[test]
+    fn binary_record_formats_are_detected() {
+        // Parquet brackets the file with PAR1 and is found by magic bytes alone.
+        let mut parquet = b"PAR1".to_vec();
+        parquet.extend([0u8; 40]);
+        parquet.extend(b"PAR1");
+        assert_eq!(
+            detect_mime(&parquet, None, None),
+            "application/vnd.apache.parquet"
+        );
+        assert_eq!(
+            detect_mime(&parquet, Some("rows.parquet"), None),
+            "application/vnd.apache.parquet"
+        );
+        // A leading PAR1 with no trailing one is not a Parquet file.
+        assert_ne!(
+            detect_mime(b"PAR1 and then some text", None, None),
+            "application/vnd.apache.parquet"
+        );
+
+        // Avro object container files open with Obj\x01.
+        let mut avro = b"Obj\x01".to_vec();
+        avro.extend([0u8; 24]);
+        assert_eq!(
+            detect_mime(&avro, None, None),
+            "application/vnd.apache.avro"
+        );
+
+        // MessagePack has no signature, so only the extension or a hint finds it.
+        let packed = [0x81u8, 0xa2, b'i', b'd', 0x01];
+        assert_eq!(
+            detect_mime(&packed, Some("data.msgpack"), None),
+            "application/vnd.msgpack"
+        );
+        assert_eq!(
+            detect_mime(&packed, Some("data.mpk"), None),
+            "application/vnd.msgpack"
+        );
+        assert_eq!(
+            detect_mime(GARBAGE, None, Some("application/x-msgpack")),
+            "application/vnd.msgpack",
+            "the alias spelling is canonicalised"
+        );
+
+        // Alias spellings collapse onto the canonical names.
+        assert_eq!(canonical_mime("application/x-parquet"), mime::PARQUET);
+        assert_eq!(canonical_mime("avro/binary"), mime::AVRO);
+        assert_eq!(canonical_mime("application/msgpack"), mime::MSGPACK);
     }
 
     #[test]

@@ -557,6 +557,9 @@ User pipelines always take precedence (same MIME trigger → user wins).
 | `builtin.markdown` | `text/markdown`, `text/x-markdown` | markdown_extractor → meili_indexer |
 | `builtin.csv` | `text/csv` | csv_parser → meili_indexer |
 | `builtin.json` | `application/json` | json_flattener → meili_indexer |
+| `builtin.parquet` | `application/vnd.apache.parquet` | parquet_parser → meili_indexer |
+| `builtin.avro` | `application/vnd.apache.avro` | avro_parser → meili_indexer |
+| `builtin.msgpack` | `application/vnd.msgpack` | msgpack_parser → meili_indexer |
 | `builtin.image` | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | image_captioner → meili_indexer |
 | `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4` | whisper_transcriber → meili_indexer |
 | `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm` | video_audio_extractor → whisper_transcriber → meili_indexer |
@@ -570,8 +573,11 @@ Default retry: `max_attempts: 3, backoff: exponential`
 
 In `crates/gateway/src/extract.rs`, `detect_mime(data, filename)` runs:
 
-1. **Magic bytes** via the `infer` crate — most reliable, checks file signature
-2. **File extension** from the `filename` field — fallback for text formats
+1. **Magic bytes** — the `PAR1` bracket of a Parquet file and the `Obj\x01` header
+   of an Avro container are checked first, then the `infer` crate for everything
+   else. Most reliable; checks the file signature
+2. **File extension** from the `filename` field — fallback for text formats, and the
+   only way to recognise MessagePack, which has no signature at all
 3. **UTF-8 sniff** of first 512 bytes — if valid UTF-8 → `text/plain`
 4. **Default** → `application/octet-stream`
 
@@ -592,6 +598,8 @@ fn mime_to_default_index(mime: &str) -> &str {
         m if m.starts_with("image/") => "images",
         "text/html"                  => "pages",
         "text/csv"                   => "datasets",
+        "application/vnd.apache.parquet" |
+        "application/vnd.apache.avro"    => "datasets",
         _                            => "documents",   // also configurable via DEFAULT_INDEX env
     }
 }

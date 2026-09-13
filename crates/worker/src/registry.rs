@@ -52,6 +52,13 @@ impl PluginRegistry {
         reg.register(Arc::new(
             meili_ingest_plugin_json::JsonFlattenerPlugin::new(),
         ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_msgpack::MsgpackParserPlugin::new(),
+        ));
+        reg.register(Arc::new(meili_ingest_plugin_avro::AvroParserPlugin::new()));
+        reg.register(Arc::new(
+            meili_ingest_plugin_parquet::ParquetParserPlugin::new(),
+        ));
         reg.register(Arc::new(meili_ingest_plugin_chunker::ChunkerPlugin::new()));
         reg.register(Arc::new(
             meili_ingest_plugin_meili_indexer::MeiliIndexerPlugin::new(),
@@ -203,6 +210,9 @@ mod tests {
             "markdown_extractor",
             "csv_parser",
             "json_flattener",
+            "msgpack_parser",
+            "avro_parser",
+            "parquet_parser",
             "chunker",
             "meili_indexer",
             "pptx_extractor",

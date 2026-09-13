@@ -11,6 +11,12 @@ block; every key is optional unless stated otherwise.
 Documents produced by extractors set `meta.source`, `meta.filename` and
 `meta.mime` from the input blob, and derive ids from the sanitised filename
 plus a page/row suffix (`report_pdf_p3`, `data_csv_r42`).
+
+`csv_parser` additionally stores the 1-based row number in a `_row` field. The
+parsers that decode to JSON first — `json_flattener`, `msgpack_parser`,
+`avro_parser`, `parquet_parser` — deliberately do not: their generated id
+already carries the index, and keeping the family uniform matters more than
+matching CSV.
 </Note>
 
 ## Extractors (bytes → documents)
@@ -75,6 +81,59 @@ one document. Nested objects are flattened to dotted keys (`a.b.c`) in
 | Key | Default | Description |
 |---|---|---|
 | `id_field` | `"id"` | Field used as document id; generated when missing. |
+
+### `parquet_parser`
+
+Apache Parquet (`parquet` + `arrow`). One document per row. The file's own
+schema supplies the types, so nothing is guessed; nested structs flatten to
+dotted keys and null cells are omitted. `columns` is pushed down into the
+reader, so unselected columns are never decoded.
+
+| Key | Default | Description |
+|---|---|---|
+| `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_r<row>`. |
+| `content_fields` | every string leaf | Keys joined by a space into `content`. |
+| `title_field` | — | Key mapped onto `title`. |
+| `columns` | all | Columns to read, pushed down as a projection. An unknown name is an error. |
+| `max_rows` | — | Stop after this many rows. |
+| `batch_size` | `1024` | Rows decoded per record batch. |
+
+### `avro_parser`
+
+Avro object container files (`apache-avro`). One document per record. The
+writer schema travels in the file, so logical types are resolved rather than
+left as raw integers: `date` → `YYYY-MM-DD`, `timestamp-*` → RFC 3339,
+`decimal` → a scaled string (a string, so no precision is lost), `uuid` and
+`enum` → strings, `bytes`/`fixed` → base64. A union is unwrapped to the branch
+that was actually written, so `["null","string"]` is just a string.
+
+| Key | Default | Description |
+|---|---|---|
+| `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_r<row>`. |
+| `content_fields` | every string leaf | Keys joined by a space into `content`. |
+| `title_field` | — | Key mapped onto `title`. |
+| `max_records` | — | Stop after this many records. |
+
+### `msgpack_parser`
+
+MessagePack (`rmpv`). Decodes to JSON values and then applies exactly the
+`json_flattener` rules, so a single value follows the array / wrapper-object
+selection and several concatenated values become one document each (the NDJSON
+analog). `bin` becomes base64, non-string map keys are stringified, and the
+standard timestamp extension becomes an RFC 3339 string.
+
+<Note>
+MessagePack has no magic bytes, so it cannot be sniffed from content. Upload it
+with a `.msgpack`/`.mpk` filename or an explicit `application/vnd.msgpack`
+content type, or route it with an explicit pipeline.
+</Note>
+
+| Key | Default | Description |
+|---|---|---|
+| `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_<index>`. |
+| `content_fields` | every string leaf | Keys joined by a space into `content`. |
+| `title_field` | — | Key mapped onto `title`. |
+| `max_records` | — | Stop after this many documents. |
 
 ### `image_captioner`
 

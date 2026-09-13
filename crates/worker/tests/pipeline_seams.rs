@@ -136,3 +136,45 @@ async fn inline_documents_flow_through_json_flattener() {
     assert_eq!(d[0].id, "1");
     assert_eq!(d[0].title.as_deref(), Some("Hello"));
 }
+
+/// A binary record format must dispatch through the registry like any other
+/// extractor. MessagePack is the interesting one: it carries no magic bytes, so
+/// the blob's declared MIME is all the pipeline has to go on.
+#[tokio::test]
+async fn msgpack_bytes_dispatch_through_the_registry() {
+    // fixmap(2) { "id": 1, "body": "hello" }, hand-encoded so the test needs no
+    // MessagePack writer of its own.
+    let packed: Vec<u8> = [
+        &[0x82u8][..],
+        &[0xa2, b'i', b'd'][..],
+        &[0x01][..],
+        &[0xa4, b'b', b'o', b'd', b'y'][..],
+        &[0xa5, b'h', b'e', b'l', b'l', b'o'][..],
+    ]
+    .concat();
+
+    let out = acts_t(1 << 20)
+        .run_step(
+            &ctx(),
+            step_in(
+                Uuid::new_v4(),
+                "extract",
+                "msgpack_parser",
+                PluginInput::Bytes(Blob::new(
+                    packed,
+                    "application/vnd.msgpack",
+                    Some("a.msgpack".into()),
+                )),
+            ),
+        )
+        .await
+        .expect("msgpack step");
+
+    let docs = match out.output {
+        PluginOutput::Documents(d) => d,
+        other => panic!("expected documents, got {:?}", other.kind()),
+    };
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].id, "1");
+    assert_eq!(docs[0].content, "hello");
+}
