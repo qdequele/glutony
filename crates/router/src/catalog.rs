@@ -109,8 +109,7 @@ fn action(
     summary: &str,
     use_cases: &[&str],
     example_step: &str,
-    accepts: &[InputKind],
-    produces: OutputKind,
+    io: (&[InputKind], OutputKind),
 ) -> ActionEntry {
     ActionEntry {
         plugin: plugin.to_owned(),
@@ -119,8 +118,8 @@ fn action(
         summary: summary.to_owned(),
         use_cases: use_cases.iter().map(|s| (*s).to_owned()).collect(),
         example_step: example_step.trim_start_matches('\n').to_owned(),
-        accepts: accepts.to_vec(),
-        produces,
+        accepts: io.0.to_vec(),
+        produces: io.1,
     }
 }
 
@@ -139,8 +138,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Keep credentials in the worker rather than in the request",
             ],
             "\n- id: fetch\n  plugin: s3_downloader\n  config:\n    bucket: my-exports\n    key: dumps/latest.jsonl\n",
-            &[I::Ref, I::Empty],
-            OutputKind::Bytes,
+            (&[I::Ref, I::Empty], OutputKind::Bytes),
         ),
         action(
             "pdf_extractor",
@@ -152,8 +150,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index scientific papers while keeping page numbers",
             ],
             "\n- id: extract\n  plugin: pdf_extractor\n  config:\n    per_page: true\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "docx_extractor",
@@ -165,8 +162,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Search internal policy documents",
             ],
             "\n- id: extract\n  plugin: docx_extractor\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "xlsx_extractor",
@@ -178,8 +174,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index an inventory export row by row",
             ],
             "\n- id: extract\n  plugin: xlsx_extractor\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "pptx_extractor",
@@ -191,8 +186,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index training material stored as presentations",
             ],
             "\n- id: extract\n  plugin: pptx_extractor\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "html_extractor",
@@ -204,8 +198,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Collect page links alongside the text",
             ],
             "\n- id: extract\n  plugin: html_extractor\n  config:\n    extract_links: true\n    include_meta_description: true\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "markdown_extractor",
@@ -217,8 +210,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Keep heading context on every search hit",
             ],
             "\n- id: extract\n  plugin: markdown_extractor\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "csv_parser",
@@ -230,8 +222,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Use an existing column as the document id",
             ],
             "\n- id: extract\n  plugin: csv_parser\n  config:\n    has_headers: true\n    id_column: sku\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "json_flattener",
@@ -243,8 +234,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Make deep fields usable as filters",
             ],
             "\n- id: extract\n  plugin: json_flattener\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "msgpack_parser",
@@ -256,8 +246,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index event dumps written by a MessagePack producer",
             ],
             "\n- id: extract\n  plugin: msgpack_parser\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "avro_parser",
@@ -269,8 +258,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Ingest a data-lake export without a schema registry",
             ],
             "\n- id: extract\n  plugin: avro_parser\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "parquet_parser",
@@ -282,8 +270,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index a warehouse table dump directly",
             ],
             "\n- id: extract\n  plugin: parquet_parser\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "video_audio_extractor",
@@ -295,8 +282,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index a video library by what is said in it",
             ],
             "\n- id: audio\n  plugin: video_audio_extractor\n",
-            &[I::Bytes],
-            OutputKind::Bytes,
+            (&[I::Bytes], OutputKind::Bytes),
         ),
         action(
             "chunker",
@@ -308,8 +294,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Return the relevant passage instead of a whole file",
             ],
             "\n- id: chunk\n  plugin: chunker\n  config:\n    strategy: sentence\n    chunk_size: 512\n    overlap: 64\n",
-            &[I::Documents],
-            OutputKind::Documents,
+            (&[I::Documents], OutputKind::Documents),
         ),
         action(
             "llm_enricher",
@@ -321,8 +306,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Classify documents into facets you can filter on",
             ],
             "\n- id: enrich\n  plugin: llm_enricher\n  depends_on: [chunk]\n  fan_out: $.documents\n  config:\n    model: gpt-4o-mini\n    max_concurrent: 20\n    merge_strategy: merge\n",
-            &[I::Documents],
-            OutputKind::Documents,
+            (&[I::Documents], OutputKind::Documents),
         ),
         action(
             "image_captioner",
@@ -334,8 +318,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Caption product images for retrieval",
             ],
             "\n- id: caption\n  plugin: image_captioner\n  config:\n    detail: auto\n    json: true\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "whisper_transcriber",
@@ -347,8 +330,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Index lecture audio with timestamps",
             ],
             "\n- id: transcribe\n  plugin: whisper_transcriber\n  config:\n    language: en\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "ocr",
@@ -360,8 +342,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Recover text from image-only PDFs",
             ],
             "\n- id: ocr\n  plugin: ocr\n",
-            &[I::Bytes],
-            OutputKind::Documents,
+            (&[I::Bytes], OutputKind::Documents),
         ),
         action(
             "meili_indexer",
@@ -373,8 +354,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Route content to a per-source index",
             ],
             "\n- id: index\n  plugin: meili_indexer\n",
-            &[I::Documents],
-            OutputKind::Indexed,
+            (&[I::Documents], OutputKind::Indexed),
         ),
     ]
 }
