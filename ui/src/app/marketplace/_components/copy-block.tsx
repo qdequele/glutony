@@ -32,7 +32,8 @@ export function CopyBlock({ text, label }: { text: string; label: string }) {
         size="sm"
         variant="ghost"
         onClick={copy}
-        aria-label={label}
+        aria-label={copied ? "Copied" : label}
+        aria-live="polite"
         className="absolute top-1.5 right-1.5"
       >
         {copied ? <Check className="size-3.5" aria-hidden /> : <Copy className="size-3.5" aria-hidden />}

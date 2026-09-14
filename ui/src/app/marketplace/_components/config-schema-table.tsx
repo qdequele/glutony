@@ -17,6 +17,10 @@ function typeLabel(schema: JsonSchema): string {
 }
 
 function defaultLabel(schema: JsonSchema): string {
+  // A system-injected field's default is never something a user needs to see,
+  // and one of them (`meili_indexer`'s `api_key`) is a secret — never render it
+  // even if a future plugin author hardcodes one.
+  if (schema.readOnly) return "—";
   if (!("default" in schema) || schema.default === undefined) return "—";
   return JSON.stringify(schema.default);
 }
