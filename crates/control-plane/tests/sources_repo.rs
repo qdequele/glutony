@@ -1,0 +1,328 @@
+//! `SourceRepo` against a live Postgres.
+//!
+//! Skips cleanly when `DATABASE_URL` is unset so the suite stays green without a server.
+
+use meili_ingest_control_plane::sources::{NewSource, RunRecord, SourceRepo};
+use meili_ingest_source::model::{IncrementalState, Location, RunOutcome};
+use sqlx::{Executor, PgPool};
+use uuid::Uuid;
+
+async fn repo() -> Option<SourceRepo> {
+    let url = std::env::var("DATABASE_URL").ok()?;
+    let pool = PgPool::connect(&url).await.ok()?;
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("migrations apply");
+    // Each run starts from a clean slate for the uids this file uses.
+    pool.execute("DELETE FROM sources WHERE uid LIKE 'test-repo-%'")
+        .await
+        .expect("clean");
+    Some(SourceRepo::new(pool))
+}
+
+fn new_source(uid: &str, project_id: Option<&str>, pipeline_uid: &str) -> NewSource {
+    NewSource {
+        id: Uuid::new_v4(),
+        uid: uid.to_string(),
+        name: format!("source {uid}"),
+        description: None,
+        project_id: project_id.map(str::to_owned),
+        pipeline_uid: pipeline_uid.to_string(),
+        location: Location::Url {
+            url: "https://example.test/feed.json".into(),
+            method: None,
+            headers: Default::default(),
+        },
+        cron: "30 0 * * *".into(),
+        timezone: "UTC".into(),
+        index_name: None,
+        fetch_auth: Some(vec![1, 2, 3]),
+        meili_ctx: vec![4, 5, 6],
+        schedule_id: format!("source-{uid}"),
+    }
+}
+
+#[tokio::test]
+async fn insert_then_get_roundtrips() {
+    let Some(repo) = repo().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let new = new_source("test-repo-a", None, "builtin.json");
+    let id = new.id;
+    let stored = repo.insert(&new).await.expect("insert");
+    assert_eq!(stored.definition.uid, "test-repo-a");
+    assert_eq!(stored.definition.id, id);
+    assert!(
+        stored.definition.paused,
+        "a source is created paused, then unpaused once its schedule exists"
+    );
+
+    let got = repo
+        .get("test-repo-a", None)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(got.meili_ctx, vec![4, 5, 6], "sealed bytes round-trip");
+    assert_eq!(got.fetch_auth.as_deref(), Some(&[1u8, 2, 3][..]));
+    assert!(got.state.etag.is_none(), "a fresh source has no state");
+}
+
+#[tokio::test]
+async fn the_same_uid_may_exist_globally_and_per_tenant() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    repo.insert(&new_source("test-repo-dup", None, "builtin.json"))
+        .await
+        .expect("global insert");
+    repo.insert(&new_source("test-repo-dup", Some("proj-1"), "builtin.json"))
+        .await
+        .expect("tenant insert");
+
+    let global = repo
+        .get("test-repo-dup", None)
+        .await
+        .expect("get")
+        .expect("exists");
+    let tenant = repo
+        .get("test-repo-dup", Some("proj-1"))
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_ne!(global.definition.id, tenant.definition.id);
+    assert_eq!(tenant.definition.project_id.as_deref(), Some("proj-1"));
+}
+
+#[tokio::test]
+async fn list_scopes_to_the_tenant_and_hides_archived() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    repo.insert(&new_source("test-repo-g", None, "builtin.json"))
+        .await
+        .expect("insert");
+    repo.insert(&new_source("test-repo-t", Some("proj-2"), "builtin.json"))
+        .await
+        .expect("insert");
+    repo.insert(&new_source(
+        "test-repo-other",
+        Some("proj-3"),
+        "builtin.json",
+    ))
+    .await
+    .expect("insert");
+
+    let listed = repo.list(Some("proj-2"), false).await.expect("list");
+    let uids: Vec<&str> = listed.iter().map(|s| s.definition.uid.as_str()).collect();
+    assert!(uids.contains(&"test-repo-t"), "tenant's own source");
+    assert!(uids.contains(&"test-repo-g"), "global sources are visible");
+    assert!(
+        !uids.contains(&"test-repo-other"),
+        "another tenant's source must not leak"
+    );
+}
+
+#[tokio::test]
+async fn archive_for_pipeline_stamps_and_hides() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    repo.insert(&new_source(
+        "test-repo-p1",
+        Some("proj-4"),
+        "doomed.pipeline",
+    ))
+    .await
+    .expect("insert");
+    repo.insert(&new_source(
+        "test-repo-p2",
+        Some("proj-4"),
+        "doomed.pipeline",
+    ))
+    .await
+    .expect("insert");
+    repo.insert(&new_source("test-repo-p3", Some("proj-4"), "safe.pipeline"))
+        .await
+        .expect("insert");
+
+    let archived = repo
+        .archive_for_pipeline("doomed.pipeline", Some("proj-4"))
+        .await
+        .expect("archive");
+    assert_eq!(archived.len(), 2, "both dependents archived");
+
+    let visible: Vec<String> = repo
+        .list(Some("proj-4"), false)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|s| s.definition.uid)
+        .collect();
+    assert!(!visible.contains(&"test-repo-p1".to_string()));
+    assert!(visible.contains(&"test-repo-p3".to_string()), "unaffected");
+
+    let with_archived: Vec<String> = repo
+        .list(Some("proj-4"), true)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|s| s.definition.uid)
+        .collect();
+    assert!(with_archived.contains(&"test-repo-p1".to_string()));
+
+    // The credentials survive, so the source can be repointed and unarchived.
+    let kept = repo
+        .get("test-repo-p1", Some("proj-4"))
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(kept.meili_ctx, vec![4, 5, 6], "sealed context is retained");
+    assert!(kept.definition.archived_at.is_some());
+}
+
+#[tokio::test]
+async fn save_state_advances_the_incremental_state() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    let new = new_source("test-repo-state", None, "builtin.json");
+    let id = new.id;
+    repo.insert(&new).await.expect("insert");
+
+    repo.save_state(
+        id,
+        &IncrementalState {
+            etag: Some("\"v9\"".into()),
+            last_modified: None,
+            hash: Some("abc123".into()),
+        },
+    )
+    .await
+    .expect("save state");
+
+    let got = repo
+        .get("test-repo-state", None)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(got.state.etag.as_deref(), Some("\"v9\""));
+    assert_eq!(got.state.hash.as_deref(), Some("abc123"));
+}
+
+#[tokio::test]
+async fn runs_are_recorded_and_listed_newest_first() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    let new = new_source("test-repo-runs", None, "builtin.json");
+    let source_id = new.id;
+    repo.insert(&new).await.expect("insert");
+
+    for (outcome, items) in [
+        (RunOutcome::Unchanged, 0),
+        (RunOutcome::Ingested, 3),
+        (RunOutcome::Failed, 0),
+    ] {
+        repo.record_run(&RunRecord {
+            run_id: Uuid::new_v4(),
+            source_id,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            outcome,
+            items,
+            job_ids: if items > 0 {
+                vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()]
+            } else {
+                vec![]
+            },
+            error: (outcome == RunOutcome::Failed).then(|| "boom".to_string()),
+        })
+        .await
+        .expect("record run");
+    }
+
+    let runs = repo.list_runs(source_id, 10).await.expect("list runs");
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0].outcome, RunOutcome::Failed, "newest first");
+    assert_eq!(runs[0].error.as_deref(), Some("boom"));
+    let ingested = runs
+        .iter()
+        .find(|r| r.outcome == RunOutcome::Ingested)
+        .expect("ingested run");
+    assert_eq!(ingested.job_ids.len(), 3, "job ids round-trip");
+
+    // The source's denormalized status mirrors the newest run.
+    let got = repo
+        .get("test-repo-runs", None)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(got.last_status.as_deref(), Some("failed"));
+    assert!(got.last_run_at.is_some());
+}
+
+#[tokio::test]
+async fn delete_removes_the_source_and_its_runs() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    let new = new_source("test-repo-del", None, "builtin.json");
+    let source_id = new.id;
+    repo.insert(&new).await.expect("insert");
+    repo.record_run(&RunRecord {
+        run_id: Uuid::new_v4(),
+        source_id,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        outcome: RunOutcome::Unchanged,
+        items: 0,
+        job_ids: vec![],
+        error: None,
+    })
+    .await
+    .expect("record run");
+
+    assert!(repo.delete("test-repo-del", None).await.expect("delete"));
+    assert!(
+        repo.get("test-repo-del", None)
+            .await
+            .expect("get")
+            .is_none(),
+        "gone"
+    );
+    assert!(
+        repo.list_runs(source_id, 10)
+            .await
+            .expect("runs")
+            .is_empty(),
+        "runs cascade"
+    );
+    assert!(
+        !repo.delete("test-repo-del", None).await.expect("delete"),
+        "deleting twice reports false"
+    );
+}
+
+#[tokio::test]
+async fn load_for_run_finds_by_id_and_skips_archived() {
+    let Some(repo) = repo().await else {
+        return;
+    };
+    let new = new_source("test-repo-load", Some("proj-5"), "doomed2.pipeline");
+    let id = new.id;
+    repo.insert(&new).await.expect("insert");
+
+    let loaded = repo.load_for_run(id).await.expect("load").expect("exists");
+    assert_eq!(loaded.definition.uid, "test-repo-load");
+    assert_eq!(loaded.meili_ctx, vec![4, 5, 6]);
+
+    repo.archive_for_pipeline("doomed2.pipeline", Some("proj-5"))
+        .await
+        .expect("archive");
+    assert!(
+        repo.load_for_run(id).await.expect("load").is_none(),
+        "an archived source must never be run"
+    );
+}

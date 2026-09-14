@@ -3191,6 +3191,7 @@ dependencies = [
  "http-body-util",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
+ "meili-ingest-source",
  "serde",
  "serde_json",
  "sqlx",

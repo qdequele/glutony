@@ -18,6 +18,7 @@ pub mod jobs;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
+pub mod sources;
 
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;

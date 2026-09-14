@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+meili-ingest-source.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
