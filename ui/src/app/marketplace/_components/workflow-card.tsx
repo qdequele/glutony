@@ -5,6 +5,7 @@ import { newPipelineHref } from "@/app/pipelines/routes";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import type { PipelineDefinition, WorkflowEntry } from "@/lib/api/types";
 import { workflowDetailHref } from "../routes";
 import { TriggerLine } from "./trigger-line";
@@ -27,9 +28,11 @@ export function definitionFor(
 export function WorkflowCard({
   entry,
   definition,
+  definitionPending,
 }: {
   entry: WorkflowEntry;
   definition: PipelineDefinition | undefined;
+  definitionPending: boolean;
 }) {
   const isBuiltin = entry.uid.startsWith("builtin.");
 
@@ -48,23 +51,33 @@ export function WorkflowCard({
       </CardHeader>
       <CardContent className="flex-1 space-y-3">
         <p className="text-sm text-muted-foreground">{entry.summary}</p>
-        <TriggerLine trigger={definition?.trigger} />
-        <div className="flex flex-wrap items-center gap-1">
-          {(definition?.steps ?? []).map((step, index) => (
-            <span key={step.id} className="flex items-center gap-1">
-              {index > 0 ? (
-                <ChevronRight className="size-3 text-muted-foreground" aria-hidden />
-              ) : null}
-              <Badge variant="outline" className="font-mono">
-                {step.plugin}
-              </Badge>
-            </span>
-          ))}
-        </div>
+        {definitionPending ? (
+          <Skeleton className="h-4 w-48" />
+        ) : !definition ? (
+          <p className="text-xs text-muted-foreground">
+            Definition unavailable in this deployment.
+          </p>
+        ) : (
+          <>
+            <TriggerLine trigger={definition.trigger} />
+            <div className="flex flex-wrap items-center gap-1">
+              {definition.steps.map((step, index) => (
+                <span key={step.id} className="flex items-center gap-1">
+                  {index > 0 ? (
+                    <ChevronRight className="size-3 text-muted-foreground" aria-hidden />
+                  ) : null}
+                  <Badge variant="outline" className="font-mono">
+                    {step.plugin}
+                  </Badge>
+                </span>
+              ))}
+            </div>
+          </>
+        )}
       </CardContent>
       <CardFooter>
         <Button asChild size="sm" variant="outline">
-          <Link href={newPipelineHref(entry.uid)}>
+          <Link href={newPipelineHref(entry.uid)} aria-label={`Clone ${entry.title} into my pipelines`}>
             <Copy aria-hidden />
             Clone into my pipelines
           </Link>

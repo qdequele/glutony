@@ -78,6 +78,7 @@ export default function WorkflowsPage() {
                 key={entry.uid}
                 entry={entry}
                 definition={definitionFor(entry, pipelines.data ?? [])}
+                definitionPending={pipelines.isPending && !entry.definition}
               />
             ))}
           </div>

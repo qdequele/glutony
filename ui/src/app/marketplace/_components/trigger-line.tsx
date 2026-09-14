@@ -22,6 +22,7 @@ export function TriggerLine({ trigger }: { trigger: PipelineTrigger | undefined 
   return (
     <p className="text-xs text-muted-foreground">
       Runs automatically for{" "}
+      {types.length === 0 ? "files " : null}
       {types.map((type, index) => (
         <span key={type}>
           {index > 0 ? ", " : ""}
