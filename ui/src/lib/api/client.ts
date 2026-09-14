@@ -12,11 +12,10 @@ import type {
   PluginManifest,
   ValidatePipelineOk,
   ValidationOutcome,
+  Catalog,
 } from "./types";
-
 /** Base URL for every request. Empty string = same origin (the embedded case). */
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
-
 /**
  * A non-2xx response from the gateway. `code` comes from the `{error, code}`
  * body when the gateway sent one, and falls back to `http_<status>`.
@@ -166,4 +165,13 @@ export async function validatePipeline(
 /** `GET /plugins` — manifests published by the worker pools at boot. */
 export function listPlugins(signal?: AbortSignal): Promise<PluginManifest[]> {
   return request<PluginManifest[]>("/plugins", { signal });
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+/** `GET /catalog` — curated action and workflow copy, compiled into the gateway. */
+export function listCatalog(signal?: AbortSignal): Promise<Catalog> {
+  return request<Catalog>("/catalog", { signal });
 }

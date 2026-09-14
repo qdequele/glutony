@@ -26,16 +26,18 @@ import {
   getPipeline,
   listPipelines,
   listPlugins,
+  listCatalog,
   upsertPipeline,
   validatePipeline,
 } from "./client";
-import type { PipelineDefinition, PluginManifest, ValidationOutcome } from "./types";
+import type { Catalog, PipelineDefinition, PluginManifest, ValidationOutcome } from "./types";
 
 /** Cache keys. Extend this object when you add an endpoint. */
 export const queryKeys = {
   pipelines: ["pipelines"] as const,
   pipeline: (uid: string) => ["pipelines", uid] as const,
   plugins: ["plugins"] as const,
+  catalog: ["catalog"] as const,
   pipelineValidation: (definition: unknown) => ["pipelines", "validate", definition] as const,
 };
 
@@ -63,6 +65,18 @@ export function usePlugins(): UseQueryResult<PluginManifest[], Error> {
   return useQuery({
     queryKey: queryKeys.plugins,
     queryFn: ({ signal }) => listPlugins(signal),
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/**
+ * The curated catalog. Compiled into the gateway, so it changes only on
+ * redeploy — cached as hard as the plugin manifests.
+ */
+export function useCatalog(): UseQueryResult<Catalog, Error> {
+  return useQuery({
+    queryKey: queryKeys.catalog,
+    queryFn: ({ signal }) => listCatalog(signal),
     staleTime: 5 * 60 * 1000,
   });
 }
