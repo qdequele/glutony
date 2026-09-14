@@ -1,5 +1,6 @@
 //! HTTP handlers, one module per route group (SPEC §6).
 
+pub mod catalog;
 pub mod ingest;
 pub mod jobs;
 pub mod pipeline;

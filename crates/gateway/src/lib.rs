@@ -72,6 +72,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::pipelines::get_pipeline).delete(handlers::pipelines::delete_pipeline),
         )
         .route("/plugins", get(handlers::plugins::list_plugins))
+        .route("/catalog", get(handlers::catalog::get_catalog))
         .route("/usage", get(handlers::usage::get_usage))
         .merge(ui::router())
         .layer(DefaultBodyLimit::max(limit))
