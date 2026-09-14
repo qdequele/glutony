@@ -39,8 +39,10 @@ export function WorkflowCard({
   return (
     <Card className="flex flex-col transition-colors hover:border-primary/40">
       <CardHeader>
-        <CardTitle className="flex items-start justify-between gap-2">
-          <Link href={workflowDetailHref(entry.uid)} className="hover:underline">
+        <CardTitle className="flex flex-wrap items-start justify-between gap-x-2 gap-y-1">
+          {/* `min-w-0` for the same reason as ActionCard: without it a long
+              title holds its min-content width and clips the `shrink-0` badge. */}
+          <Link href={workflowDetailHref(entry.uid)} className="min-w-0 hover:underline">
             {entry.title}
           </Link>
           <Badge variant={isBuiltin ? "secondary" : "outline"}>

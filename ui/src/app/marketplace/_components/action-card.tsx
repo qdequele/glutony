@@ -13,8 +13,11 @@ export function ActionCard({ action }: { action: MergedAction }) {
   return (
     <Card className="transition-colors hover:border-primary/40">
       <CardHeader>
-        <CardTitle className="flex items-start justify-between gap-2">
-          <Link href={actionDetailHref(entry.plugin)} className="hover:underline">
+        <CardTitle className="flex flex-wrap items-start justify-between gap-x-2 gap-y-1">
+          {/* `min-w-0` lets the title wrap instead of holding its min-content
+              width, which would push the `shrink-0` badge past the card edge
+              and get it clipped at narrow widths. */}
+          <Link href={actionDetailHref(entry.plugin)} className="min-w-0 hover:underline">
             {entry.title}
           </Link>
           <Badge variant={registered ? "secondary" : "outline"}>
