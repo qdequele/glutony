@@ -88,10 +88,14 @@ function WorkflowDetail() {
         <h3 className="mb-2 text-sm font-semibold tracking-tight">How it starts</h3>
         {!definition && pipelines.isPending ? (
           <Skeleton className="h-4 w-48" />
+        ) : !definition ? (
+          <p className="text-xs text-muted-foreground">
+            Definition unavailable in this deployment.
+          </p>
         ) : (
           <>
-            <TriggerLine trigger={definition?.trigger} />
-            {definition?.trigger?.index_pattern ? (
+            <TriggerLine trigger={definition.trigger} />
+            {definition.trigger?.index_pattern ? (
               <p className="mt-1 text-xs text-muted-foreground">
                 Writes to <code className="font-mono">{definition.trigger.index_pattern}</code>
               </p>

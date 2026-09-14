@@ -100,6 +100,7 @@ export default function ActionsPage() {
                     <span className="ml-2 font-normal text-muted-foreground">
                       {section.length}
                     </span>
+                    <span className="sr-only"> actions</span>
                   </h2>
                   <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                     {section.map((action) => (

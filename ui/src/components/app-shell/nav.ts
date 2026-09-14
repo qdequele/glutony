@@ -1,6 +1,8 @@
 import type { LucideIcon } from "lucide-react";
 import { Activity, BarChart3, FlaskConical, Store, Workflow } from "lucide-react";
 
+import { MARKETPLACE_HREF } from "@/app/marketplace/routes";
+
 /** One entry of the left sidebar. */
 export interface NavItem {
   href: string;
@@ -14,7 +16,7 @@ export interface NavItem {
  */
 export const NAV_ITEMS: NavItem[] = [
   {
-    href: "/marketplace",
+    href: MARKETPLACE_HREF,
     label: "Marketplace",
     icon: Store,
     description: "Browse every action and workflow the system ships with",

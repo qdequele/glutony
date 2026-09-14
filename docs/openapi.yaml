@@ -56,6 +56,8 @@ tags:
     description: Manage pipeline definitions (built-in and user-defined).
   - name: Plugins
     description: Discover registered plugins.
+  - name: Catalog
+    description: Curated action and workflow catalog.
   - name: System
     description: Liveness and readiness.
 
@@ -444,6 +446,7 @@ paths:
 
   /catalog:
     get:
+      tags: [Catalog]
       summary: Curated action and workflow catalog
       description: >
         Authored descriptions of every action the system can run and every

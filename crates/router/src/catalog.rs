@@ -378,7 +378,7 @@ fn builtin_workflow(
     }
 }
 
-/// Every workflow the system ships with, in built-in table order.
+/// Every workflow the system ships with, grouped by category.
 fn workflows() -> Vec<WorkflowEntry> {
     use WorkflowCategory::*;
     vec![
@@ -585,6 +585,22 @@ mod tests {
                 "built-in `{}` has {count} catalog entries, want 1",
                 pipeline.uid
             );
+        }
+    }
+
+    #[test]
+    fn every_builtin_workflow_entry_matches_a_real_pipeline() {
+        // The mirror of `every_builtin_pipeline_has_a_workflow_entry`. Without it a
+        // `builtin.*` entry can outlive the pipeline it names, and its Clone link
+        // 404s against `GET /pipelines/{uid}`.
+        let uids: Vec<String> = builtin_pipelines().into_iter().map(|p| p.uid).collect();
+        for entry in catalog().workflows {
+            if let Some(suffix) = entry.uid.strip_prefix("builtin.") {
+                assert!(
+                    uids.contains(&entry.uid),
+                    "catalog describes `builtin.{suffix}`, which is not a built-in pipeline"
+                );
+            }
         }
     }
 

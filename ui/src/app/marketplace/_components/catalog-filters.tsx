@@ -50,7 +50,12 @@ export function CatalogFilters<T extends string>({
         {categories.map((category) => {
           const selected = active.includes(category);
           return (
-            <button key={category} type="button" onClick={() => onToggle(category)}>
+            <button
+              key={category}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => onToggle(category)}
+            >
               <Badge
                 variant={selected ? "default" : "outline"}
                 className={cn("cursor-pointer capitalize", !selected && "hover:bg-muted")}

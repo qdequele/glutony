@@ -13,6 +13,11 @@ const TABS = [
   { href: MARKETPLACE_WORKFLOWS_HREF, label: "Workflows" },
 ];
 
+/** `usePathname()` keeps the trailing slash `next.config.ts` adds; hrefs do not carry one. */
+function samePath(pathname: string, href: string): boolean {
+  return pathname.replace(/\/$/, "") === href;
+}
+
 /**
  * Shell for both marketplace surfaces.
  *
@@ -32,7 +37,7 @@ export default function MarketplaceLayout({ children }: { children: ReactNode })
       />
       <div className="flex gap-1 border-b px-4">
         {TABS.map((tab) => {
-          const active = pathname === tab.href;
+          const active = samePath(pathname, tab.href);
           return (
             <Link
               key={tab.href}
