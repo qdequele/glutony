@@ -13,8 +13,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod guard;
 pub mod secret;
 
+pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
 pub use secret::{SecretKey, open_json, seal_json};
 
 /// Errors produced while handling a source.
@@ -29,4 +31,10 @@ pub enum SourceError {
     /// A sealed payload did not deserialize into the expected type.
     #[error("sealed payload: {0}")]
     Payload(String),
+    /// The URL was rejected before any socket was opened (scheme or address policy).
+    #[error("blocked url: {0}")]
+    Blocked(String),
+    /// DNS resolution failed.
+    #[error("dns: {0}")]
+    Dns(String),
 }
