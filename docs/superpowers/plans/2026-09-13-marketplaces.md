@@ -20,7 +20,9 @@
 - **Use existing shadcn primitives** from `ui/src/components/ui/` — `card`, `badge`, `button`, `input`, `tabs`, `tooltip`, `alert`, `skeleton`, `separator` are all vendored. Do not add new dependencies.
 - **Co-locate components** in the feature's `_components/` directory.
 - **Rust: run `cargo fmt` before every commit.** `rustfmt.toml` is at the repo root.
-- **Commit messages end with:** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
+- **Commit messages end with a `Co-Authored-By:` trailer naming the model that wrote the commit**, e.g. `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` or `Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>`. Use your own model's name — never copy another model's.
+- **Clippy must be clean on the crates you touch**, e.g. `cargo clippy -p meili-ingest-router -p meili-ingest-control-plane -p meili-ingest-gateway --all-targets -- -D warnings`. CI gates on clippy (`.github/workflows/ci.yml:38`), so a warning is a build failure, not a style note. Never silence one with `#[allow(...)]` — there is no precedent for it anywhere in `crates/`. Note: `--workspace` currently fails with 7 errors inside the third-party `prost-reflect` crate, for reasons that predate this branch (verified at merge base 3f99358). Ignore that, and never try to fix it as part of a task here.
+- **Do not run `git checkout`, `git restore`, or `git stash` across the worktree.** Stage and commit only the files your task names. A blanket revert destroys the controller's uncommitted plan and ledger edits — this has already happened once.
 - **Never add catalog copy to `PluginManifest`.** That type is implemented by third-party WASM and gRPC plugin authors; showcase copy belongs only in `catalog.rs`.
 
 ## File Structure
