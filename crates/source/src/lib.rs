@@ -13,15 +13,19 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod connector;
 pub mod guard;
 pub mod model;
 pub mod secret;
 pub mod template;
+pub mod url;
 
+pub use connector::{Resolution, ResolveRuntime, ResolvedItem, SourceConnector};
 pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
 pub use model::{FetchAuth, IncrementalState, Location, RunOutcome, SourceDefinition, redact};
 pub use secret::{SecretKey, open_json, seal_json};
 pub use template::render;
+pub use url::UrlConnector;
 
 /// Errors produced while handling a source.
 #[derive(Debug, thiserror::Error)]
@@ -44,4 +48,7 @@ pub enum SourceError {
     /// A URL template could not be rendered.
     #[error("url template: {0}")]
     Template(String),
+    /// The upstream fetch failed.
+    #[error("fetch: {0}")]
+    Fetch(String),
 }
