@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use chrono::Utc;
 use http_body_util::BodyExt;
+use meili_ingest_control_plane::builtin_pipelines::builtin_plugin_names;
 use meili_ingest_control_plane::error::ErrorBody;
 use meili_ingest_control_plane::jobs::{JobRecord, JobUpdate};
 use meili_ingest_control_plane::pipelines::PipelineRepo;
@@ -268,13 +269,18 @@ async fn pipeline_routes_end_to_end() {
     let (status, _) = call(app(state.clone()), req_json("POST", "/pipelines", &bad)).await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // GET list: user rows first, then 12 builtins.
+    // GET list: the two user rows first, then every built-in. Counted from
+    // `builtin_pipelines()` rather than hardcoded: the literal that used to live
+    // here went stale the moment parquet/avro/msgpack were added.
     let (status, body) = call(app(state.clone()), get("/pipelines?project_id=t1")).await;
     assert_eq!(status, StatusCode::OK);
     let list: Vec<PipelineDefinition> = json(&body);
     assert_eq!(list[0].uid, "hdr-scoped");
     assert_eq!(list[1].uid, "bad-plugin");
-    assert_eq!(list.len(), 2 + 12);
+    assert_eq!(
+        list.len(),
+        2 + meili_ingest_router::builtin_pipelines().len()
+    );
     assert!(list[2..].iter().all(|p| p.builtin));
 
     // GET one (scoped) / 404 for other tenant / builtin fallback.
@@ -378,7 +384,8 @@ async fn plugins_registry_falls_back_to_static_list() {
     let (status, body) = call(app(state.clone()), get("/plugins")).await;
     assert_eq!(status, StatusCode::OK);
     let list: Vec<PluginManifest> = json(&body);
-    assert_eq!(list.len(), 16);
+    // Same reasoning as the pipeline count above: derive it, do not hardcode it.
+    assert_eq!(list.len(), builtin_plugin_names().len());
     assert!(
         list.iter()
             .any(|m| m.name == "pdf_extractor" && m.kind == PluginKind::Builtin)
