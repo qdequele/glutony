@@ -1,5 +1,5 @@
 import type { LucideIcon } from "lucide-react";
-import { Activity, BarChart3, FlaskConical, Workflow } from "lucide-react";
+import { Activity, BarChart3, FlaskConical, Store, Workflow } from "lucide-react";
 
 /** One entry of the left sidebar. */
 export interface NavItem {
@@ -10,9 +10,15 @@ export interface NavItem {
 }
 
 /**
- * The four screens of the admin UI.
+ * The five screens of the admin UI.
  */
 export const NAV_ITEMS: NavItem[] = [
+  {
+    href: "/marketplace",
+    label: "Marketplace",
+    icon: Store,
+    description: "Browse every action and workflow the system ships with",
+  },
   {
     href: "/pipelines",
     label: "Pipelines",
