@@ -62,10 +62,11 @@ async fn sources_schema_exists_after_migration() {
         .await
         .expect("delete source");
 
-    let (runs,): (i64,) =
-        sqlx::query_as("SELECT count(*) FROM source_runs WHERE run_id = '22222222-2222-2222-2222-222222222222'")
-            .fetch_one(&pool)
-            .await
-            .expect("count runs");
+    let (runs,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM source_runs WHERE run_id = '22222222-2222-2222-2222-222222222222'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count runs");
     assert_eq!(runs, 0, "runs cascade-delete with their source");
 }
