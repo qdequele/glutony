@@ -117,4 +117,15 @@ mod tests {
         assert!(!is_builtin_uid("my-builtin.pdf"));
         assert!(!is_builtin_uid("pdf"));
     }
+
+    #[test]
+    fn catalog_describes_every_known_plugin() {
+        // The catalog keeps its own list because router cannot depend on this
+        // crate. This test is the joint that stops the two drifting.
+        let mut catalog_names = meili_ingest_router::catalog::ALL_KNOWN_PLUGINS.to_vec();
+        let mut known = builtin_plugin_names().to_vec();
+        catalog_names.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(catalog_names, known);
+    }
 }

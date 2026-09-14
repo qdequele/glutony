@@ -8,6 +8,7 @@
  */
 import type {
   ApiErrorBody,
+  Catalog,
   PipelineDefinition,
   PluginManifest,
   ValidatePipelineOk,
@@ -166,4 +167,13 @@ export async function validatePipeline(
 /** `GET /plugins` — manifests published by the worker pools at boot. */
 export function listPlugins(signal?: AbortSignal): Promise<PluginManifest[]> {
   return request<PluginManifest[]>("/plugins", { signal });
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+/** `GET /catalog` — curated action and workflow copy, compiled into the gateway. */
+export function listCatalog(signal?: AbortSignal): Promise<Catalog> {
+  return request<Catalog>("/catalog", { signal });
 }

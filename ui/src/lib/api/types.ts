@@ -195,6 +195,70 @@ export interface PluginManifest {
 }
 
 // ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+/** `ActionCategory` — where an action sits in the shape of a pipeline. */
+export type ActionCategory = "fetch" | "extract" | "transform" | "enrich" | "index";
+
+/** The five categories in pipeline order, which is the order the grid renders. */
+export const ACTION_CATEGORIES: ActionCategory[] = [
+  "fetch",
+  "extract",
+  "transform",
+  "enrich",
+  "index",
+];
+
+/** `WorkflowCategory` — what a workflow is for. */
+export type WorkflowCategory = "documents" | "data" | "media" | "web";
+
+/** The four workflow categories, in grid order. */
+export const WORKFLOW_CATEGORIES: WorkflowCategory[] = ["documents", "data", "media", "web"];
+
+/**
+ * `ActionEntry` — authored copy for one plugin.
+ *
+ * Deliberately separate from `PluginManifest`: that type is implemented by
+ * third-party WASM and gRPC plugin authors and carries no product copy.
+ */
+export interface ActionEntry {
+  /** Joins to `PluginManifest.name`. */
+  plugin: string;
+  title: string;
+  category: ActionCategory;
+  summary: string;
+  use_cases: string[];
+  /** A copyable YAML step block. */
+  example_step: string;
+  /** Fallback for when no worker has registered a manifest. */
+  accepts: InputKind[];
+  /** Fallback for when no worker has registered a manifest. */
+  produces: OutputKind;
+}
+
+/** `WorkflowEntry` — authored copy for one workflow. */
+export interface WorkflowEntry {
+  /** `builtin.pdf`, or a curated template uid. */
+  uid: string;
+  title: string;
+  category: WorkflowCategory;
+  summary: string;
+  when_to_use: string;
+  /**
+   * Present only for curated templates that are not deployed as pipelines.
+   * Absent for `builtin.*`, whose definition comes from `GET /pipelines`.
+   */
+  definition?: PipelineDefinition;
+}
+
+/** `Catalog` — the body of `GET /catalog`. */
+export interface Catalog {
+  actions: ActionEntry[];
+  workflows: WorkflowEntry[];
+}
+
+// ---------------------------------------------------------------------------
 // Jobs
 // ---------------------------------------------------------------------------
 

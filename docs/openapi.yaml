@@ -56,6 +56,8 @@ tags:
     description: Manage pipeline definitions (built-in and user-defined).
   - name: Plugins
     description: Discover registered plugins.
+  - name: Catalog
+    description: Curated action and workflow catalog.
   - name: System
     description: Liveness and readiness.
 
@@ -441,6 +443,23 @@ paths:
                   $ref: "#/components/schemas/PluginManifest"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+
+  /catalog:
+    get:
+      tags: [Catalog]
+      summary: Curated action and workflow catalog
+      description: >
+        Authored descriptions of every action the system can run and every
+        workflow it ships with. Static data compiled into the gateway: identical
+        for every caller, and unaffected by which workers have registered.
+      operationId: getCatalog
+      responses:
+        "200":
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Catalog"
 
 components:
   securitySchemes:
@@ -910,3 +929,53 @@ components:
           items:
             type: string
           description: MIME types the plugin is designed for (informational).
+
+    Catalog:
+      type: object
+      required: [actions, workflows]
+      properties:
+        actions:
+          type: array
+          items: { $ref: "#/components/schemas/ActionEntry" }
+        workflows:
+          type: array
+          items: { $ref: "#/components/schemas/WorkflowEntry" }
+    ActionEntry:
+      type: object
+      required: [plugin, title, category, summary, use_cases, example_step, accepts, produces]
+      properties:
+        plugin:
+          type: string
+          description: Joins to PluginManifest.name.
+        title: { type: string }
+        category:
+          type: string
+          enum: [fetch, extract, transform, enrich, index]
+        summary: { type: string }
+        use_cases:
+          type: array
+          items: { type: string }
+        example_step:
+          type: string
+          description: A copyable YAML step block.
+        accepts:
+          type: array
+          items: { $ref: "#/components/schemas/InputKind" }
+        produces: { $ref: "#/components/schemas/OutputKind" }
+    WorkflowEntry:
+      type: object
+      required: [uid, title, category, summary, when_to_use]
+      properties:
+        uid: { type: string }
+        title: { type: string }
+        category:
+          type: string
+          enum: [documents, data, media, web]
+        summary: { type: string }
+        when_to_use: { type: string }
+        definition:
+          allOf: [{ $ref: "#/components/schemas/PipelineDefinition" }]
+          description: >
+            Present only for curated templates that are not deployed as
+            pipelines. Absent for builtin.* entries, whose definition comes
+            from GET /pipelines.
