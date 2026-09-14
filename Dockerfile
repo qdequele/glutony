@@ -40,7 +40,10 @@ FROM node:${NODE_VERSION}-bookworm-slim AS ui
 WORKDIR /ui
 RUN corepack enable
 # Install from the lockfile first so a source-only change reuses this layer.
-COPY ui/package.json ui/pnpm-lock.yaml* ./
+# `pnpm-workspace.yaml` must come along: it carries the build-script policy for
+# `sharp` and `unrs-resolver`, and without it pnpm 10+ fails the install outright
+# with ERR_PNPM_IGNORED_BUILDS rather than just warning.
+COPY ui/package.json ui/pnpm-lock.yaml* ui/pnpm-workspace.yaml* ./
 RUN pnpm install --frozen-lockfile
 COPY ui/ ./
 # Mounted under /ui so the export never shadows the API routes, which share the
