@@ -17,6 +17,8 @@
 - **The UI is a static export** (`output: "export"`). No dynamic route segments — detail pages take query params and every URL goes through a feature-local `routes.ts` helper. Any component calling `useSearchParams` must be wrapped in `<Suspense>` or the build fails.
 - **Every server read goes through a hook** in `ui/src/lib/api/hooks.ts`, never a bare `fetch`. Add cache keys to the `queryKeys` object, never inline string arrays.
 - **Use `cn()`** for conditional class merging, never string concatenation.
+- **Run `pnpm build` before `pnpm exec tsc --noEmit`.** Next 16 generates global types (`LayoutProps`, `PageProps`) into `.next/types` at build time; without a prior build, `tsc` reports a spurious `TS2304: Cannot find name 'LayoutProps'` in `ui/src/app/layout.tsx`. That file is unmodified by this plan — if you see that error, build first rather than reporting it as pre-existing breakage.
+- **Two eslint warnings are pre-existing** in `ui/src/app/playground/_components/ingest-form.tsx` (`react-hooks/incompatible-library`). `pnpm lint` should report exactly `2 problems (0 errors, 2 warnings)` — anything more is yours.
 - **Use existing shadcn primitives** from `ui/src/components/ui/` — `card`, `badge`, `button`, `input`, `tabs`, `tooltip`, `alert`, `skeleton`, `separator` are all vendored. Do not add new dependencies.
 - **Co-locate components** in the feature's `_components/` directory.
 - **Rust: run `cargo fmt` before every commit.** `rustfmt.toml` is at the repo root.
