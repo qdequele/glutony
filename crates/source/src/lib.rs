@@ -14,10 +14,12 @@
 #![warn(missing_docs)]
 
 pub mod guard;
+pub mod model;
 pub mod secret;
 pub mod template;
 
 pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
+pub use model::{FetchAuth, IncrementalState, Location, RunOutcome, SourceDefinition, redact};
 pub use secret::{SecretKey, open_json, seal_json};
 pub use template::render;
 
