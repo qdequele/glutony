@@ -15,9 +15,11 @@
 
 pub mod guard;
 pub mod secret;
+pub mod template;
 
 pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
 pub use secret::{SecretKey, open_json, seal_json};
+pub use template::render;
 
 /// Errors produced while handling a source.
 #[derive(Debug, thiserror::Error)]
@@ -37,4 +39,7 @@ pub enum SourceError {
     /// DNS resolution failed.
     #[error("dns: {0}")]
     Dns(String),
+    /// A URL template could not be rendered.
+    #[error("url template: {0}")]
+    Template(String),
 }
