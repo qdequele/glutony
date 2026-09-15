@@ -4,7 +4,7 @@
 
 use meili_ingest_control_plane::sources::{NewSource, RunRecord, SourceRepo};
 use meili_ingest_source::model::{IncrementalState, Location, RunOutcome};
-use sqlx::{Executor, PgPool};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Tests in one file run concurrently against the same database, so each takes its own
@@ -17,8 +17,10 @@ async fn repo(prefix: &str) -> Option<SourceRepo> {
         .run(&pool)
         .await
         .expect("migrations apply");
+    // The trailing dash matters: a bare `tr-a%` also matches `tr-arch-p1`, so one test
+    // would wipe another's rows. Every uid in this file is `<prefix>-<suffix>`.
     sqlx::query("DELETE FROM sources WHERE uid LIKE $1")
-        .bind(format!("{prefix}%"))
+        .bind(format!("{prefix}-%"))
         .execute(&pool)
         .await
         .expect("clean");
