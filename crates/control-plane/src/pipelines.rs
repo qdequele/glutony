@@ -129,6 +129,51 @@ impl PipelineRepo {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Delete a pipeline and archive every source that feeds from it, in one
+    /// transaction. Returns whether the pipeline existed and the ids of the sources
+    /// archived, so the caller can delete their Temporal schedules.
+    ///
+    /// Deleting is **never blocked** by a source referencing the pipeline. Archiving
+    /// rather than cascade-deleting the sources keeps the credentials a tenant supplied
+    /// by hand: destroying those as a side effect of an unrelated delete is not
+    /// recoverable, whereas an archived source can be repointed and unarchived.
+    pub async fn delete_cascading(
+        &self,
+        uid: &str,
+        project_id: Option<&str>,
+    ) -> Result<(bool, Vec<uuid::Uuid>), CpError> {
+        let mut tx = self.pool.begin().await?;
+
+        let archived: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            "UPDATE sources SET archived_at = now(), paused = true, updated_at = now() \
+             WHERE pipeline_uid = $1 \
+               AND COALESCE(project_id, '') = COALESCE($2, '') \
+               AND archived_at IS NULL \
+             RETURNING id",
+        )
+        .bind(uid)
+        .bind(project_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let res = sqlx::query(
+            "DELETE FROM pipelines WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '')",
+        )
+        .bind(uid)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let deleted = res.rows_affected() > 0;
+        if !deleted {
+            // Nothing was deleted, so nothing should have been archived either.
+            tx.rollback().await?;
+            return Ok((false, Vec::new()));
+        }
+        tx.commit().await?;
+        Ok((deleted, archived.into_iter().map(|(id,)| id).collect()))
+    }
+
     /// Names present in the `plugins` table (manifests registered by workers).
     pub async fn registered_plugin_names(&self) -> Result<Vec<String>, CpError> {
         let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM plugins")
@@ -317,12 +362,21 @@ pub async fn delete_pipeline(
         )));
     }
     let project_id = project_scope(q.project_id.as_deref(), &headers);
-    if state
+    let (deleted, archived) = state
         .pipelines()
-        .delete(&uid, project_id.as_deref())
-        .await?
-    {
+        .delete_cascading(&uid, project_id.as_deref())
+        .await?;
+    if deleted {
         state.cache.invalidate().await;
+        if !archived.is_empty() {
+            // The gateway deletes the corresponding Temporal schedules; logging the ids
+            // here is what makes an orphaned schedule traceable if that step fails.
+            tracing::info!(
+                uid = %uid,
+                archived_sources = ?archived,
+                "pipeline deleted; dependent sources archived"
+            );
+        }
         tracing::info!(uid = %uid, project_id = ?project_id, "pipeline deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {

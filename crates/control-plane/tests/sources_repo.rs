@@ -7,15 +7,19 @@ use meili_ingest_source::model::{IncrementalState, Location, RunOutcome};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
-async fn repo() -> Option<SourceRepo> {
+/// Tests in one file run concurrently against the same database, so each takes its own
+/// uid namespace and cleans only that. A shared `LIKE 'test-repo-%'` wipe would delete
+/// rows out from under a neighbouring test.
+async fn repo(prefix: &str) -> Option<SourceRepo> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = PgPool::connect(&url).await.ok()?;
     sqlx::migrate!("../../migrations")
         .run(&pool)
         .await
         .expect("migrations apply");
-    // Each run starts from a clean slate for the uids this file uses.
-    pool.execute("DELETE FROM sources WHERE uid LIKE 'test-repo-%'")
+    sqlx::query("DELETE FROM sources WHERE uid LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
         .await
         .expect("clean");
     Some(SourceRepo::new(pool))
@@ -45,14 +49,14 @@ fn new_source(uid: &str, project_id: Option<&str>, pipeline_uid: &str) -> NewSou
 
 #[tokio::test]
 async fn insert_then_get_roundtrips() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-a").await else {
         eprintln!("DATABASE_URL unset; skipping");
         return;
     };
-    let new = new_source("test-repo-a", None, "builtin.json");
+    let new = new_source("tr-a-1", None, "builtin.json");
     let id = new.id;
     let stored = repo.insert(&new).await.expect("insert");
-    assert_eq!(stored.definition.uid, "test-repo-a");
+    assert_eq!(stored.definition.uid, "tr-a-1");
     assert_eq!(stored.definition.id, id);
     assert!(
         stored.definition.paused,
@@ -60,7 +64,7 @@ async fn insert_then_get_roundtrips() {
     );
 
     let got = repo
-        .get("test-repo-a", None)
+        .get("tr-a-1", None)
         .await
         .expect("get")
         .expect("exists");
@@ -71,23 +75,23 @@ async fn insert_then_get_roundtrips() {
 
 #[tokio::test]
 async fn the_same_uid_may_exist_globally_and_per_tenant() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-dup").await else {
         return;
     };
-    repo.insert(&new_source("test-repo-dup", None, "builtin.json"))
+    repo.insert(&new_source("tr-dup-1", None, "builtin.json"))
         .await
         .expect("global insert");
-    repo.insert(&new_source("test-repo-dup", Some("proj-1"), "builtin.json"))
+    repo.insert(&new_source("tr-dup-1", Some("proj-1"), "builtin.json"))
         .await
         .expect("tenant insert");
 
     let global = repo
-        .get("test-repo-dup", None)
+        .get("tr-dup-1", None)
         .await
         .expect("get")
         .expect("exists");
     let tenant = repo
-        .get("test-repo-dup", Some("proj-1"))
+        .get("tr-dup-1", Some("proj-1"))
         .await
         .expect("get")
         .expect("exists");
@@ -97,53 +101,48 @@ async fn the_same_uid_may_exist_globally_and_per_tenant() {
 
 #[tokio::test]
 async fn list_scopes_to_the_tenant_and_hides_archived() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-list").await else {
         return;
     };
-    repo.insert(&new_source("test-repo-g", None, "builtin.json"))
-        .await
-        .expect("insert");
-    repo.insert(&new_source("test-repo-t", Some("proj-2"), "builtin.json"))
+    repo.insert(&new_source("tr-list-global", None, "builtin.json"))
         .await
         .expect("insert");
     repo.insert(&new_source(
-        "test-repo-other",
-        Some("proj-3"),
+        "tr-list-tenant",
+        Some("proj-2"),
         "builtin.json",
     ))
     .await
     .expect("insert");
+    repo.insert(&new_source("tr-list-other", Some("proj-3"), "builtin.json"))
+        .await
+        .expect("insert");
 
     let listed = repo.list(Some("proj-2"), false).await.expect("list");
     let uids: Vec<&str> = listed.iter().map(|s| s.definition.uid.as_str()).collect();
-    assert!(uids.contains(&"test-repo-t"), "tenant's own source");
-    assert!(uids.contains(&"test-repo-g"), "global sources are visible");
+    assert!(uids.contains(&"tr-list-tenant"), "tenant's own source");
     assert!(
-        !uids.contains(&"test-repo-other"),
+        uids.contains(&"tr-list-global"),
+        "global sources are visible"
+    );
+    assert!(
+        !uids.contains(&"tr-list-other"),
         "another tenant's source must not leak"
     );
 }
 
 #[tokio::test]
 async fn archive_for_pipeline_stamps_and_hides() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-arch").await else {
         return;
     };
-    repo.insert(&new_source(
-        "test-repo-p1",
-        Some("proj-4"),
-        "doomed.pipeline",
-    ))
-    .await
-    .expect("insert");
-    repo.insert(&new_source(
-        "test-repo-p2",
-        Some("proj-4"),
-        "doomed.pipeline",
-    ))
-    .await
-    .expect("insert");
-    repo.insert(&new_source("test-repo-p3", Some("proj-4"), "safe.pipeline"))
+    repo.insert(&new_source("tr-arch-p1", Some("proj-4"), "doomed.pipeline"))
+        .await
+        .expect("insert");
+    repo.insert(&new_source("tr-arch-p2", Some("proj-4"), "doomed.pipeline"))
+        .await
+        .expect("insert");
+    repo.insert(&new_source("tr-arch-p3", Some("proj-4"), "safe.pipeline"))
         .await
         .expect("insert");
 
@@ -160,8 +159,8 @@ async fn archive_for_pipeline_stamps_and_hides() {
         .into_iter()
         .map(|s| s.definition.uid)
         .collect();
-    assert!(!visible.contains(&"test-repo-p1".to_string()));
-    assert!(visible.contains(&"test-repo-p3".to_string()), "unaffected");
+    assert!(!visible.contains(&"tr-arch-p1".to_string()));
+    assert!(visible.contains(&"tr-arch-p3".to_string()), "unaffected");
 
     let with_archived: Vec<String> = repo
         .list(Some("proj-4"), true)
@@ -170,11 +169,11 @@ async fn archive_for_pipeline_stamps_and_hides() {
         .into_iter()
         .map(|s| s.definition.uid)
         .collect();
-    assert!(with_archived.contains(&"test-repo-p1".to_string()));
+    assert!(with_archived.contains(&"tr-arch-p1".to_string()));
 
     // The credentials survive, so the source can be repointed and unarchived.
     let kept = repo
-        .get("test-repo-p1", Some("proj-4"))
+        .get("tr-arch-p1", Some("proj-4"))
         .await
         .expect("get")
         .expect("exists");
@@ -184,10 +183,10 @@ async fn archive_for_pipeline_stamps_and_hides() {
 
 #[tokio::test]
 async fn save_state_advances_the_incremental_state() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-state").await else {
         return;
     };
-    let new = new_source("test-repo-state", None, "builtin.json");
+    let new = new_source("tr-state-1", None, "builtin.json");
     let id = new.id;
     repo.insert(&new).await.expect("insert");
 
@@ -203,7 +202,7 @@ async fn save_state_advances_the_incremental_state() {
     .expect("save state");
 
     let got = repo
-        .get("test-repo-state", None)
+        .get("tr-state-1", None)
         .await
         .expect("get")
         .expect("exists");
@@ -213,10 +212,10 @@ async fn save_state_advances_the_incremental_state() {
 
 #[tokio::test]
 async fn runs_are_recorded_and_listed_newest_first() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-runs").await else {
         return;
     };
-    let new = new_source("test-repo-runs", None, "builtin.json");
+    let new = new_source("tr-runs-1", None, "builtin.json");
     let source_id = new.id;
     repo.insert(&new).await.expect("insert");
 
@@ -255,7 +254,7 @@ async fn runs_are_recorded_and_listed_newest_first() {
 
     // The source's denormalized status mirrors the newest run.
     let got = repo
-        .get("test-repo-runs", None)
+        .get("tr-runs-1", None)
         .await
         .expect("get")
         .expect("exists");
@@ -265,10 +264,10 @@ async fn runs_are_recorded_and_listed_newest_first() {
 
 #[tokio::test]
 async fn delete_removes_the_source_and_its_runs() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-del").await else {
         return;
     };
-    let new = new_source("test-repo-del", None, "builtin.json");
+    let new = new_source("tr-del-1", None, "builtin.json");
     let source_id = new.id;
     repo.insert(&new).await.expect("insert");
     repo.record_run(&RunRecord {
@@ -284,12 +283,9 @@ async fn delete_removes_the_source_and_its_runs() {
     .await
     .expect("record run");
 
-    assert!(repo.delete("test-repo-del", None).await.expect("delete"));
+    assert!(repo.delete("tr-del-1", None).await.expect("delete"));
     assert!(
-        repo.get("test-repo-del", None)
-            .await
-            .expect("get")
-            .is_none(),
+        repo.get("tr-del-1", None).await.expect("get").is_none(),
         "gone"
     );
     assert!(
@@ -300,22 +296,22 @@ async fn delete_removes_the_source_and_its_runs() {
         "runs cascade"
     );
     assert!(
-        !repo.delete("test-repo-del", None).await.expect("delete"),
+        !repo.delete("tr-del-1", None).await.expect("delete"),
         "deleting twice reports false"
     );
 }
 
 #[tokio::test]
 async fn load_for_run_finds_by_id_and_skips_archived() {
-    let Some(repo) = repo().await else {
+    let Some(repo) = repo("tr-load").await else {
         return;
     };
-    let new = new_source("test-repo-load", Some("proj-5"), "doomed2.pipeline");
+    let new = new_source("tr-load-1", Some("proj-5"), "doomed2.pipeline");
     let id = new.id;
     repo.insert(&new).await.expect("insert");
 
     let loaded = repo.load_for_run(id).await.expect("load").expect("exists");
-    assert_eq!(loaded.definition.uid, "test-repo-load");
+    assert_eq!(loaded.definition.uid, "tr-load-1");
     assert_eq!(loaded.meili_ctx, vec![4, 5, 6]);
 
     repo.archive_for_pipeline("doomed2.pipeline", Some("proj-5"))
