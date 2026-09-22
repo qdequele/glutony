@@ -15,6 +15,7 @@
 
 pub mod connector;
 pub mod guard;
+pub mod host_policy;
 pub mod model;
 pub mod secret;
 pub mod template;
@@ -22,6 +23,7 @@ pub mod url;
 
 pub use connector::{Resolution, ResolveRuntime, ResolvedItem, SourceConnector};
 pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
+pub use host_policy::{HOSTS_ENV, HostPolicy, HostPort};
 pub use model::{FetchAuth, IncrementalState, Location, RunOutcome, SourceDefinition, redact};
 pub use secret::{SecretKey, open_json, seal_json};
 pub use template::render;
