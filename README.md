@@ -238,6 +238,14 @@ cd .. && cargo run --features meili-ingest-gateway/ui --bin meili-ingest-gateway
 
 The published image builds it automatically.
 
+In the Docker dev stack the UI is a service of its own instead
+(`docker compose watch`, then <http://ui.meili-ingest.orb.local:3000>): `next dev` gives hot reload,
+which embedding cannot, since a UI edit would mean a full rebuild of the gateway
+binary. The trade-off is that the UI is no longer same-origin, so the dev gateway
+allows its origin with `CORS_ALLOW_ORIGINS` (set in `compose.yaml`). That variable is
+unset in production — no `CorsLayer` is mounted at all — because the embedded UI
+needs no cross-origin grant.
+
 ## Usage & metering
 
 Every job records per-tenant usage — documents, bytes, LLM tokens, transcription

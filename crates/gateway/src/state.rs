@@ -85,6 +85,12 @@ pub struct GatewayConfig {
     /// Read-side usage analytics API, when configured. Absent means `GET /usage`
     /// answers 501 rather than failing.
     pub usage_api: Option<UsageApiConfig>,
+    /// Browser origins allowed to call the API cross-origin
+    /// (`CORS_ALLOW_ORIGINS`, comma-separated). Empty means no `CorsLayer` is
+    /// mounted at all, which is what production wants: the embedded UI is
+    /// same-origin. It exists for `next dev`, which serves the UI from another
+    /// port and would otherwise be blocked by the browser.
+    pub cors_allow_origins: Vec<String>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -109,6 +115,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("blob_store_url", &self.blob_store_url)
             .field("inline_max_bytes", &self.inline_max_bytes)
             .field("usage_api", &self.usage_api)
+            .field("cors_allow_origins", &self.cors_allow_origins)
             .finish()
     }
 }
@@ -128,6 +135,7 @@ impl Default for GatewayConfig {
             blob_store_url: "file://./blobs".into(),
             inline_max_bytes: 1_048_576,
             usage_api: None,
+            cors_allow_origins: Vec::new(),
         }
     }
 }
@@ -157,6 +165,9 @@ impl GatewayConfig {
                 token,
                 pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
             }),
+            cors_allow_origins: env_opt("CORS_ALLOW_ORIGINS")
+                .map(|v| split_list(&v))
+                .unwrap_or_default(),
         })
     }
 
@@ -171,6 +182,17 @@ fn env_opt(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Split a comma-separated env value, trimming each entry and dropping empty ones
+/// (`"a, b,,"` → `["a", "b"]`), so the spacing people naturally type is harmless.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -725,6 +747,17 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn split_list_trims_and_drops_empty_entries() {
+        // The exact shape compose passes: a space after the comma must not leak into
+        // an origin, where it would never match the browser's `Origin` header.
+        assert_eq!(
+            split_list("http://localhost:3000, http://ui.local:3000,,"),
+            vec!["http://localhost:3000", "http://ui.local:3000"]
+        );
+        assert!(split_list(" , ").is_empty());
+    }
 
     fn sample_pipeline() -> PipelineDefinition {
         PipelineDefinition {
