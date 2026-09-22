@@ -331,14 +331,18 @@ impl SourceRepo {
         Ok(SourceRecord::from(row))
     }
 
-    /// Apply a partial update. `None` when the source does not exist.
+    /// Apply a partial update to the row in exactly `project_id`'s scope. `None` when no
+    /// such row exists.
+    ///
+    /// Writes never fall back to the global row the way [`SourceRepo::get`] does: a
+    /// tenant must not be able to rename, repoint or delete a global source.
     pub async fn update(
         &self,
         uid: &str,
         project_id: Option<&str>,
         patch: &SourcePatch,
     ) -> Result<Option<SourceRecord>, CpError> {
-        // `$9` distinguishes "clear the credential" from "leave it alone": COALESCE
+        // `$10` distinguishes "clear the credential" from "leave it alone": COALESCE
         // alone cannot express the former, because both arrive as SQL NULL.
         let (set_auth, auth_value) = match &patch.fetch_auth {
             None => (false, None),
@@ -356,7 +360,7 @@ impl SourceRepo {
                 fetch_auth = CASE WHEN $10 THEN $11 ELSE fetch_auth END, \
                 paused = COALESCE($12, paused), \
                 updated_at = now() \
-             WHERE uid = $1 AND (project_id IS NULL OR project_id = $2) \
+             WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '') \
              RETURNING {SOURCE_COLUMNS}"
         );
         let row: Option<SourceRow> = sqlx::query_as(AssertSqlSafe(sql))
@@ -387,10 +391,13 @@ impl SourceRepo {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Delete a source. Its runs cascade.
+    /// Delete the source in exactly `project_id`'s scope. Its runs cascade.
+    ///
+    /// Exact scope matters: a looser `project_id IS NULL OR project_id = $2` would make a
+    /// tenant's delete remove the global source of the same uid as well.
     pub async fn delete(&self, uid: &str, project_id: Option<&str>) -> Result<bool, CpError> {
         let done = sqlx::query(
-            "DELETE FROM sources WHERE uid = $1 AND (project_id IS NULL OR project_id = $2)",
+            "DELETE FROM sources WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '')",
         )
         .bind(uid)
         .bind(project_id)
@@ -413,7 +420,7 @@ impl SourceRepo {
         let rows: Vec<(Uuid,)> = sqlx::query_as(
             "UPDATE sources SET archived_at = now(), paused = true, updated_at = now() \
              WHERE pipeline_uid = $1 \
-               AND (project_id IS NULL OR project_id = $2) \
+               AND COALESCE(project_id, '') = COALESCE($2, '') \
                AND archived_at IS NULL \
              RETURNING id",
         )

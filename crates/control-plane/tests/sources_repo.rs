@@ -326,3 +326,90 @@ async fn load_for_run_finds_by_id_and_skips_archived() {
         "an archived source must never be run"
     );
 }
+
+#[tokio::test]
+async fn a_tenant_cannot_modify_or_delete_a_global_source() {
+    let Some(repo) = repo("tr-scope").await else {
+        return;
+    };
+    // The same uid exists globally and for one tenant.
+    repo.insert(&new_source("tr-scope-1", None, "builtin.json"))
+        .await
+        .expect("global insert");
+    repo.insert(&new_source("tr-scope-1", Some("proj-6"), "builtin.json"))
+        .await
+        .expect("tenant insert");
+
+    // The tenant renames and deletes "its" source...
+    let patch = meili_ingest_control_plane::sources::SourcePatch {
+        name: Some("renamed by tenant".into()),
+        ..Default::default()
+    };
+    repo.update("tr-scope-1", Some("proj-6"), &patch)
+        .await
+        .expect("update")
+        .expect("tenant row exists");
+    assert!(
+        repo.delete("tr-scope-1", Some("proj-6"))
+            .await
+            .expect("delete")
+    );
+
+    // ...and the global row is untouched.
+    let global = repo
+        .get("tr-scope-1", None)
+        .await
+        .expect("get")
+        .expect("the global source must survive a tenant delete");
+    assert_eq!(global.definition.name, "source tr-scope-1", "not renamed");
+    assert!(global.definition.project_id.is_none());
+
+    // A tenant with no row of its own cannot reach the global one either.
+    assert!(
+        repo.update("tr-scope-1", Some("proj-7"), &patch)
+            .await
+            .expect("update")
+            .is_none(),
+        "no tenant row, so nothing to update"
+    );
+    assert!(
+        !repo
+            .delete("tr-scope-1", Some("proj-7"))
+            .await
+            .expect("delete")
+    );
+    assert!(repo.get("tr-scope-1", None).await.expect("get").is_some());
+}
+
+#[tokio::test]
+async fn archiving_a_tenant_pipeline_leaves_global_sources_alone() {
+    let Some(repo) = repo("tr-garch").await else {
+        return;
+    };
+    repo.insert(&new_source("tr-garch-global", None, "tr-garch.pipeline"))
+        .await
+        .expect("global insert");
+    repo.insert(&new_source(
+        "tr-garch-tenant",
+        Some("proj-8"),
+        "tr-garch.pipeline",
+    ))
+    .await
+    .expect("tenant insert");
+
+    let archived = repo
+        .archive_for_pipeline("tr-garch.pipeline", Some("proj-8"))
+        .await
+        .expect("archive");
+    assert_eq!(archived.len(), 1, "only the tenant's own source");
+
+    let global = repo
+        .get("tr-garch-global", None)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert!(
+        global.definition.archived_at.is_none(),
+        "a tenant deleting its pipeline must not archive a global source"
+    );
+}
