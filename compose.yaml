@@ -75,7 +75,10 @@ services:
   postgres:
     image: postgres:17-alpine
     ports:
-      - "5432:5432"
+      # Host side is overridable because 5432 is the port every other local
+      # Postgres wants too; the stack itself reaches this over the compose network
+      # (postgres:5432), so only host tools care. POSTGRES_HOST_PORT=55433 to dodge.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: dev-password
