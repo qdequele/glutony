@@ -52,10 +52,13 @@ These resolve the design's forks. Where later sections appear to differ, this li
    `If-Modified-Since`. A `304`, or a body whose hash matches the last run, ends the run
    before any job is created. Documents are upserted by id as today; documents that
    disappear upstream stay in the index. Mirror-sync deletion is a non-goal (see below).
-6. **Two secrets per source, sealed at rest**: the fetch credential, and a
-   `MeiliContext` (host + write key). The second is unavoidable — a cron tick has no
-   incoming request, so there is no Envoy to inject `X-Meili-*` headers. Both are
-   captured from the creating request and never returned by the API.
+6. **The destination lives on the pipeline, not the source.** *(Revised 2026-09-23;
+   this replaced "two secrets per source".)* A cron tick has no incoming request, so no
+   Envoy to inject `X-Meili-*` headers. Rather than have each source capture and seal a
+   Meilisearch key, the pipeline's `meili_indexer` step names a **Meilisearch
+   connection** (Decision 11) that pins host + key. A source stores exactly one secret —
+   its fetch credential — and `POST /sources` refuses (`422`) a pipeline whose indexer
+   step names no connection.
 7. **`Resolution::Items` are source items, not documents.** One TMDB export is *one*
    item that yields ~600k documents. `MAX_FAN_OUT_BRANCHES` (500,
    `crates/worker/src/workflow.rs`) therefore never applies to a source's document
@@ -71,6 +74,29 @@ These resolve the design's forks. Where later sections appear to differ, this li
     expression; the gateway surfaces that as `422` rather than shipping a second cron
     parser that could disagree with the one actually firing. This costs a round trip on
     create and is worth it.
+11. **Meilisearch connections are a named, tenant-scoped entity** holding a host and a
+    sealed API key. Pipelines reference them by name, so a key lives in exactly one
+    place: rotating it updates every pipeline at once, and pipeline JSON never contains a
+    secret and stays safe to view, export and share.
+12. **A connection on the indexer step always wins over the request context** for
+    `host`/`api_key`. A step without one behaves exactly as today. This inverts
+    `inject_meili_context` (`crates/plugin-sdk/src/types.rs`), which currently
+    *always* overwrites `host`/`api_key` with the request's.
+13. **The connection's key is opened inside the indexer activity, never in the
+    workflow.** The workflow passes only the connection name; the key is decrypted in
+    memory just before the plugin runs, so it never enters Temporal history. That is
+    stricter than today's request path, where the injected `api_key` is recorded in the
+    activity input.
+14. **Connection hosts follow a deployment policy, strict by default.**
+    `MEILI_CONNECTION_HOSTS` is `public` (default), `any`, or a comma list of
+    `host[:port]`. A connection's host is a tenant-supplied URL written to from inside
+    the cluster — the fetch-side SSRF exposure, on the write side — but self-hosted
+    users routinely run Meilisearch on a private address, so the policy is one line of
+    config rather than hard-coded.
+15. **Deleting a connection is never blocked**, matching the pipeline rule. Pipelines
+    still referencing it fail at run time with `connection "<uid>" not found`, and the
+    pipeline editor flags the dangling reference. Nothing is archived: the pipeline is
+    intact, only its destination is gone.
 
 ### New dependencies
 
@@ -78,7 +104,7 @@ None of these are in the workspace today; all are added to `[workspace.dependenc
 
 | Crate | Why |
 |---|---|
-| `chacha20poly1305` | Sealing `fetch_auth` and `meili_ctx`. No crypto crate exists in the tree. |
+| `chacha20poly1305` | Sealing a source's `fetch_auth` and a connection's `api_key`. No crypto crate exists in the tree. |
 | `blake3` | Hashing the streamed body for change detection when the server sends no `ETag`. |
 | `flate2` | Transparent gzip. The existing `zip` dep is used only by the docx/pptx parsers. |
 | `chrono-tz` | Rendering date templates in the source's timezone. `chrono` alone is UTC/offset only. |
@@ -101,20 +127,34 @@ CREATE TABLE IF NOT EXISTS sources (
     paused       BOOLEAN NOT NULL DEFAULT false,
     index_name   TEXT,
     fetch_auth   BYTEA,                    -- sealed; NULL = unauthenticated
-    meili_ctx    BYTEA NOT NULL,           -- sealed: host + api_key + region
     last_etag      TEXT,
     last_modified  TEXT,
-    last_hash      BYTEA,                  -- blake3 of the last fetched body
+    last_hash      TEXT,                   -- hex blake3 of the last fetched body
     last_run_at    TIMESTAMPTZ,
     last_status    TEXT,
     last_error     TEXT,
     schedule_id  TEXT NOT NULL,            -- Temporal schedule id
+    archived_at  TIMESTAMPTZ,              -- set when the source's pipeline is deleted
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS sources_uid_project
     ON sources (uid, COALESCE(project_id, ''));
+
+CREATE TABLE IF NOT EXISTS meili_connections (
+    id           UUID PRIMARY KEY,
+    uid          TEXT NOT NULL,            -- what an indexer step names
+    name         TEXT NOT NULL,
+    project_id   TEXT,                     -- NULL = global / self-hosted
+    host         TEXT NOT NULL,            -- not secret; returned by the API
+    api_key      BYTEA NOT NULL,           -- sealed; never returned
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS meili_connections_uid_project
+    ON meili_connections (uid, COALESCE(project_id, ''));
 
 CREATE TABLE IF NOT EXISTS source_runs (
     run_id      UUID PRIMARY KEY,
@@ -137,6 +177,11 @@ CREATE INDEX IF NOT EXISTS jobs_source ON jobs (source_id, started_at DESC);
 `source_runs` duplicates information Temporal already holds, for the same reason `jobs`
 does: workflow history is retention-limited and cannot be filtered per tenant without a
 visibility query per request. It is a cache; Temporal remains the source of truth.
+
+`0002_sources.sql` is revised in place for the connection redesign rather than followed
+by a `0003` that drops `meili_ctx`: the branch is unmerged, so no deployed database has
+applied it. A local dev database that ran the earlier version must drop `sources`,
+`source_runs`, `jobs.source_id` and the `_sqlx_migrations` row for version 2 once.
 
 ### `location` is a tagged union
 
@@ -171,6 +216,66 @@ The offset form matters for TMDB: a schedule running at 00:30 UTC must fetch the
 
 Unknown tokens are a validation error at source-create time, not a silent passthrough.
 
+## Meilisearch connections and the indexer step
+
+### The indexer step names its destination
+
+```yaml
+- id: index
+  plugin: meili_indexer
+  config:
+    connection: prod-movies     # pins host + api_key (Decision 12)
+    index: movies               # optional; pins the index too
+    batch_size: 1000            # existing: max documents per request
+    max_batch_bytes: 52428800   # new: max serialized bytes per request
+```
+
+**Index resolution** when a connection is set: step `index` → pipeline trigger
+`index_pattern` → the request's index, when there is a request → deployment default.
+Without a connection, today's chain is unchanged.
+
+**Batching.** `batch_size` (default 1000) stays the document-count cap. `max_batch_bytes`
+(default 50 MiB, under Meilisearch's 100 MB default `http_payload_size_limit`) is measured
+on the serialized JSON; a batch is cut at whichever limit is reached first. A single
+document larger than `max_batch_bytes` is a **non-retryable** error naming its id — the
+alternative is a Meilisearch `413` that the retry policy would repeat forever. Document
+count alone is the wrong knob: 1000 TMDB id rows are ~60 KB, 1000 chunked PDFs with
+embedded text can exceed the payload limit.
+
+### Where the key is opened
+
+```
+PipelineWorkflow (deterministic)      execute_step activity (I/O)
+─────────────────────────────         ─────────────────────────────────────────
+step config: { connection:            1. GET /internal/connections/{uid}?project_id
+  "prod-movies", index: … }  ───────▶ 2. open api_key with SecretKey (in memory)
+                                      3. re-check host against MEILI_CONNECTION_HOSTS
+                                      4. merge host/api_key into the config
+                                      5. call meili_indexer
+```
+
+The workflow's `step_config` (`crates/worker/src/workflow.rs`) stops calling
+`inject_meili_context` for `host`/`api_key` when a `connection` is present, so the
+activity input — and therefore Temporal history — carries only the name.
+
+### `MeiliContext` becomes optional at the start of a pipeline
+
+`host` and `api_key` on the workflow input become `Option`. `POST /ingest` against a
+pipeline whose indexer pins a connection no longer requires `X-Meili-*` headers or
+standalone credentials, where today it returns `400 MissingContext`. A pipeline whose
+indexer has no connection still requires them, with the same error as today.
+
+### Connection validation
+
+On create and on any `PATCH` touching `host` or `api_key`, the gateway:
+
+1. applies the `MEILI_CONNECTION_HOSTS` policy to `host` (Decision 14);
+2. calls `GET {host}/health`;
+3. calls `GET {host}/indexes?limit=1` with the key, so a wrong key fails with `422` at
+   save time rather than at 3am inside a cron run.
+
+The dev `compose.yaml` sets `MEILI_CONNECTION_HOSTS=meilisearch:7700`.
+
 ## Connector interface
 
 The v2 carve-out. Lives in a new crate `crates/source`.
@@ -184,8 +289,9 @@ pub trait SourceConnector: Send + Sync {
     async fn resolve(
         &self,
         loc: &Location,
+        auth: Option<&FetchAuth>,
         state: &IncrementalState,
-        rt: &ResolveRuntime,   // http client, blob store, guard, scheduled time
+        rt: &ResolveRuntime,   // http client, guard, scheduled time, timezone
     ) -> Result<Resolution, SourceError>;
 }
 
@@ -193,7 +299,7 @@ pub enum Resolution {
     /// Upstream is byte-identical to the previous run. No job, no usage.
     Unchanged,
     Items {
-        items: Vec<PluginInput>,   // always Ref(ContentRef::Staged { .. })
+        items: Vec<ResolvedItem>,  // bytes + mime + filename
         state: IncrementalState,
     },
 }
@@ -201,9 +307,14 @@ pub enum Resolution {
 pub struct IncrementalState {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-    pub hash: Option<[u8; 32]>,
+    pub hash: Option<String>,      // hex, so it survives JSON and Temporal payloads
 }
 ```
+
+A `ResolvedItem` carries bytes, not a staged ref: staging into the blob store is the
+worker activity's job, which is what keeps every connector test free of an object store.
+The activity stages each item and hands the workflow a `ContentRef::Staged`, so bytes
+never enter workflow history.
 
 v1 ships `UrlConnector` only. `Items` being a `Vec` from the start is the whole point:
 when `BucketConnector` later returns 400 objects, the scheduler is unchanged.
@@ -213,12 +324,16 @@ when `BucketConnector` later returns 400 objects, the scheduler is unchanged.
 1. Render the URL template against the scheduled time.
 2. Run the SSRF guard (below). Reject before any socket is opened.
 3. `GET` with `If-None-Match` / `If-Modified-Since` from `state`. `304` → `Unchanged`.
-4. **Stream** the body to the blob store — never `response.bytes()` into a `Vec`.
-   `fetch_ref` buffers today (`crates/blob/src/lib.rs`), which is fine for a 1 MiB
-   upload and not fine for a 50 MB export fetched by several sources at once. Hash with
-   blake3 while streaming; enforce a byte cap during the stream, not after.
-5. If the streamed hash equals `state.hash`, discard the staged object → `Unchanged`.
-   (Covers servers that send no `ETag`, which is the common case for static exports.)
+4. **Stream** the body chunk by chunk, hashing with blake3 as it arrives and enforcing
+   the byte cap *during* the stream, not after — so an oversized body is abandoned
+   early rather than downloaded in full.
+   *As built:* chunks accumulate in memory up to `UrlGuard::max_bytes` (512 MiB), and
+   the worker activity stages the result into the blob store afterwards. Streaming
+   straight into the blob store is still the target — several sources fetching 50 MB
+   exports at once should not hold them all in RAM — but it needs gzip decompression to
+   become streaming too, and is deferred to a follow-up.
+5. If the hash equals `state.hash` → `Unchanged`, nothing staged. (Covers servers that
+   send no `ETag`, which is the common case for static exports.)
 6. **Decompress transparently** when the body is gzip — detected by magic bytes
    (`1f 8b`), with the `.gz` extension only as a filename hint. Requires adding `flate2`
    to the workspace; nothing in the tree decompresses today (`zip` is a workspace dep
@@ -236,14 +351,20 @@ project_id }` — so the Schedule's frozen payload stays valid across every edit
 source or its pipeline.
 
 ```
-1. load_source(source_id)        activity → definition, decrypted secrets, state,
+1. load_source(source_id)        activity → definition, decrypted fetch_auth, state,
                                             the current pipeline definition
 2. resolve_source(…)             activity → Resolution
 3. Resolution::Unchanged         → record_run(unchanged); return.  No job. No usage.
 4. Resolution::Items             → for each item, start a PipelineWorkflow child with a
-                                   fresh job_id and the source's MeiliContext
+                                   fresh job_id and a MeiliContext carrying only
+                                   project_id + index; host/api_key come from the
+                                   indexer step's connection (Decision 13)
 5. record_run(outcome, state)    activity → persist etag/last_modified/hash, job ids
 ```
+
+`load_source` re-checks that the pipeline's indexer still names a connection. If it was
+edited to drop one since the source was created, the run is recorded `failed` with that
+reason rather than starting a child that would fail on missing context.
 
 Because the pipeline is read in step 1 at run time, editing a pipeline takes effect on
 the next tick with no schedule rewrite.
@@ -262,26 +383,49 @@ created. This is what makes an aggressive cron safe on a metered tenant.
 
 No crypto crate exists in the workspace today. Add `chacha20poly1305` (RustCrypto).
 
-- Key from `SOURCE_SECRET_KEY`, 32 bytes base64.
-- Sealed value is `nonce ‖ ciphertext`, nonce random per write.
-- **If the key is unset, the whole `/sources` API returns `501 Not Implemented`.**
-  Storing a tenant's Meilisearch write key in plaintext because an env var was missed is
-  not an acceptable degraded mode.
-- Rotation is out of scope for v1; the sealed blob carries a version byte so a rotation
-  scheme can be added without a migration.
+Two secrets exist, one per entity: a source's `fetch_auth`, and a connection's
+`api_key`.
+
+- Key from `SOURCE_SECRET_KEY`, 32 bytes base64. One key seals both.
+- Sealed value is `version ‖ nonce ‖ ciphertext`, nonce random per write.
+- **If the key is unset, the `/sources` and `/connections` APIs return
+  `501 Not Implemented`**, and the worker fails any step naming a connection with a
+  non-retryable error. Storing a Meilisearch write key in plaintext because an env var
+  was missed is not an acceptable degraded mode.
+- The control plane only ever moves sealed bytes. Decryption happens in the gateway
+  (to validate a connection on save) and in the worker activity (to use it) — never in
+  the control plane, which keeps its blast radius small.
+- Rotation is out of scope for v1; the version byte lets a rotation scheme be added
+  without a migration.
 
 ### Redaction
 
-`GET /sources/{uid}` renders secrets as a kind plus a mask, never a value:
+Secrets render as a kind plus a mask, never a value:
 
 ```json
-{ "auth": { "kind": "bearer", "token": "****" },
-  "meili": { "host": "https://x.us-west.meilisearch.io", "api_key": "****" } }
+GET /sources/tmdb        { "auth": { "kind": "bearer", "token": "****" }, … }
+GET /connections/prod    { "host": "https://x.meilisearch.io", "api_key": "****", … }
 ```
 
-A `PATCH` that omits `auth` leaves the stored secret untouched; a `PATCH` sending
-`"auth": null` clears it. Tests assert no response body and no log line ever contains a
-decrypted value — the existing `MeiliContext::redacted()` convention extended to sources.
+A `PATCH` that omits the secret leaves it untouched; `"auth": null` clears a source's
+credential. A connection's `api_key` cannot be cleared, only replaced — a connection
+without a key is meaningless. Tests assert no response body and no log line ever
+contains a decrypted value — the existing `MeiliContext::redacted()` convention,
+extended to both entities.
+
+### Connection host policy
+
+`MEILI_CONNECTION_HOSTS` (Decision 14):
+
+| Value | Accepts |
+|---|---|
+| `public` *(default)* | `https` only; every resolved address public — the source-fetch guard, reused |
+| `any` | any `http`/`https` host |
+| `meilisearch:7700,meili.internal` | exactly these `host[:port]` entries, `http` or `https`; nothing else |
+
+Checked on save and again in the activity before each use, because DNS can change in
+between. `public` is the default so a multi-tenant deployment is safe without
+configuration; a self-hosted operator writing to a private instance sets one line.
 
 ### SSRF guard
 
@@ -307,7 +451,7 @@ Gateway routes, mirroring the existing `/pipelines` shape
 
 | Method | Route | Notes |
 |---|---|---|
-| `POST` | `/sources` | Captures + seals `MeiliContext` from request headers. Validates cron, template tokens and pipeline existence. Creates the Temporal Schedule. |
+| `POST` | `/sources` | Validates cron, template tokens, pipeline existence, and that the pipeline's indexer names a connection (`422` otherwise). Seals `fetch_auth`. Creates the Temporal Schedule. |
 | `GET` | `/sources` | Tenant-scoped list, secrets redacted. |
 | `GET` | `/sources/{uid}` | Includes `next_run_at` from Temporal `describe`. |
 | `PATCH` | `/sources/{uid}` | Updates the Schedule when cron/timezone change. |
@@ -315,6 +459,15 @@ Gateway routes, mirroring the existing `/pipelines` shape
 | `POST` | `/sources/{uid}/pause` / `/unpause` | Temporal pause/unpause. |
 | `POST` | `/sources/{uid}/run` | `trigger` — run now, off-schedule. |
 | `GET` | `/sources/{uid}/runs` | Paginated `source_runs`. |
+| `POST` | `/connections` | Validates host policy, health and key (see *Connection validation*). Seals `api_key`. |
+| `GET` | `/connections` | Tenant-scoped list, `api_key` masked. |
+| `GET` | `/connections/{uid}` | Includes `used_by`: the pipeline uids referencing it. |
+| `PATCH` | `/connections/{uid}` | Re-validates when `host` or `api_key` change; omitting `api_key` keeps it. |
+| `DELETE` | `/connections/{uid}` | Never blocked (Decision 15). |
+
+`POST /ingest` changes only in the permissive direction: a pipeline whose indexer pins a
+connection accepts requests with no Meilisearch context (see *`MeiliContext` becomes
+optional*).
 
 Create is not atomic across Postgres and Temporal. The row is written first with
 `paused = true`, the Schedule is created, then the row is unpaused. A crash between the
@@ -324,8 +477,8 @@ than a schedule firing against a row that does not exist.
 **A source's pipeline may be deleted underneath it.** `DELETE /pipelines/{uid}` is
 **never blocked** — its behaviour is unchanged from today. Deleting a pipeline cascades
 to *archive* every source that references it: the Temporal Schedule is deleted so nothing
-fires again, and the row is stamped `archived_at` with its sealed `meili_ctx` and
-`fetch_auth` retained.
+fires again, and the row is stamped `archived_at` with its sealed `fetch_auth`
+retained.
 
 Archive rather than cascade-delete because the source row holds credentials a tenant
 supplied by hand; destroying them as a side effect of an unrelated pipeline delete is
@@ -343,11 +496,18 @@ say) by recording a `failed` run with a clear message rather than retrying forev
 + shadcn, lucide icons), run history table linking each run to its jobs, and
 pause/resume/run-now controls. Secrets are write-only inputs showing `****` when set.
 
+`ui/src/app/connections/` lists and edits connections, showing `used_by` so a user sees
+what a delete will break. The pipeline editor's `meili_indexer` form gains a connection
+picker plus `batch_size` / `max_batch_bytes` fields, and flags a dangling connection
+reference.
+
 ## Docs
 
 - `docs/concepts/sources.mdx` — concepts, cron syntax, templating table, the TMDB
   walkthrough end to end.
-- `docs/openapi.yaml` — the eight routes above.
+- `docs/concepts/connections.mdx` — connections, precedence over the request context,
+  batching, and `MEILI_CONNECTION_HOSTS`.
+- `docs/openapi.yaml` — the thirteen routes above, plus the `POST /ingest` change.
 - `README.md` — one line in the feature list.
 
 ## Testing
@@ -362,6 +522,14 @@ pause/resume/run-now controls. Secrets are write-only inputs showing `****` when
 - `UrlConnector` against wiremock: `304` → `Unchanged`; changed body → one item;
   identical body with no `ETag` → `Unchanged` via hash; gzip body decompressed and typed
   as `application/x-ndjson`; oversized body rejected mid-stream; non-2xx surfaced.
+- `inject_meili_context`: a step with `connection` keeps its own `host`/`api_key`; a
+  step without one is overwritten exactly as today.
+- Batching: cut on count, cut on bytes, whichever first; a single oversized document is
+  a non-retryable error naming its id.
+- Host policy: `public` rejects `http://meilisearch:7700` and accepts a public https
+  host; an allowlist accepts only its entries; `any` accepts both.
+- The indexer activity's input, as serialized for Temporal, never contains the
+  connection's key.
 
 **Workflow** (Temporal test env)
 - `Unchanged` starts zero children and writes one `unchanged` run row.
@@ -370,8 +538,10 @@ pause/resume/run-now controls. Secrets are write-only inputs showing `****` when
 - Overlap: a second trigger while running is skipped.
 
 **Integration** (`scripts/e2e.sh`)
-- Create a source against a local fixture server → `POST /run` → job appears, documents
-  land in Meilisearch → second `POST /run` → `unchanged`, no new job.
+- Create a connection to the dev Meilisearch, a pipeline whose indexer names it, and a
+  source against a local fixture server → `POST /run` → job appears, documents land in
+  Meilisearch → second `POST /run` → `unchanged`, no new job.
+- `POST /ingest` with no `X-Meili-*` headers against that pipeline succeeds.
 
 ## Non-goals for v1
 
@@ -384,10 +554,23 @@ Explicitly out of scope, listed so the plan does not quietly grow:
 - Webhook or event-driven triggers.
 - Secret rotation.
 - Extending the SSRF guard to ad-hoc `POST /ingest` URLs.
+- Streaming a source fetch straight into the blob store (see `UrlConnector` step 4).
+- Pinning connections on steps other than `meili_indexer` — it is the only plugin that
+  talks to Meilisearch (`INDEXER_PLUGIN`).
 
-## Open risk
+## Open risks
 
-The `meili_ctx` secret is a long-lived, write-capable Meilisearch key held at rest. That
-is inherent to request-less execution and was accepted deliberately. If Meilisearch Cloud
-later exposes an internal mint-a-scoped-key authority, sources should migrate to
-storing only `project_id` and minting per run.
+**A connection's key is a long-lived, write-capable Meilisearch key held at rest.** That
+is inherent to request-less execution and is accepted deliberately. The connection
+redesign concentrates the risk rather than removing it: there is now one key per
+destination instead of one per source, which makes it easier to rotate and audit. If
+Meilisearch Cloud later exposes an internal mint-a-scoped-key authority, a connection
+should hold only a project reference and mint a scoped key per run.
+
+**Nothing stops a tenant pinning a destination they do not own**, provided they hold its
+key. That is equivalent to calling that Meilisearch directly with the same key, so it is
+not an escalation — but usage is metered against the *pipeline's* tenant, not the
+destination's owner.
+
+**DNS rebinding** between the host-policy check and the actual connect is unsolved on
+both the fetch and the write path (see *SSRF guard*).
