@@ -5,6 +5,7 @@
 
 pub mod activity;
 pub mod config;
+pub mod connection;
 pub mod dag;
 pub mod registry;
 pub mod workflow;

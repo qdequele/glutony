@@ -23,6 +23,7 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::connection::{ConnectionSettings, ControlPlane, resolve_connection};
 use crate::registry::PluginRegistry;
 
 /// Interval at which the activity heartbeats on its own, independent of the plugin.
@@ -73,8 +74,11 @@ pub struct StepActivities {
     pub spill_threshold: usize,
     /// Analytics client, absent when usage reporting is not configured.
     pub usage: Option<UsageClient>,
-    /// Control plane base URL, used to keep the job row's status honest.
+    /// Control plane base URL, used to keep the job row's status honest and to resolve
+    /// Meilisearch connections.
     pub control_plane_url: Option<String>,
+    /// Key and host policy for resolving an indexer step's Meilisearch connection.
+    pub connections: ConnectionSettings,
 }
 
 impl StepActivities {
@@ -87,7 +91,15 @@ impl StepActivities {
             spill_threshold,
             usage: None,
             control_plane_url: None,
+            connections: ConnectionSettings::default(),
         }
+    }
+
+    /// Attach what resolving a Meilisearch connection needs: the key that opens sealed
+    /// connection keys, and the host policy re-applied at use.
+    pub fn with_connections(mut self, connections: ConnectionSettings) -> Self {
+        self.connections = connections;
+        self
     }
 
     /// Attach the analytics client used by [`StepActivities::record_usage`].
@@ -187,7 +199,20 @@ impl StepActivities {
             input_bytes,
             "executing step"
         );
-        let output = plugin.execute(plugin_ctx, resolved, input.config).await?;
+        // Resolved here, in memory, rather than in the workflow: the activity input only
+        // ever names the connection, so its key never reaches Temporal history.
+        let config = resolve_connection(
+            &ControlPlane {
+                http: &self.http,
+                base_url: self.control_plane_url.as_deref(),
+            },
+            &self.connections,
+            &input.plugin,
+            input.config,
+            input.project_id.as_deref(),
+        )
+        .await?;
+        let output = plugin.execute(plugin_ctx, resolved, config).await?;
         let doc_count = output.document_count();
         let output = self
             .blob
@@ -490,6 +515,78 @@ mod tests {
             branch_total: None,
             project_id: None,
         }
+    }
+
+    /// Stands in for `meili_indexer` and records the config it was handed.
+    struct CapturingIndexer(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
+    #[async_trait]
+    impl Plugin for CapturingIndexer {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new(meili_ingest_plugin_sdk::INDEXER_PLUGIN, "0")
+        }
+        async fn execute(
+            &self,
+            _ctx: &PluginContext,
+            _input: PluginInput,
+            config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            if let Ok(mut slot) = self.0.lock() {
+                *slot = Some(config);
+            }
+            Ok(PluginOutput::Empty)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_key_reaches_the_plugin_but_never_the_activity_input() {
+        use meili_ingest_source::{HostPolicy, SecretKey};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PLAINTEXT: &str = "sk-live-NEVER-IN-HISTORY";
+        let key = Arc::new(SecretKey::from_bytes([5u8; 32]));
+        let sealed = key.seal(PLAINTEXT.as_bytes()).expect("seal");
+
+        let control_plane = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "host": "http://meilisearch:7700",
+                "api_key": sealed,
+            })))
+            .mount(&control_plane)
+            .await;
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let a = acts(vec![Arc::new(CapturingIndexer(seen.clone()))])
+            .with_control_plane(Some(control_plane.uri()))
+            .with_connections(ConnectionSettings {
+                key: Some(key),
+                policy: HostPolicy::parse("meilisearch:7700").expect("policy"),
+            });
+
+        let mut input = step_input(meili_ingest_plugin_sdk::INDEXER_PLUGIN, PluginInput::Empty);
+        input.config = serde_json::json!({ "connection": "prod-movies", "index": "movies" });
+        input.project_id = Some("tenant-1".into());
+
+        // What Temporal records for this activity.
+        let recorded = serde_json::to_string(&input).expect("serialize");
+        assert!(
+            !recorded.contains(PLAINTEXT) && !recorded.contains("api_key"),
+            "the activity input must carry the connection name only: {recorded}"
+        );
+
+        a.run_step(&PluginContext::noop(), input)
+            .await
+            .expect("step runs");
+
+        let received = seen.lock().expect("lock").clone().expect("plugin ran");
+        assert_eq!(
+            received["api_key"], PLAINTEXT,
+            "the plugin gets the opened key"
+        );
+        assert_eq!(received["host"], "http://meilisearch:7700");
+        assert_eq!(received["connection"], "prod-movies");
     }
 
     #[tokio::test]

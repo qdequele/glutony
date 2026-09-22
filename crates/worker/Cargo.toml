@@ -34,6 +34,7 @@ meili-ingest-plugin-image-captioner.workspace = true
 meili-ingest-plugin-pptx.workspace = true
 meili-ingest-plugin-audio-transcriber.workspace = true
 meili-ingest-plugin-video-audio.workspace = true
+meili-ingest-source.workspace = true
 
 temporalio-sdk.workspace = true
 temporalio-client.workspace = true
@@ -56,3 +57,6 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

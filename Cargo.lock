@@ -3593,6 +3593,7 @@ dependencies = [
  "meili-ingest-plugin-video-audio",
  "meili-ingest-plugin-xlsx",
  "meili-ingest-router",
+ "meili-ingest-source",
  "meili-ingest-usage",
  "reqwest 0.13.5",
  "serde",
@@ -3609,6 +3610,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
