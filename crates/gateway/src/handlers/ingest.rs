@@ -311,8 +311,8 @@ mod tests {
             wf.context,
             MeiliContext {
                 project_id: Some("xxx".into()),
-                host: "https://xxx.us-west.meilisearch.io".into(),
-                api_key: "envoyKey".into(),
+                host: Some("https://xxx.us-west.meilisearch.io".into()),
+                api_key: Some("envoyKey".into()),
                 index: Some("from-query".into()),
                 region: Some("us-west".into()),
             }

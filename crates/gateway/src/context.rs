@@ -124,7 +124,13 @@ pub fn resolve_context(
     }
 
     match (host, api_key) {
-        (Some(host), Some(api_key)) => Ok(MeiliContext { project_id, host, api_key, index, region }),
+        (Some(host), Some(api_key)) => Ok(MeiliContext {
+            project_id,
+            host: Some(host),
+            api_key: Some(api_key),
+            index,
+            region,
+        }),
         (None, _) => Err(GatewayError::MissingContext(
             "no Meilisearch host: send X-Meili-Host (via Envoy) or set MEILI_URL".into(),
         )),
@@ -226,8 +232,8 @@ mod tests {
             ctx,
             MeiliContext {
                 project_id: Some("xxx".into()),
-                host: "https://xxx.us-west.meilisearch.io".into(),
-                api_key: "envoyKey".into(),
+                host: Some("https://xxx.us-west.meilisearch.io".into()),
+                api_key: Some("envoyKey".into()),
                 index: Some("from-header".into()),
                 region: Some("us-west".into()),
             }
@@ -238,8 +244,8 @@ mod tests {
     fn host_and_key_headers_alone_are_enough() {
         let h = headers(&[(H_HOST, "http://h"), (H_API_KEY, "k")]);
         let ctx = resolve_context(&h, None, &cfg()).unwrap();
-        assert_eq!(ctx.host, "http://h");
-        assert_eq!(ctx.api_key, "k");
+        assert_eq!(ctx.host.as_deref(), Some("http://h"));
+        assert_eq!(ctx.api_key.as_deref(), Some("k"));
         assert_eq!(ctx.project_id, None);
         assert_eq!(ctx.index, None);
         assert_eq!(ctx.region, None);
@@ -282,8 +288,8 @@ mod tests {
             ("authorization", "Bearer masterKey"),
         ]);
         let ctx = resolve_context(&h, None, &cfg()).unwrap();
-        assert_eq!(ctx.api_key, "masterKey");
-        assert_eq!(ctx.host, "http://localhost:7700");
+        assert_eq!(ctx.api_key.as_deref(), Some("masterKey"));
+        assert_eq!(ctx.host.as_deref(), Some("http://localhost:7700"));
     }
 
     #[test]
@@ -291,13 +297,19 @@ mod tests {
         let mut h = envoy_headers();
         h.insert("authorization", HeaderValue::from_static("Bearer other"));
         let ctx = resolve_context(&h, None, &cfg()).unwrap();
-        assert_eq!(ctx.api_key, "envoyKey");
+        assert_eq!(ctx.api_key.as_deref(), Some("envoyKey"));
     }
 
     #[test]
     fn bearer_scheme_is_case_insensitive_and_other_schemes_are_ignored() {
         let h = headers(&[(H_HOST, "http://h"), ("authorization", "bearer   k1  ")]);
-        assert_eq!(resolve_context(&h, None, &cfg()).unwrap().api_key, "k1");
+        assert_eq!(
+            resolve_context(&h, None, &cfg())
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("k1")
+        );
         let h = headers(&[(H_HOST, "http://h"), ("authorization", "Basic abc")]);
         assert!(matches!(
             resolve_context(&h, None, &cfg()),
@@ -315,8 +327,8 @@ mod tests {
     #[test]
     fn standalone_env_only() {
         let ctx = resolve_context(&HeaderMap::new(), None, &cfg_env()).unwrap();
-        assert_eq!(ctx.host, "http://env:7700");
-        assert_eq!(ctx.api_key, "envKey");
+        assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
+        assert_eq!(ctx.api_key.as_deref(), Some("envKey"));
         assert_eq!(ctx.project_id, None);
         assert_eq!(ctx.index, None);
     }
@@ -330,16 +342,19 @@ mod tests {
     #[test]
     fn headers_beat_env() {
         let ctx = resolve_context(&envoy_headers(), None, &cfg_env()).unwrap();
-        assert_eq!(ctx.host, "https://xxx.us-west.meilisearch.io");
-        assert_eq!(ctx.api_key, "envoyKey");
+        assert_eq!(
+            ctx.host.as_deref(),
+            Some("https://xxx.us-west.meilisearch.io")
+        );
+        assert_eq!(ctx.api_key.as_deref(), Some("envoyKey"));
     }
 
     #[test]
     fn bearer_beats_env_key_and_env_host_fills_in() {
         let h = headers(&[("authorization", "Bearer bearerKey")]);
         let ctx = resolve_context(&h, None, &cfg_env()).unwrap();
-        assert_eq!(ctx.api_key, "bearerKey");
-        assert_eq!(ctx.host, "http://env:7700");
+        assert_eq!(ctx.api_key.as_deref(), Some("bearerKey"));
+        assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
     }
 
     #[test]
@@ -350,8 +365,8 @@ mod tests {
         };
         let h = headers(&[(H_API_KEY, "k")]);
         let ctx = resolve_context(&h, None, &cfg).unwrap();
-        assert_eq!(ctx.host, "http://env:7700");
-        assert_eq!(ctx.api_key, "k");
+        assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
+        assert_eq!(ctx.api_key.as_deref(), Some("k"));
     }
 
     // --- nothing → 400 ----------------------------------------------------------------
@@ -399,7 +414,7 @@ mod tests {
         assert!(envoy_headers_trusted(&h, &cfg_secret()));
         let ctx = resolve_context(&h, None, &cfg_secret()).unwrap();
         assert_eq!(ctx.project_id.as_deref(), Some("xxx"));
-        assert_eq!(ctx.api_key, "envoyKey");
+        assert_eq!(ctx.api_key.as_deref(), Some("envoyKey"));
     }
 
     #[test]
@@ -432,8 +447,8 @@ mod tests {
         let mut h = envoy_headers();
         h.insert(H_ENVOY_SECRET, HeaderValue::from_static("nope"));
         let ctx = resolve_context(&h, Some("q"), &cfg).unwrap();
-        assert_eq!(ctx.host, "http://env:7700");
-        assert_eq!(ctx.api_key, "envKey");
+        assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
+        assert_eq!(ctx.api_key.as_deref(), Some("envKey"));
         assert_eq!(ctx.project_id, None, "tenant header must not be honoured");
         assert_eq!(ctx.region, None);
         assert_eq!(
@@ -454,7 +469,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = resolve_context(&h, None, &cfg).unwrap();
-        assert_eq!(ctx.api_key, "b");
+        assert_eq!(ctx.api_key.as_deref(), Some("b"));
     }
 
     #[test]
@@ -478,8 +493,8 @@ mod tests {
     fn ctx_with_index(index: Option<&str>) -> MeiliContext {
         MeiliContext {
             project_id: None,
-            host: "http://h".into(),
-            api_key: "k".into(),
+            host: Some("http://h".into()),
+            api_key: Some("k".into()),
             index: index.map(str::to_string),
             region: None,
         }

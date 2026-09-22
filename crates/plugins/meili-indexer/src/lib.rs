@@ -57,25 +57,47 @@ impl MeiliIndexerPlugin {
     }
 }
 
+/// A validated indexer config, with the destination resolved to plain strings.
+struct ParsedConfig {
+    cfg: IndexerConfig,
+    index: String,
+    host: String,
+    api_key: String,
+}
+
 /// Validate and deserialize the step config into an [`IndexerConfig`].
-fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
-    let obj = config.as_object().ok_or_else(|| {
-        PluginError::InvalidConfig(format!("{NAME}: config must be a JSON object"))
-    })?;
-    let present = |key: &str| {
-        obj.get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-    };
-    if !present("host") || !present("api_key") {
+fn parse_config(config: Value) -> Result<ParsedConfig, PluginError> {
+    if !config.is_object() {
         return Err(PluginError::InvalidConfig(format!(
-            "{NAME}: config has no `host`/`api_key`. The Meilisearch tenant context \
-             (MeiliContext) must be injected into this step's config by the gateway/workflow; \
-             this plugin never reads MEILI_URL/MEILI_API_KEY from the environment (SPEC §7.4)"
+            "{NAME}: config must be a JSON object"
         )));
     }
     let cfg: IndexerConfig = serde_json::from_value(config)
         .map_err(|e| PluginError::InvalidConfig(format!("{NAME}: {e}")))?;
+    let non_blank = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let (Some(host), Some(api_key)) = (non_blank(&cfg.meili.host), non_blank(&cfg.meili.api_key))
+    else {
+        let why = match cfg.connection.as_deref() {
+            // The worker activity resolves a connection before calling this plugin, so
+            // reaching here means that step was skipped (an older worker, say).
+            Some(name) => format!(
+                "{NAME}: connection {name:?} was not resolved into a host and API key \
+                 before this step ran"
+            ),
+            None => format!(
+                "{NAME}: config has no `host`/`api_key`. Name a Meilisearch `connection` \
+                 on this step, or send the tenant context (MeiliContext) with the request; \
+                 this plugin never reads MEILI_URL/MEILI_API_KEY from the environment \
+                 (SPEC §7.4)"
+            ),
+        };
+        return Err(PluginError::InvalidConfig(why));
+    };
     if cfg.batch_size == 0 {
         return Err(PluginError::InvalidConfig(format!(
             "{NAME}: `batch_size` must be at least 1"
@@ -102,7 +124,12 @@ fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
                  X-Meili-Index header, the `?index=` query or MEILI_INDEX on the gateway (SPEC §3.4)"
             ))
         })?;
-    Ok((cfg, index))
+    Ok(ParsedConfig {
+        cfg,
+        index,
+        host,
+        api_key,
+    })
 }
 
 /// A single document whose serialized size exceeds `max_batch_bytes` on its own.
@@ -281,38 +308,44 @@ impl Plugin for MeiliIndexerPlugin {
     fn manifest(&self) -> PluginManifest {
         PluginManifest::new(NAME, env!("CARGO_PKG_VERSION"))
             .description(
-                "Pushes documents into Meilisearch using the tenant MeiliContext injected into \
-                 the step config (host, api_key, index). Creates the index when missing, batches \
-                 addOrReplace calls and waits for the tasks.",
+                "Pushes documents into Meilisearch. The destination is the named `connection` \
+                 when the step sets one, otherwise the tenant MeiliContext sent with the \
+                 request. Creates the index when missing, batches addOrReplace calls by \
+                 document count and serialized size, and waits for the tasks.",
             )
             .accepts([InputKind::Documents, InputKind::Many, InputKind::Empty])
             .produces(OutputKind::Indexed)
             .config_schema(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                // `host`, `api_key`, `index`, `project_id` and `region` are NOT listed
-                // as required and are marked `readOnly`: the workflow injects them from
-                // the tenant's MeiliContext just before the step runs. A pipeline author
-                // must never type them, least of all the API key, and a schema-driven
-                // editor is expected to skip `readOnly` properties rather than render an
-                // empty required field for a secret.
+                // `host`, `api_key`, `project_id` and `region` are NOT listed as
+                // required and are marked `readOnly`: they are injected just before the
+                // step runs, from the named `connection` or from the tenant's
+                // MeiliContext. A pipeline author must never type them, least of all the
+                // API key, and a schema-driven editor is expected to skip `readOnly`
+                // properties rather than render an empty required field for a secret.
+                // To pin a destination, name a `connection` instead.
                 "required": [],
                 "properties": {
+                    "connection": {
+                        "type": "string",
+                        "format": "meili-connection",
+                        "description": "Optional: name of a Meilisearch connection. When set it is the destination, and it wins over any Meilisearch context sent with the request. Required for pipelines run by a scheduled source, which have no request."
+                    },
                     "host": {
                         "type": "string",
                         "readOnly": true,
-                        "description": "Injected: Meilisearch base URL from the tenant MeiliContext. Never set this by hand."
+                        "description": "Injected: Meilisearch base URL from the connection or the tenant MeiliContext. Never set this by hand."
                     },
                     "api_key": {
                         "type": "string",
                         "readOnly": true,
                         "writeOnly": true,
-                        "description": "Injected: Meilisearch API key from the tenant MeiliContext. Never set this by hand."
+                        "description": "Injected: Meilisearch API key from the connection or the tenant MeiliContext. Never set this by hand."
                     },
                     "index": {
                         "type": "string",
-                        "readOnly": true,
-                        "description": "Injected: target index uid, resolved by the gateway (SPEC §3.4). Set `trigger.index_pattern` on the pipeline instead."
+                        "description": "Optional: pin the target index uid. When unset it is resolved from the pipeline's `trigger.index_pattern`, then the request, then the deployment default (SPEC §3.4)."
                     },
                     "project_id": {
                         "type": ["string", "null"],
@@ -363,7 +396,12 @@ impl Plugin for MeiliIndexerPlugin {
         input: PluginInput,
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
-        let (cfg, index_uid) = parse_config(config)?;
+        let ParsedConfig {
+            cfg,
+            index: index_uid,
+            host,
+            api_key,
+        } = parse_config(config)?;
         let docs = input.into_documents()?;
         tracing::info!(
             plugin = NAME,
@@ -375,8 +413,8 @@ impl Plugin for MeiliIndexerPlugin {
             "indexing documents"
         );
 
-        let host = cfg.meili.host.trim().trim_end_matches('/').to_owned();
-        let client = Client::new(host, Some(cfg.meili.api_key.as_str()))
+        let host = host.trim_end_matches('/').to_owned();
+        let client = Client::new(host, Some(api_key.as_str()))
             .map_err(|e| map_error(e, "building the Meilisearch client"))?;
 
         if cfg.auto_create_index {
@@ -1007,15 +1045,23 @@ mod tests {
         let props = m.config_schema["properties"]
             .as_object()
             .expect("properties");
-        for key in ["host", "api_key", "index", "project_id", "region"] {
+        // Destination credentials and tenant tags are injected, never typed.
+        for key in ["host", "api_key", "project_id", "region"] {
             assert_eq!(
                 props[key]["readOnly"],
                 serde_json::json!(true),
                 "{key} must be marked readOnly"
             );
         }
-        // Author-controlled knobs stay editable.
-        for key in ["primary_key", "batch_size"] {
+        // Author-controlled knobs stay editable, including the connection that pins the
+        // destination and the index that may be pinned next to it.
+        for key in [
+            "connection",
+            "index",
+            "primary_key",
+            "batch_size",
+            "max_batch_bytes",
+        ] {
             assert!(
                 props[key].get("readOnly").is_none(),
                 "{key} should remain editable"
@@ -1104,5 +1150,33 @@ mod tests {
             "host": "http://m", "api_key": "k", "index": "i", "max_batch_bytes": 0
         });
         assert!(parse_config(zero).is_err());
+    }
+
+    #[test]
+    fn an_unresolved_connection_is_named_in_the_error() {
+        // The worker activity resolves `connection` into host/api_key before the plugin
+        // runs; if that did not happen, the error must say which connection, not just
+        // "no host".
+        let Err(PluginError::InvalidConfig(msg)) = parse_config(serde_json::json!({
+            "connection": "prod-movies", "index": "movies"
+        })) else {
+            panic!("an unresolved connection must be rejected");
+        };
+        assert!(msg.contains("prod-movies"), "{msg}");
+        assert!(msg.contains("not resolved"), "{msg}");
+    }
+
+    #[test]
+    fn a_resolved_connection_parses_to_its_host_and_key() {
+        let parsed = parse_config(serde_json::json!({
+            "connection": "prod-movies",
+            "host": " https://movies.example ",
+            "api_key": "k",
+            "index": "movies"
+        }))
+        .unwrap_or_else(|e| panic!("resolved config must parse: {e}"));
+        assert_eq!(parsed.host, "https://movies.example", "trimmed");
+        assert_eq!(parsed.api_key, "k");
+        assert_eq!(parsed.cfg.connection.as_deref(), Some("prod-movies"));
     }
 }
