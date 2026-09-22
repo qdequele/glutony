@@ -44,7 +44,6 @@ fn new_source(uid: &str, project_id: Option<&str>, pipeline_uid: &str) -> NewSou
         timezone: "UTC".into(),
         index_name: None,
         fetch_auth: Some(vec![1, 2, 3]),
-        meili_ctx: vec![4, 5, 6],
         schedule_id: format!("source-{uid}"),
     }
 }
@@ -70,7 +69,6 @@ async fn insert_then_get_roundtrips() {
         .await
         .expect("get")
         .expect("exists");
-    assert_eq!(got.meili_ctx, vec![4, 5, 6], "sealed bytes round-trip");
     assert_eq!(got.fetch_auth.as_deref(), Some(&[1u8, 2, 3][..]));
     assert!(got.state.etag.is_none(), "a fresh source has no state");
 }
@@ -179,7 +177,11 @@ async fn archive_for_pipeline_stamps_and_hides() {
         .await
         .expect("get")
         .expect("exists");
-    assert_eq!(kept.meili_ctx, vec![4, 5, 6], "sealed context is retained");
+    assert_eq!(
+        kept.fetch_auth.as_deref(),
+        Some(&[1u8, 2, 3][..]),
+        "the sealed credential is retained"
+    );
     assert!(kept.definition.archived_at.is_some());
 }
 
@@ -314,7 +316,7 @@ async fn load_for_run_finds_by_id_and_skips_archived() {
 
     let loaded = repo.load_for_run(id).await.expect("load").expect("exists");
     assert_eq!(loaded.definition.uid, "tr-load-1");
-    assert_eq!(loaded.meili_ctx, vec![4, 5, 6]);
+    assert_eq!(loaded.fetch_auth.as_deref(), Some(&[1u8, 2, 3][..]));
 
     repo.archive_for_pipeline("doomed2.pipeline", Some("proj-5"))
         .await

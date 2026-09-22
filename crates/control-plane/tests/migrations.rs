@@ -25,16 +25,29 @@ async fn sources_schema_exists_after_migration() {
         .await
         .ok();
 
-    // A source row round-trips with the columns the repo binds.
+    // A source row round-trips with the columns the repo binds. No Meilisearch context:
+    // the destination lives on the pipeline's connection (spec Decision 6).
     pool.execute(
-        "INSERT INTO sources (id, uid, name, pipeline_uid, location, cron, meili_ctx, schedule_id)
+        "INSERT INTO sources (id, uid, name, pipeline_uid, location, cron, schedule_id)
          VALUES ('11111111-1111-1111-1111-111111111111', 'tmdb-migration-test', 'TMDB',
                  'builtin.json',
                  '{\"kind\":\"url\",\"url\":\"https://example.test/x.json\"}'::jsonb,
-                 '0 9 * * *', '\\x00'::bytea, 'source-tmdb')",
+                 '0 9 * * *', 'source-tmdb')",
     )
     .await
     .expect("insert source");
+
+    let (has_meili_ctx,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                        WHERE table_name = 'sources' AND column_name = 'meili_ctx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query columns");
+    assert!(
+        !has_meili_ctx,
+        "sources must not store a Meilisearch key; connections do"
+    );
 
     let (archived,): (Option<chrono::DateTime<chrono::Utc>>,) =
         sqlx::query_as("SELECT archived_at FROM sources WHERE uid = 'tmdb-migration-test'")
@@ -69,4 +82,52 @@ async fn sources_schema_exists_after_migration() {
     .await
     .expect("count runs");
     assert_eq!(runs, 0, "runs cascade-delete with their source");
+}
+
+#[tokio::test]
+async fn meili_connections_schema_exists_after_migration() {
+    let Some(pool) = pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("migrations apply");
+    pool.execute("DELETE FROM meili_connections WHERE uid = 'mig-conn'")
+        .await
+        .expect("clean");
+
+    let insert = |id: &'static str, project: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO meili_connections (id, uid, name, project_id, host, api_key) \
+             VALUES ($1::uuid, 'mig-conn', 'Movies', $2, 'https://m.example', '\\x01'::bytea)",
+        )
+        .bind(id)
+        .bind(project)
+    };
+
+    // The same uid may exist once globally and once per tenant…
+    insert("33333333-3333-3333-3333-333333333333", None)
+        .execute(&pool)
+        .await
+        .expect("global insert");
+    insert("44444444-4444-4444-4444-444444444444", Some("mig-proj"))
+        .execute(&pool)
+        .await
+        .expect("tenant insert");
+
+    // …but not twice in the same scope.
+    let dup = insert("55555555-5555-5555-5555-555555555555", Some("mig-proj"))
+        .execute(&pool)
+        .await;
+    assert!(dup.is_err(), "uid must be unique per project");
+    let dup_global = insert("66666666-6666-6666-6666-666666666666", None)
+        .execute(&pool)
+        .await;
+    assert!(dup_global.is_err(), "uid must be unique globally too");
+
+    pool.execute("DELETE FROM meili_connections WHERE uid = 'mig-conn'")
+        .await
+        .expect("clean");
 }

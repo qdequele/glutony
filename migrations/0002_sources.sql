@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS sources (
     paused        BOOLEAN NOT NULL DEFAULT false,
     index_name    TEXT,
     fetch_auth    BYTEA,                   -- sealed; NULL = unauthenticated
-    meili_ctx     BYTEA NOT NULL,          -- sealed: host + api_key + region
+    -- No Meilisearch context here: a cron run has no request to carry one, so the
+    -- destination lives on the pipeline's meili_indexer step as a named connection.
     last_etag     TEXT,
     last_modified TEXT,
     last_hash     TEXT,                    -- hex blake3 of the last fetched body
@@ -52,6 +53,23 @@ CREATE TABLE IF NOT EXISTS source_runs (
 
 CREATE INDEX IF NOT EXISTS source_runs_source_started
     ON source_runs (source_id, started_at DESC);
+
+-- Named Meilisearch destinations. A pipeline's meili_indexer step references one by uid,
+-- so a key lives in exactly one place and pipeline JSON never contains a secret. The key
+-- is sealed; the control plane only ever moves the sealed bytes.
+CREATE TABLE IF NOT EXISTS meili_connections (
+    id          UUID PRIMARY KEY,
+    uid         TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    project_id  TEXT,                      -- NULL = global / self-hosted
+    host        TEXT NOT NULL,             -- not secret; returned by the API
+    api_key     BYTEA NOT NULL,            -- sealed; never returned
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS meili_connections_uid_project
+    ON meili_connections (uid, COALESCE(project_id, ''));
 
 -- Lets a job trace back to the source that triggered it. NULL for request-driven jobs.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_id UUID;

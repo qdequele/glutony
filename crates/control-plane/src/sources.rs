@@ -1,8 +1,12 @@
 //! Scheduled-source repository (`sources`, `source_runs`).
 //!
-//! The repository never decrypts anything: `fetch_auth` and `meili_ctx` move through it
-//! as opaque sealed bytes. Only the worker activity holds a `SecretKey`, which keeps the
-//! blast radius of the control plane small.
+//! The repository never decrypts anything: `fetch_auth` moves through it as opaque
+//! sealed bytes. Only the gateway and the worker activity hold a `SecretKey`, which keeps
+//! the blast radius of the control plane small.
+//!
+//! A source holds no Meilisearch destination. That lives on its pipeline's
+//! `meili_indexer` step as a named connection, since a cron run has no request to carry
+//! one (spec Decision 6).
 //!
 //! Temporal owns the schedule; `sources.last_*` and `source_runs` are a queryable mirror
 //! for the UI, the same arrangement `jobs` has with workflow state.
@@ -47,8 +51,6 @@ pub struct NewSource {
     /// Sealed fetch credential; `None` for an unauthenticated source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_auth: Option<Vec<u8>>,
-    /// Sealed `MeiliContext`.
-    pub meili_ctx: Vec<u8>,
     /// Temporal schedule id.
     pub schedule_id: String,
 }
@@ -96,8 +98,6 @@ pub struct SourceRecord {
     /// Sealed fetch credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_auth: Option<Vec<u8>>,
-    /// Sealed `MeiliContext`.
-    pub meili_ctx: Vec<u8>,
     /// What the previous run learned.
     #[serde(default)]
     pub state: IncrementalState,
@@ -139,7 +139,7 @@ pub struct RunRecord {
 
 /// Columns selected by every source query, in the order [`SourceRow`] declares them.
 const SOURCE_COLUMNS: &str = "id, uid, name, description, project_id, pipeline_uid, location, \
-     cron, timezone, paused, index_name, schedule_id, archived_at, fetch_auth, meili_ctx, \
+     cron, timezone, paused, index_name, schedule_id, archived_at, fetch_auth, \
      last_etag, last_modified, last_hash, last_run_at, last_status, last_error";
 
 /// Raw row as Postgres returns it.
@@ -159,7 +159,6 @@ struct SourceRow {
     schedule_id: String,
     archived_at: Option<DateTime<Utc>>,
     fetch_auth: Option<Vec<u8>>,
-    meili_ctx: Vec<u8>,
     last_etag: Option<String>,
     last_modified: Option<String>,
     last_hash: Option<String>,
@@ -187,7 +186,6 @@ impl From<SourceRow> for SourceRecord {
                 archived_at: r.archived_at,
             },
             fetch_auth: r.fetch_auth,
-            meili_ctx: r.meili_ctx,
             state: IncrementalState {
                 etag: r.last_etag,
                 last_modified: r.last_modified,
@@ -311,8 +309,8 @@ impl SourceRepo {
         let sql = format!(
             "INSERT INTO sources (id, uid, name, description, project_id, pipeline_uid, \
                                   location, cron, timezone, paused, index_name, fetch_auth, \
-                                  meili_ctx, schedule_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13) \
+                                  schedule_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12) \
              RETURNING {SOURCE_COLUMNS}"
         );
         let row: SourceRow = sqlx::query_as(AssertSqlSafe(sql))
@@ -327,7 +325,6 @@ impl SourceRepo {
             .bind(&new.timezone)
             .bind(new.index_name.as_deref())
             .bind(new.fetch_auth.as_deref())
-            .bind(&new.meili_ctx)
             .bind(&new.schedule_id)
             .fetch_one(&self.pool)
             .await?;

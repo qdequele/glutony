@@ -65,7 +65,6 @@ fn source(uid: &str, pipeline_uid: &str, project: &str) -> NewSource {
         timezone: "UTC".into(),
         index_name: None,
         fetch_auth: Some(vec![9, 9, 9]),
-        meili_ctx: vec![8, 8, 8],
         schedule_id: format!("source-{uid}"),
     }
 }
@@ -130,7 +129,6 @@ async fn deleting_a_pipeline_archives_its_sources_and_still_succeeds() {
         .await
         .expect("get")
         .expect("still exists");
-    assert_eq!(kept.meili_ctx, vec![8, 8, 8]);
     assert_eq!(kept.fetch_auth.as_deref(), Some(&[9u8, 9, 9][..]));
     assert!(kept.definition.archived_at.is_some());
     assert!(kept.definition.paused, "an archived source must not fire");
