@@ -12,6 +12,7 @@
 //! router can be exercised in tests without opening a socket.
 
 pub mod builtin_pipelines;
+pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
@@ -53,6 +54,11 @@ impl AppState {
     /// Pipeline repository bound to this state's pool.
     pub fn pipelines(&self) -> pipelines::PipelineRepo {
         pipelines::PipelineRepo::new(self.pool.clone())
+    }
+
+    /// Meilisearch connection repository bound to this state's pool.
+    pub fn connections(&self) -> connections::ConnectionRepo {
+        connections::ConnectionRepo::new(self.pool.clone())
     }
 }
 
@@ -115,6 +121,20 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/internal/jobs/{job_id}",
             get(jobs::get_job).patch(jobs::update_job),
+        )
+        .route(
+            "/internal/connections",
+            get(connections::list_connections).post(connections::create_connection),
+        )
+        .route(
+            "/internal/connections/{uid}",
+            get(connections::get_connection)
+                .patch(connections::patch_connection)
+                .delete(connections::delete_connection),
+        )
+        .route(
+            "/internal/connections/{uid}/used_by",
+            get(connections::connection_used_by),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
