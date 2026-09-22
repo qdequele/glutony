@@ -12,8 +12,11 @@
 //! 2. when `auto_create_index` (default `true`), create the index with
 //!    `primary_key` if `GET /indexes/{uid}` says it does not exist, and wait
 //!    for that task;
-//! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it
-//!    in batches of `batch_size` (default 1000) via `addOrReplace`;
+//! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it via
+//!    `addOrReplace` in batches cut at whichever of `batch_size` (documents, default
+//!    1000) and `max_batch_bytes` (serialized bytes, default 50 MiB) comes first. A
+//!    document too large for any batch is a [`PluginError::NonRetryable`] naming it;
+//!    sending it would earn a `413` the retry policy would repeat forever;
 //! 4. when `wait_for_completion` (default `true`), poll each task until it
 //!    finishes; a `failed` task is a [`PluginError::NonRetryable`] carrying the
 //!    Meilisearch error message;
@@ -78,6 +81,11 @@ fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
             "{NAME}: `batch_size` must be at least 1"
         )));
     }
+    if cfg.max_batch_bytes == 0 {
+        return Err(PluginError::InvalidConfig(format!(
+            "{NAME}: `max_batch_bytes` must be at least 1"
+        )));
+    }
     if cfg.primary_key.trim().is_empty() {
         return Err(PluginError::InvalidConfig(format!(
             "{NAME}: `primary_key` must not be empty"
@@ -95,6 +103,57 @@ fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
             ))
         })?;
     Ok((cfg, index))
+}
+
+/// A single document whose serialized size exceeds `max_batch_bytes` on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OversizedDoc {
+    /// Position of the document in the input.
+    index: usize,
+    /// Its serialized size in bytes.
+    bytes: usize,
+}
+
+/// Split documents into consecutive batches, given each document's serialized size.
+///
+/// A batch is cut at whichever of `max_docs` and `max_bytes` is reached first. Bytes are
+/// counted as the JSON array Meilisearch actually receives: the documents, the commas
+/// between them, and the enclosing brackets.
+///
+/// Pure and I/O-free so the splitting is testable without a Meilisearch. A document that
+/// does not fit even alone is an error rather than a batch of one: sending it would earn
+/// a `413` that the retry policy would repeat forever.
+fn plan_batches(
+    sizes: &[usize],
+    max_docs: usize,
+    max_bytes: u64,
+) -> Result<Vec<std::ops::Range<usize>>, OversizedDoc> {
+    const BRACKETS: u64 = 2;
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = BRACKETS;
+    for (i, &size) in sizes.iter().enumerate() {
+        let size64 = size as u64;
+        if BRACKETS + size64 > max_bytes {
+            return Err(OversizedDoc {
+                index: i,
+                bytes: size,
+            });
+        }
+        let in_batch = i - start;
+        let comma = u64::from(in_batch > 0);
+        if in_batch > 0 && (in_batch >= max_docs || bytes + comma + size64 > max_bytes) {
+            batches.push(start..i);
+            start = i;
+            bytes = BRACKETS + size64;
+        } else {
+            bytes += comma + size64;
+        }
+    }
+    if start < sizes.len() {
+        batches.push(start..sizes.len());
+    }
+    Ok(batches)
 }
 
 /// Whether an SDK error means "the index does not exist".
@@ -281,7 +340,13 @@ impl Plugin for MeiliIndexerPlugin {
                         "type": "integer",
                         "minimum": 1,
                         "default": 1000,
-                        "description": "Documents per addOrReplace request."
+                        "description": "Maximum documents per addOrReplace request."
+                    },
+                    "max_batch_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": DEFAULT_MAX_BATCH_BYTES,
+                        "description": "Maximum serialized bytes per addOrReplace request. A batch is cut at whichever of this and batch_size is reached first. Keep it under Meilisearch's http_payload_size_limit (100 MB by default)."
                     },
                     "wait_for_completion": {
                         "type": "boolean",
@@ -327,18 +392,33 @@ impl Plugin for MeiliIndexerPlugin {
         }
 
         let index = client.index(index_uid.clone());
-        let batch_total = docs.len().div_ceil(cfg.batch_size);
+        let payloads: Vec<Value> = docs.iter().map(Document::to_index_json).collect();
+        let sizes: Vec<usize> = payloads
+            .iter()
+            .map(|p| serde_json::to_vec(p).map(|b| b.len()).unwrap_or(usize::MAX))
+            .collect();
+        let batches = plan_batches(&sizes, cfg.batch_size, cfg.max_batch_bytes).map_err(
+            |OversizedDoc { index, bytes }| {
+                PluginError::NonRetryable(format!(
+                    "{NAME}: document {:?} is {bytes} bytes serialized, over \
+                     `max_batch_bytes` ({}); it cannot be sent in any batch. Raise \
+                     `max_batch_bytes` or chunk the document upstream",
+                    docs[index].id, cfg.max_batch_bytes
+                ))
+            },
+        )?;
+        let batch_total = batches.len();
         let mut tasks: Vec<TaskInfo> = Vec::with_capacity(batch_total);
-        for (batch_no, batch) in docs.chunks(cfg.batch_size).enumerate() {
+        for (batch_no, range) in batches.into_iter().enumerate() {
             ctx.check_cancelled()?;
+            let payload = &payloads[range];
             ctx.heartbeat(format!(
                 "{NAME}: sending batch {}/{batch_total} ({} documents)",
                 batch_no + 1,
-                batch.len()
+                payload.len()
             ));
-            let payload: Vec<Value> = batch.iter().map(Document::to_index_json).collect();
             let info = index
-                .add_or_replace(&payload, Some(&cfg.primary_key))
+                .add_or_replace(payload, Some(&cfg.primary_key))
                 .await
                 .map_err(|e| map_error(e, &format!("adding documents (batch {})", batch_no + 1)))?;
             tracing::debug!(
@@ -346,7 +426,7 @@ impl Plugin for MeiliIndexerPlugin {
                 index = %index_uid,
                 task_uid = info.task_uid,
                 batch = batch_no + 1,
-                documents = batch.len(),
+                documents = payload.len(),
                 "batch enqueued"
             );
             tasks.push(info);
@@ -941,5 +1021,88 @@ mod tests {
                 "{key} should remain editable"
             );
         }
+    }
+
+    // ----- batch planning (max_batch_bytes) -----
+
+    #[test]
+    fn plan_batches_splits_on_count() {
+        let got = plan_batches(&[10; 5], 2, u64::MAX).expect("fits");
+        assert_eq!(got, vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn plan_batches_splits_on_bytes() {
+        // Each batch is "[" + docs joined by "," + "]". Two 10-byte docs = 2 + 10 + 1 + 10
+        // = 23 bytes, so a 23-byte cap fits exactly two and a 22-byte cap only one.
+        assert_eq!(
+            plan_batches(&[10; 4], 1000, 23).expect("fits"),
+            vec![0..2, 2..4]
+        );
+        assert_eq!(
+            plan_batches(&[10; 3], 1000, 22).expect("fits"),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn plan_batches_cuts_at_whichever_limit_comes_first() {
+        // Bytes bind first: a 25-byte cap fits two 10-byte docs, count would allow 3.
+        assert_eq!(
+            plan_batches(&[10; 4], 3, 25).expect("fits"),
+            vec![0..2, 2..4]
+        );
+        // Count binds first: bytes would allow many, count caps at 2.
+        assert_eq!(
+            plan_batches(&[1; 5], 2, 10_000).expect("fits"),
+            vec![0..2, 2..4, 4..5]
+        );
+    }
+
+    #[test]
+    fn plan_batches_rejects_a_document_that_fits_no_batch() {
+        let err = plan_batches(&[10, 500, 10], 1000, 100).expect_err("oversized");
+        assert_eq!(
+            err,
+            OversizedDoc {
+                index: 1,
+                bytes: 500
+            }
+        );
+    }
+
+    #[test]
+    fn plan_batches_of_nothing_is_no_batches() {
+        assert!(plan_batches(&[], 1000, 100).expect("fits").is_empty());
+    }
+
+    #[test]
+    fn plan_batches_covers_every_document_exactly_once() {
+        let sizes: Vec<usize> = (1..=97).map(|i| (i * 37) % 200 + 1).collect();
+        let batches = plan_batches(&sizes, 7, 600).expect("fits");
+        let mut next = 0;
+        for r in &batches {
+            assert_eq!(r.start, next, "batches are contiguous");
+            assert!(!r.is_empty(), "no empty batch");
+            assert!(r.len() <= 7, "count cap respected");
+            let bytes = 2 + r.len() - 1 + sizes[r.clone()].iter().sum::<usize>();
+            assert!(bytes <= 600, "byte cap respected: {bytes}");
+            next = r.end;
+        }
+        assert_eq!(next, sizes.len(), "every document is sent");
+    }
+
+    #[test]
+    fn max_batch_bytes_defaults_and_rejects_zero() {
+        let cfg: IndexerConfig = serde_json::from_value(serde_json::json!({
+            "host": "http://m", "api_key": "k", "index": "i"
+        }))
+        .expect("config");
+        assert_eq!(cfg.max_batch_bytes, DEFAULT_MAX_BATCH_BYTES);
+
+        let zero = serde_json::json!({
+            "host": "http://m", "api_key": "k", "index": "i", "max_batch_bytes": 0
+        });
+        assert!(parse_config(zero).is_err());
     }
 }

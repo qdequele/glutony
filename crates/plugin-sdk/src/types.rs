@@ -1260,9 +1260,15 @@ pub struct IndexerConfig {
     /// Create the index if missing.
     #[serde(default = "default_true")]
     pub auto_create_index: bool,
-    /// Documents per `addDocuments` request.
+    /// Maximum documents per `addDocuments` request.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum serialized bytes per `addDocuments` request. A batch is cut at whichever
+    /// of this and [`IndexerConfig::batch_size`] is reached first. The default stays
+    /// under Meilisearch's 100 MB `http_payload_size_limit`; document count alone is the
+    /// wrong knob, since 1000 id rows are kilobytes and 1000 chunked PDFs can exceed it.
+    #[serde(default = "default_max_batch_bytes")]
+    pub max_batch_bytes: u64,
     /// Wait for Meilisearch tasks to complete before returning.
     #[serde(default = "default_true")]
     pub wait_for_completion: bool,
@@ -1276,6 +1282,11 @@ fn default_true() -> bool {
 }
 fn default_batch_size() -> usize {
     1000
+}
+/// Default [`IndexerConfig::max_batch_bytes`]: 50 MiB.
+pub const DEFAULT_MAX_BATCH_BYTES: u64 = 50 * 1024 * 1024;
+fn default_max_batch_bytes() -> u64 {
+    DEFAULT_MAX_BATCH_BYTES
 }
 
 /// Merge a [`MeiliContext`] into a step config object (used by the workflow for the
