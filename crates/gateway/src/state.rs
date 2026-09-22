@@ -494,11 +494,11 @@ impl ControlPlaneClient {
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
 
-    fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
+    pub(crate) fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
         project_id
             .map(|p| vec![("project_id", p.to_string())])
             .unwrap_or_default()
@@ -529,7 +529,7 @@ impl ControlPlaneClient {
         }
     }
 
-    async fn send_json<T: DeserializeOwned>(
+    pub(crate) async fn send_json<T: DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
@@ -543,7 +543,7 @@ impl ControlPlaneClient {
         })
     }
 
-    async fn send_empty(
+    pub(crate) async fn send_empty(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
@@ -711,6 +711,8 @@ pub struct AppState {
     pub blob: BlobStore,
     /// Shared HTTP client.
     pub http: reqwest::Client,
+    /// Meilisearch connection settings: sealing key, host policy, probe client.
+    pub connections: crate::connections::ConnectionConfig,
 }
 
 impl std::fmt::Debug for AppState {
@@ -719,6 +721,7 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("control_plane", &self.control_plane)
             .field("blob", &self.blob)
+            .field("connections", &self.connections)
             .finish_non_exhaustive()
     }
 }
@@ -738,7 +741,15 @@ impl AppState {
             control_plane,
             blob,
             http,
+            connections: crate::connections::ConnectionConfig::default(),
         }
+    }
+
+    /// Enable the `/connections` routes with a sealing key and host policy. Without it
+    /// they answer 501, so a key is never stored unsealed by accident.
+    pub fn with_connections(mut self, connections: crate::connections::ConnectionConfig) -> Self {
+        self.connections = connections;
+        self
     }
 }
 

@@ -91,7 +91,23 @@ async fn main() -> anyhow::Result<()> {
         .context("cannot build HTTP client")?;
     let temporal = connect_temporal(&config).await?;
     let bind = config.bind.clone();
-    let state = AppState::new(config, Arc::new(TemporalStarter(temporal)), blob, http);
+    // Meilisearch connections. Without SOURCE_SECRET_KEY the /connections routes answer
+    // 501 rather than store a key unsealed; a malformed key or host policy stops the
+    // gateway instead of silently running with something other than what was written.
+    let connection_key = meili_ingest_source::SecretKey::from_env()
+        .context("invalid SOURCE_SECRET_KEY")?
+        .map(Arc::new);
+    let host_policy =
+        meili_ingest_source::HostPolicy::from_env().context("invalid MEILI_CONNECTION_HOSTS")?;
+    if connection_key.is_none() {
+        tracing::warn!("SOURCE_SECRET_KEY is not set: /connections is disabled (501)");
+    }
+    tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
+
+    let state =
+        AppState::new(config, Arc::new(TemporalStarter(temporal)), blob, http).with_connections(
+            meili_ingest_gateway::connections::ConnectionConfig::new(connection_key, host_policy),
+        );
     let app = meili_ingest_gateway::router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)

@@ -37,6 +37,10 @@ pub enum GatewayError {
     /// A pipeline definition failed validation (422).
     #[error("invalid pipeline: {0}")]
     Invalid(String),
+    /// Any other request that is well-formed but cannot be accepted (422), e.g. a
+    /// Meilisearch connection whose host is forbidden or whose key is rejected.
+    #[error("{0}")]
+    Unprocessable(String),
     /// A feature is not configured on this deployment (501).
     #[error("{0}")]
     NotImplemented(String),
@@ -59,7 +63,9 @@ impl GatewayError {
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             GatewayError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            GatewayError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            GatewayError::Invalid(_) | GatewayError::Unprocessable(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             GatewayError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             GatewayError::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -76,6 +82,7 @@ impl GatewayError {
             GatewayError::TooLarge(_) => "payload_too_large",
             GatewayError::Unsupported(_) => "unsupported_media_type",
             GatewayError::Invalid(_) => "invalid_pipeline",
+            GatewayError::Unprocessable(_) => "validation",
             GatewayError::NotImplemented(_) => "not_configured",
             GatewayError::Upstream(_) => "upstream_error",
             GatewayError::Internal(_) => "internal_error",
@@ -215,6 +222,8 @@ mod tests {
             GatewayError::TooLarge("x".into()),
             GatewayError::Unsupported("x".into()),
             GatewayError::Invalid("x".into()),
+            GatewayError::Unprocessable("x".into()),
+            GatewayError::NotImplemented("x".into()),
             GatewayError::Upstream("x".into()),
             GatewayError::Internal("x".into()),
         ];
@@ -226,6 +235,15 @@ mod tests {
                 "{c}"
             );
         }
+    }
+
+    #[test]
+    fn unprocessable_is_422_without_the_pipeline_wording() {
+        // `Invalid` reads "invalid pipeline: …", which is wrong for a rejected connection.
+        let e = GatewayError::Unprocessable("the API key was rejected".into());
+        assert_eq!(e.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(e.code(), "validation");
+        assert_eq!(e.to_string(), "the API key was rejected");
     }
 
     #[tokio::test]

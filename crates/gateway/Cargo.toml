@@ -26,6 +26,7 @@ ui = ["dep:rust-embed"]
 meili-ingest-plugin-sdk.workspace = true
 meili-ingest-router.workspace = true
 meili-ingest-blob.workspace = true
+meili-ingest-source.workspace = true
 
 # http
 axum.workspace = true
@@ -50,6 +51,7 @@ temporalio-common.workspace = true
 # misc
 uuid.workspace = true
 chrono.workspace = true
+url.workspace = true
 mime_guess.workspace = true
 # Only pulled in with the `ui` feature: embeds the exported admin UI.
 rust-embed = { workspace = true, optional = true }

@@ -6,6 +6,7 @@
 //! starts one Temporal `PipelineWorkflow` per job. The binary lives in `main.rs`; this
 //! library exposes the router so it can be exercised in tests without a network.
 
+pub mod connections;
 pub mod context;
 pub mod error;
 pub mod extract;
@@ -120,6 +121,17 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/pipelines/{name}",
             get(handlers::pipelines::get_pipeline).delete(handlers::pipelines::delete_pipeline),
+        )
+        .route(
+            "/connections",
+            get(handlers::connections::list_connections)
+                .post(handlers::connections::create_connection),
+        )
+        .route(
+            "/connections/{uid}",
+            get(handlers::connections::get_connection)
+                .patch(handlers::connections::patch_connection)
+                .delete(handlers::connections::delete_connection),
         )
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))

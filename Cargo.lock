@@ -3216,6 +3216,7 @@ dependencies = [
  "meili-ingest-blob",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
+ "meili-ingest-source",
  "mime_guess",
  "reqwest 0.13.5",
  "rust-embed",
@@ -3230,6 +3231,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
 ]

@@ -55,7 +55,17 @@ x-rust-dev: &rust-dev
       - action: rebuild
         path: ./Cargo.lock
 
+# Meilisearch connections, shared by the gateway (which seals keys) and every worker
+# (which opens them). They must use the same SOURCE_SECRET_KEY. The default below is a
+# well-known dev-only value ("dev-only-source-secret-key-32byt"): never deploy it.
+# The dev Meilisearch is a private address, which the default `public` host policy would
+# refuse, hence the allowlist.
+x-connections-env: &connections-env
+  SOURCE_SECRET_KEY: ${SOURCE_SECRET_KEY:-ZGV2LW9ubHktc291cmNlLXNlY3JldC1rZXktMzJieXQ=}
+  MEILI_CONNECTION_HOSTS: ${MEILI_CONNECTION_HOSTS:-meilisearch:7700}
+
 x-worker-env: &worker-env
+  <<: *connections-env
   RUST_LOG: info,meili_ingest=debug
   TEMPORAL_URL: http://temporal:7233
   TEMPORAL_NAMESPACE: default
@@ -158,6 +168,7 @@ services:
     ports:
       - "8080:8080"
     environment:
+      <<: *connections-env
       RUST_LOG: info,meili_ingest=debug
       BIND: 0.0.0.0:8080
       TEMPORAL_URL: http://temporal:7233
