@@ -18,6 +18,7 @@ pub const IN_REPO_PLUGINS: &[&str] = &[
     "avro_parser",
     "parquet_parser",
     "chunker",
+    "document_script",
     "meili_indexer",
     "llm_enricher",
     "image_captioner",
@@ -42,6 +43,7 @@ const ALL_KNOWN: &[&str] = &[
     "avro_parser",
     "parquet_parser",
     "chunker",
+    "document_script",
     "meili_indexer",
     "llm_enricher",
     "image_captioner",
@@ -53,7 +55,7 @@ const ALL_KNOWN: &[&str] = &[
 ];
 
 /// Every plugin name the control plane accepts in a user pipeline without a worker
-/// having registered it first: the 17 in-repo plugins plus the known gRPC plugins.
+/// having registered it first: the 18 in-repo plugins plus the known gRPC plugins.
 pub fn builtin_plugin_names() -> &'static [&'static str] {
     ALL_KNOWN
 }
@@ -86,8 +88,14 @@ mod tests {
         let mut expected: Vec<&str> = IN_REPO_PLUGINS.to_vec();
         expected.extend_from_slice(EXTERNAL_PLUGINS);
         assert_eq!(builtin_plugin_names(), expected.as_slice());
-        assert_eq!(IN_REPO_PLUGINS.len(), 17);
-        assert_eq!(builtin_plugin_names().len(), 19);
+        assert_eq!(
+            builtin_plugin_names().len(),
+            IN_REPO_PLUGINS.len() + EXTERNAL_PLUGINS.len()
+        );
+        let mut unique = builtin_plugin_names().to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), builtin_plugin_names().len(), "duplicate name");
     }
 
     #[test]

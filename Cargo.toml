@@ -17,6 +17,7 @@ members = [
     "crates/plugins/csv",
     "crates/plugins/json",
     "crates/plugins/chunker",
+    "crates/plugins/script",
     "crates/plugins/meili-indexer",
     "crates/plugins/llm-enricher",
     "crates/plugins/image-captioner",
@@ -50,6 +51,7 @@ meili-ingest-plugin-markdown = { path = "crates/plugins/markdown" }
 meili-ingest-plugin-csv = { path = "crates/plugins/csv" }
 meili-ingest-plugin-json = { path = "crates/plugins/json" }
 meili-ingest-plugin-chunker = { path = "crates/plugins/chunker" }
+meili-ingest-plugin-script = { path = "crates/plugins/script" }
 meili-ingest-plugin-meili-indexer = { path = "crates/plugins/meili-indexer" }
 meili-ingest-plugin-llm-enricher = { path = "crates/plugins/llm-enricher" }
 meili-ingest-plugin-image-captioner = { path = "crates/plugins/image-captioner" }
@@ -132,6 +134,12 @@ quick-xml = "0.41"
 symphonia = { version = "0.6", default-features = false, features = ["isomp4", "mkv", "ogg", "wav", "aac", "mp3", "alac", "flac", "vorbis", "pcm"] }
 hound = "3.5"
 rubato = "5.0"
+
+# Sandboxed scripting for the `document_script` plugin. `sync` makes the engine
+# Send + Sync (the `Plugin` trait requires it), `serde` converts documents to and
+# from `Dynamic`, and `no_module` / `no_custom_syntax` / `no_time` strip the parts
+# of the language a tenant-authored script has no business reaching.
+rhai = { version = "1.26", features = ["sync", "serde", "no_module", "no_custom_syntax", "no_time"] }
 
 # plugin runtime
 extism = "1.30"
