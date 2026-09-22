@@ -213,6 +213,11 @@ A script that does not compile fails the step immediately with a config error,
 before any document is touched, whatever `on_error` says. A script that exceeds
 `max_ops` or `timeout_ms` is aborted and treated as a per-document error.
 
+Float arithmetic that produces NaN or an infinity is also a per-document error.
+Rhai does not raise on `x / 0.0` the way it does on integer division by zero, and
+JSON has no way to spell those values — without the check they would be indexed as
+`null` and the job would report success.
+
 **Sandbox.** Pipeline configs are tenant-authored, so the engine is built with
 `no_module` (no `import`/`export`), `no_custom_syntax` and `no_time`; rhai has no
 file, network or process API, so a script can only reach `doc`. Every run is

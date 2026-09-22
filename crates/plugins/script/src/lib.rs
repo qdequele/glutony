@@ -32,6 +32,9 @@
 //! `doc.content.trim() == ""` is always `false` — trim as its own statement, then
 //! test `is_empty()`.
 //!
+//! Float arithmetic that produces NaN or an infinity (`x / 0.0`, which rhai does
+//! not raise on) fails the document rather than writing `null` into the index.
+//!
 //! ## Sandbox
 //!
 //! Pipeline configs are tenant-authored, so the engine is locked down. `no_module`
@@ -283,6 +286,33 @@ fn json_to_dynamic(value: &Value) -> Result<Dynamic, PluginError> {
     })
 }
 
+/// Reject floats JSON cannot represent, before they are silently turned into `null`.
+///
+/// Rhai produces NaN and infinities from ordinary float arithmetic — `x / 0.0` does
+/// not raise, unlike integer division — and `serde_json` maps every non-finite float
+/// onto `null`. Left alone that writes a null field into the index and reports
+/// success, so the conversion refuses instead and the step's `on_error` policy
+/// decides what happens to the document.
+fn reject_non_finite(value: &Dynamic, path: &str) -> Result<(), PluginError> {
+    if value.is_float() {
+        let f = value.as_float().unwrap_or(0.0);
+        if !f.is_finite() {
+            return Err(PluginError::NonRetryable(format!(
+                "{NAME}: `{path}` is not a finite number ({f})"
+            )));
+        }
+    } else if let Some(map) = value.read_lock::<Map>() {
+        for (k, v) in map.iter() {
+            reject_non_finite(v, &format!("{path}.{k}"))?;
+        }
+    } else if let Some(array) = value.read_lock::<rhai::Array>() {
+        for (i, v) in array.iter().enumerate() {
+            reject_non_finite(v, &format!("{path}[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Convert rhai values back into JSON.
 fn dynamic_to_json(value: &Dynamic) -> Result<Value, PluginError> {
     rhai::serde::from_dynamic(value).map_err(|e| {
@@ -297,6 +327,11 @@ fn dynamic_to_json(value: &Dynamic) -> Result<Value, PluginError> {
 /// `meta` is deliberately not read back: it is provenance the pipeline owns, so the
 /// script sees it but cannot rewrite it.
 fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
+    for key in ["id", "title", "content", "fields"] {
+        if let Some(v) = map.get(key) {
+            reject_non_finite(v, &format!("doc.{key}"))?;
+        }
+    }
     if let Some(id) = map.get("id") {
         let id = match dynamic_to_json(id)? {
             Value::String(s) => s,
@@ -793,6 +828,49 @@ mod tests {
             out.iter()
                 .all(|d| d.fields.get("seen") == Some(&json!(true)))
         );
+    }
+
+    /// A float that JSON cannot represent must not reach the index. Rhai produces
+    /// NaN and infinities from ordinary float arithmetic (`x / 0.0`), and
+    /// `serde_json` turns every one of them into `null` — so without this check a
+    /// divide-by-zero silently writes a null field instead of failing.
+    #[tokio::test]
+    async fn a_non_finite_number_is_an_error_not_a_null() {
+        for expr in ["0.0/0.0", "1.0/0.0", "-1.0/0.0"] {
+            let err = try_run(
+                vec![doc("a", "x")],
+                script(&format!("doc.fields.v = {expr};")),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(&err, PluginError::NonRetryable(m) if m.contains("not a finite number")),
+                "{expr} gave {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_number_nested_in_a_field_is_caught() {
+        let err = try_run(
+            vec![doc("a", "x")],
+            script("doc.fields.stats = #{ ratios: [1.0, 1.0/0.0] };"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("not a finite number")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_floats_still_round_trip() {
+        let out = run(vec![doc("a", "x")], script("doc.fields.v = 10.0 / 4.0;")).await;
+
+        assert_eq!(out[0].fields.get("v"), Some(&json!(2.5)));
     }
 
     #[tokio::test]
