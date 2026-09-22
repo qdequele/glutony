@@ -1981,3 +1981,118 @@ Create a source against a local fixture server, `POST /sources/{uid}/run`, asser
 **Known gap, deliberate.** Tasks 7–15 are specified at interface-and-test level rather than with literal code blocks, unlike Tasks 1–6. They depend on decisions best made against the real compiler (exact `temporalio_client` schedule builder shapes, the sqlx query forms). Executors must apply the same TDD cycle — failing test, run it, implement, run it, commit — and should re-read the spec section named in each task before starting. If a task's shape turns out to differ materially from what is described here, stop and revise the plan rather than improvising.
 
 **Type consistency.** `IncrementalState.hash` is a hex `String` everywhere (model, connector, repo, activity) — never `[u8;32]`, which the spec's prose sketched but would not survive a JSON payload. `Resolution::Items.items` is `Vec<ResolvedItem>` in the crate and becomes `Vec<PluginInput>` only inside the worker activity (Task 12), which is the single place blob staging happens. `RunOutcome::as_str()` values (`unchanged`/`ingested`/`failed`) match `source_runs.outcome` in the migration.
+
+---
+
+## Revision 2026-09-23 — destinations move to Meilisearch connections
+
+The spec's Decisions 6 and 11–15 replace the per-source sealed `MeiliContext` with named
+**Meilisearch connections** referenced by the `meili_indexer` step. Read the spec's
+*Meilisearch connections and the indexer step* section before any task below.
+
+**Status of Tasks 1–9.** Tasks 1–7 and 9 are done. Task 1's migration and Task 7's repo
+still carry `meili_ctx` and are reworked by Task R1. Tasks 2–6 (`crates/source`) are
+unaffected. Task 8 was never started.
+
+**Revised order.** R1 first so the branch stays coherent, then the self-contained pieces
+(C1, C2), then the precedence change and everything that depends on it.
+
+### Task R1: Drop `meili_ctx`; add `meili_connections`
+
+**Files:** Modify `migrations/0002_sources.sql`, `crates/control-plane/src/sources.rs`,
+`crates/control-plane/tests/{migrations,sources_repo,pipeline_delete_cascade}.rs`.
+
+Remove `meili_ctx` from the table, `NewSource`, `SourceRecord`, `SOURCE_COLUMNS` and every
+test fixture. Add the `meili_connections` table from the spec. Before running the tests,
+repair the local dev database once, since it applied the earlier `0002`:
+`DROP TABLE source_runs, sources; ALTER TABLE jobs DROP COLUMN source_id; DELETE FROM
+_sqlx_migrations WHERE version = 2;`. Test: the migration test asserts `meili_ctx` is
+**absent** and `meili_connections` exists with its unique index.
+
+### Task C1: Connection host policy
+
+**Files:** Create `crates/source/src/host_policy.rs`.
+
+**Produces:** `enum HostPolicy { Public, Any, Allow(Vec<HostPort>) }`,
+`HostPolicy::parse(&str) -> Result<HostPolicy, SourceError>`,
+`HostPolicy::from_env() -> Result<HostPolicy, SourceError>` (reads
+`MEILI_CONNECTION_HOSTS`, default `Public`), and
+`async fn check(&self, url: &Url) -> Result<(), SourceError>`. `Public` delegates to the
+existing `UrlGuard::check_url`. `Allow` compares host and effective port and accepts
+`http` or `https`. Tests: `public` rejects `http://meilisearch:7700`, rejects
+`https://127.0.0.1`; an allowlist accepts exactly its entries and rejects a different
+port; `any` accepts both schemes; parsing rejects an empty entry and a garbage value.
+
+### Task C2: `max_batch_bytes` in `meili_indexer`
+
+**Files:** Modify `crates/plugins/meili-indexer/src/lib.rs`.
+
+Add `max_batch_bytes: u64` (default `50 * 1024 * 1024`) to the config and its JSON schema.
+Replace `docs.chunks(cfg.batch_size)` with a pure `fn plan_batches(sizes: &[usize],
+max_docs: usize, max_bytes: u64) -> Result<Vec<Range<usize>>, OversizedDoc>` over the
+serialized size of each document, so the splitting is unit-testable without Meilisearch.
+Tests: splits on count; splits on bytes; whichever comes first; one document over the
+cap returns `OversizedDoc { index }` and the plugin maps it to `NonRetryable` naming the
+document id; an empty input gives no batches; the existing indexer tests still pass.
+
+### Task C3: Connection repository and internal routes
+
+**Files:** Create `crates/control-plane/src/connections.rs`; modify `lib.rs`.
+
+Mirror `SourceRepo`: `insert`, `get(uid, project_id)`, `list(project_id)`, `update`,
+`delete`, plus `used_by(uid, project_id) -> Vec<String>` scanning pipeline definitions
+for `meili_indexer` steps whose `config.connection` equals the uid. The key moves only as
+sealed bytes. Routes under `/internal/connections`. Tests against Postgres, each test in
+its own `<prefix>-` namespace (see the isolation fix in commit `2fe6534`).
+
+### Task C4: Pinned destinations win in `inject_meili_context`
+
+**Files:** Modify `crates/plugin-sdk/src/types.rs` (`MeiliContext`,
+`inject_meili_context`), and every caller the compiler then flags — at least
+`crates/gateway/src/context.rs` and `crates/worker/src/workflow.rs`.
+
+`MeiliContext.host` and `.api_key` become `Option<String>`. `inject_meili_context` no
+longer writes `host`/`api_key` when the step config has a `connection`; otherwise its
+behaviour is byte-for-byte today's. Tests: with `connection`, a pinned `host` survives and
+no `api_key` is injected; without, today's overwrite is preserved; `redacted()` never
+prints a key in either shape.
+
+### Task C5: The indexer activity resolves the connection
+
+**Files:** Modify `crates/worker/src/activity.rs`, `crates/worker/src/config.rs`.
+
+Before calling `meili_indexer`, when the config has `connection`: fetch
+`/internal/connections/{uid}?project_id=`, open `api_key` with `SecretKey::from_env()`,
+re-check the host with `HostPolicy`, and merge `host`/`api_key` into the config in
+memory. Missing connection, missing `SOURCE_SECRET_KEY`, or a policy rejection are
+`NonRetryable` with a message naming the connection. Test: assert on the serialized
+`StepActivityInput` that the key is absent, and that the plugin receives it.
+
+### Task C6: `/connections` on the gateway
+
+**Files:** Create `crates/gateway/src/handlers/connections.rs`; modify `lib.rs`,
+`state.rs`.
+
+The five routes from the spec's API table. Create and host/key `PATCH` run the spec's
+three-step validation (policy, `GET /health`, `GET /indexes?limit=1`) against wiremock in
+tests. `501` without `SOURCE_SECRET_KEY`. Responses mask `api_key`.
+
+### Task C7: `POST /ingest` without context for pinned pipelines
+
+**Files:** Modify `crates/gateway/src/handlers/ingest.rs`, `crates/gateway/src/context.rs`.
+
+After the pipeline is resolved, a missing context is only an error if the pipeline's
+indexer step names no connection. Tests: headerless request to a pinned pipeline →
+`202`; headerless request to an unpinned pipeline → the same `400 MissingContext` as
+today.
+
+### Then Tasks 8, 10–15 as written, with these changes
+
+- **Task 8 / 11:** `NewSource` has no `meili_ctx`; `POST /sources` returns `422` when the
+  pipeline's indexer names no connection, instead of capturing headers.
+- **Task 12:** children get a `MeiliContext` with only `project_id` and `index`;
+  `load_source` fails the run if the pipeline no longer pins a connection.
+- **Task 13:** add `ui/src/app/connections/` and the indexer-step connection picker.
+- **Task 14:** add `docs/concepts/connections.mdx`.
+- **Task 15:** the e2e creates a connection first and also checks headerless
+  `POST /ingest`.
