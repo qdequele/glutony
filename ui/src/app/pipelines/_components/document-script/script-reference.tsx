@@ -35,7 +35,7 @@ export function ScriptReference({
         placeholder="Filter operations…"
         aria-label="Filter the reference"
       />
-      <ScrollArea className="min-h-0 flex-1 pr-3">
+      <ScrollArea className="min-h-0 flex-1 pr-3 [&_[data-radix-scroll-area-viewport]>div]:!block">
         <div className="space-y-5 pb-4">
           {REFERENCE_GROUPS.map((group) => {
             const inGroup = entries.filter((entry) => entry.group === group);
@@ -50,7 +50,7 @@ export function ScriptReference({
                   return (
                     <article key={entry.id} className="space-y-1.5 rounded-md border p-2.5">
                       <div className="flex items-start justify-between gap-2">
-                        <div>
+                        <div className="min-w-0">
                           <p className="text-sm font-medium">{entry.title}</p>
                           <p className="text-xs text-muted-foreground">{entry.summary}</p>
                         </div>
@@ -61,11 +61,12 @@ export function ScriptReference({
                           disabled={!usable}
                           title={readOnly ? "Read-only step" : usable ? undefined : "Code mode only"}
                           onClick={() => onUse(entry)}
+                          className="shrink-0"
                         >
                           {mode === "code" ? "Insert" : "Add"}
                         </Button>
                       </div>
-                      <pre className="overflow-x-auto rounded bg-muted px-2 py-1.5 font-mono text-[11px]">
+                      <pre className="overflow-x-auto rounded bg-muted px-2 py-1.5 font-mono text-[11px] whitespace-pre-wrap break-words">
                         {entry.snippet}
                       </pre>
                     </article>
