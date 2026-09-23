@@ -53,33 +53,20 @@
 //! | `max_ops` | `100000` | rhai operations one document may use |
 //! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+mod config;
+mod convert;
+mod runner;
 
 use meili_ingest_plugin_sdk::prelude::*;
-use rhai::{AST, Dynamic, Engine, Map, Scope};
-use serde::Deserialize;
-use serde_json::Value;
+
+use crate::config::{Config, OnError};
+use crate::runner::{Runner, Verdict};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "document_script";
 
 /// Documents between two heartbeats.
 const HEARTBEAT_EVERY: usize = 10;
-
-/// Longest expression nesting a script may use, inside and outside functions.
-const MAX_EXPR_DEPTH: usize = 64;
-/// Deepest function call chain a script may build (bounds recursion).
-const MAX_CALL_LEVELS: usize = 16;
-/// Longest string a script may build, in characters.
-const MAX_STRING_SIZE: usize = 512 * 1024;
-/// Largest array a script may build.
-const MAX_ARRAY_SIZE: usize = 10_000;
-/// Largest map a script may build.
-const MAX_MAP_SIZE: usize = 10_000;
-/// Operations between two wall-clock checks in `on_progress`.
-const PROGRESS_EVERY: u64 = 1_000;
 
 /// The document script plugin. Stateless; construct with [`DocumentScriptPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -90,290 +77,6 @@ impl DocumentScriptPlugin {
     pub fn new() -> Self {
         Self
     }
-}
-
-/// What a per-document script error does to that document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-enum OnError {
-    /// Fail the step, naming the document and the rhai error.
-    #[default]
-    Fail,
-    /// Drop the document and carry on.
-    Skip,
-    /// Emit the document untouched and carry on.
-    Keep,
-}
-
-/// Step configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    /// The rhai script, run once per document.
-    script: String,
-    /// What a per-document error does.
-    #[serde(default)]
-    on_error: OnError,
-    /// Rhai operations one document may use.
-    #[serde(default = "default_max_ops")]
-    max_ops: u64,
-    /// Wall-clock milliseconds one document may use.
-    #[serde(default = "default_timeout_ms")]
-    timeout_ms: u64,
-}
-
-fn default_max_ops() -> u64 {
-    100_000
-}
-
-fn default_timeout_ms() -> u64 {
-    1_000
-}
-
-impl Config {
-    /// Validate a raw `config:` block. `script` is required, so `null` is an error.
-    fn parse(value: Value) -> Result<Self, PluginError> {
-        let cfg: Config = serde_json::from_value(value)
-            .map_err(|e| PluginError::InvalidConfig(format!("{NAME}: {e}")))?;
-        if cfg.script.trim().is_empty() {
-            return Err(PluginError::InvalidConfig(format!(
-                "{NAME}: `script` must not be empty"
-            )));
-        }
-        if cfg.max_ops == 0 {
-            return Err(PluginError::InvalidConfig(format!(
-                "{NAME}: `max_ops` must be at least 1"
-            )));
-        }
-        if cfg.timeout_ms == 0 {
-            return Err(PluginError::InvalidConfig(format!(
-                "{NAME}: `timeout_ms` must be at least 1"
-            )));
-        }
-        Ok(cfg)
-    }
-}
-
-/// One step's compiled script and the engine that runs it.
-///
-/// The engine is built once and reused for every document: compiling and installing
-/// the sandbox per document would dominate the cost of a small script. Rhai's only
-/// abort hook is `on_progress`, and an `Engine` cannot be cloned, so the per-document
-/// wall-clock budget is carried in a shared deadline the closure reads and
-/// [`Runner::run`] rewrites before each document.
-struct Runner {
-    engine: Engine,
-    ast: AST,
-    /// Start of the step; both the deadline and the progress closure measure from it.
-    base: Instant,
-    /// Nanoseconds after `base` at which the current document must stop.
-    deadline: Arc<AtomicU64>,
-    timeout_ms: u64,
-}
-
-impl Runner {
-    /// Build the sandboxed engine and compile the script.
-    ///
-    /// A syntax error surfaces here — before any document is touched — so it fails
-    /// the step as `InvalidConfig` whatever `on_error` says.
-    fn new(cfg: &Config) -> Result<Self, PluginError> {
-        let mut engine = Engine::new();
-        engine.set_max_operations(cfg.max_ops);
-        engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
-        engine.set_max_call_levels(MAX_CALL_LEVELS);
-        engine.set_max_string_size(MAX_STRING_SIZE);
-        engine.set_max_array_size(MAX_ARRAY_SIZE);
-        engine.set_max_map_size(MAX_MAP_SIZE);
-
-        let base = Instant::now();
-        let deadline = Arc::new(AtomicU64::new(u64::MAX));
-        let watch = Arc::clone(&deadline);
-        engine.on_progress(move |ops| {
-            if ops % PROGRESS_EVERY != 0 {
-                return None;
-            }
-            let elapsed = base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            if elapsed >= watch.load(Ordering::Relaxed) {
-                // Any `Some` aborts the script; the value is discarded by rhai.
-                Some(Dynamic::UNIT)
-            } else {
-                None
-            }
-        });
-
-        let ast = engine.compile(&cfg.script).map_err(|e| {
-            PluginError::InvalidConfig(format!("{NAME}: script does not compile: {e}"))
-        })?;
-
-        Ok(Self {
-            engine,
-            ast,
-            base,
-            deadline,
-            timeout_ms: cfg.timeout_ms,
-        })
-    }
-
-    /// Give the next document a fresh wall-clock budget.
-    fn arm_deadline(&self) {
-        let now = self.base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        let budget = self.timeout_ms.saturating_mul(1_000_000);
-        self.deadline
-            .store(now.saturating_add(budget), Ordering::Relaxed);
-    }
-
-    /// Run the script over one document, mutating it in place.
-    fn run(&self, doc: &mut Document) -> Result<Verdict, PluginError> {
-        let map = to_scope_map(doc)?;
-        let mut scope = Scope::new();
-        scope.push("doc", map);
-
-        self.arm_deadline();
-        let result: Dynamic = self
-            .engine
-            .eval_ast_with_scope(&mut scope, &self.ast)
-            .map_err(|e| PluginError::InvalidInput(format!("{e}")))?;
-
-        let map = scope.get_value::<Map>("doc").ok_or_else(|| {
-            PluginError::InvalidInput(format!(
-                "{NAME}: the script replaced `doc` with a non-map value"
-            ))
-        })?;
-        from_scope_map(&map, doc)?;
-
-        if result.as_bool() == Ok(false) {
-            return Ok(Verdict::Drop);
-        }
-        Ok(Verdict::Keep)
-    }
-}
-
-/// Bind a document as the rhai map the script mutates.
-///
-/// Built key by key rather than through `serde`: `Document` skips empty `title` and
-/// `fields` when it serialises, and a script that cannot count on `doc.fields`
-/// existing is unusable.
-fn to_scope_map(doc: &Document) -> Result<Map, PluginError> {
-    let mut map = Map::new();
-    map.insert("id".into(), Dynamic::from(doc.id.clone()));
-    map.insert(
-        "title".into(),
-        match &doc.title {
-            Some(t) => Dynamic::from(t.clone()),
-            None => Dynamic::UNIT,
-        },
-    );
-    map.insert("content".into(), Dynamic::from(doc.content.clone()));
-    map.insert(
-        "fields".into(),
-        json_to_dynamic(&Value::Object(doc.fields.clone()))?,
-    );
-    map.insert(
-        "meta".into(),
-        json_to_dynamic(
-            &serde_json::to_value(&doc.meta).map_err(|e| {
-                PluginError::NonRetryable(format!("{NAME}: cannot expose meta: {e}"))
-            })?,
-        )?,
-    );
-    Ok(map)
-}
-
-/// Convert JSON into rhai values.
-fn json_to_dynamic(value: &Value) -> Result<Dynamic, PluginError> {
-    rhai::serde::to_dynamic(value).map_err(|e| {
-        PluginError::NonRetryable(format!("{NAME}: cannot convert to script value: {e}"))
-    })
-}
-
-/// Reject floats JSON cannot represent, before they are silently turned into `null`.
-///
-/// Rhai produces NaN and infinities from ordinary float arithmetic — `x / 0.0` does
-/// not raise, unlike integer division — and `serde_json` maps every non-finite float
-/// onto `null`. Left alone that writes a null field into the index and reports
-/// success, so the conversion refuses instead and the step's `on_error` policy
-/// decides what happens to the document.
-fn reject_non_finite(value: &Dynamic, path: &str) -> Result<(), PluginError> {
-    if value.is_float() {
-        let f = value.as_float().unwrap_or(0.0);
-        if !f.is_finite() {
-            return Err(PluginError::NonRetryable(format!(
-                "{NAME}: `{path}` is not a finite number ({f})"
-            )));
-        }
-    } else if let Some(map) = value.read_lock::<Map>() {
-        for (k, v) in map.iter() {
-            reject_non_finite(v, &format!("{path}.{k}"))?;
-        }
-    } else if let Some(array) = value.read_lock::<rhai::Array>() {
-        for (i, v) in array.iter().enumerate() {
-            reject_non_finite(v, &format!("{path}[{i}]"))?;
-        }
-    }
-    Ok(())
-}
-
-/// Convert rhai values back into JSON.
-fn dynamic_to_json(value: &Dynamic) -> Result<Value, PluginError> {
-    rhai::serde::from_dynamic(value).map_err(|e| {
-        PluginError::InvalidInput(format!(
-            "{NAME}: script produced a value that is not valid JSON: {e}"
-        ))
-    })
-}
-
-/// Read the mutated map back onto the document.
-///
-/// `meta` is deliberately not read back: it is provenance the pipeline owns, so the
-/// script sees it but cannot rewrite it.
-fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
-    for key in ["id", "title", "content", "fields"] {
-        if let Some(v) = map.get(key) {
-            reject_non_finite(v, &format!("doc.{key}"))?;
-        }
-    }
-    if let Some(id) = map.get("id") {
-        let id = match dynamic_to_json(id)? {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        doc.id = sanitize_id(&id);
-    }
-    doc.title = match map.get("title") {
-        None => None,
-        Some(t) if t.is_unit() => None,
-        Some(t) => Some(match dynamic_to_json(t)? {
-            Value::String(s) => s,
-            other => other.to_string(),
-        }),
-    };
-    if let Some(content) = map.get("content") {
-        doc.content = match dynamic_to_json(content)? {
-            Value::String(s) => s,
-            Value::Null => String::new(),
-            other => other.to_string(),
-        };
-    }
-    doc.fields = match map.get("fields") {
-        Some(f) => match dynamic_to_json(f)? {
-            Value::Object(o) => o,
-            other => {
-                return Err(PluginError::InvalidInput(format!(
-                    "{NAME}: `doc.fields` must stay a map, got {other}"
-                )));
-            }
-        },
-        None => Default::default(),
-    };
-    Ok(())
-}
-
-/// What the script decided about one document.
-enum Verdict {
-    /// Keep it, with the script's mutations applied.
-    Keep,
-    /// Drop it: the script returned `false`.
-    Drop,
 }
 
 #[async_trait]
@@ -463,7 +166,10 @@ impl Plugin for DocumentScriptPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::runner::Runner;
     use serde_json::{Value, json};
+    use std::sync::atomic::Ordering;
 
     fn doc(id: &str, content: &str) -> Document {
         Document::with_id(id, content)
