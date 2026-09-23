@@ -126,7 +126,7 @@ impl SourceConnector for UrlConnector {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| SourceError::Fetch(format!("reading {parsed}: {e}")))?;
             if body.len() as u64 + chunk.len() as u64 > max_bytes {
-                return Err(SourceError::Fetch(format!(
+                return Err(SourceError::TooLarge(format!(
                     "GET {parsed}: body exceeds the {max_bytes} byte cap"
                 )));
             }
@@ -142,7 +142,7 @@ impl SourceConnector for UrlConnector {
         }
 
         let filename = last_segment(parsed.path());
-        let (bytes, filename) = maybe_gunzip(body, filename)?;
+        let (bytes, filename) = maybe_gunzip(body, filename, max_bytes)?;
         let mime = header_mime
             .or_else(|| detect_mime(&bytes, filename.as_deref()))
             .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -198,17 +198,28 @@ fn last_segment(path: &str) -> Option<String> {
 /// Detected by magic bytes rather than by filename: a `.gz` extension is only a hint,
 /// and `Content-Encoding` does not apply to a gzipped *file* served as octet-stream,
 /// which is exactly the TMDB case.
+///
+/// The output is capped at `max_bytes` like the download: gzip compresses repetitive
+/// input by over 1000x, so a small file could otherwise expand to exhaust the worker's
+/// memory.
 fn maybe_gunzip(
     body: Vec<u8>,
     filename: Option<String>,
+    max_bytes: u64,
 ) -> Result<(Vec<u8>, Option<String>), SourceError> {
     if body.len() < 2 || body[0] != 0x1f || body[1] != 0x8b {
         return Ok((body, filename));
     }
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(&body[..])
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut out)
         .map_err(|e| SourceError::Fetch(format!("gunzip: {e}")))?;
+    if out.len() as u64 > max_bytes {
+        return Err(SourceError::TooLarge(format!(
+            "decompressed content exceeds the {max_bytes} byte cap"
+        )));
+    }
     // Strip the .gz so MIME detection sees the real extension.
     let stripped = filename.map(|f| f.strip_suffix(".gz").map(str::to_owned).unwrap_or(f));
     Ok((out, stripped))
@@ -699,9 +710,28 @@ mod tests {
     }
 
     #[test]
+    fn a_gzip_bomb_is_stopped_at_the_cap_not_after_inflating() {
+        use std::io::Write;
+        // 1 MiB of zeros compresses to about 1 KiB.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 1 << 20]).expect("compress");
+        let bomb = enc.finish().expect("finish");
+        assert!(bomb.len() < 8 * 1024, "small on the wire: {}", bomb.len());
+
+        let err = maybe_gunzip(bomb.clone(), Some("x.json.gz".into()), 64 * 1024)
+            .expect_err("inflating past the cap is refused");
+        assert!(matches!(err, SourceError::TooLarge(_)), "{err}");
+
+        let (out, name) =
+            maybe_gunzip(bomb, Some("x.json.gz".into()), 1 << 20).expect("exactly at the cap");
+        assert_eq!(out.len(), 1 << 20);
+        assert_eq!(name.as_deref(), Some("x.json"));
+    }
+
+    #[test]
     fn maybe_gunzip_passes_through_uncompressed_bodies() {
         let (bytes, name) =
-            maybe_gunzip(b"plain".to_vec(), Some("a.json".into())).expect("no gzip");
+            maybe_gunzip(b"plain".to_vec(), Some("a.json".into()), 1024).expect("no gzip");
         assert_eq!(bytes, b"plain");
         assert_eq!(name.as_deref(), Some("a.json"));
     }

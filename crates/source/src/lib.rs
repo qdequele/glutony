@@ -56,4 +56,8 @@ pub enum SourceError {
     /// The upstream fetch failed.
     #[error("fetch: {0}")]
     Fetch(String),
+    /// The content is larger than the fetch cap, compressed or once decompressed.
+    /// Not transient: fetching the same file again yields the same size.
+    #[error("too large: {0}")]
+    TooLarge(String),
 }
