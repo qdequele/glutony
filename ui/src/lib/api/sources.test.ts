@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { isArchived, pipelinePinsConnection, sourceListSearch } from "./sources";
+import {
+  isArchived,
+  pipelinePinsConnection,
+  RUN_POLL_MAX_MS,
+  runLandedInRuns,
+  runLandedInSource,
+  shouldPollForRun,
+  sourceListSearch,
+  type PendingRun,
+  type RunRecord,
+} from "./sources";
 import type { PipelineDefinition, StepDefinition } from "./types";
 
 function pipeline(...steps: StepDefinition[]): PipelineDefinition {
@@ -49,5 +59,42 @@ describe("sourceListSearch", () => {
   it("asks for archived sources only when told to", () => {
     expect(sourceListSearch({ includeArchived: true })).toBe("?include_archived=true");
     expect(sourceListSearch({ includeArchived: false })).toBe("");
+  });
+});
+
+describe("polling after Run now", () => {
+  const pending: PendingRun = {
+    since: 1_000,
+    lastRunId: "run-1",
+    lastRunAt: "2026-09-22T09:00:00Z",
+  };
+  const run = (run_id: string): RunRecord => ({
+    run_id,
+    source_id: "s",
+    started_at: "2026-09-23T09:00:00Z",
+    finished_at: "2026-09-23T09:00:01Z",
+    outcome: "unchanged",
+    items: 0,
+    job_ids: [],
+  });
+
+  it("polls only while a run is pending, not landed, and inside the window", () => {
+    expect(shouldPollForRun(undefined, false, 2_000)).toBe(false);
+    expect(shouldPollForRun(pending, false, 2_000)).toBe(true);
+    expect(shouldPollForRun(pending, true, 2_000)).toBe(false);
+    expect(shouldPollForRun(pending, false, 1_000 + RUN_POLL_MAX_MS + 1)).toBe(false);
+  });
+
+  it("sees a run land as a new newest run id, whatever its outcome", () => {
+    expect(runLandedInRuns(pending, [run("run-1")])).toBe(false);
+    expect(runLandedInRuns(pending, [run("run-2"), run("run-1")])).toBe(true);
+    expect(runLandedInRuns({ ...pending, lastRunId: null }, [])).toBe(false);
+    expect(runLandedInRuns({ ...pending, lastRunId: null }, [run("run-1")])).toBe(true);
+  });
+
+  it("sees a run land on the source as a moved last_run_at", () => {
+    expect(runLandedInSource(pending, { last_run_at: "2026-09-22T09:00:00Z" })).toBe(false);
+    expect(runLandedInSource(pending, { last_run_at: "2026-09-23T09:00:00Z" })).toBe(true);
+    expect(runLandedInSource({ ...pending, lastRunAt: null }, {})).toBe(false);
   });
 });

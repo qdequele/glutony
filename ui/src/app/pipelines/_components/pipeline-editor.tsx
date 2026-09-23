@@ -199,8 +199,11 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,26rem)]">
-        {/* Left: metadata and steps */}
-        <div className="min-h-0 overflow-auto p-4">
+        {/* Left: metadata and steps. `relative` contains the hidden native inputs that
+            Radix Select/Switch position absolutely; without it they escape this scroll
+            area, make the page taller than the shell, and opening a Select scrolls the
+            window into blank space. */}
+        <div className="relative min-h-0 overflow-auto p-4">
           {readOnly ? (
             <Alert className="mb-4">
               <Lock aria-hidden />

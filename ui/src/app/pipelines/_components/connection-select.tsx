@@ -42,17 +42,24 @@ export function ConnectionSelect({ value, onChange, disabled, inputId }: SchemaW
         disabled={disabled}
         onValueChange={(next) => onChange(next === NONE ? undefined : next)}
       >
-        <SelectTrigger id={inputId} className="w-full">
+        {/* The value slot is a flex row, which defeats the trigger's line clamp:
+            clip it so a long label truncates instead of widening the step card. */}
+        <SelectTrigger
+          id={inputId}
+          className="w-full min-w-0 *:data-[slot=select-value]:min-w-0 *:data-[slot=select-value]:overflow-hidden"
+        >
           <SelectValue placeholder={connections.isPending ? "Loading connections…" : undefined} />
         </SelectTrigger>
         <SelectContent>
           <SelectItem value={NONE}>
-            <span className="text-muted-foreground">None — use the request&rsquo;s Meilisearch</span>
+            <span className="truncate text-muted-foreground">
+              None — use the request&rsquo;s Meilisearch
+            </span>
           </SelectItem>
           {list.length > 0 || missing ? <SelectSeparator /> : null}
           {list.map((entry) => (
             <SelectItem key={entry.uid} value={entry.uid}>
-              <span className="font-mono text-xs">{entry.uid}</span>
+              <span className="shrink-0 font-mono text-xs">{entry.uid}</span>
               <span className="truncate text-xs text-muted-foreground">{entry.host}</span>
             </SelectItem>
           ))}

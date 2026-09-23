@@ -246,32 +246,114 @@ export const sourceQueryKeys = {
   runs: (uid: string) => ["sources", "runs", uid] as const,
 };
 
+// ---------------------------------------------------------------------------
+// Polling after "Run now"
+// ---------------------------------------------------------------------------
+
+/**
+ * What the screens knew about a source when a run was triggered. `POST /run` is
+ * asynchronous, so the run lands seconds later: the queries poll until what
+ * they show differs from this, rather than refetching once, too early.
+ */
+export interface PendingRun {
+  /** When the run was triggered (`Date.now()`). */
+  since: number;
+  /** Newest run id before the trigger, `null` when there was none. */
+  lastRunId: string | null;
+  /** The source's `last_run_at` before the trigger. */
+  lastRunAt: string | null;
+}
+
+/** How often to poll while a triggered run has not landed. */
+export const RUN_POLL_MS = 2_000;
+/** Give up polling after this long; a slow run shows up on the next visit. */
+export const RUN_POLL_MAX_MS = 120_000;
+
+/** Kept outside `sourceQueryKeys.all` so invalidating sources never touches it. */
+const pendingRunKey = (uid: string) => ["source-run-pending", uid] as const;
+
+/**
+ * Whether a query should keep polling: a run is pending, it has not shown up
+ * yet (`landed` is false), and the window has not expired.
+ */
+export function shouldPollForRun(
+  pending: PendingRun | undefined,
+  landed: boolean,
+  now: number,
+): boolean {
+  if (!pending || landed) return false;
+  return now - pending.since <= RUN_POLL_MAX_MS;
+}
+
+/** A run is recorded when it finishes, so a new newest run id means it landed. */
+export function runLandedInRuns(pending: PendingRun, runs: RunRecord[] | undefined): boolean {
+  const newest = runs?.[0]?.run_id ?? null;
+  return newest !== null && newest !== pending.lastRunId;
+}
+
+/** The source's `last_run_at` moved, so its detail or list row is up to date. */
+export function runLandedInSource(
+  pending: PendingRun,
+  source: Pick<SourceView, "last_run_at"> | undefined,
+): boolean {
+  const current = source?.last_run_at ?? null;
+  return current !== null && current !== pending.lastRunAt;
+}
+
+function pendingRun(
+  queryClient: ReturnType<typeof useQueryClient>,
+  uid: string,
+): PendingRun | undefined {
+  return queryClient.getQueryData<PendingRun>(pendingRunKey(uid));
+}
+
 /** Every source visible to the caller, archived ones only when asked. */
 export function useSources(
   includeArchived: boolean = true,
 ): UseQueryResult<SourceView[], Error> {
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: sourceQueryKeys.list(includeArchived),
     queryFn: ({ signal }) => listSources({ includeArchived }, signal),
     placeholderData: (previous) => previous,
+    refetchInterval: (query) => {
+      const now = Date.now();
+      const waiting = (query.state.data ?? []).some((source) => {
+        const pending = pendingRun(queryClient, source.uid);
+        return shouldPollForRun(pending, pending ? runLandedInSource(pending, source) : true, now);
+      });
+      return waiting ? RUN_POLL_MS : false;
+    },
   });
 }
 
 /** One source, with `next_run_at`. Disabled while `uid` is empty. */
 export function useSource(uid: string | undefined): UseQueryResult<SourceView, Error> {
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: sourceQueryKeys.detail(uid ?? ""),
     queryFn: ({ signal }) => getSource(uid as string, signal),
     enabled: Boolean(uid),
+    refetchInterval: (query) => {
+      const pending = uid ? pendingRun(queryClient, uid) : undefined;
+      const landed = pending ? runLandedInSource(pending, query.state.data) : true;
+      return shouldPollForRun(pending, landed, Date.now()) ? RUN_POLL_MS : false;
+    },
   });
 }
 
 /** Recent runs of one source. Disabled while `uid` is empty. */
 export function useSourceRuns(uid: string | undefined): UseQueryResult<RunRecord[], Error> {
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: sourceQueryKeys.runs(uid ?? ""),
     queryFn: ({ signal }) => listSourceRuns(uid as string, SOURCE_RUNS_LIMIT, signal),
     enabled: Boolean(uid),
+    refetchInterval: (query) => {
+      const pending = uid ? pendingRun(queryClient, uid) : undefined;
+      const landed = pending ? runLandedInRuns(pending, query.state.data) : true;
+      return shouldPollForRun(pending, landed, Date.now()) ? RUN_POLL_MS : false;
+    },
   });
 }
 
@@ -363,13 +445,30 @@ export function useSetSourcePaused(): UseMutationResult<
 }
 
 /**
- * Run a source now. The run is asynchronous (202): the source, its runs and the
- * jobs list are invalidated so the screens pick the run up as soon as it lands.
+ * Run a source now. The run is asynchronous (202): the trigger records a
+ * {@link PendingRun}, so the source, its runs and the list poll until the run
+ * lands instead of refetching once before it has finished.
  */
 export function useTriggerSourceRun(): UseMutationResult<TriggerRunResponse, Error, string> {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (uid: string) => triggerSourceRun(uid),
+    onMutate: (uid) => {
+      // Snapshot before the request, so what counts as "new" is what the
+      // screens showed when the button was pressed.
+      const runs = queryClient.getQueryData<RunRecord[]>(sourceQueryKeys.runs(uid));
+      const detail = queryClient.getQueryData<SourceView>(sourceQueryKeys.detail(uid));
+      const listed = queryClient
+        .getQueriesData<SourceView[]>({ queryKey: ["sources", "list"] })
+        .flatMap(([, rows]) => rows ?? [])
+        .find((row) => row.uid === uid);
+      const pending: PendingRun = {
+        since: Date.now(),
+        lastRunId: runs?.[0]?.run_id ?? null,
+        lastRunAt: detail?.last_run_at ?? listed?.last_run_at ?? null,
+      };
+      queryClient.setQueryData(pendingRunKey(uid), pending);
+    },
     onSuccess: async (_response, uid) => {
       toast.success(`Run of "${uid}" triggered`, {
         description: "It appears in the run history once the fetch finishes.",
@@ -379,7 +478,8 @@ export function useTriggerSourceRun(): UseMutationResult<TriggerRunResponse, Err
         queryClient.invalidateQueries({ queryKey: jobQueryKeys.all }),
       ]);
     },
-    onError: (error) => {
+    onError: (error, uid) => {
+      queryClient.removeQueries({ queryKey: pendingRunKey(uid) });
       toast.error("Could not trigger a run", { description: errorMessage(error) });
     },
   });
