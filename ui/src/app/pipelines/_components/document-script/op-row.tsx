@@ -212,6 +212,7 @@ export function OpRow({ idPrefix, index, total, value, onChange, onMove, onRemov
     default:
       controls = (
         <Textarea
+          key={JSON.stringify(value)}
           id={`${id}-raw`}
           className="font-mono text-xs"
           rows={3}
