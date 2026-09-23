@@ -135,6 +135,37 @@ fn to_utc(t: SystemTime) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(t))
 }
 
+/// [`ScheduleClient`] used until a real one is configured: every operation is a 501,
+/// so a source can never be half-created without a schedule behind it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DisabledSchedules;
+
+fn disabled() -> GatewayError {
+    GatewayError::NotImplemented("scheduled sources are not configured on this gateway".into())
+}
+
+#[async_trait]
+impl ScheduleClient for DisabledSchedules {
+    async fn create(&self, _: &SourceSchedule) -> Result<(), GatewayError> {
+        Err(disabled())
+    }
+    async fn update(&self, _: &SourceSchedule) -> Result<(), GatewayError> {
+        Err(disabled())
+    }
+    async fn delete(&self, _: &str) -> Result<(), GatewayError> {
+        Err(disabled())
+    }
+    async fn set_paused(&self, _: &str, _: bool) -> Result<(), GatewayError> {
+        Err(disabled())
+    }
+    async fn trigger(&self, _: &str) -> Result<(), GatewayError> {
+        Err(disabled())
+    }
+    async fn describe(&self, _: &str) -> Result<Option<ScheduleInfo>, GatewayError> {
+        Err(disabled())
+    }
+}
+
 /// [`ScheduleClient`] backed by a real Temporal client.
 #[derive(Clone)]
 pub struct TemporalSchedules(pub Client);

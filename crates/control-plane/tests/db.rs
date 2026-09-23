@@ -340,8 +340,14 @@ async fn pipeline_routes_end_to_end() {
     let req = Request::delete("/pipelines/hdr-scoped?project_id=t1")
         .body(Body::empty())
         .unwrap();
-    let (status, _) = call(app(state.clone()), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(app(state.clone()), req).await;
+    // 200 with the sources the delete archived, so the gateway can drop their
+    // Temporal schedules. None feed this pipeline.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json::<serde_json::Value>(&body),
+        serde_json::json!({ "archived_sources": [] })
+    );
     let (status, body) = call(
         app(state.clone()),
         req_json(
@@ -359,7 +365,7 @@ async fn pipeline_routes_end_to_end() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = call(app(state.clone()), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     let (status, body) = call(
         app(state.clone()),
         req_json(

@@ -137,11 +137,29 @@ pub async fn delete_pipeline(
     headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
     let project_id = resolve_project_id(&headers, &state.config);
-    state
+    let archived = state
         .control_plane
         .delete_pipeline(&name, project_id.as_deref())
         .await?;
-    tracing::info!(pipeline = %name, project_id = ?project_id, "pipeline deleted");
+    // The control plane archived the sources feeding this pipeline; stop their
+    // schedules so they do not keep firing into a source that can no longer run. The
+    // pipeline is already gone, so a failure here is logged rather than returned.
+    for source_id in &archived {
+        let schedule_id = meili_ingest_source::SourceRunInput::schedule_id(*source_id);
+        if let Err(e) = state.schedules.delete(&schedule_id).await {
+            tracing::error!(
+                pipeline = %name,
+                schedule = %schedule_id,
+                "could not delete the schedule of an archived source: {e}"
+            );
+        }
+    }
+    tracing::info!(
+        pipeline = %name,
+        project_id = ?project_id,
+        archived_sources = archived.len(),
+        "pipeline deleted"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

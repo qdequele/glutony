@@ -349,13 +349,24 @@ pub async fn get_pipeline(
     find_builtin(&uid).map(Json)
 }
 
-/// `DELETE /pipelines/{uid}?project_id=` → 204, 403 for built-ins, 404 when missing.
+/// Body of `DELETE /pipelines/{uid}`: the sources the delete archived.
+///
+/// Returned so the gateway can delete their Temporal schedules; without it they would
+/// keep firing into a source that can no longer run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedPipeline {
+    /// Ids of the sources archived because they fed this pipeline.
+    pub archived_sources: Vec<uuid::Uuid>,
+}
+
+/// `DELETE /pipelines/{uid}?project_id=` → 200 [`DeletedPipeline`], 403 for built-ins,
+/// 404 when missing.
 pub async fn delete_pipeline(
     State(state): State<AppState>,
     Path(uid): Path<String>,
     Query(q): Query<ProjectQuery>,
     headers: HeaderMap,
-) -> Result<StatusCode, CpError> {
+) -> Result<Json<DeletedPipeline>, CpError> {
     if is_builtin_uid(&uid) {
         return Err(CpError::Builtin(format!(
             "pipeline {uid:?} is built in and cannot be deleted"
@@ -378,7 +389,9 @@ pub async fn delete_pipeline(
             );
         }
         tracing::info!(uid = %uid, project_id = ?project_id, "pipeline deleted");
-        Ok(StatusCode::NO_CONTENT)
+        Ok(Json(DeletedPipeline {
+            archived_sources: archived,
+        }))
     } else {
         Err(CpError::NotFound(format!(
             "pipeline {uid:?} not found (project_id={project_id:?})"

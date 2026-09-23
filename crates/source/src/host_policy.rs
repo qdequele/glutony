@@ -1,4 +1,7 @@
-//! Which hosts a Meilisearch connection may point at (spec Decision 14).
+//! Which hosts meili-ingest may talk to on a tenant's behalf: where a Meilisearch
+//! connection may write (`MEILI_CONNECTION_HOSTS`, spec Decision 14) and where a
+//! scheduled source may fetch from (`SOURCE_FETCH_HOSTS`). Both use this type and the
+//! same public-only default.
 //!
 //! A connection's host is a tenant-supplied URL that meili-ingest writes documents to
 //! from inside the cluster — the fetch-side SSRF exposure, on the write side. The safe
@@ -121,7 +124,7 @@ fn check_http_scheme(url: &Url) -> Result<(), SourceError> {
     match url.scheme() {
         "http" | "https" => Ok(()),
         other => Err(SourceError::Blocked(format!(
-            "scheme {other:?} is not allowed for a Meilisearch connection"
+            "scheme {other:?} is not allowed; only http and https are"
         ))),
     }
 }

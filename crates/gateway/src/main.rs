@@ -104,10 +104,20 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
 
-    let state =
-        AppState::new(config, Arc::new(TemporalStarter(temporal)), blob, http).with_connections(
-            meili_ingest_gateway::connections::ConnectionConfig::new(connection_key, host_policy),
-        );
+    let fetch_policy =
+        meili_ingest_source::HostPolicy::from_env_var(meili_ingest_source::FETCH_HOSTS_ENV)
+            .context("invalid SOURCE_FETCH_HOSTS")?;
+    tracing::info!(policy = ?fetch_policy, "scheduled-source fetch host policy");
+
+    let schedules = Arc::new(meili_ingest_gateway::schedules::TemporalSchedules(
+        temporal.clone(),
+    ));
+    let state = AppState::new(config, Arc::new(TemporalStarter(temporal)), blob, http)
+        .with_connections(meili_ingest_gateway::connections::ConnectionConfig::new(
+            connection_key,
+            host_policy,
+        ))
+        .with_sources(schedules, fetch_policy);
     let app = meili_ingest_gateway::router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)

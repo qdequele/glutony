@@ -63,6 +63,9 @@ x-rust-dev: &rust-dev
 x-connections-env: &connections-env
   SOURCE_SECRET_KEY: ${SOURCE_SECRET_KEY:-ZGV2LW9ubHktc291cmNlLXNlY3JldC1rZXktMzJieXQ=}
   MEILI_CONNECTION_HOSTS: ${MEILI_CONNECTION_HOSTS:-meilisearch:7700}
+  # Where scheduled sources may fetch from. `public` (https, public addresses only) is
+  # the safe default; list hosts here to fetch from an internal file server.
+  SOURCE_FETCH_HOSTS: ${SOURCE_FETCH_HOSTS:-public}
 
 x-worker-env: &worker-env
   <<: *connections-env

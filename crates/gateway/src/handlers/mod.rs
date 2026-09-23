@@ -7,6 +7,7 @@ pub mod jobs;
 pub mod pipeline;
 pub mod pipelines;
 pub mod plugins;
+pub mod sources;
 pub mod usage;
 
 use std::collections::HashMap;

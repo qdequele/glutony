@@ -12,6 +12,7 @@ pub mod error;
 pub mod extract;
 pub mod handlers;
 pub mod schedules;
+pub mod sources;
 pub mod state;
 pub mod ui;
 
@@ -134,6 +135,26 @@ pub fn router(state: AppState) -> Router {
                 .patch(handlers::connections::patch_connection)
                 .delete(handlers::connections::delete_connection),
         )
+        .route(
+            "/sources",
+            get(handlers::sources::list_sources).post(handlers::sources::create_source),
+        )
+        .route(
+            "/sources/{uid}",
+            get(handlers::sources::get_source)
+                .patch(handlers::sources::patch_source)
+                .delete(handlers::sources::delete_source),
+        )
+        .route(
+            "/sources/{uid}/pause",
+            post(handlers::sources::pause_source),
+        )
+        .route(
+            "/sources/{uid}/unpause",
+            post(handlers::sources::unpause_source),
+        )
+        .route("/sources/{uid}/run", post(handlers::sources::run_source))
+        .route("/sources/{uid}/runs", get(handlers::sources::list_runs))
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))
         .route("/usage", get(handlers::usage::get_usage))
