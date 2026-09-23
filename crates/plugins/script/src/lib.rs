@@ -53,6 +53,7 @@
 //! | `max_ops` | `100000` | rhai operations one document may use |
 //! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
 
+mod codegen;
 mod config;
 mod convert;
 mod diagnostic;
@@ -906,5 +907,90 @@ mod tests {
         .await;
         assert_eq!(fields(&out[0]), json!({"a": 1}));
         assert_eq!(out[0].title, None);
+    }
+
+    use crate::codegen::{generate, string_literal, value_literal};
+    use crate::ops::Op;
+
+    fn ops(value: Value) -> Vec<Op> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn each_operation_becomes_one_readable_line() {
+        let program = generate(&ops(json!([
+            {"rename": {"from": "prix", "to": "price"}},
+            {"drop": ["a", "b"]},
+            {"filter": {"drop_if": {"field": "content", "is": "empty"}}},
+            {"filter": {"drop_if": {"field": "s", "not_equals": "live"}}},
+            {"round": {"field": "p", "decimals": 2}}
+        ])));
+        assert_eq!(
+            program,
+            concat!(
+                "doc.rename_field(\"prix\", \"price\");\n",
+                "doc.drop_fields([\"a\", \"b\"]);\n",
+                "if doc.field_is_empty(\"content\") { return false; }\n",
+                "if !doc.field_equals(\"s\", \"live\") { return false; }\n",
+                "doc.round_field(\"p\", 2);\n",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn adversarial_field_names_touch_only_their_own_key() {
+        for name in [
+            r#""]; loop {}; //"#,
+            "a\"b",
+            "back\\slash",
+            "new\nline",
+            "tab\tbed",
+            "é日本",
+            "${x}",
+            "`tick`",
+        ] {
+            let mut d = with_fields(json!({ "other": 1 }));
+            d.fields.insert(name.into(), json!("v"));
+            let program = generate(&ops(json!([{ "rename": { "from": name, "to": "safe" } }])));
+
+            let out = run(vec![d], json!({ "script": program })).await;
+
+            assert_eq!(fields(&out[0]), json!({"other": 1, "safe": "v"}), "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn string_literals_escape_everything_but_printable_ascii() {
+        assert_eq!(string_literal("a\"b\\c\né"), r#""a\U00000022b\U0000005Cc\U0000000A\U000000E9""#);
+    }
+
+    #[tokio::test]
+    async fn value_literals_round_trip() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(3),
+            json!(-5),
+            json!(2.5),
+            json!(1e20),
+            json!(1.5e-7),
+            json!("é\n\"q\""),
+            json!([1, "a", null]),
+            json!({"k": [1, {"n": null}], "odd key": "x"}),
+        ] {
+            let program = format!("doc.fields.out = {};", value_literal(&value));
+            let out = run(vec![with_fields(json!({}))], json!({ "script": program })).await;
+            assert_eq!(out[0].fields.get("out"), Some(&value), "literal {}", value_literal(&value));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trailing_comment_in_a_set_expression_cannot_swallow_the_statement() {
+        let program = generate(&ops(json!([
+            {"set": {"field": "t", "expr": "price * 2 // double it"}},
+            {"drop": ["price"]}
+        ])));
+        let out = run(vec![with_fields(json!({"price": 4}))], json!({ "script": program })).await;
+        assert_eq!(fields(&out[0]), json!({"t": 8}));
     }
 }
