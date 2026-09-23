@@ -335,6 +335,20 @@ export interface ValidatePipelineOk {
   valid: true;
   /** Topological execution order of the steps. */
   order: string[];
+  /** Builder-mode `document_script` steps: the rhai their `ops` compile to. */
+  generated_scripts?: Record<string, string>;
+}
+
+/** One compile problem in a step's config, from an `invalid_step_config` error. */
+export interface StepDiagnostic {
+  /** The step id. */
+  step: string;
+  /** Where in the step's config: `script`, `ops[2].expr`, `config`, … */
+  path: string;
+  message: string;
+  /** 1-based; absent for structural problems. */
+  line?: number;
+  column?: number;
 }
 
 /**
@@ -344,6 +358,6 @@ export interface ValidatePipelineOk {
  * yet — the UI degrades to client-side validation only.
  */
 export type ValidationOutcome =
-  | { kind: "ok"; order: string[] }
-  | { kind: "invalid"; error: string; code: string }
+  | { kind: "ok"; order: string[]; generatedScripts: Record<string, string> }
+  | { kind: "invalid"; error: string; code: string; diagnostics: StepDiagnostic[] }
   | { kind: "unsupported" };

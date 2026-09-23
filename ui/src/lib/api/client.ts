@@ -6,6 +6,7 @@
  * involved. `NEXT_PUBLIC_API_BASE_URL` exists only for running `next dev`
  * against a gateway on another port.
  */
+import { parseDiagnostics, parseGeneratedScripts } from "./diagnostics";
 import type {
   ApiErrorBody,
   Catalog,
@@ -27,12 +28,15 @@ export class ApiError extends Error {
   readonly status: number;
   /** Stable snake_case error code from the body. */
   readonly code: string;
+  /** The raw error body, for callers that need fields beyond `error`/`code`. */
+  readonly body: unknown;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, body: unknown = undefined) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.body = body;
   }
 
   /** True when the endpoint itself is missing (not yet deployed). */
@@ -60,12 +64,13 @@ async function toApiError(response: Response): Promise<ApiError> {
     body = undefined;
   }
   if (isApiErrorBody(body)) {
-    return new ApiError(response.status, body.code, body.error);
+    return new ApiError(response.status, body.code, body.error, body);
   }
   return new ApiError(
     response.status,
     `http_${response.status}`,
     `${response.status} ${response.statusText || "request failed"}`,
+    body,
   );
 }
 
@@ -147,14 +152,19 @@ export async function validatePipeline(
       json: definition,
       signal,
     });
-    return { kind: "ok", order: body.order ?? [] };
+    return { kind: "ok", order: body.order ?? [], generatedScripts: parseGeneratedScripts(body) };
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
     if (error.status === 404 || error.status === 405 || error.status === 501) {
       return { kind: "unsupported" };
     }
     if (error.status === 422 || error.status === 400) {
-      return { kind: "invalid", error: error.message, code: error.code };
+      return {
+        kind: "invalid",
+        error: error.message,
+        code: error.code,
+        diagnostics: parseDiagnostics(error.body),
+      };
     }
     throw error;
   }
