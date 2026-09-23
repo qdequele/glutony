@@ -291,7 +291,7 @@ impl Plugin for LlmEnricherPlugin {
                     "max_tokens": { "type": "integer", "minimum": 1 },
                     "max_input_chars": { "type": "integer", "minimum": 1, "default": 12000 },
                     "merge_strategy": { "type": "string", "enum": ["merge", "replace"], "default": "merge" },
-                    "system_prompt": { "type": "string", "default": DEFAULT_SYSTEM_PROMPT }
+                    "system_prompt": { "type": "string", "x-widget": "textarea", "default": DEFAULT_SYSTEM_PROMPT }
                 }
             }))
     }
