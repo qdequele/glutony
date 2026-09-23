@@ -1,10 +1,11 @@
 "use client";
 
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, defaultHighlightStyle, indentOnInput, syntaxHighlighting } from "@codemirror/language";
+import { bracketMatching, HighlightStyle, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { lintGutter, setDiagnostics } from "@codemirror/lint";
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
+import { tags } from "@lezer/highlight";
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 
 import type { StepDiagnostic } from "@/lib/api/types";
@@ -27,6 +28,19 @@ export interface ScriptCodeEditorProps {
   maxLines?: number;
   ariaLabel: string;
 }
+
+/**
+ * Theme-aware token colours: CSS variables so they follow the app's light/dark mode
+ * instead of CodeMirror's fixed-hex `defaultHighlightStyle` (unreadable in dark mode).
+ */
+const rhaiHighlightStyle = HighlightStyle.define([
+  { tag: tags.keyword, color: "var(--code-keyword)", fontWeight: 600 },
+  { tag: tags.string, color: "var(--code-string)" },
+  { tag: tags.number, color: "var(--code-number)" },
+  { tag: tags.comment, color: "var(--muted-foreground)", fontStyle: "italic" },
+  { tag: tags.variableName, color: "var(--foreground)" },
+  { tag: tags.special(tags.variableName), color: "var(--code-special)", fontWeight: 600 },
+]);
 
 function theme(maxLines: number | undefined) {
   return EditorView.theme({
@@ -68,7 +82,7 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorHandle, ScriptCodeEdi
             history(),
             indentOnInput(),
             bracketMatching(),
-            syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+            syntaxHighlighting(rhaiHighlightStyle, { fallback: true }),
             keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
             rhai,
             lintGutter(),
