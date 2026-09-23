@@ -16,6 +16,7 @@ pub mod ui;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -43,11 +44,60 @@ async fn health(
     }))
 }
 
+/// Normalise one `CORS_ALLOW_ORIGINS` entry into the exact value a browser sends in
+/// its `Origin` header, or `None` when it cannot be an origin.
+///
+/// Origins match byte-for-byte on scheme, host and port, so an entry that merely
+/// parses as a header value is not enough: `localhost:3000` (no scheme) or
+/// `http://host/app` (a path) would be accepted and then never match anything. A
+/// trailing slash is the one typo that is safe to repair.
+fn normalize_origin(raw: &str) -> Option<axum::http::HeaderValue> {
+    let origin = raw.trim().trim_end_matches('/');
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    if authority.is_empty() || authority.contains(['/', '?', '#']) {
+        return None;
+    }
+    origin.parse().ok()
+}
+
+/// Cross-origin layer for `CORS_ALLOW_ORIGINS`, or `None` when it is unset.
+///
+/// Production embeds the UI in this binary and is same-origin, so no layer is
+/// mounted and the browser's default same-origin policy stands. `next dev` serves
+/// the UI from its own port, so the dev stack names that origin explicitly. An
+/// entry that is not an origin is dropped with a warning rather than silently
+/// widening the policy; if that leaves nothing, no layer is mounted.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let mut accepted = Vec::new();
+    for raw in origins {
+        match normalize_origin(raw) {
+            Some(origin) => accepted.push(origin),
+            None => tracing::warn!(
+                origin = %raw,
+                "ignoring CORS_ALLOW_ORIGINS entry: expected scheme://host[:port]"
+            ),
+        }
+    }
+    if accepted.is_empty() {
+        return None;
+    }
+    tracing::info!(origins = ?accepted, "CORS enabled");
+    Some(
+        CorsLayer::new()
+            .allow_origin(accepted)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+}
+
 /// Build the axum router with every route of SPEC §4 plus `GET /health`, the body
 /// limits (`MAX_UPLOAD_MB`) and request tracing.
 pub fn router(state: AppState) -> Router {
     let limit = state.config.max_upload_bytes();
-    Router::new()
+    let cors = cors_layer(&state.config.cors_allow_origins);
+    let router = Router::new()
         .route("/health", get(health))
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/ingest/batch", post(handlers::ingest::ingest_batch))
@@ -77,8 +127,14 @@ pub fn router(state: AppState) -> Router {
         .merge(ui::router())
         .layer(DefaultBodyLimit::max(limit))
         .layer(RequestBodyLimitLayer::new(limit))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .layer(TraceLayer::new_for_http());
+    // Applied with a `match` rather than an `Option` layer so the gateway does not
+    // need tower's `util` feature just for `option_layer`.
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+    .with_state(state)
 }
 
 /// Shared fixtures for handler tests: a recording [`WorkflowStarter`], an in-memory blob
@@ -284,6 +340,7 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
+    use super::{cors_layer, normalize_origin};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -347,6 +404,137 @@ mod tests {
             .await
             .unwrap();
         assert!(json_body(resp).await["project_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn no_cors_headers_without_an_allowed_origin() {
+        // The production shape: the UI is embedded and same-origin, so the gateway
+        // must not hand out cross-origin permission to anybody.
+        let server = MockServer::start().await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !resp
+                .headers()
+                .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "unconfigured gateway should not send Access-Control-Allow-Origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_allows_only_the_configured_origins() {
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            cors_allow_origins: vec!["http://localhost:3000".into()],
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://localhost:3000"
+        );
+
+        // An origin that was not listed gets no grant, so naming one dev origin
+        // does not quietly open the API to every site the browser visits.
+        let resp = app
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !resp
+                .headers()
+                .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "unlisted origin should not be granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_grants_the_ui_json_writes() {
+        // The UI's POST/DELETE calls send `Content-Type: application/json`, which
+        // makes the browser preflight them. Without this grant, reads would work
+        // and every pipeline save would fail.
+        use axum::http::header;
+
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            cors_allow_origins: vec!["http://localhost:3000".into()],
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+        let resp = app
+            .oneshot(
+                Request::options("/pipelines")
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "http://localhost:3000"
+        );
+        assert!(
+            headers.contains_key(header::ACCESS_CONTROL_ALLOW_METHODS),
+            "preflight must grant the method"
+        );
+        assert!(
+            headers.contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            "preflight must grant content-type"
+        );
+    }
+
+    #[test]
+    fn origin_entries_are_normalised_or_rejected() {
+        let ok = |raw: &str| normalize_origin(raw).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            ok("http://localhost:3000").as_deref(),
+            Some("http://localhost:3000")
+        );
+        // The trailing slash a browser never sends is repaired, not kept.
+        assert_eq!(
+            ok("http://localhost:3000/").as_deref(),
+            Some("http://localhost:3000")
+        );
+        assert_eq!(
+            ok(" https://ui.example ").as_deref(),
+            Some("https://ui.example")
+        );
+        // These would parse as header values yet could never match an Origin.
+        assert_eq!(ok("localhost:3000"), None);
+        assert_eq!(ok("http://"), None);
+        assert_eq!(ok("http://host/app"), None);
+        assert_eq!(ok("http://host?x=1"), None);
+        assert!(cors_layer(&["localhost:3000".into()]).is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,11 @@
+# The `ui` compose service builds with ./ui as its context, so the repo-root
+# .dockerignore does not apply here. Without this, `COPY . .` would copy a
+# host-installed node_modules (macOS native binaries: SWC, sharp, lightningcss)
+# over the Linux install from `pnpm install`, and `next dev` would fail to load.
+node_modules
+.next
+out
+*.log
+.DS_Store
+.env
+.env.local

@@ -10,10 +10,11 @@
 #   Gateway        http://gateway.meili-ingest.orb.local:8080
 #   Control plane  http://control-plane.meili-ingest.orb.local:9000
 #   Temporal UI    http://temporal.meili-ingest.orb.local:8233
+#   Admin UI       http://ui.meili-ingest.orb.local:3000
 #   Meilisearch    http://meilisearch.meili-ingest.orb.local:7700   (master key: masterKey)
 #   Postgres       postgres://postgres:dev-password@postgres.meili-ingest.orb.local:5432/postgres
 #
-# The same ports are also published on localhost (8080, 9000, 7233, 8233, 7700, 5432).
+# The same ports are also published on localhost (3000, 8080, 9000, 7233, 8233, 7700, 5432).
 #
 # Smoke test once everything is up:
 #   curl -F "file=@report.pdf" http://gateway.meili-ingest.orb.local:8080/ingest
@@ -74,7 +75,10 @@ services:
   postgres:
     image: postgres:17-alpine
     ports:
-      - "5432:5432"
+      # Host side is overridable because 5432 is the port every other local
+      # Postgres wants too; the stack itself reaches this over the compose network
+      # (postgres:5432), so only host tools care. POSTGRES_HOST_PORT=55433 to dodge.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: dev-password
@@ -165,6 +169,13 @@ services:
       MEILI_API_KEY: masterKey
       DEFAULT_INDEX: documents
       MAX_UPLOAD_MB: "500"
+      # The dev UI runs as its own service on :3000, so its API calls are
+      # cross-origin. Production embeds the UI in this binary and is same-origin,
+      # which is why this is unset there and no CORS layer is mounted at all.
+      # Origins match exactly on scheme, host AND port, so each URL the UI can be
+      # opened at is listed: the OrbStack name with and without the port, plus the
+      # localhost publish.
+      CORS_ALLOW_ORIGINS: http://ui.meili-ingest.orb.local:3000,http://ui.meili-ingest.orb.local,http://localhost:3000
       # Uploads above INLINE_MAX_BYTES are staged in the blob store instead of
       # travelling inside the Temporal payload.
       BLOB_STORE_URL: file:///data/blobs
@@ -267,6 +278,53 @@ services:
         condition: service_healthy
       control-plane:
         condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # Admin UI (Next.js dev server, hot-reloaded from ./ui/src)
+  # ---------------------------------------------------------------------------
+  # Dev only. The published image builds a static export and compiles it into the
+  # gateway binary instead (see Dockerfile stage `ui`), so production serves the
+  # UI from http://gateway/ui with no Node runtime and no CORS.
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      # Absolute because the browser, not the container, makes these calls: it
+      # resolves this from the host, not from inside the compose network, so the
+      # in-network name `gateway:8080` would not resolve. Override UI_API_BASE_URL
+      # (e.g. http://localhost:8080) when not running under OrbStack.
+      NEXT_PUBLIC_API_BASE_URL: ${UI_API_BASE_URL:-http://gateway.meili-ingest.orb.local:8080}
+      # Next needs polling to notice files delivered by a compose sync.
+      WATCHPACK_POLLING: "true"
+    depends_on:
+      gateway:
+        condition: service_started
+    develop:
+      watch:
+        - action: sync
+          path: ./ui/src
+          target: /app/src
+        # Read once at dev-server start, so a sync alone would leave the running
+        # server on the old config.
+        - action: sync+restart
+          path: ./ui/next.config.ts
+          target: /app/next.config.ts
+        - action: sync+restart
+          path: ./ui/tsconfig.json
+          target: /app/tsconfig.json
+        - action: sync+restart
+          path: ./ui/postcss.config.mjs
+          target: /app/postcss.config.mjs
+        - action: rebuild
+          path: ./ui/package.json
+        - action: rebuild
+          path: ./ui/pnpm-lock.yaml
+        # Carries the pnpm build-script policy, which only applies at install time.
+        - action: rebuild
+          path: ./ui/pnpm-workspace.yaml
 
 volumes:
   cargo-registry:

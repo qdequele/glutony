@@ -1,0 +1,26 @@
+# meili-ingest admin UI — development image (used by compose.yaml).
+#
+# `next dev` with hot reload. Compose syncs ./ui/src into /app/src and Next's
+# watcher picks the change up; package.json / lockfile changes rebuild the image.
+#
+# Production does NOT use this: the prod Dockerfile builds a static export and
+# compiles it into the gateway binary (same-origin, no Node at runtime). Here the
+# UI runs on its own port, so it calls the gateway cross-origin and the gateway
+# must allow that origin via CORS_ALLOW_ORIGINS.
+
+FROM node:22-bookworm-slim
+WORKDIR /app
+RUN corepack enable
+
+# Install from the lockfile first so a source-only change reuses this layer.
+# `pnpm-workspace.yaml` carries the build-script policy for sharp and
+# unrs-resolver; without it pnpm 10+ fails the install with ERR_PNPM_IGNORED_BUILDS.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+EXPOSE 3000
+# -H is explicit rather than relying on the dev server's default host: bound to
+# loopback inside the container, the published port would connect to nothing.
+CMD ["pnpm", "dev", "-H", "0.0.0.0", "-p", "3000"]
