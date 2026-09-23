@@ -1008,6 +1008,21 @@ impl PipelineDefinition {
         self.steps.iter().find(|s| s.id == id)
     }
 
+    /// Whether this pipeline supplies its own Meilisearch destination: it has at least
+    /// one `meili_indexer` step and **every** such step names a connection.
+    ///
+    /// When true, a request needs no `X-Meili-*` context and a scheduled source may run
+    /// the pipeline. A pipeline with no indexer step returns false, so it keeps
+    /// requiring a context exactly as before connections existed.
+    pub fn pins_destination(&self) -> bool {
+        let mut indexers = self
+            .steps
+            .iter()
+            .filter(|s| s.plugin == INDEXER_PLUGIN)
+            .peekable();
+        indexers.peek().is_some() && indexers.all(|s| pinned_connection(&s.config).is_some())
+    }
+
     /// Whether this pipeline's trigger matches a MIME type / filename.
     pub fn trigger_matches(&self, mime: &str, filename: Option<&str>) -> bool {
         let Some(t) = &self.trigger else { return false };
@@ -1587,6 +1602,41 @@ steps:
             index: Some("from-request".into()),
             region: Some("eu".into()),
         }
+    }
+
+    fn pipeline_with(steps: Vec<StepDefinition>) -> PipelineDefinition {
+        PipelineDefinition {
+            uid: "p".into(),
+            name: "p".into(),
+            description: None,
+            version: 1,
+            trigger: None,
+            steps,
+            builtin: false,
+            project_id: None,
+        }
+    }
+
+    #[test]
+    fn pins_destination_needs_every_indexer_to_name_a_connection() {
+        let pinned = || {
+            StepDefinition::new("i", INDEXER_PLUGIN).config(serde_json::json!({"connection": "c"}))
+        };
+        let unpinned = || StepDefinition::new("j", INDEXER_PLUGIN);
+
+        assert!(
+            pipeline_with(vec![StepDefinition::new("p", "json_parser"), pinned()])
+                .pins_destination()
+        );
+        assert!(
+            !pipeline_with(vec![pinned(), unpinned()]).pins_destination(),
+            "one unpinned indexer still needs the request's context"
+        );
+        assert!(!pipeline_with(vec![unpinned()]).pins_destination());
+        assert!(
+            !pipeline_with(vec![StepDefinition::new("p", "json_parser")]).pins_destination(),
+            "a pipeline without an indexer keeps today's requirement"
+        );
     }
 
     #[test]

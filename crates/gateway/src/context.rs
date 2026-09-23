@@ -92,6 +92,41 @@ pub fn resolve_context(
     query_index: Option<&str>,
     config: &GatewayConfig,
 ) -> Result<MeiliContext, GatewayError> {
+    let ctx = resolve_request_context(headers, query_index, config);
+    require_destination(&ctx)?;
+    Ok(ctx)
+}
+
+/// Fail with the historical `MissingContext` errors unless `ctx` carries both a host and
+/// an API key.
+///
+/// Callers apply this only once the pipeline is known and does not pin its own
+/// destination ([`meili_ingest_plugin_sdk::PipelineDefinition::pins_destination`]).
+pub fn require_destination(ctx: &MeiliContext) -> Result<(), GatewayError> {
+    match (&ctx.host, &ctx.api_key) {
+        (Some(_), Some(_)) => Ok(()),
+        (None, _) => Err(GatewayError::MissingContext(
+            "no Meilisearch host: send X-Meili-Host (via Envoy), set MEILI_URL, or name a \
+             Meilisearch connection on the pipeline's meili_indexer step"
+                .into(),
+        )),
+        (Some(_), None) => Err(GatewayError::MissingContext(
+            "no Meilisearch API key: send X-Meili-Api-Key (via Envoy), Authorization: Bearer <key>, \
+             set MEILI_API_KEY, or name a Meilisearch connection on the pipeline's \
+             meili_indexer step"
+                .into(),
+        )),
+    }
+}
+
+/// Resolve the tenant context from headers, query and env, **without** requiring a
+/// destination: `host` and `api_key` are `None` when nothing supplies them. A pipeline
+/// pinned to a Meilisearch connection needs neither.
+pub fn resolve_request_context(
+    headers: &HeaderMap,
+    query_index: Option<&str>,
+    config: &GatewayConfig,
+) -> MeiliContext {
     let trusted = envoy_headers_trusted(headers, config);
     if !trusted && headers.contains_key(H_HOST) {
         tracing::debug!("ignoring X-Meili-* headers: missing or wrong X-Meili-Envoy-Secret");
@@ -123,21 +158,12 @@ pub fn resolve_context(
         api_key = config.meili_api_key.clone();
     }
 
-    match (host, api_key) {
-        (Some(host), Some(api_key)) => Ok(MeiliContext {
-            project_id,
-            host: Some(host),
-            api_key: Some(api_key),
-            index,
-            region,
-        }),
-        (None, _) => Err(GatewayError::MissingContext(
-            "no Meilisearch host: send X-Meili-Host (via Envoy) or set MEILI_URL".into(),
-        )),
-        (Some(_), None) => Err(GatewayError::MissingContext(
-            "no Meilisearch API key: send X-Meili-Api-Key (via Envoy), Authorization: Bearer <key>, or set MEILI_API_KEY"
-                .into(),
-        )),
+    MeiliContext {
+        project_id,
+        host,
+        api_key,
+        index,
+        region,
     }
 }
 
