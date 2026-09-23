@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 meili-ingest-plugin-sdk.workspace = true
+meili-ingest-plugin-script.workspace = true
 meili-ingest-router.workspace = true
 
 axum.workspace = true

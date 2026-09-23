@@ -3118,6 +3118,7 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
+ "meili-ingest-plugin-script",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
  "serde",
