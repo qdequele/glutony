@@ -41,6 +41,13 @@ export function DocumentScriptEditor({
   const [expanded, setExpanded] = useState(false);
   const codeRef = useRef<ScriptCodeEditorHandle>(null);
 
+  // Always holds the latest config, so an in-flight `generateScript` request (below)
+  // can tell whether the ops it was generated from are still current when it resolves.
+  const latest = useRef(config);
+  useEffect(() => {
+    latest.current = config;
+  }, [config]);
+
   // A freshly added step has neither key: start it in the builder with no operations.
   useEffect(() => {
     if (!readOnly && needsInitialOps(config)) onChange(withInitialOps(config));
@@ -53,10 +60,15 @@ export function DocumentScriptEditor({
       return;
     }
     setSwitching(true);
+    const requested = config.ops;
     try {
       const script = await generateScript(stepId, config);
+      // The ops may have changed while the request was in flight (an edit to the
+      // builder, or to another config field): a stale result must never overwrite
+      // whatever the user has since typed.
+      if (JSON.stringify(latest.current.ops) !== JSON.stringify(requested)) return;
       if (script === undefined) setConfirm("to-code-empty");
-      else onChange(toCode(config, script));
+      else onChange(toCode(latest.current, script));
     } finally {
       setSwitching(false);
     }
@@ -83,7 +95,7 @@ export function DocumentScriptEditor({
         ops={readOps(config)}
         onChange={(ops) => onChange(writeOps(config, ops))}
         diagnostics={diagnostics}
-        readOnly={readOnly}
+        readOnly={readOnly || switching}
       />
     ) : (
       <ScriptCodeEditor
