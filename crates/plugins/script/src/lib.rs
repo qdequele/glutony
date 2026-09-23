@@ -759,4 +759,148 @@ mod tests {
             "script must be required"
         );
     }
+
+    #[tokio::test]
+    async fn text_helpers_transform_listed_strings() {
+        let out = run(
+            vec![with_fields(json!({"a": "  Hi  ", "b": "MiXed", "c": "ab-1"}))],
+            script(r#"doc.trim_fields(["a"]); doc.lowercase_fields(["b"]); doc.uppercase_fields(["c"]);"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": "Hi", "b": "mixed", "c": "AB-1"}));
+    }
+
+    #[tokio::test]
+    async fn a_text_helper_on_a_non_string_is_an_error() {
+        let err = try_run(vec![with_fields(json!({"n": 1}))], script(r#"doc.trim_fields(["n"]);"#))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn split_and_join_round_trip() {
+        let out = run(
+            vec![with_fields(json!({"tags": "a,b,c", "list": ["x", 2, true]}))],
+            script(r#"doc.split_field("tags", ","); doc.join_field("list", " | ");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"tags": ["a", "b", "c"], "list": "x | 2 | true"}));
+    }
+
+    #[tokio::test]
+    async fn join_rejects_nested_collections() {
+        let err = try_run(vec![with_fields(json!({"l": [{"k": 1}]}))], script(r#"doc.join_field("l", ",");"#))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("cannot be joined")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn promote_moves_a_field_into_title_or_content() {
+        let out = run(
+            vec![with_fields(json!({"name": "Widget", "body": "Text", "keep": 1}))],
+            script(r#"doc.promote_field("name", "title"); doc.promote_field("body", "content");"#),
+        )
+        .await;
+        assert_eq!(out[0].title.as_deref(), Some("Widget"));
+        assert_eq!(out[0].content, "Text");
+        assert_eq!(fields(&out[0]), json!({"keep": 1}));
+    }
+
+    #[tokio::test]
+    async fn promote_rejects_a_non_string() {
+        let err = try_run(vec![with_fields(json!({"n": 3}))], script(r#"doc.promote_field("n", "title");"#))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn round_field_rounds_floats_and_leaves_integers() {
+        let out = run(
+            vec![with_fields(json!({"f": 10.456, "i": 7}))],
+            script(r#"doc.round_field("f", 2); doc.round_field("i", 2);"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"f": 10.46, "i": 7}));
+    }
+
+    #[tokio::test]
+    async fn round_takes_decimals_in_expressions() {
+        let out = run(
+            vec![with_fields(json!({"price": 10, "qty": 3}))],
+            script("doc.fields.t = round(price * qty * 1.2, 2); doc.fields.i = round(7, 2);"),
+        )
+        .await;
+        assert_eq!(out[0].fields.get("t"), Some(&json!(36.0)));
+        assert_eq!(out[0].fields.get("i"), Some(&json!(7)));
+    }
+
+    #[tokio::test]
+    async fn round_rejects_decimals_out_of_range() {
+        let err = try_run(vec![with_fields(json!({"f": 1.5}))], script(r#"doc.round_field("f", 16);"#))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("between 0 and 15")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn cast_field_follows_the_documented_table() {
+        let out = run(
+            vec![with_fields(json!({
+                "i": "10", "f": " 2.5 ", "b": true, "t": "TRUE", "z": 0, "n": 3, "s": 1.5
+            }))],
+            script(r#"
+                doc.cast_field("i", "number"); doc.cast_field("f", "number");
+                doc.cast_field("b", "number"); doc.cast_field("t", "boolean");
+                doc.cast_field("z", "boolean"); doc.cast_field("n", "string");
+                doc.cast_field("s", "string");
+            "#),
+        )
+        .await;
+        assert_eq!(
+            fields(&out[0]),
+            json!({"i": 10, "f": 2.5, "b": 1, "t": true, "z": false, "n": "3", "s": "1.5"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cast_that_cannot_convert_is_an_error() {
+        for (value, to) in [(json!("abc"), "number"), (json!(2), "boolean"), (json!([1]), "string")] {
+            let err = try_run(
+                vec![with_fields(json!({ "v": value }))],
+                script(&format!(r#"doc.cast_field("v", "{to}");"#)),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, PluginError::NonRetryable(_)), "{value} -> {to}");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_field_fills_missing_and_null_only() {
+        let out = run(
+            vec![with_fields(json!({"b": null, "c": "set"}))],
+            script(r#"doc.default_field("a", "EUR"); doc.default_field("b", 1); doc.default_field("c", "no");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": "EUR", "b": 1, "c": "set"}));
+    }
+
+    #[tokio::test]
+    async fn text_and_number_helpers_ignore_a_missing_field() {
+        let out = run(
+            vec![with_fields(json!({"a": 1}))],
+            script(r#"
+                doc.trim_fields(["nope"]); doc.lowercase_fields(["nope"]); doc.uppercase_fields(["nope"]);
+                doc.split_field("nope", ","); doc.join_field("nope", ",");
+                doc.promote_field("nope", "title"); doc.round_field("nope", 2);
+                doc.cast_field("nope", "string");
+            "#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+        assert_eq!(out[0].title, None);
+    }
 }
