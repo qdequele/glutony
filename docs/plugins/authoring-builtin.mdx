@@ -110,6 +110,22 @@ Conventions (enforced by clippy `-D warnings` in CI):
   `with_client(..)` constructor for tests.
 - Log with structured fields: `tracing::info!(plugin = NAME, count = out.len(), "done")`.
 
+## Editor hints
+
+The pipeline editor renders a step's form from your `config_schema`. A `string`
+property renders as a one-line input unless you add `"x-widget"`:
+
+```json
+"prompt": { "type": "string", "x-widget": "textarea" }
+```
+
+| Value | Renders as |
+|---|---|
+| `"textarea"` | multi-line text |
+| `"code"` | multi-line monospace text |
+
+Unknown values are ignored.
+
 ## 3. Register it
 
 In `crates/worker/src/registry.rs`, `PluginRegistry::builtin()` registers every

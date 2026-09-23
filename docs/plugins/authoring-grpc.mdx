@@ -54,6 +54,22 @@ The exact `.proto` shipped in the repository is authoritative:
 [`proto/plugin.proto`](https://github.com/meilisearch/meili-ingest/blob/main/proto/plugin.proto).
 </Note>
 
+## Editor hints
+
+The pipeline editor renders a step's form from your `config_schema`. A `string`
+property renders as a one-line input unless you add `"x-widget"`:
+
+```json
+"prompt": { "type": "string", "x-widget": "textarea" }
+```
+
+| Value | Renders as |
+|---|---|
+| `"textarea"` | multi-line text |
+| `"code"` | multi-line monospace text |
+
+Unknown values are ignored.
+
 ## Python example (Whisper)
 
 ```python

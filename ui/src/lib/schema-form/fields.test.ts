@@ -189,6 +189,24 @@ describe("parseFieldInput", () => {
   });
 });
 
+describe("x-widget", () => {
+  it("maps textarea and code hints on strings", () => {
+    expect(schemaToField("prompt", { type: "string", "x-widget": "textarea" }).kind).toBe("text");
+    expect(schemaToField("script", { type: "string", "x-widget": "code" }).kind).toBe("code");
+  });
+
+  it("ignores unknown hints and hints on non-strings", () => {
+    expect(schemaToField("a", { type: "string", "x-widget": "rainbow" }).kind).toBe("string");
+    expect(schemaToField("n", { type: "integer", "x-widget": "textarea" }).kind).toBe("integer");
+  });
+
+  it("keeps multi-line text verbatim", () => {
+    const field = schemaToField("prompt", { type: "string", "x-widget": "textarea" });
+    expect(parseFieldInput(field, "line 1\nline 2")).toEqual({ ok: true, value: "line 1\nline 2" });
+    expect(formatFieldValue(field, "a\nb")).toBe("a\nb");
+  });
+});
+
 describe("formatFieldValue", () => {
   const json = schemaToField("content_columns", { type: "array" });
   const text = schemaToField("model", { type: "string" });

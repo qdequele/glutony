@@ -15,6 +15,7 @@
  * | `{"type": "integer"}`                    | `integer`  |
  * | `{"type": "number"}`                     | `number`   |
  * | `{"type": ["integer", "null"]}`          | `integer`, nullable |
+ * | `{"type": "string", "x-widget": "textarea" \| "code"}` | `text` / `code` |
  * | anything else (arrays, objects, `oneOf`) | `json`     |
  *
  * Nothing is ever dropped: a property whose shape is not understood becomes a
@@ -24,7 +25,7 @@
 import type { JsonObject, JsonSchema, JsonValue } from "@/lib/api/types";
 
 /** The control the editor renders for a property. */
-export type FieldKind = "string" | "enum" | "boolean" | "integer" | "number" | "json";
+export type FieldKind = "string" | "enum" | "boolean" | "integer" | "number" | "json" | "text" | "code";
 
 /** One rendered property of a plugin `config:` block. */
 export interface SchemaField {
@@ -88,6 +89,8 @@ function kindFor(types: string[], schema: JsonSchema): FieldKind {
   if (types.length !== 1) return "json";
   switch (types[0]) {
     case "string":
+      if (schema["x-widget"] === "textarea") return "text";
+      if (schema["x-widget"] === "code") return "code";
       return "string";
     case "boolean":
       return "boolean";

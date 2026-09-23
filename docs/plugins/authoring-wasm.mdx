@@ -35,6 +35,22 @@ Heartbeats: the host heartbeats on your behalf while the call runs. Keep
 single calls under the step's `timeout_secs`; for big inputs prefer
 `fan_out: "$.documents"` in the pipeline so each call handles one document.
 
+## Editor hints
+
+The pipeline editor renders a step's form from your `config_schema`. A `string`
+property renders as a one-line input unless you add `"x-widget"`:
+
+```json
+"prompt": { "type": "string", "x-widget": "textarea" }
+```
+
+| Value | Renders as |
+|---|---|
+| `"textarea"` | multi-line text |
+| `"code"` | multi-line monospace text |
+
+Unknown values are ignored.
+
 ## Rust example (`extism-pdk`)
 
 ```toml

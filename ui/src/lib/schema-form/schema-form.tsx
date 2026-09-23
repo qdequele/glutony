@@ -95,12 +95,12 @@ function TextControl({ field, value, onChange, disabled, inputId }: ControlProps
 
   return (
     <>
-      {field.kind === "json" ? (
+      {field.kind === "json" || field.kind === "text" || field.kind === "code" ? (
         <Textarea
           {...shared}
-          rows={Math.min(10, Math.max(3, text.split("\n").length))}
-          spellCheck={false}
-          className="font-mono text-xs"
+          rows={Math.min(field.kind === "text" ? 16 : 10, Math.max(3, text.split("\n").length))}
+          spellCheck={field.kind === "text"}
+          className={cn(field.kind !== "text" && "font-mono text-xs")}
           onChange={(event) => handle(event.target.value)}
         />
       ) : (
@@ -323,7 +323,14 @@ export function SchemaForm({ schema, value, onChange, idPrefix, disabled }: Sche
       {fields.map((field) => (
         <div
           key={field.name}
-          className={field.kind === "json" || field.kind === "boolean" ? "sm:col-span-2" : undefined}
+          className={
+            field.kind === "json" ||
+            field.kind === "boolean" ||
+            field.kind === "text" ||
+            field.kind === "code"
+              ? "sm:col-span-2"
+              : undefined
+          }
         >
           <SchemaFieldRow
             field={field}

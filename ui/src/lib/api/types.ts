@@ -170,6 +170,11 @@ export interface JsonSchema {
   items?: JsonSchema;
   /** Whether unlisted keys are accepted. */
   additionalProperties?: boolean | JsonSchema;
+  /**
+   * Editor hint for `string` properties: `"textarea"` (multi-line text) or `"code"`
+   * (monospace). Unknown values are ignored.
+   */
+  "x-widget"?: string;
   /** Keywords this UI does not model (`$schema`, `oneOf`, ...). */
   [keyword: string]: unknown;
 }
