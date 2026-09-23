@@ -6,10 +6,13 @@
 //! starts one Temporal `PipelineWorkflow` per job. The binary lives in `main.rs`; this
 //! library exposes the router so it can be exercised in tests without a network.
 
+pub mod connections;
 pub mod context;
 pub mod error;
 pub mod extract;
 pub mod handlers;
+pub mod schedules;
+pub mod sources;
 pub mod state;
 pub mod ui;
 
@@ -121,6 +124,37 @@ pub fn router(state: AppState) -> Router {
             "/pipelines/{name}",
             get(handlers::pipelines::get_pipeline).delete(handlers::pipelines::delete_pipeline),
         )
+        .route(
+            "/connections",
+            get(handlers::connections::list_connections)
+                .post(handlers::connections::create_connection),
+        )
+        .route(
+            "/connections/{uid}",
+            get(handlers::connections::get_connection)
+                .patch(handlers::connections::patch_connection)
+                .delete(handlers::connections::delete_connection),
+        )
+        .route(
+            "/sources",
+            get(handlers::sources::list_sources).post(handlers::sources::create_source),
+        )
+        .route(
+            "/sources/{uid}",
+            get(handlers::sources::get_source)
+                .patch(handlers::sources::patch_source)
+                .delete(handlers::sources::delete_source),
+        )
+        .route(
+            "/sources/{uid}/pause",
+            post(handlers::sources::pause_source),
+        )
+        .route(
+            "/sources/{uid}/unpause",
+            post(handlers::sources::unpause_source),
+        )
+        .route("/sources/{uid}/run", post(handlers::sources::run_source))
+        .route("/sources/{uid}/runs", get(handlers::sources::list_runs))
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))
         .route("/usage", get(handlers::usage::get_usage))

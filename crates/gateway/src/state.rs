@@ -494,11 +494,11 @@ impl ControlPlaneClient {
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
 
-    fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
+    pub(crate) fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
         project_id
             .map(|p| vec![("project_id", p.to_string())])
             .unwrap_or_default()
@@ -529,7 +529,7 @@ impl ControlPlaneClient {
         }
     }
 
-    async fn send_json<T: DeserializeOwned>(
+    pub(crate) async fn send_json<T: DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
@@ -543,7 +543,7 @@ impl ControlPlaneClient {
         })
     }
 
-    async fn send_empty(
+    pub(crate) async fn send_empty(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
@@ -640,18 +640,37 @@ impl ControlPlaneClient {
     }
 
     /// `DELETE /pipelines/{uid}?project_id=`.
+    ///
+    /// Returns the ids of the sources the delete archived, whose Temporal schedules the
+    /// caller must delete. An older control plane answering `204` reports none.
     pub async fn delete_pipeline(
         &self,
         uid: &str,
         project_id: Option<&str>,
-    ) -> Result<(), GatewayError> {
-        self.send_empty(
-            self.http
-                .delete(self.url(&format!("/pipelines/{uid}")))
-                .query(&Self::project_query(project_id)),
-            "delete pipeline",
-        )
-        .await
+    ) -> Result<Vec<Uuid>, GatewayError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/pipelines/{uid}")))
+            .query(&Self::project_query(project_id))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Self::error_from(resp, "delete pipeline").await);
+        }
+        if resp.status() == StatusCode::NO_CONTENT {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct Deleted {
+            #[serde(default)]
+            archived_sources: Vec<Uuid>,
+        }
+        let deleted: Deleted = resp.json().await.map_err(|e| {
+            GatewayError::Upstream(format!(
+                "control plane delete pipeline: invalid response: {e}"
+            ))
+        })?;
+        Ok(deleted.archived_sources)
     }
 
     /// `GET /plugins`.
@@ -711,6 +730,12 @@ pub struct AppState {
     pub blob: BlobStore,
     /// Shared HTTP client.
     pub http: reqwest::Client,
+    /// Meilisearch connection settings: sealing key, host policy, probe client.
+    pub connections: crate::connections::ConnectionConfig,
+    /// Temporal Schedules for scheduled sources.
+    pub schedules: Arc<dyn crate::schedules::ScheduleClient>,
+    /// Which hosts a source may fetch from (`SOURCE_FETCH_HOSTS`), checked on save.
+    pub fetch_policy: meili_ingest_source::HostPolicy,
 }
 
 impl std::fmt::Debug for AppState {
@@ -719,6 +744,7 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("control_plane", &self.control_plane)
             .field("blob", &self.blob)
+            .field("connections", &self.connections)
             .finish_non_exhaustive()
     }
 }
@@ -738,7 +764,29 @@ impl AppState {
             control_plane,
             blob,
             http,
+            connections: crate::connections::ConnectionConfig::default(),
+            schedules: Arc::new(crate::schedules::DisabledSchedules),
+            fetch_policy: meili_ingest_source::HostPolicy::default(),
         }
+    }
+
+    /// Enable scheduled sources: the Temporal Schedule client and the fetch policy.
+    /// Without it the `/sources` routes answer 501.
+    pub fn with_sources(
+        mut self,
+        schedules: Arc<dyn crate::schedules::ScheduleClient>,
+        fetch_policy: meili_ingest_source::HostPolicy,
+    ) -> Self {
+        self.schedules = schedules;
+        self.fetch_policy = fetch_policy;
+        self
+    }
+
+    /// Enable the `/connections` routes with a sealing key and host policy. Without it
+    /// they answer 501, so a key is never stored unsealed by accident.
+    pub fn with_connections(mut self, connections: crate::connections::ConnectionConfig) -> Self {
+        self.connections = connections;
+        self
     }
 }
 

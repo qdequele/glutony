@@ -12,8 +12,11 @@
 //! 2. when `auto_create_index` (default `true`), create the index with
 //!    `primary_key` if `GET /indexes/{uid}` says it does not exist, and wait
 //!    for that task;
-//! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it
-//!    in batches of `batch_size` (default 1000) via `addOrReplace`;
+//! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it via
+//!    `addOrReplace` in batches cut at whichever of `batch_size` (documents, default
+//!    1000) and `max_batch_bytes` (serialized bytes, default 50 MiB) comes first. A
+//!    document too large for any batch is a [`PluginError::NonRetryable`] naming it;
+//!    sending it would earn a `413` the retry policy would repeat forever;
 //! 4. when `wait_for_completion` (default `true`), poll each task until it
 //!    finishes; a `failed` task is a [`PluginError::NonRetryable`] carrying the
 //!    Meilisearch error message;
@@ -54,28 +57,55 @@ impl MeiliIndexerPlugin {
     }
 }
 
+/// A validated indexer config, with the destination resolved to plain strings.
+struct ParsedConfig {
+    cfg: IndexerConfig,
+    index: String,
+    host: String,
+    api_key: String,
+}
+
 /// Validate and deserialize the step config into an [`IndexerConfig`].
-fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
-    let obj = config.as_object().ok_or_else(|| {
-        PluginError::InvalidConfig(format!("{NAME}: config must be a JSON object"))
-    })?;
-    let present = |key: &str| {
-        obj.get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-    };
-    if !present("host") || !present("api_key") {
+fn parse_config(config: Value) -> Result<ParsedConfig, PluginError> {
+    if !config.is_object() {
         return Err(PluginError::InvalidConfig(format!(
-            "{NAME}: config has no `host`/`api_key`. The Meilisearch tenant context \
-             (MeiliContext) must be injected into this step's config by the gateway/workflow; \
-             this plugin never reads MEILI_URL/MEILI_API_KEY from the environment (SPEC §7.4)"
+            "{NAME}: config must be a JSON object"
         )));
     }
     let cfg: IndexerConfig = serde_json::from_value(config)
         .map_err(|e| PluginError::InvalidConfig(format!("{NAME}: {e}")))?;
+    let non_blank = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let (Some(host), Some(api_key)) = (non_blank(&cfg.meili.host), non_blank(&cfg.meili.api_key))
+    else {
+        let why = match cfg.connection.as_deref() {
+            // The worker activity resolves a connection before calling this plugin, so
+            // reaching here means that step was skipped (an older worker, say).
+            Some(name) => format!(
+                "{NAME}: connection {name:?} was not resolved into a host and API key \
+                 before this step ran"
+            ),
+            None => format!(
+                "{NAME}: config has no `host`/`api_key`. Name a Meilisearch `connection` \
+                 on this step, or send the tenant context (MeiliContext) with the request; \
+                 this plugin never reads MEILI_URL/MEILI_API_KEY from the environment \
+                 (SPEC §7.4)"
+            ),
+        };
+        return Err(PluginError::InvalidConfig(why));
+    };
     if cfg.batch_size == 0 {
         return Err(PluginError::InvalidConfig(format!(
             "{NAME}: `batch_size` must be at least 1"
+        )));
+    }
+    if cfg.max_batch_bytes == 0 {
+        return Err(PluginError::InvalidConfig(format!(
+            "{NAME}: `max_batch_bytes` must be at least 1"
         )));
     }
     if cfg.primary_key.trim().is_empty() {
@@ -94,7 +124,63 @@ fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
                  X-Meili-Index header, the `?index=` query or MEILI_INDEX on the gateway (SPEC §3.4)"
             ))
         })?;
-    Ok((cfg, index))
+    Ok(ParsedConfig {
+        cfg,
+        index,
+        host,
+        api_key,
+    })
+}
+
+/// A single document whose serialized size exceeds `max_batch_bytes` on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OversizedDoc {
+    /// Position of the document in the input.
+    index: usize,
+    /// Its serialized size in bytes.
+    bytes: usize,
+}
+
+/// Split documents into consecutive batches, given each document's serialized size.
+///
+/// A batch is cut at whichever of `max_docs` and `max_bytes` is reached first. Bytes are
+/// counted as the JSON array Meilisearch actually receives: the documents, the commas
+/// between them, and the enclosing brackets.
+///
+/// Pure and I/O-free so the splitting is testable without a Meilisearch. A document that
+/// does not fit even alone is an error rather than a batch of one: sending it would earn
+/// a `413` that the retry policy would repeat forever.
+fn plan_batches(
+    sizes: &[usize],
+    max_docs: usize,
+    max_bytes: u64,
+) -> Result<Vec<std::ops::Range<usize>>, OversizedDoc> {
+    const BRACKETS: u64 = 2;
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = BRACKETS;
+    for (i, &size) in sizes.iter().enumerate() {
+        let size64 = size as u64;
+        if BRACKETS + size64 > max_bytes {
+            return Err(OversizedDoc {
+                index: i,
+                bytes: size,
+            });
+        }
+        let in_batch = i - start;
+        let comma = u64::from(in_batch > 0);
+        if in_batch > 0 && (in_batch >= max_docs || bytes + comma + size64 > max_bytes) {
+            batches.push(start..i);
+            start = i;
+            bytes = BRACKETS + size64;
+        } else {
+            bytes += comma + size64;
+        }
+    }
+    if start < sizes.len() {
+        batches.push(start..sizes.len());
+    }
+    Ok(batches)
 }
 
 /// Whether an SDK error means "the index does not exist".
@@ -222,38 +308,44 @@ impl Plugin for MeiliIndexerPlugin {
     fn manifest(&self) -> PluginManifest {
         PluginManifest::new(NAME, env!("CARGO_PKG_VERSION"))
             .description(
-                "Pushes documents into Meilisearch using the tenant MeiliContext injected into \
-                 the step config (host, api_key, index). Creates the index when missing, batches \
-                 addOrReplace calls and waits for the tasks.",
+                "Pushes documents into Meilisearch. The destination is the named `connection` \
+                 when the step sets one, otherwise the tenant MeiliContext sent with the \
+                 request. Creates the index when missing, batches addOrReplace calls by \
+                 document count and serialized size, and waits for the tasks.",
             )
             .accepts([InputKind::Documents, InputKind::Many, InputKind::Empty])
             .produces(OutputKind::Indexed)
             .config_schema(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                // `host`, `api_key`, `index`, `project_id` and `region` are NOT listed
-                // as required and are marked `readOnly`: the workflow injects them from
-                // the tenant's MeiliContext just before the step runs. A pipeline author
-                // must never type them, least of all the API key, and a schema-driven
-                // editor is expected to skip `readOnly` properties rather than render an
-                // empty required field for a secret.
+                // `host`, `api_key`, `project_id` and `region` are NOT listed as
+                // required and are marked `readOnly`: they are injected just before the
+                // step runs, from the named `connection` or from the tenant's
+                // MeiliContext. A pipeline author must never type them, least of all the
+                // API key, and a schema-driven editor is expected to skip `readOnly`
+                // properties rather than render an empty required field for a secret.
+                // To pin a destination, name a `connection` instead.
                 "required": [],
                 "properties": {
+                    "connection": {
+                        "type": "string",
+                        "format": "meili-connection",
+                        "description": "Optional: name of a Meilisearch connection. When set it is the destination, and it wins over any Meilisearch context sent with the request. Required for pipelines run by a scheduled source, which have no request."
+                    },
                     "host": {
                         "type": "string",
                         "readOnly": true,
-                        "description": "Injected: Meilisearch base URL from the tenant MeiliContext. Never set this by hand."
+                        "description": "Injected: Meilisearch base URL from the connection or the tenant MeiliContext. Never set this by hand."
                     },
                     "api_key": {
                         "type": "string",
                         "readOnly": true,
                         "writeOnly": true,
-                        "description": "Injected: Meilisearch API key from the tenant MeiliContext. Never set this by hand."
+                        "description": "Injected: Meilisearch API key from the connection or the tenant MeiliContext. Never set this by hand."
                     },
                     "index": {
                         "type": "string",
-                        "readOnly": true,
-                        "description": "Injected: target index uid, resolved by the gateway (SPEC §3.4). Set `trigger.index_pattern` on the pipeline instead."
+                        "description": "Optional: pin the target index uid. When unset it is resolved from the pipeline's `trigger.index_pattern`, then the request, then the deployment default (SPEC §3.4)."
                     },
                     "project_id": {
                         "type": ["string", "null"],
@@ -281,7 +373,13 @@ impl Plugin for MeiliIndexerPlugin {
                         "type": "integer",
                         "minimum": 1,
                         "default": 1000,
-                        "description": "Documents per addOrReplace request."
+                        "description": "Maximum documents per addOrReplace request."
+                    },
+                    "max_batch_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": DEFAULT_MAX_BATCH_BYTES,
+                        "description": "Maximum serialized bytes per addOrReplace request. A batch is cut at whichever of this and batch_size is reached first. Keep it under Meilisearch's http_payload_size_limit (100 MB by default)."
                     },
                     "wait_for_completion": {
                         "type": "boolean",
@@ -298,7 +396,12 @@ impl Plugin for MeiliIndexerPlugin {
         input: PluginInput,
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
-        let (cfg, index_uid) = parse_config(config)?;
+        let ParsedConfig {
+            cfg,
+            index: index_uid,
+            host,
+            api_key,
+        } = parse_config(config)?;
         let docs = input.into_documents()?;
         tracing::info!(
             plugin = NAME,
@@ -310,8 +413,8 @@ impl Plugin for MeiliIndexerPlugin {
             "indexing documents"
         );
 
-        let host = cfg.meili.host.trim().trim_end_matches('/').to_owned();
-        let client = Client::new(host, Some(cfg.meili.api_key.as_str()))
+        let host = host.trim_end_matches('/').to_owned();
+        let client = Client::new(host, Some(api_key.as_str()))
             .map_err(|e| map_error(e, "building the Meilisearch client"))?;
 
         if cfg.auto_create_index {
@@ -327,18 +430,33 @@ impl Plugin for MeiliIndexerPlugin {
         }
 
         let index = client.index(index_uid.clone());
-        let batch_total = docs.len().div_ceil(cfg.batch_size);
+        let payloads: Vec<Value> = docs.iter().map(Document::to_index_json).collect();
+        let sizes: Vec<usize> = payloads
+            .iter()
+            .map(|p| serde_json::to_vec(p).map(|b| b.len()).unwrap_or(usize::MAX))
+            .collect();
+        let batches = plan_batches(&sizes, cfg.batch_size, cfg.max_batch_bytes).map_err(
+            |OversizedDoc { index, bytes }| {
+                PluginError::NonRetryable(format!(
+                    "{NAME}: document {:?} is {bytes} bytes serialized, over \
+                     `max_batch_bytes` ({}); it cannot be sent in any batch. Raise \
+                     `max_batch_bytes` or chunk the document upstream",
+                    docs[index].id, cfg.max_batch_bytes
+                ))
+            },
+        )?;
+        let batch_total = batches.len();
         let mut tasks: Vec<TaskInfo> = Vec::with_capacity(batch_total);
-        for (batch_no, batch) in docs.chunks(cfg.batch_size).enumerate() {
+        for (batch_no, range) in batches.into_iter().enumerate() {
             ctx.check_cancelled()?;
+            let payload = &payloads[range];
             ctx.heartbeat(format!(
                 "{NAME}: sending batch {}/{batch_total} ({} documents)",
                 batch_no + 1,
-                batch.len()
+                payload.len()
             ));
-            let payload: Vec<Value> = batch.iter().map(Document::to_index_json).collect();
             let info = index
-                .add_or_replace(&payload, Some(&cfg.primary_key))
+                .add_or_replace(payload, Some(&cfg.primary_key))
                 .await
                 .map_err(|e| map_error(e, &format!("adding documents (batch {})", batch_no + 1)))?;
             tracing::debug!(
@@ -346,7 +464,7 @@ impl Plugin for MeiliIndexerPlugin {
                 index = %index_uid,
                 task_uid = info.task_uid,
                 batch = batch_no + 1,
-                documents = batch.len(),
+                documents = payload.len(),
                 "batch enqueued"
             );
             tasks.push(info);
@@ -927,19 +1045,138 @@ mod tests {
         let props = m.config_schema["properties"]
             .as_object()
             .expect("properties");
-        for key in ["host", "api_key", "index", "project_id", "region"] {
+        // Destination credentials and tenant tags are injected, never typed.
+        for key in ["host", "api_key", "project_id", "region"] {
             assert_eq!(
                 props[key]["readOnly"],
                 serde_json::json!(true),
                 "{key} must be marked readOnly"
             );
         }
-        // Author-controlled knobs stay editable.
-        for key in ["primary_key", "batch_size"] {
+        // Author-controlled knobs stay editable, including the connection that pins the
+        // destination and the index that may be pinned next to it.
+        for key in [
+            "connection",
+            "index",
+            "primary_key",
+            "batch_size",
+            "max_batch_bytes",
+        ] {
             assert!(
                 props[key].get("readOnly").is_none(),
                 "{key} should remain editable"
             );
         }
+    }
+
+    // ----- batch planning (max_batch_bytes) -----
+
+    #[test]
+    fn plan_batches_splits_on_count() {
+        let got = plan_batches(&[10; 5], 2, u64::MAX).expect("fits");
+        assert_eq!(got, vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn plan_batches_splits_on_bytes() {
+        // Each batch is "[" + docs joined by "," + "]". Two 10-byte docs = 2 + 10 + 1 + 10
+        // = 23 bytes, so a 23-byte cap fits exactly two and a 22-byte cap only one.
+        assert_eq!(
+            plan_batches(&[10; 4], 1000, 23).expect("fits"),
+            vec![0..2, 2..4]
+        );
+        assert_eq!(
+            plan_batches(&[10; 3], 1000, 22).expect("fits"),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn plan_batches_cuts_at_whichever_limit_comes_first() {
+        // Bytes bind first: a 25-byte cap fits two 10-byte docs, count would allow 3.
+        assert_eq!(
+            plan_batches(&[10; 4], 3, 25).expect("fits"),
+            vec![0..2, 2..4]
+        );
+        // Count binds first: bytes would allow many, count caps at 2.
+        assert_eq!(
+            plan_batches(&[1; 5], 2, 10_000).expect("fits"),
+            vec![0..2, 2..4, 4..5]
+        );
+    }
+
+    #[test]
+    fn plan_batches_rejects_a_document_that_fits_no_batch() {
+        let err = plan_batches(&[10, 500, 10], 1000, 100).expect_err("oversized");
+        assert_eq!(
+            err,
+            OversizedDoc {
+                index: 1,
+                bytes: 500
+            }
+        );
+    }
+
+    #[test]
+    fn plan_batches_of_nothing_is_no_batches() {
+        assert!(plan_batches(&[], 1000, 100).expect("fits").is_empty());
+    }
+
+    #[test]
+    fn plan_batches_covers_every_document_exactly_once() {
+        let sizes: Vec<usize> = (1..=97).map(|i| (i * 37) % 200 + 1).collect();
+        let batches = plan_batches(&sizes, 7, 600).expect("fits");
+        let mut next = 0;
+        for r in &batches {
+            assert_eq!(r.start, next, "batches are contiguous");
+            assert!(!r.is_empty(), "no empty batch");
+            assert!(r.len() <= 7, "count cap respected");
+            let bytes = 2 + r.len() - 1 + sizes[r.clone()].iter().sum::<usize>();
+            assert!(bytes <= 600, "byte cap respected: {bytes}");
+            next = r.end;
+        }
+        assert_eq!(next, sizes.len(), "every document is sent");
+    }
+
+    #[test]
+    fn max_batch_bytes_defaults_and_rejects_zero() {
+        let cfg: IndexerConfig = serde_json::from_value(serde_json::json!({
+            "host": "http://m", "api_key": "k", "index": "i"
+        }))
+        .expect("config");
+        assert_eq!(cfg.max_batch_bytes, DEFAULT_MAX_BATCH_BYTES);
+
+        let zero = serde_json::json!({
+            "host": "http://m", "api_key": "k", "index": "i", "max_batch_bytes": 0
+        });
+        assert!(parse_config(zero).is_err());
+    }
+
+    #[test]
+    fn an_unresolved_connection_is_named_in_the_error() {
+        // The worker activity resolves `connection` into host/api_key before the plugin
+        // runs; if that did not happen, the error must say which connection, not just
+        // "no host".
+        let Err(PluginError::InvalidConfig(msg)) = parse_config(serde_json::json!({
+            "connection": "prod-movies", "index": "movies"
+        })) else {
+            panic!("an unresolved connection must be rejected");
+        };
+        assert!(msg.contains("prod-movies"), "{msg}");
+        assert!(msg.contains("not resolved"), "{msg}");
+    }
+
+    #[test]
+    fn a_resolved_connection_parses_to_its_host_and_key() {
+        let parsed = parse_config(serde_json::json!({
+            "connection": "prod-movies",
+            "host": " https://movies.example ",
+            "api_key": "k",
+            "index": "movies"
+        }))
+        .unwrap_or_else(|e| panic!("resolved config must parse: {e}"));
+        assert_eq!(parsed.host, "https://movies.example", "trimmed");
+        assert_eq!(parsed.api_key, "k");
+        assert_eq!(parsed.cfg.connection.as_deref(), Some("prod-movies"));
     }
 }

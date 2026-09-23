@@ -225,14 +225,14 @@ impl PipelineWorkflow {
 /// Temporal's own `Display` is always "Activity task failed"; the message a plugin
 /// produced sits in the failure's cause chain. Walk it and return the deepest
 /// non-empty message so `GET /jobs/{id}` shows something actionable.
-fn describe_activity_failure(err: &ActivityExecutionError) -> String {
+pub(crate) fn describe_activity_failure(err: &ActivityExecutionError) -> String {
     err.failure()
         .and_then(deepest_failure_message)
         .unwrap_or_else(|| err.to_string())
 }
 
 /// Deepest non-generic message in a failure's cause chain.
-fn deepest_failure_message(failure: &Failure) -> Option<String> {
+pub(crate) fn deepest_failure_message(failure: &Failure) -> Option<String> {
     {
         fn deepest(failure: &Failure) -> Option<String> {
             let mut best = non_empty(&failure.message);
@@ -262,7 +262,7 @@ fn describe_failure_for_test(failure: &Failure) -> String {
 ///
 /// Uses `WorkflowContext::workflow_time`, which replays identically, rather than the
 /// wall clock, which would make the workflow non-deterministic.
-fn to_utc(time: Option<SystemTime>) -> DateTime<Utc> {
+pub(crate) fn to_utc(time: Option<SystemTime>) -> DateTime<Utc> {
     time.map(DateTime::<Utc>::from)
         .unwrap_or_else(|| DateTime::<Utc>::from(UNIX_EPOCH))
 }

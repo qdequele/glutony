@@ -68,7 +68,13 @@ development, never for an exposed deployment.
 7. MEILI_URL / MEILI_API_KEY env     → host / api_key (self-hosted fallback)
 ```
 
-Nothing found → `400 {"error": "...", "code": "missing_context"}`.
+Nothing found → `400 {"error": "...", "code": "missing_context"}`, unless the
+pipeline is pinned.
+
+A **pinned** pipeline names a [Meilisearch connection](/concepts/connections)
+on every `meili_indexer` step. The connection's host and key always win over
+steps 1, 2, 6 and 7, so such a pipeline accepts requests with no context at
+all; `project_id` and `index` still resolve as above.
 
 ## Index resolution
 

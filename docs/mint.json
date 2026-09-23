@@ -49,6 +49,8 @@
         "concepts/pipelines",
         "concepts/plugins",
         "concepts/jobs",
+        "concepts/connections",
+        "concepts/sources",
         "concepts/usage"
       ]
     },

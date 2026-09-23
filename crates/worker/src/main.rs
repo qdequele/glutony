@@ -1,12 +1,16 @@
 //! meili-ingest worker binary. Polls one Temporal task queue (`TASK_QUEUE`) and runs
-//! the `PipelineWorkflow` plus the `execute_step` / `expand_fan_out` activities.
+//! the `PipelineWorkflow` plus the `execute_step` / `expand_fan_out` activities, and the
+//! `SourceRunWorkflow` that scheduled sources start.
 
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
 use meili_ingest_blob::BlobStore;
-use meili_ingest_worker::{PipelineWorkflow, PluginRegistry, StepActivities, WorkerConfig};
+use meili_ingest_worker::{
+    PipelineWorkflow, PluginRegistry, SourceActivities, SourceRunWorkflow, StepActivities,
+    WorkerConfig,
+};
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Url};
 use temporalio_sdk::runtime::worker_tuner::{FixedSizeSlotSupplier, TunerHolder};
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
@@ -62,9 +66,43 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::warn!("usage analytics disabled (TINYBIRD_TOKEN is not set)"),
     }
 
+    // Meilisearch connections: optional, so a worker without SOURCE_SECRET_KEY still
+    // runs every request-driven pipeline and only fails steps that name a connection. A
+    // malformed policy, unlike a missing key, stops the worker: silently falling back
+    // to a different policy than the operator wrote would be worse than not starting.
+    let connection_key = meili_ingest_source::SecretKey::from_env()
+        .context("invalid SOURCE_SECRET_KEY")?
+        .map(Arc::new);
+    let host_policy =
+        meili_ingest_source::HostPolicy::from_env().context("invalid MEILI_CONNECTION_HOSTS")?;
+    if connection_key.is_none() {
+        tracing::warn!(
+            "SOURCE_SECRET_KEY is not set: steps that name a Meilisearch connection will fail"
+        );
+    }
+    tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
+
+    // Scheduled sources: fetches obey SOURCE_FETCH_HOSTS, re-checked on every redirect.
+    let fetch_policy =
+        meili_ingest_source::HostPolicy::from_env_var(meili_ingest_source::FETCH_HOSTS_ENV)
+            .context("invalid SOURCE_FETCH_HOSTS")?;
+    tracing::info!(policy = ?fetch_policy, "source fetch host policy");
+    let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
+        .with_security(connection_key.clone(), fetch_policy)
+        .with_default_index(
+            std::env::var("DEFAULT_INDEX")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "documents".to_string()),
+        );
+
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
         .with_usage(usage)
-        .with_control_plane(config.control_plane_url.clone());
+        .with_control_plane(config.control_plane_url.clone())
+        .with_connections(meili_ingest_worker::connection::ConnectionSettings {
+            key: connection_key,
+            policy: host_policy,
+        });
     let tuner = TunerHolder::builder()
         .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(50))
         .activity_task_slot_supplier(FixedSizeSlotSupplier::new(config.max_concurrent_activities))
@@ -73,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
         .build();
     let options = WorkerOptions::new(config.task_queue.clone())
         .register_workflow::<PipelineWorkflow>()?
+        .register_workflow::<SourceRunWorkflow>()?
         .register_activities(activities)
+        .register_activities(source_activities)
         .tuner(tuner)
         .graceful_shutdown_period(std::time::Duration::from_secs(30))
         .build();

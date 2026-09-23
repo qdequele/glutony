@@ -340,8 +340,14 @@ async fn pipeline_routes_end_to_end() {
     let req = Request::delete("/pipelines/hdr-scoped?project_id=t1")
         .body(Body::empty())
         .unwrap();
-    let (status, _) = call(app(state.clone()), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(app(state.clone()), req).await;
+    // 200 with the sources the delete archived, so the gateway can drop their
+    // Temporal schedules. None feed this pipeline.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json::<serde_json::Value>(&body),
+        serde_json::json!({ "archived_sources": [] })
+    );
     let (status, body) = call(
         app(state.clone()),
         req_json(
@@ -359,7 +365,7 @@ async fn pipeline_routes_end_to_end() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = call(app(state.clone()), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     let (status, body) = call(
         app(state.clone()),
         req_json(
@@ -437,6 +443,7 @@ async fn jobs_insert_patch_get() {
         error: None,
         started_at: now,
         updated_at: now,
+        source_id: None,
     };
 
     let (status, body) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
@@ -535,6 +542,7 @@ async fn terminal_status_clears_the_current_step() {
         error: None,
         started_at: now,
         updated_at: now,
+        source_id: None,
     };
     let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
     assert_eq!(status, StatusCode::CREATED);

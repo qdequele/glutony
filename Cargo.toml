@@ -9,6 +9,7 @@ members = [
     "crates/plugin-sdk",
     "crates/usage",
     "crates/plugin-runtime",
+    "crates/source",
     "crates/plugins/pdf",
     "crates/plugins/docx",
     "crates/plugins/xlsx",
@@ -59,6 +60,7 @@ meili-ingest-plugin-video-audio = { path = "crates/plugins/video-audio" }
 meili-ingest-plugin-msgpack = { path = "crates/plugins/msgpack" }
 meili-ingest-plugin-avro = { path = "crates/plugins/avro" }
 meili-ingest-plugin-parquet = { path = "crates/plugins/parquet" }
+meili-ingest-source = { path = "crates/source" }
 
 # async / runtime
 tokio = { version = "1.47", features = ["full"] }
@@ -81,6 +83,13 @@ serde_json = "1"
 serde_yaml = "0.9"
 base64 = "0.23"
 bytes = "1"
+
+# scheduled sources: sealed secrets, change detection, transparent gzip, cron timezones
+chacha20poly1305 = "0.10"
+rand = "0.9"
+blake3 = "1"
+flate2 = "1"
+chrono-tz = "0.10"
 
 # temporal
 temporalio-sdk = "1.0"

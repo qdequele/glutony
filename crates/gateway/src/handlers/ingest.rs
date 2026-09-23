@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{QueryParams, query_param, read_payload};
-use crate::context::{resolve_context, resolve_index};
+use crate::context::{require_destination, resolve_index, resolve_request_context};
 use crate::error::{ErrorBody, GatewayError};
 use crate::extract::{Extracted, IngestPayload};
 use crate::state::{AppState, JobRecord};
@@ -62,14 +62,17 @@ pub enum PipelineSelection {
 
 /// Resolve the tenant context from headers + query + body fields. The `?index=` query
 /// param beats the `index` body field, which beats the `X-Meili-Index` header.
+///
+/// Never fails on a missing destination: whether one is needed depends on the pipeline,
+/// which [`submit_one`] checks once it knows it.
 pub fn context_for(
     state: &AppState,
     headers: &HeaderMap,
     query: &QueryParams,
     extracted: &Extracted,
-) -> Result<MeiliContext, GatewayError> {
+) -> MeiliContext {
     let query_index = query_param(query, "index").or(extracted.index.as_deref());
-    resolve_context(headers, query_index, &state.config)
+    resolve_request_context(headers, query_index, &state.config)
 }
 
 /// Submit one item: route → resolve index → stage bytes → start workflow → cache job.
@@ -111,6 +114,12 @@ pub async fn submit_one(
             ((**def).clone(), pattern)
         }
     };
+
+    // Only now is it known whether the request must carry a destination: a pipeline
+    // pinned to Meilisearch connections needs none (spec Decision 12).
+    if !pipeline.pins_destination() {
+        require_destination(&ctx)?;
+    }
 
     let target_index = resolve_index(
         &mut ctx,
@@ -216,10 +225,8 @@ pub async fn ingest(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<IngestResponse>), GatewayError> {
-    // Fail fast on a missing context before buffering the body.
-    resolve_context(&headers, query_param(&query, "index"), &state.config)?;
     let extracted = read_payload(&headers, &query, req).await?;
-    let ctx = context_for(&state, &headers, &query, &extracted)?;
+    let ctx = context_for(&state, &headers, &query, &extracted);
     let explicit = query_param(&query, "pipeline")
         .map(str::to_string)
         .or(extracted.pipeline);
@@ -245,9 +252,8 @@ pub async fn ingest_batch(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<BatchResponse>), GatewayError> {
-    resolve_context(&headers, query_param(&query, "index"), &state.config)?;
     let extracted = read_payload(&headers, &query, req).await?;
-    let ctx = context_for(&state, &headers, &query, &extracted)?;
+    let ctx = context_for(&state, &headers, &query, &extracted);
     let explicit = query_param(&query, "pipeline")
         .map(str::to_string)
         .or(extracted.pipeline);
@@ -311,8 +317,8 @@ mod tests {
             wf.context,
             MeiliContext {
                 project_id: Some("xxx".into()),
-                host: "https://xxx.us-west.meilisearch.io".into(),
-                api_key: "envoyKey".into(),
+                host: Some("https://xxx.us-west.meilisearch.io".into()),
+                api_key: Some("envoyKey".into()),
                 index: Some("from-query".into()),
                 region: Some("us-west".into()),
             }
@@ -496,6 +502,15 @@ mod tests {
         let json = json_body(resp).await;
         assert_eq!(json["code"], "unsupported_media_type");
         assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_context_is_400_for_a_pipeline_without_a_connection() {
+        // The context is checked once the pipeline is known, so this request is routed
+        // first; its pipeline pins no connection, so the request's context is required.
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
 
         let req = Request::builder()
             .method("POST")
@@ -506,6 +521,38 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(resp).await["code"], "missing_context");
+        assert!(starter.inputs().is_empty(), "no workflow is started");
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_pinned_to_a_connection_needs_no_context() {
+        let server = MockServer::start().await;
+        let mut pinned = sample_pipeline("movies", None);
+        pinned.steps[0].config = json!({ "connection": "prod-movies" });
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "pipeline": pinned })))
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        // No X-Meili-* headers, no bearer token, no MEILI_URL / MEILI_API_KEY.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header(CONTENT_TYPE, "application/pdf")
+            .body(Body::from(PDF_MAGIC))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let inputs = starter.inputs();
+        assert_eq!(inputs.len(), 1);
+        assert!(
+            inputs[0].context.host.is_none() && inputs[0].context.api_key.is_none(),
+            "the destination comes from the connection, not the request"
+        );
     }
 
     #[tokio::test]

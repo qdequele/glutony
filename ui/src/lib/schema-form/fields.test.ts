@@ -217,3 +217,25 @@ describe("formatFieldValue", () => {
     expect(fields.map((f) => f.name)).toEqual(["primary_key", "batch_size"]);
   });
 });
+
+describe("schema format", () => {
+  it("carries a string property's format so the form can swap in a widget", () => {
+    const fields = schemaToFields({
+      type: "object",
+      properties: {
+        connection: { type: "string", format: "meili-connection" },
+        index: { type: "string" },
+        max_batch_bytes: { type: "integer", minimum: 1 },
+      },
+    });
+    const byName = Object.fromEntries(fields.map((f) => [f.name, f]));
+    expect(byName.connection.kind).toBe("string");
+    expect(byName.connection.format).toBe("meili-connection");
+    expect(byName.index.format).toBeUndefined();
+    expect(byName.max_batch_bytes.kind).toBe("integer");
+  });
+
+  it("ignores a format on a non-string property", () => {
+    expect(schemaToField("n", { type: "integer", format: "int64" }).format).toBeUndefined();
+  });
+});

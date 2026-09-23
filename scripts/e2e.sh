@@ -29,6 +29,13 @@ export INLINE_MAX_BYTES=${INLINE_MAX_BYTES:-1048576}
 export LOG_FORMAT=text
 ENVOY_SECRET=e2e-envoy-secret
 export RUST_LOG=${RUST_LOG:-info,meili_ingest=debug}
+FILE_PORT=${FILE_PORT:-58099}
+# Connections and scheduled sources: a sealing key, and host policies that let the
+# gateway and the worker reach this machine's Meilisearch and fixture file server.
+export SOURCE_SECRET_KEY="ZTJlLW9ubHktc291cmNlLXNlY3JldC1rZXktMzJieXQ="
+export MEILI_CONNECTION_HOSTS="localhost:${MEILI_PORT}"
+export SOURCE_FETCH_HOSTS="localhost:${FILE_PORT}"
+FETCH_TOKEN=e2e-fetch-token
 
 PIDS=()
 cleanup() {
@@ -415,6 +422,108 @@ MD=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_me
 echo "e2e_media documents (one per transcript segment): $MD"; [ "$MD" -ge 2 ] || { echo "expected segment documents" >&2; exit 1; }
 curl -fsS -X DELETE "${GW}/pipelines/e2e-media" -o /dev/null -w "delete pipeline → %{http_code}\n"
 
+echo "--- Meilisearch connection pins a pipeline's destination"
+CONN=$(curl -fsS -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"e2e-local\",\"host\":\"${MEILI_URL}\",\"api_key\":\"masterKey\"}" "${GW}/connections")
+echo "$CONN" | jq -c .
+[ "$(echo "$CONN" | jq -r .api_key)" = "****" ] || { echo "connection key was not masked" >&2; exit 1; }
+code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"e2e-badkey\",\"host\":\"${MEILI_URL}\",\"api_key\":\"wrong\"}" "${GW}/connections")
+echo "connection with a wrong key → ${code} (expect 422)"; [ "$code" = "422" ] || exit 1
+cat > "${WORK}/movies.yaml" <<'YAML'
+uid: e2e-movies
+name: "Movies into a pinned connection"
+steps:
+  - id: parse
+    plugin: json_flattener
+    config: { id_field: id, title_field: title }
+  - id: index
+    plugin: meili_indexer
+    config: { connection: e2e-local, index: e2e_movies, primary_key: id }
+YAML
+curl -fsS -X POST -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/movies.yaml" "${GW}/pipelines" | jq -r .uid
+# Trusted Envoy headers name a host that does not exist: the connection must win, and
+# the documents must land in the real Meilisearch.
+PIN=$(curl -fsS -H "X-Meili-Envoy-Secret: ${ENVOY_SECRET}" \
+  -H 'X-Meili-Host: http://evil.invalid:9' -H 'X-Meili-Api-Key: spoofed' \
+  -H 'Content-Type: application/json' \
+  -d '{"documents":[{"id":900,"title":"Pinned by connection"}]}' "${GW}/ingest/pipeline/e2e-movies")
+JOB_P=$(echo "$PIN" | jq -r .job_id)
+for _ in $(seq 1 60); do S=$(curl -fsS "${GW}/jobs/${JOB_P}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB_P}" | jq .; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "pinned job ended $S" >&2; exit 1; }
+
+echo "--- scheduled source: first run ingests"
+python3 - "${WORK}/movies_$(date -u +%Y).json.gz" <<'PYEOF'
+import gzip, json, sys
+rows = [{"id": 1, "title": "Heat"}, {"id": 2, "title": "Ran"}, {"id": 3, "title": "Alien"}]
+# TMDB-style: gzipped NDJSON named .json.gz, with an mtime of 0 so the bytes are stable.
+with open(sys.argv[1], "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as fh:
+    fh.write("".join(json.dumps(r) + "\n" for r in rows).encode())
+PYEOF
+SRC=$(curl -fsS -H 'Content-Type: application/json' -d "{
+  \"uid\": \"e2e-movies\",
+  \"pipeline\": \"e2e-movies\",
+  \"location\": {\"kind\": \"url\", \"url\": \"http://localhost:${FILE_PORT}/movies_{{ date:%Y }}.json.gz\"},
+  \"cron\": \"0 3 * * *\",
+  \"auth\": {\"kind\": \"bearer\", \"token\": \"${FETCH_TOKEN}\"}
+}" "${GW}/sources")
+echo "$SRC" | jq -c .
+[ "$(echo "$SRC" | jq -r .auth.token)" = "****" ] || { echo "fetch token was not masked" >&2; exit 1; }
+echo "$SRC" | grep -q "${FETCH_TOKEN}" && { echo "fetch token leaked in the API" >&2; exit 1; }
+# An allowed host, so the 422 can only come from the pipeline having no connection.
+UNPINNED=$(curl -sS -w '\n%{http_code}' -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"e2e-unpinned\",\"pipeline\":\"builtin.json\",\"location\":{\"kind\":\"url\",\"url\":\"http://localhost:${FILE_PORT}/x.json\"},\"cron\":\"0 3 * * *\"}" "${GW}/sources")
+code=$(echo "$UNPINNED" | tail -1)
+echo "source on an unpinned pipeline → ${code} (expect 422)"; [ "$code" = "422" ] || exit 1
+echo "$UNPINNED" | head -1 | grep -q "connection" || { echo "422 did not explain the missing connection" >&2; exit 1; }
+
+wait_runs() { # count
+  for _ in $(seq 1 90); do
+    RUNS=$(curl -fsS "${GW}/sources/e2e-movies/runs")
+    [ "$(echo "$RUNS" | jq length)" -ge "$1" ] && return 0
+    sleep 1
+  done
+  echo "source run $1 did not finish" >&2; echo "$RUNS" | jq .; tail -60 "${WORK}/worker.log"; return 1
+}
+curl -fsS -X POST "${GW}/sources/e2e-movies/run" | jq -c .
+wait_runs 1
+FIRST=$(echo "$RUNS" | jq '.[0]')
+echo "$FIRST" | jq -c .
+[ "$(echo "$FIRST" | jq -r .outcome)" = "ingested" ] || { echo "first run was not ingested" >&2; tail -60 "${WORK}/worker.log"; exit 1; }
+SJOB=$(echo "$FIRST" | jq -r '.job_ids[0]')
+[ "$(curl -fsS "${GW}/jobs/${SJOB}" | jq -r .status)" = "succeeded" ] || { echo "source job did not succeed" >&2; exit 1; }
+sleep 1
+MN=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_movies/stats" | jq .numberOfDocuments)
+echo "e2e_movies documents: $MN"; [ "$MN" -eq 4 ] || { echo "expected 3 fetched + 1 pinned documents" >&2; exit 1; }
+
+echo "--- scheduled source: an unchanged upstream starts no job"
+curl -fsS -X POST "${GW}/sources/e2e-movies/run" | jq -c .
+wait_runs 2
+SECOND=$(echo "$RUNS" | jq '.[0]')
+echo "$SECOND" | jq -c .
+[ "$(echo "$SECOND" | jq -r .outcome)" = "unchanged" ] || { echo "second run was not unchanged" >&2; exit 1; }
+[ "$(echo "$SECOND" | jq '.job_ids | length')" -eq 0 ] || { echo "an unchanged run started a job" >&2; exit 1; }
+[ "$(curl -fsS "${GW}/sources/e2e-movies" | jq -r .last_status)" = "unchanged" ] || { echo "last_status not updated" >&2; exit 1; }
+
+echo "--- no secret reached Temporal history for source runs"
+for WF in $(temporal workflow list --address "localhost:${TEMPORAL_PORT}" \
+    --query 'WorkflowType="SourceRunWorkflow"' -o json | jq -r '.[].execution.workflowId') \
+    "ingest-${SJOB}" "ingest-${JOB_P}"; do
+  HIST=$(temporal workflow show --address "localhost:${TEMPORAL_PORT}" -w "$WF" -o json)
+  for secret in "${FETCH_TOKEN}" masterKey; do
+    echo "$HIST" | grep -q "$secret" && { echo "secret ${secret} is in the history of ${WF}" >&2; exit 1; }
+  done
+done
+echo "histories clean"
+
+echo "--- deleting the pipeline archives its source"
+curl -fsS -X DELETE "${GW}/pipelines/e2e-movies" -o /dev/null -w "delete pipeline → %{http_code}\n"
+[ "$(curl -fsS "${GW}/sources/e2e-movies" | jq -r '.archived_at != null')" = "true" ] || { echo "source was not archived" >&2; exit 1; }
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${GW}/sources/e2e-movies/run")
+echo "run an archived source → ${code} (expect 422)"; [ "$code" = "422" ] || exit 1
+curl -fsS -X DELETE "${GW}/sources/e2e-movies" -o /dev/null -w "delete source → %{http_code}\n"
+curl -fsS -X DELETE "${GW}/connections/e2e-local" -o /dev/null -w "delete connection → %{http_code}\n"
+
 echo "--- usage events reached the analytics store"
 sleep 2
 USAGE="${WORK}/usage.ndjson"
@@ -481,7 +590,7 @@ if secs <= 0:
 
 # No credential ever reaches the analytics store.
 blob = json.dumps(rows)
-for secret in ("masterKey", "e2e-envoy-secret", "test-key"):
+for secret in ("masterKey", "e2e-envoy-secret", "test-key", "e2e-fetch-token"):
     if secret in blob:
         fail(f"secret {secret!r} leaked into usage events")
 
@@ -531,7 +640,7 @@ if [ -n "$UI_FEATURES" ]; then
   code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/")
   echo "/ui/ → ${code}"
   [ "$code" = "200" ] || { echo "the trailing-slash UI root did not serve" >&2; exit 1; }
-  for route in pipelines jobs playground usage; do
+  for route in pipelines jobs playground usage sources connections; do
     code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/${route}/")
     echo "/ui/${route}/ → ${code}"
     [ "$code" = "200" ] || { echo "route ${route} did not serve" >&2; exit 1; }

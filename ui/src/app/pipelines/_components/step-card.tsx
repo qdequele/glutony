@@ -23,6 +23,7 @@ import { DEFAULT_RETRY, DEFAULT_TIMEOUT_SECS, type StepDraft } from "@/lib/pipel
 import type { IssueField, ValidationIssue } from "@/lib/pipeline/validate";
 import { SchemaForm } from "@/lib/schema-form";
 import { cn } from "@/lib/utils";
+import { STEP_CONFIG_WIDGETS } from "./connection-select";
 import { PluginPicker } from "./plugin-picker";
 
 const NO_FAN_OUT = "__none__";
@@ -250,21 +251,26 @@ export function StepCard({
             <FieldDescription className="text-xs">Start-to-close.</FieldDescription>
           </Field>
 
-          <Field orientation="horizontal" className="items-start gap-2">
-            <Switch
-              id={`${idPrefix}-retry`}
-              checked={retryEnabled}
-              disabled={readOnly}
-              onCheckedChange={(checked) =>
-                onPatch({ retry: checked ? { ...DEFAULT_RETRY } : undefined })
-              }
-            />
+          {/* Laid out like its siblings (label, control, description) so the
+              description wraps within the column instead of sitting beside the
+              switch and forcing the grid wider than the card. */}
+          <Field className="min-w-0 gap-1.5">
             <FieldLabel htmlFor={`${idPrefix}-retry`} className="text-xs font-medium">
               Custom retry
-              <FieldDescription className="text-xs font-normal">
-                Default: {DEFAULT_RETRY.max_attempts} attempts, {DEFAULT_RETRY.backoff}.
-              </FieldDescription>
             </FieldLabel>
+            <div className="flex h-8 items-center">
+              <Switch
+                id={`${idPrefix}-retry`}
+                checked={retryEnabled}
+                disabled={readOnly}
+                onCheckedChange={(checked) =>
+                  onPatch({ retry: checked ? { ...DEFAULT_RETRY } : undefined })
+                }
+              />
+            </div>
+            <FieldDescription className="text-xs">
+              Default: {DEFAULT_RETRY.max_attempts} attempts, {DEFAULT_RETRY.backoff}.
+            </FieldDescription>
           </Field>
         </div>
 
@@ -335,6 +341,7 @@ export function StepCard({
             schema={manifest?.config_schema}
             value={step.config}
             disabled={readOnly}
+            widgets={STEP_CONFIG_WIDGETS}
             onChange={(next: JsonObject) => onPatch({ config: next })}
           />
         </div>

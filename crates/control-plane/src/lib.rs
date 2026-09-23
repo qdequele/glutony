@@ -6,23 +6,28 @@
 //!   the router crate;
 //! * MIME/filename → pipeline resolution (`POST /internal/resolve`);
 //! * plugin manifest registry (`/plugins`, `POST /internal/plugins`);
-//! * denormalized job cache (`/internal/jobs`).
+//! * denormalized job cache (`/internal/jobs`);
+//! * Meilisearch connections (`/internal/connections`), keys held sealed;
+//! * scheduled sources (`/internal/sources`, `/internal/sources-by-id`,
+//!   `/internal/source-runs`).
 //!
 //! The binary lives in `main.rs`; everything else is exposed as a library so the
 //! router can be exercised in tests without opening a socket.
 
 pub mod builtin_pipelines;
+pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
+pub mod sources;
 
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -52,6 +57,11 @@ impl AppState {
     /// Pipeline repository bound to this state's pool.
     pub fn pipelines(&self) -> pipelines::PipelineRepo {
         pipelines::PipelineRepo::new(self.pool.clone())
+    }
+
+    /// Meilisearch connection repository bound to this state's pool.
+    pub fn connections(&self) -> connections::ConnectionRepo {
+        connections::ConnectionRepo::new(self.pool.clone())
     }
 }
 
@@ -115,6 +125,47 @@ pub fn app(state: AppState) -> Router {
             "/internal/jobs/{job_id}",
             get(jobs::get_job).patch(jobs::update_job),
         )
+        .route(
+            "/internal/connections",
+            get(connections::list_connections).post(connections::create_connection),
+        )
+        .route(
+            "/internal/connections/{uid}",
+            get(connections::get_connection)
+                .patch(connections::patch_connection)
+                .delete(connections::delete_connection),
+        )
+        .route(
+            "/internal/connections/{uid}/used_by",
+            get(connections::connection_used_by),
+        )
+        .route(
+            "/internal/sources",
+            get(sources::list_sources).post(sources::create_source),
+        )
+        .route(
+            "/internal/sources/{uid}",
+            get(sources::get_source)
+                .patch(sources::patch_source)
+                .delete(sources::delete_source),
+        )
+        .route(
+            "/internal/sources-by-id/{id}",
+            get(sources::load_source_for_run),
+        )
+        .route(
+            "/internal/sources-by-id/{id}/state",
+            put(sources::save_source_state),
+        )
+        .route(
+            "/internal/sources-by-id/{id}/paused",
+            put(sources::set_source_paused),
+        )
+        .route(
+            "/internal/sources-by-id/{id}/runs",
+            get(sources::list_source_runs),
+        )
+        .route("/internal/source-runs", post(sources::record_source_run))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

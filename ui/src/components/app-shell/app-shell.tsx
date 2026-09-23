@@ -10,7 +10,10 @@ export function AppShell({ children }: { children: ReactNode }) {
       <Header />
       <div className="flex min-h-0 flex-1">
         <Sidebar />
-        <main className="min-w-0 flex-1 overflow-auto">{children}</main>
+        {/* `relative` keeps the hidden native inputs Radix Select/Switch position
+            absolutely inside this scroll area; otherwise they stretch the document past
+            the viewport and opening a Select scrolls the whole window. */}
+        <main className="relative min-w-0 flex-1 overflow-auto">{children}</main>
       </div>
     </div>
   );
