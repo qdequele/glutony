@@ -1,7 +1,7 @@
 "use client";
 
 import { ArrowDown, ArrowUp, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,7 +13,7 @@ import { cn } from "@/lib/utils";
 
 import { MultiValueInput } from "../multi-value-input";
 import { routeDiagnostic } from "./diagnostics";
-import { formatLiteral, opKind, OP_KINDS, parseLiteral, type DropIf, type OpKind } from "./ops";
+import { formatLiteral, opKind, OP_KINDS, parseDecimals, parseLiteral, type DropIf, type OpKind } from "./ops";
 
 type FilterTest = "empty" | "missing" | "equals" | "not_equals";
 
@@ -40,6 +40,48 @@ function filterTest(dropIf: DropIf): FilterTest {
   if (dropIf.equals !== undefined) return "equals";
   if (dropIf.not_equals !== undefined) return "not_equals";
   return dropIf.is ?? "empty";
+}
+
+interface DecimalsInputProps {
+  id: string;
+  value: number | undefined;
+  disabled: boolean;
+  invalid: boolean;
+  onCommit: (decimals: number) => void;
+}
+
+/**
+ * The round `decimals` input. Keeps its own text so it can be emptied mid-edit; only a
+ * whole number 0–15 reaches the op, and leaving the input empty restores the stored one.
+ */
+function DecimalsInput({ id, value, disabled, invalid, onCommit }: DecimalsInputProps) {
+  const stored = value === undefined ? "" : String(value);
+  const [text, setText] = useState(stored);
+  const [synced, setSynced] = useState(stored);
+  if (stored !== synced) {
+    // The op changed from outside (undo, YAML pane): show the new value.
+    setSynced(stored);
+    setText(stored);
+  }
+  return (
+    <Input
+      id={id}
+      inputMode="numeric"
+      value={text}
+      disabled={disabled}
+      aria-invalid={invalid}
+      onChange={(event) => {
+        const draft = parseDecimals(event.target.value);
+        if (!draft) return;
+        setText(draft.text);
+        if (draft.value !== undefined) {
+          setSynced(String(draft.value));
+          onCommit(draft.value);
+        }
+      }}
+      onBlur={() => setText(stored)}
+    />
+  );
 }
 
 export function OpRow({ idPrefix, index, total, value, onChange, onMove, onRemove, diagnostics, readOnly }: OpRowProps) {
@@ -180,16 +222,12 @@ export function OpRow({ idPrefix, index, total, value, onChange, onMove, onRemov
         <div className="grid grid-cols-[2fr_auto_1fr] items-center gap-2">
           {field("field", "field")}
           <span className="text-xs text-muted-foreground">decimals</span>
-          <Input
+          <DecimalsInput
             id={`${id}-decimals`}
-            inputMode="numeric"
-            value={String(typeof obj.decimals === "number" ? obj.decimals : "")}
+            value={typeof obj.decimals === "number" ? obj.decimals : undefined}
             disabled={readOnly}
-            aria-invalid={invalidKey(diagnostics, "decimals")}
-            onChange={(event) => {
-              const raw = event.target.value.trim();
-              if (/^\d{1,2}$/.test(raw)) patch({ decimals: Number(raw) });
-            }}
+            invalid={invalidKey(diagnostics, "decimals")}
+            onCommit={(decimals) => patch({ decimals })}
           />
         </div>
       );

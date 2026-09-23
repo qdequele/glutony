@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatLiteral, newOp, opKind, OP_KINDS, parseLiteral } from "./ops";
+import { formatLiteral, newOp, opKind, OP_KINDS, parseDecimals, parseLiteral } from "./ops";
 
 describe("opKind", () => {
   it("reads the single key of a known operation", () => {
@@ -33,5 +33,24 @@ describe("literals", () => {
     expect(formatLiteral("12")).toBe('"12"');
     expect(formatLiteral(12)).toBe("12");
     expect(formatLiteral(undefined)).toBe("");
+  });
+});
+
+describe("parseDecimals", () => {
+  it("allows clearing the input without storing anything", () => {
+    expect(parseDecimals("")).toEqual({ text: "", value: undefined });
+    expect(parseDecimals("  ")).toEqual({ text: "", value: undefined });
+  });
+  it("stores whole numbers from 0 to 15", () => {
+    expect(parseDecimals("0")).toEqual({ text: "0", value: 0 });
+    expect(parseDecimals("15")).toEqual({ text: "15", value: 15 });
+    expect(parseDecimals("07")).toEqual({ text: "07", value: 7 });
+  });
+  it("rejects anything else", () => {
+    expect(parseDecimals("16")).toBeUndefined();
+    expect(parseDecimals("100")).toBeUndefined();
+    expect(parseDecimals("-1")).toBeUndefined();
+    expect(parseDecimals("1.5")).toBeUndefined();
+    expect(parseDecimals("x")).toBeUndefined();
   });
 });

@@ -150,3 +150,15 @@ export function formatLiteral(value: JsonValue | undefined): string {
   }
   return JSON.stringify(value);
 }
+
+/** What the round `decimals` input accepts while typing: an empty draft, or a whole number 0–15 to store. */
+export type DecimalsDraft = { text: ""; value: undefined } | { text: string; value: number };
+
+/** Parse typed `decimals` text; `undefined` means reject the keystroke. */
+export function parseDecimals(raw: string): DecimalsDraft | undefined {
+  const text = raw.trim();
+  if (text === "") return { text: "", value: undefined };
+  if (!/^\d{1,2}$/.test(text)) return undefined;
+  const value = Number(text);
+  return value <= 15 ? { text, value } : undefined;
+}
