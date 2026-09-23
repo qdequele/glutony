@@ -327,7 +327,8 @@ steps:
     #[tokio::test]
     async fn validate_forwards_step_config_diagnostics_unchanged() {
         let server = MockServer::start().await;
-        let diagnostics = json!([{"step": "a", "path": "script", "line": 1, "column": 15, "message": "boom"}]);
+        let diagnostics =
+            json!([{"step": "a", "path": "script", "line": 1, "column": 15, "message": "boom"}]);
         Mock::given(method("POST"))
             .and(path("/pipelines/validate"))
             .respond_with(ResponseTemplate::new(422).set_body_json(json!({
@@ -338,7 +339,8 @@ steps:
             .mount(&server)
             .await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
-        let body = json!({"uid": "g", "steps": [{"id": "a", "plugin": "document_script"}]}).to_string();
+        let body =
+            json!({"uid": "g", "steps": [{"id": "a", "plugin": "document_script"}]}).to_string();
         let req = Request::post("/pipelines/validate")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body))
@@ -358,7 +360,10 @@ steps:
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/pipelines/validate"))
-            .respond_with(ResponseTemplate::new(422).set_body_json(json!({"error": "cycle", "code": "validation"})))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"error": "cycle", "code": "validation"})),
+            )
             .mount(&server)
             .await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;

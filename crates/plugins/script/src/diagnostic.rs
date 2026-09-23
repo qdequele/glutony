@@ -17,7 +17,12 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub(crate) fn at(path: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { path: path.into(), message: message.into(), line: None, column: None }
+        Self {
+            path: path.into(),
+            message: message.into(),
+            line: None,
+            column: None,
+        }
     }
 
     pub(crate) fn from_parse_error(path: impl Into<String>, error: &rhai::ParseError) -> Self {

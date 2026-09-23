@@ -334,9 +334,16 @@ fn script_pipeline(steps: Vec<StepDefinition>) -> PipelineDefinition {
 async fn validate_reports_every_broken_document_script_step() {
     let def = script_pipeline(vec![
         script_step("a", serde_json::json!({"script": "doc.fields.x = ;"})),
-        script_step("b", serde_json::json!({"ops": [{"set": {"field": "t", "expr": "1 +"}}]})),
+        script_step(
+            "b",
+            serde_json::json!({"ops": [{"set": {"field": "t", "expr": "1 +"}}]}),
+        ),
     ]);
-    let (status, body) = call(app(state()), post_json("/pipelines/validate", serde_json::to_vec(&def).unwrap())).await;
+    let (status, body) = call(
+        app(state()),
+        post_json("/pipelines/validate", serde_json::to_vec(&def).unwrap()),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = json(&body);
@@ -354,21 +361,35 @@ async fn validate_reports_every_broken_document_script_step() {
 #[tokio::test]
 async fn validate_returns_generated_scripts_for_builder_steps_only() {
     let def = script_pipeline(vec![
-        script_step("shape", serde_json::json!({"ops": [{"rename": {"from": "a", "to": "b"}}]})),
+        script_step(
+            "shape",
+            serde_json::json!({"ops": [{"rename": {"from": "a", "to": "b"}}]}),
+        ),
         script_step("raw", serde_json::json!({"script": "1"})),
     ]);
-    let (status, body) = call(app(state()), post_json("/pipelines/validate", serde_json::to_vec(&def).unwrap())).await;
+    let (status, body) = call(
+        app(state()),
+        post_json("/pipelines/validate", serde_json::to_vec(&def).unwrap()),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
     let body: serde_json::Value = json(&body);
-    assert_eq!(body["generated_scripts"]["shape"], "doc.rename_field(\"a\", \"b\");\n");
+    assert_eq!(
+        body["generated_scripts"]["shape"],
+        "doc.rename_field(\"a\", \"b\");\n"
+    );
     assert!(body["generated_scripts"].get("raw").is_none());
 }
 
 #[tokio::test]
 async fn saving_a_broken_script_is_rejected_before_the_database() {
     let def = script_pipeline(vec![script_step("a", serde_json::json!({"script": "1 +"}))]);
-    let (status, body) = call(app(state()), post_json("/pipelines", serde_json::to_vec(&def).unwrap())).await;
+    let (status, body) = call(
+        app(state()),
+        post_json("/pipelines", serde_json::to_vec(&def).unwrap()),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = json(&body);

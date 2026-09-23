@@ -775,7 +775,10 @@ mod tests {
             assert!(props.contains_key(key), "schema missing {key}");
         }
         assert!(props.contains_key("ops"), "schema missing ops");
-        assert!(m.config_schema.get("required").is_none(), "neither key is required on its own");
+        assert!(
+            m.config_schema.get("required").is_none(),
+            "neither key is required on its own"
+        );
         assert_eq!(
             m.config_schema["oneOf"],
             json!([{"required": ["script"]}, {"required": ["ops"]}])
@@ -789,39 +792,61 @@ mod tests {
             script(r#"doc.trim_fields(["a"]); doc.lowercase_fields(["b"]); doc.uppercase_fields(["c"]);"#),
         )
         .await;
-        assert_eq!(fields(&out[0]), json!({"a": "Hi", "b": "mixed", "c": "AB-1"}));
+        assert_eq!(
+            fields(&out[0]),
+            json!({"a": "Hi", "b": "mixed", "c": "AB-1"})
+        );
     }
 
     #[tokio::test]
     async fn a_text_helper_on_a_non_string_is_an_error() {
-        let err = try_run(vec![with_fields(json!({"n": 1}))], script(r#"doc.trim_fields(["n"]);"#))
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")), "got {err:?}");
+        let err = try_run(
+            vec![with_fields(json!({"n": 1}))],
+            script(r#"doc.trim_fields(["n"]);"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
     async fn split_and_join_round_trip() {
         let out = run(
-            vec![with_fields(json!({"tags": "a,b,c", "list": ["x", 2, true]}))],
+            vec![with_fields(
+                json!({"tags": "a,b,c", "list": ["x", 2, true]}),
+            )],
             script(r#"doc.split_field("tags", ","); doc.join_field("list", " | ");"#),
         )
         .await;
-        assert_eq!(fields(&out[0]), json!({"tags": ["a", "b", "c"], "list": "x | 2 | true"}));
+        assert_eq!(
+            fields(&out[0]),
+            json!({"tags": ["a", "b", "c"], "list": "x | 2 | true"})
+        );
     }
 
     #[tokio::test]
     async fn join_rejects_nested_collections() {
-        let err = try_run(vec![with_fields(json!({"l": [{"k": 1}]}))], script(r#"doc.join_field("l", ",");"#))
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("cannot be joined")), "got {err:?}");
+        let err = try_run(
+            vec![with_fields(json!({"l": [{"k": 1}]}))],
+            script(r#"doc.join_field("l", ",");"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("cannot be joined")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
     async fn promote_moves_a_field_into_title_or_content() {
         let out = run(
-            vec![with_fields(json!({"name": "Widget", "body": "Text", "keep": 1}))],
+            vec![with_fields(
+                json!({"name": "Widget", "body": "Text", "keep": 1}),
+            )],
             script(r#"doc.promote_field("name", "title"); doc.promote_field("body", "content");"#),
         )
         .await;
@@ -832,10 +857,16 @@ mod tests {
 
     #[tokio::test]
     async fn promote_rejects_a_non_string() {
-        let err = try_run(vec![with_fields(json!({"n": 3}))], script(r#"doc.promote_field("n", "title");"#))
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")), "got {err:?}");
+        let err = try_run(
+            vec![with_fields(json!({"n": 3}))],
+            script(r#"doc.promote_field("n", "title");"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -861,10 +892,16 @@ mod tests {
 
     #[tokio::test]
     async fn round_rejects_decimals_out_of_range() {
-        let err = try_run(vec![with_fields(json!({"f": 1.5}))], script(r#"doc.round_field("f", 16);"#))
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, PluginError::NonRetryable(m) if m.contains("between 0 and 15")), "got {err:?}");
+        let err = try_run(
+            vec![with_fields(json!({"f": 1.5}))],
+            script(r#"doc.round_field("f", 16);"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("between 0 and 15")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -873,12 +910,14 @@ mod tests {
             vec![with_fields(json!({
                 "i": "10", "f": " 2.5 ", "b": true, "t": "TRUE", "z": 0, "n": 3, "s": 1.5
             }))],
-            script(r#"
+            script(
+                r#"
                 doc.cast_field("i", "number"); doc.cast_field("f", "number");
                 doc.cast_field("b", "number"); doc.cast_field("t", "boolean");
                 doc.cast_field("z", "boolean"); doc.cast_field("n", "string");
                 doc.cast_field("s", "string");
-            "#),
+            "#,
+            ),
         )
         .await;
         assert_eq!(
@@ -889,14 +928,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_cast_that_cannot_convert_is_an_error() {
-        for (value, to) in [(json!("abc"), "number"), (json!(2), "boolean"), (json!([1]), "string")] {
+        for (value, to) in [
+            (json!("abc"), "number"),
+            (json!(2), "boolean"),
+            (json!([1]), "string"),
+        ] {
             let err = try_run(
                 vec![with_fields(json!({ "v": value }))],
                 script(&format!(r#"doc.cast_field("v", "{to}");"#)),
             )
             .await
             .unwrap_err();
-            assert!(matches!(err, PluginError::NonRetryable(_)), "{value} -> {to}");
+            assert!(
+                matches!(err, PluginError::NonRetryable(_)),
+                "{value} -> {to}"
+            );
         }
     }
 
@@ -972,13 +1018,20 @@ mod tests {
 
             let out = run(vec![d], json!({ "script": program })).await;
 
-            assert_eq!(fields(&out[0]), json!({"other": 1, "safe": "v"}), "name {name:?}");
+            assert_eq!(
+                fields(&out[0]),
+                json!({"other": 1, "safe": "v"}),
+                "name {name:?}"
+            );
         }
     }
 
     #[test]
     fn string_literals_escape_everything_but_printable_ascii() {
-        assert_eq!(string_literal("a\"b\\c\né"), r#""a\U00000022b\U0000005Cc\U0000000A\U000000E9""#);
+        assert_eq!(
+            string_literal("a\"b\\c\né"),
+            r#""a\U00000022b\U0000005Cc\U0000000A\U000000E9""#
+        );
     }
 
     #[tokio::test]
@@ -997,7 +1050,12 @@ mod tests {
         ] {
             let program = format!("doc.fields.out = {};", value_literal(&value));
             let out = run(vec![with_fields(json!({}))], json!({ "script": program })).await;
-            assert_eq!(out[0].fields.get("out"), Some(&value), "literal {}", value_literal(&value));
+            assert_eq!(
+                out[0].fields.get("out"),
+                Some(&value),
+                "literal {}",
+                value_literal(&value)
+            );
         }
     }
 
@@ -1007,7 +1065,11 @@ mod tests {
             {"set": {"field": "t", "expr": "price * 2 // double it"}},
             {"drop": ["price"]}
         ])));
-        let out = run(vec![with_fields(json!({"price": 4}))], json!({ "script": program })).await;
+        let out = run(
+            vec![with_fields(json!({"price": 4}))],
+            json!({ "script": program }),
+        )
+        .await;
         assert_eq!(fields(&out[0]), json!({"t": 8}));
     }
 
@@ -1027,7 +1089,10 @@ mod tests {
         )
         .await;
         assert_eq!(out.len(), 1);
-        assert_eq!(fields(&out[0]), json!({"price": 10, "qty": 3, "status": "live", "total": 30}));
+        assert_eq!(
+            fields(&out[0]),
+            json!({"price": 10, "qty": 3, "status": "live", "total": 30})
+        );
     }
 
     #[tokio::test]
@@ -1038,22 +1103,38 @@ mod tests {
 
     #[tokio::test]
     async fn script_and_ops_together_is_a_config_error() {
-        let err = try_run(vec![doc("a", "x")], json!({"script": "1", "ops": []})).await.unwrap_err();
-        assert!(matches!(&err, PluginError::InvalidConfig(m) if m.contains("exactly one")), "got {err:?}");
+        let err = try_run(vec![doc("a", "x")], json!({"script": "1", "ops": []}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("exactly one")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
     async fn a_script_over_64_kib_is_a_config_error() {
         let big = format!("// {}\n1", "x".repeat(65536));
-        let err = try_run(vec![doc("a", "x")], json!({ "script": big })).await.unwrap_err();
-        assert!(matches!(&err, PluginError::InvalidConfig(m) if m.contains("65536")), "got {err:?}");
+        let err = try_run(vec![doc("a", "x")], json!({ "script": big }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("65536")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
     async fn a_bad_operation_names_its_index() {
-        let err = try_run(vec![doc("a", "x")], json!({"ops": [{"drop": ["a"]}, {"round": {"field": "p", "decimals": 99}}]}))
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, PluginError::InvalidConfig(m) if m.contains("ops[1].decimals")), "got {err:?}");
+        let err = try_run(
+            vec![doc("a", "x")],
+            json!({"ops": [{"drop": ["a"]}, {"round": {"field": "p", "decimals": 99}}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("ops[1].decimals")),
+            "got {err:?}"
+        );
     }
 }

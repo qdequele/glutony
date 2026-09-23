@@ -30,7 +30,12 @@ pub fn check_config(config: &Value) -> CheckResult {
     let engine = sandboxed_engine(default_max_ops());
     let cfg = match Config::check(config.clone(), &engine) {
         Ok(cfg) => cfg,
-        Err(diagnostics) => return CheckResult { diagnostics, generated_script: None },
+        Err(diagnostics) => {
+            return CheckResult {
+                diagnostics,
+                generated_script: None,
+            };
+        }
     };
     match &cfg.source {
         Source::Script(script) => match engine.compile(script) {
@@ -43,9 +48,15 @@ pub fn check_config(config: &Value) -> CheckResult {
         Source::Ops(ops) => {
             let program = generate(ops);
             match engine.compile(&program) {
-                Ok(_) => CheckResult { diagnostics: vec![], generated_script: Some(program) },
+                Ok(_) => CheckResult {
+                    diagnostics: vec![],
+                    generated_script: Some(program),
+                },
                 Err(e) => CheckResult {
-                    diagnostics: vec![Diagnostic::at("ops", format!("generated program does not compile: {e}"))],
+                    diagnostics: vec![Diagnostic::at(
+                        "ops",
+                        format!("generated program does not compile: {e}"),
+                    )],
                     generated_script: None,
                 },
             }
@@ -60,7 +71,10 @@ mod tests {
 
     #[test]
     fn a_valid_script_has_no_diagnostics() {
-        assert_eq!(check_config(&json!({"script": "doc.fields.x = 1;"})), CheckResult::default());
+        assert_eq!(
+            check_config(&json!({"script": "doc.fields.x = 1;"})),
+            CheckResult::default()
+        );
     }
 
     #[test]
@@ -77,7 +91,10 @@ mod tests {
     fn valid_ops_return_their_generated_program() {
         let result = check_config(&json!({"ops": [{"rename": {"from": "a", "to": "b"}}]}));
         assert!(result.diagnostics.is_empty());
-        assert_eq!(result.generated_script.as_deref(), Some("doc.rename_field(\"a\", \"b\");\n"));
+        assert_eq!(
+            result.generated_script.as_deref(),
+            Some("doc.rename_field(\"a\", \"b\");\n")
+        );
     }
 
     #[test]

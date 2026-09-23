@@ -15,7 +15,11 @@ async fn run(example: &Value, config: Value) -> Vec<Document> {
     let mut doc = Document::with_id("example", example["content"].as_str().unwrap_or(""));
     doc.fields = example["fields"].as_object().cloned().unwrap_or_default();
     match DocumentScriptPlugin::new()
-        .execute(&ActivityContext::noop(), PluginInput::Documents(vec![doc]), config)
+        .execute(
+            &ActivityContext::noop(),
+            PluginInput::Documents(vec![doc]),
+            config,
+        )
         .await
     {
         Ok(PluginOutput::Documents(docs)) => docs,
@@ -26,20 +30,32 @@ async fn run(example: &Value, config: Value) -> Vec<Document> {
 
 fn assert_expected(id: &str, mode: &str, out: &[Document], expect: &Value) {
     if expect["dropped"] == json!(true) {
-        assert!(out.is_empty(), "{id} ({mode}): expected the document to be dropped");
+        assert!(
+            out.is_empty(),
+            "{id} ({mode}): expected the document to be dropped"
+        );
         return;
     }
     assert_eq!(out.len(), 1, "{id} ({mode}): expected one document");
-    assert_eq!(Value::Object(out[0].fields.clone()), expect["fields"], "{id} ({mode}): fields");
+    assert_eq!(
+        Value::Object(out[0].fields.clone()),
+        expect["fields"],
+        "{id} ({mode}): fields"
+    );
     if let Some(title) = expect.get("title") {
-        assert_eq!(out[0].title.as_deref(), title.as_str(), "{id} ({mode}): title");
+        assert_eq!(
+            out[0].title.as_deref(),
+            title.as_str(),
+            "{id} ({mode}): title"
+        );
     }
 }
 
 #[tokio::test]
 async fn every_reference_example_runs_as_documented() {
-    let reference: Value = serde_json::from_str(&std::fs::read_to_string(REFERENCE).expect("reference.json"))
-        .expect("reference.json is JSON");
+    let reference: Value =
+        serde_json::from_str(&std::fs::read_to_string(REFERENCE).expect("reference.json"))
+            .expect("reference.json is JSON");
     let entries = reference["entries"].as_array().expect("entries");
     assert!(!entries.is_empty());
 
@@ -57,15 +73,34 @@ async fn every_reference_example_runs_as_documented() {
 
 #[test]
 fn every_builder_operation_has_a_reference_entry() {
-    let reference: Value = serde_json::from_str(&std::fs::read_to_string(REFERENCE).unwrap()).unwrap();
+    let reference: Value =
+        serde_json::from_str(&std::fs::read_to_string(REFERENCE).unwrap()).unwrap();
     let kinds: Vec<String> = reference["entries"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|e| e["op"].as_object().and_then(|op| op.keys().next().cloned()))
         .collect();
-    for kind in ["rename", "drop", "keep", "copy", "set", "filter", "trim", "lowercase",
-                 "uppercase", "split", "join", "promote", "round", "cast", "default"] {
-        assert!(kinds.iter().any(|k| k == kind), "no reference entry for `{kind}`");
+    for kind in [
+        "rename",
+        "drop",
+        "keep",
+        "copy",
+        "set",
+        "filter",
+        "trim",
+        "lowercase",
+        "uppercase",
+        "split",
+        "join",
+        "promote",
+        "round",
+        "cast",
+        "default",
+    ] {
+        assert!(
+            kinds.iter().any(|k| k == kind),
+            "no reference entry for `{kind}`"
+        );
     }
 }

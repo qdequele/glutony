@@ -143,14 +143,23 @@ fn field_equals(doc: &mut Map, name: &str, expected: Dynamic) -> HelperResult<bo
 }
 
 /// Replace each listed string field with `f(value)`.
-fn map_strings(doc: &mut Map, list: Array, helper: &str, f: impl Fn(&str) -> String) -> HelperResult<()> {
+fn map_strings(
+    doc: &mut Map,
+    list: Array,
+    helper: &str,
+    f: impl Fn(&str) -> String,
+) -> HelperResult<()> {
     let names = names(list, helper)?;
     with_fields(doc, |fields| {
         for name in &names {
-            let Some(value) = fields.get_mut(name.as_str()) else { continue };
+            let Some(value) = fields.get_mut(name.as_str()) else {
+                continue;
+            };
             let text = match value.clone().into_string() {
                 Ok(text) => text,
-                Err(type_name) => return fail(format!("{helper}: `{name}` is {type_name}, not a string")),
+                Err(type_name) => {
+                    return fail(format!("{helper}: `{name}` is {type_name}, not a string"));
+                }
             };
             *value = Dynamic::from(f(&text));
         }
@@ -175,22 +184,36 @@ fn split_field(doc: &mut Map, name: &str, separator: &str) -> HelperResult<()> {
         return fail("split_field: separator must not be empty".into());
     }
     with_fields(doc, |fields| {
-        let Some(value) = fields.get_mut(name) else { return Ok(()) };
+        let Some(value) = fields.get_mut(name) else {
+            return Ok(());
+        };
         let text = match value.clone().into_string() {
             Ok(text) => text,
-            Err(type_name) => return fail(format!("split_field: `{name}` is {type_name}, not a string")),
+            Err(type_name) => {
+                return fail(format!(
+                    "split_field: `{name}` is {type_name}, not a string"
+                ));
+            }
         };
-        *value = Dynamic::from_array(text.split(separator).map(|part| Dynamic::from(part.to_string())).collect());
+        *value = Dynamic::from_array(
+            text.split(separator)
+                .map(|part| Dynamic::from(part.to_string()))
+                .collect(),
+        );
         Ok(())
     })
 }
 
 fn join_field(doc: &mut Map, name: &str, separator: &str) -> HelperResult<()> {
     with_fields(doc, |fields| {
-        let Some(value) = fields.get_mut(name) else { return Ok(()) };
+        let Some(value) = fields.get_mut(name) else {
+            return Ok(());
+        };
         let items = match value.clone().into_array() {
             Ok(items) => items,
-            Err(type_name) => return fail(format!("join_field: `{name}` is {type_name}, not an array")),
+            Err(type_name) => {
+                return fail(format!("join_field: `{name}` is {type_name}, not an array"));
+            }
         };
         let parts = items
             .iter()
@@ -198,7 +221,10 @@ fn join_field(doc: &mut Map, name: &str, separator: &str) -> HelperResult<()> {
                 if item.is_string() || item.is_int() || item.is_float() || item.is_bool() {
                     Ok(item.to_string())
                 } else {
-                    fail(format!("join_field: `{name}` holds {}, which cannot be joined", item.type_name()))
+                    fail(format!(
+                        "join_field: `{name}` holds {}, which cannot be joined",
+                        item.type_name()
+                    ))
                 }
             })
             .collect::<HelperResult<Vec<_>>>()?;
@@ -210,14 +236,18 @@ fn join_field(doc: &mut Map, name: &str, separator: &str) -> HelperResult<()> {
 /// Move a string field into the document's `title` or `content`.
 fn promote_field(doc: &mut Map, name: &str, target: &str) -> HelperResult<()> {
     if target != "title" && target != "content" {
-        return fail(format!("promote_field: target must be \"title\" or \"content\", got {target:?}"));
+        return fail(format!(
+            "promote_field: target must be \"title\" or \"content\", got {target:?}"
+        ));
     }
     let moved = with_fields(doc, |fields| {
         let shape = fields.get(name).map(|v| (v.is_string(), v.type_name()));
         match shape {
             None => Ok(None),
             Some((true, _)) => Ok(fields.remove(name)),
-            Some((false, type_name)) => fail(format!("promote_field: `{name}` is {type_name}, not a string")),
+            Some((false, type_name)) => fail(format!(
+                "promote_field: `{name}` is {type_name}, not a string"
+            )),
         }
     })?;
     if let Some(value) = moved {
@@ -228,7 +258,9 @@ fn promote_field(doc: &mut Map, name: &str, target: &str) -> HelperResult<()> {
 
 pub(crate) fn round_to(x: FLOAT, decimals: INT) -> HelperResult<FLOAT> {
     if !(0..=15).contains(&decimals) {
-        return fail(format!("round: decimals must be between 0 and 15, got {decimals}"));
+        return fail(format!(
+            "round: decimals must be between 0 and 15, got {decimals}"
+        ));
     }
     let factor = 10f64.powi(decimals as i32);
     Ok((x * factor).round() / factor)
@@ -237,12 +269,17 @@ pub(crate) fn round_to(x: FLOAT, decimals: INT) -> HelperResult<FLOAT> {
 fn round_field(doc: &mut Map, name: &str, decimals: INT) -> HelperResult<()> {
     round_to(0.0, decimals)?; // validate decimals even when the value is an integer
     with_fields(doc, |fields| {
-        let Some(value) = fields.get_mut(name) else { return Ok(()) };
+        let Some(value) = fields.get_mut(name) else {
+            return Ok(());
+        };
         if value.is_int() {
             return Ok(());
         }
         let Ok(x) = value.as_float() else {
-            return fail(format!("round_field: `{name}` is {}, not a number", value.type_name()));
+            return fail(format!(
+                "round_field: `{name}` is {}, not a number",
+                value.type_name()
+            ));
         };
         *value = Dynamic::from_float(round_to(x, decimals)?);
         Ok(())
@@ -251,7 +288,9 @@ fn round_field(doc: &mut Map, name: &str, decimals: INT) -> HelperResult<()> {
 
 fn cast_field(doc: &mut Map, name: &str, to: &str) -> HelperResult<()> {
     with_fields(doc, |fields| {
-        let Some(value) = fields.get_mut(name) else { return Ok(()) };
+        let Some(value) = fields.get_mut(name) else {
+            return Ok(());
+        };
         let cast = match to {
             "number" => cast_number(value),
             "string" => cast_string(value),
@@ -288,7 +327,10 @@ fn cast_number(v: &Dynamic) -> Result<Dynamic, String> {
         }
         return Err(format!("{text:?} is not a number"));
     }
-    Err(format!("is {}, which cannot become a number", v.type_name()))
+    Err(format!(
+        "is {}, which cannot become a number",
+        v.type_name()
+    ))
 }
 
 fn cast_string(v: &Dynamic) -> Result<Dynamic, String> {
@@ -298,7 +340,10 @@ fn cast_string(v: &Dynamic) -> Result<Dynamic, String> {
     if v.is_int() || v.is_float() || v.is_bool() {
         return Ok(Dynamic::from(v.to_string()));
     }
-    Err(format!("is {}, which cannot become a string", v.type_name()))
+    Err(format!(
+        "is {}, which cannot become a string",
+        v.type_name()
+    ))
 }
 
 fn cast_boolean(v: &Dynamic) -> Result<Dynamic, String> {
@@ -320,7 +365,10 @@ fn cast_boolean(v: &Dynamic) -> Result<Dynamic, String> {
             _ => Err(format!("{text:?} is not true or false")),
         };
     }
-    Err(format!("is {}, which cannot become a boolean", v.type_name()))
+    Err(format!(
+        "is {}, which cannot become a boolean",
+        v.type_name()
+    ))
 }
 
 fn default_field(doc: &mut Map, name: &str, value: Dynamic) -> HelperResult<()> {

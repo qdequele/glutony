@@ -50,7 +50,11 @@ fn emit(out: &mut String, op: &Op) {
             };
             format!("doc.cast_field({}, {});", s(&c.field), s(target))
         }
-        Op::Default(d) => format!("doc.default_field({}, {});", s(&d.field), value_literal(&d.value)),
+        Op::Default(d) => format!(
+            "doc.default_field({}, {});",
+            s(&d.field),
+            value_literal(&d.value)
+        ),
     };
     out.push_str(&line);
     out.push('\n');
@@ -124,5 +128,9 @@ fn number_literal(n: &Number) -> String {
     }
     // Integers above i64::MAX are rejected by `check_ops`, so this is a float.
     let text = format!("{:?}", n.as_f64().unwrap_or(0.0));
-    if text.contains('.') || !text.contains('e') { text } else { text.replacen('e', ".0e", 1) }
+    if text.contains('.') || !text.contains('e') {
+        text
+    } else {
+        text.replacen('e', ".0e", 1)
+    }
 }

@@ -171,23 +171,39 @@ pub fn unknown_plugins(def: &PipelineDefinition, registered: &[String]) -> Vec<S
 fn check_step_configs(def: &PipelineDefinition) -> Result<BTreeMap<String, String>, CpError> {
     let mut generated = BTreeMap::new();
     let mut diagnostics = Vec::new();
-    for step in def.steps.iter().filter(|s| s.plugin == meili_ingest_plugin_script::NAME) {
+    for step in def
+        .steps
+        .iter()
+        .filter(|s| s.plugin == meili_ingest_plugin_script::NAME)
+    {
         let result = meili_ingest_plugin_script::check_config(&step.config);
         diagnostics.extend(
-            result.diagnostics.into_iter().map(|diagnostic| StepDiagnostic { step: step.id.clone(), diagnostic }),
+            result
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| StepDiagnostic {
+                    step: step.id.clone(),
+                    diagnostic,
+                }),
         );
         if let Some(script) = result.generated_script {
             generated.insert(step.id.clone(), script);
         }
     }
-    if diagnostics.is_empty() { Ok(generated) } else { Err(CpError::StepConfig(diagnostics)) }
+    if diagnostics.is_empty() {
+        Ok(generated)
+    } else {
+        Err(CpError::StepConfig(diagnostics))
+    }
 }
 
 /// Static checks shared by the handler and unit tests: reserved uid, normalization,
 /// structural validation and per-step config compile checks. Mutates `def`
 /// (normalization) on success. Returns the program each Builder-mode `document_script`
 /// step compiles to, by step id.
-pub fn prepare_definition(def: &mut PipelineDefinition) -> Result<BTreeMap<String, String>, CpError> {
+pub fn prepare_definition(
+    def: &mut PipelineDefinition,
+) -> Result<BTreeMap<String, String>, CpError> {
     if is_builtin_uid(&def.uid) {
         return Err(CpError::Builtin(format!(
             "pipeline uid {:?} is reserved: built-in pipelines cannot be created or overwritten",

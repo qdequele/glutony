@@ -85,7 +85,10 @@ impl Config {
                 None
             }
             (None, None) => {
-                diagnostics.push(Diagnostic::at("config", "set exactly one of `script` or `ops`"));
+                diagnostics.push(Diagnostic::at(
+                    "config",
+                    "set exactly one of `script` or `ops`",
+                ));
                 None
             }
             (Some(script), None) => {
@@ -94,7 +97,10 @@ impl Config {
                 } else if script.len() > MAX_SCRIPT_BYTES {
                     diagnostics.push(Diagnostic::at(
                         "script",
-                        format!("`script` is {} bytes; the limit is {MAX_SCRIPT_BYTES}", script.len()),
+                        format!(
+                            "`script` is {} bytes; the limit is {MAX_SCRIPT_BYTES}",
+                            script.len()
+                        ),
                     ));
                 }
                 Some(Source::Script(script))
@@ -111,7 +117,10 @@ impl Config {
             diagnostics.push(Diagnostic::at("max_ops", "`max_ops` must be at least 1"));
         }
         if raw.timeout_ms == 0 {
-            diagnostics.push(Diagnostic::at("timeout_ms", "`timeout_ms` must be at least 1"));
+            diagnostics.push(Diagnostic::at(
+                "timeout_ms",
+                "`timeout_ms` must be at least 1",
+            ));
         }
 
         match source {

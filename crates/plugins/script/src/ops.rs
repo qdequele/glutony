@@ -54,9 +54,17 @@ pub(crate) struct DropIf {
     pub field: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is: Option<Presence>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub equals: Option<Value>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub not_equals: Option<Value>,
 }
 
@@ -139,7 +147,11 @@ pub(crate) fn check_ops(raw: &[Value], engine: &Engine) -> Result<Vec<Op>, Vec<D
             Err(e) => diagnostics.push(Diagnostic::at(format!("ops[{i}]"), e.to_string())),
         }
     }
-    if diagnostics.is_empty() { Ok(ops) } else { Err(diagnostics) }
+    if diagnostics.is_empty() {
+        Ok(ops)
+    } else {
+        Err(diagnostics)
+    }
 }
 
 fn validate_op(i: usize, op: &Op, engine: &Engine, out: &mut Vec<Diagnostic>) {
@@ -149,7 +161,11 @@ fn validate_op(i: usize, op: &Op, engine: &Engine, out: &mut Vec<Diagnostic>) {
             require_name(out, at("from"), &ft.from);
             require_name(out, at("to"), &ft.to);
         }
-        Op::Drop(names) | Op::Keep(names) | Op::Trim(names) | Op::Lowercase(names) | Op::Uppercase(names) => {
+        Op::Drop(names)
+        | Op::Keep(names)
+        | Op::Trim(names)
+        | Op::Lowercase(names)
+        | Op::Uppercase(names) => {
             require_names(out, format!("ops[{i}]"), names);
         }
         Op::Set(set) => {
@@ -161,7 +177,10 @@ fn validate_op(i: usize, op: &Op, engine: &Engine, out: &mut Vec<Diagnostic>) {
             require_name(out, at("drop_if.field"), &d.field);
             let tests = [d.is.is_some(), d.equals.is_some(), d.not_equals.is_some()];
             if tests.iter().filter(|set| **set).count() != 1 {
-                out.push(Diagnostic::at(at("drop_if"), "set exactly one of `is`, `equals` or `not_equals`"));
+                out.push(Diagnostic::at(
+                    at("drop_if"),
+                    "set exactly one of `is`, `equals` or `not_equals`",
+                ));
             }
             for value in [&d.equals, &d.not_equals].into_iter().flatten() {
                 check_literal(out, at("drop_if"), value);
@@ -170,14 +189,20 @@ fn validate_op(i: usize, op: &Op, engine: &Engine, out: &mut Vec<Diagnostic>) {
         Op::Split(sep) | Op::Join(sep) => {
             require_name(out, at("field"), &sep.field);
             if sep.separator.is_empty() {
-                out.push(Diagnostic::at(at("separator"), "separator must not be empty"));
+                out.push(Diagnostic::at(
+                    at("separator"),
+                    "separator must not be empty",
+                ));
             }
         }
         Op::Promote(p) => require_name(out, at("field"), &p.field),
         Op::Round(r) => {
             require_name(out, at("field"), &r.field);
             if r.decimals > 15 {
-                out.push(Diagnostic::at(at("decimals"), "decimals must be between 0 and 15"));
+                out.push(Diagnostic::at(
+                    at("decimals"),
+                    "decimals must be between 0 and 15",
+                ));
             }
         }
         Op::Cast(c) => require_name(out, at("field"), &c.field),
@@ -217,10 +242,17 @@ fn check_expr(out: &mut Vec<Diagnostic>, path: String, expr: &str, engine: &Engi
 fn check_literal(out: &mut Vec<Diagnostic>, path: String, value: &Value) {
     match value {
         Value::Number(n) if n.is_u64() && n.as_i64().is_none() => {
-            out.push(Diagnostic::at(path, format!("{n} is too large; integers must fit in 64 bits")));
+            out.push(Diagnostic::at(
+                path,
+                format!("{n} is too large; integers must fit in 64 bits"),
+            ));
         }
-        Value::Array(items) => items.iter().for_each(|v| check_literal(out, path.clone(), v)),
-        Value::Object(map) => map.values().for_each(|v| check_literal(out, path.clone(), v)),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|v| check_literal(out, path.clone(), v)),
+        Value::Object(map) => map
+            .values()
+            .for_each(|v| check_literal(out, path.clone(), v)),
         _ => {}
     }
 }
@@ -266,7 +298,11 @@ mod tests {
     fn an_unknown_operation_names_its_index() {
         let diags = check(json!([{"drop": ["a"]}, {"explode": {}}])).unwrap_err();
         assert_eq!(paths(&diags), ["ops[1]"]);
-        assert!(diags[0].message.contains("unknown variant"), "{}", diags[0].message);
+        assert!(
+            diags[0].message.contains("unknown variant"),
+            "{}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -304,7 +340,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             paths(&diags),
-            ["ops[0].from", "ops[1]", "ops[2][1]", "ops[3].separator", "ops[4].decimals"]
+            [
+                "ops[0].from",
+                "ops[1]",
+                "ops[2][1]",
+                "ops[3].separator",
+                "ops[4].decimals"
+            ]
         );
     }
 
@@ -329,7 +371,8 @@ mod tests {
 
     #[test]
     fn an_integer_beyond_64_bits_is_reported() {
-        let diags = check(json!([{"default": {"field": "a", "value": 18446744073709551615u64}}])).unwrap_err();
+        let diags = check(json!([{"default": {"field": "a", "value": 18446744073709551615u64}}]))
+            .unwrap_err();
         assert_eq!(paths(&diags), ["ops[0].value"]);
     }
 }
