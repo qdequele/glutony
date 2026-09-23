@@ -194,11 +194,11 @@ output; any other result keeps it.
   plugin: document_script
   config:
     script: |
-      doc.fields.price = doc.fields.prix;     # rename
-      doc.fields.remove("prix");              # drop
+      doc.fields.price = doc.fields.prix;     // rename
+      doc.fields.remove("prix");              // drop
       doc.fields.total_ttc = doc.fields.price * doc.fields.qty * 1.2;
-      doc.title = doc.fields.name;            # promote into title
-      if doc.content.is_empty() { return false; }   # filter out
+      doc.title = doc.fields.name;            // promote into title
+      if doc.content.is_empty() { return false; }   // filter out
       true
     on_error: skip
 ```
@@ -239,7 +239,7 @@ per-document error, handled by `on_error`. In `filter`, the names `id`, `title` 
 `content` mean the document's own attributes; a missing field compares as `null`.
 
 Every operation is also a method on `doc` in a script — `doc.rename_field("prix", "price")`,
-`doc.drop_fields([..])`, `doc.field_is_empty("content")`, and so on — and a bare name
+`doc.drop_fields(["raw_html"])`, `doc.field_is_empty("content")`, and so on — and a bare name
 that is not a variable reads the field of that name (`price * qty`). A variable always
 wins over a field. `round(x, decimals)` takes the number of decimals.
 

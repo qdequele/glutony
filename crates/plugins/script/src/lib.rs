@@ -44,11 +44,12 @@
 //! operation budget (`max_ops`), a wall-clock budget (`timeout_ms`) and fixed caps on
 //! expression depth, call depth, string, array and map sizes.
 //!
-//! Configuration:
+//! Configuration — set exactly one of `script` or `ops`:
 //!
 //! | key | default | meaning |
 //! |---|---|---|
-//! | `script` | required | the rhai script, run once per document |
+//! | `script` | one of `script`/`ops` | the rhai script, run once per document |
+//! | `ops` | one of `script`/`ops` | builder operations (`rename`, `drop`, `set`, `filter`, …), compiled to rhai and applied in order |
 //! | `on_error` | `fail` | what a per-document error does: `fail`, `skip` or `keep` |
 //! | `max_ops` | `100000` | rhai operations one document may use |
 //! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
