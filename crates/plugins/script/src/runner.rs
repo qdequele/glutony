@@ -8,7 +8,7 @@ use meili_ingest_plugin_sdk::{Document, PluginError};
 use rhai::{AST, Dynamic, Engine, Map, Scope};
 
 use crate::NAME;
-use crate::config::Config;
+use crate::config::{Config, Source};
 use crate::convert::{from_scope_map, to_scope_map};
 use crate::resolver::install_field_resolver;
 
@@ -83,7 +83,11 @@ impl Runner {
             }
         });
 
-        let ast = engine.compile(&cfg.script).map_err(|e| {
+        let source = match &cfg.source {
+            Source::Script(script) => script.clone(),
+            Source::Ops(ops) => crate::codegen::generate(ops),
+        };
+        let ast = engine.compile(&source).map_err(|e| {
             PluginError::InvalidConfig(format!("{NAME}: script does not compile: {e}"))
         })?;
 

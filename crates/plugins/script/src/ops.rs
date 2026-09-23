@@ -127,7 +127,6 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
 /// Each operation is deserialized on its own so a problem names the operation it is in,
 /// and `set` expressions are compiled with `compile_expression`, which rejects
 /// statements, `let` and loops outright.
-#[allow(dead_code)] // Task 7 wires this into `Config`; only tests call it for now.
 pub(crate) fn check_ops(raw: &[Value], engine: &Engine) -> Result<Vec<Op>, Vec<Diagnostic>> {
     let mut ops = Vec::with_capacity(raw.len());
     let mut diagnostics = Vec::new();

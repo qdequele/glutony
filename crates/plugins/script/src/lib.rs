@@ -993,4 +993,50 @@ mod tests {
         let out = run(vec![with_fields(json!({"price": 4}))], json!({ "script": program })).await;
         assert_eq!(fields(&out[0]), json!({"t": 8}));
     }
+
+    #[tokio::test]
+    async fn ops_run_end_to_end() {
+        let docs = vec![
+            with_fields(json!({"prix": 10, "qty": 3, "status": "live"})),
+            with_fields(json!({"prix": 1, "qty": 1, "status": "draft"})),
+        ];
+        let out = run(
+            docs,
+            json!({"ops": [
+                {"rename": {"from": "prix", "to": "price"}},
+                {"set": {"field": "total", "expr": "price * qty"}},
+                {"filter": {"drop_if": {"field": "status", "equals": "draft"}}}
+            ]}),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(fields(&out[0]), json!({"price": 10, "qty": 3, "status": "live", "total": 30}));
+    }
+
+    #[tokio::test]
+    async fn an_empty_ops_list_passes_documents_through() {
+        let out = run(vec![with_fields(json!({"a": 1}))], json!({"ops": []})).await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn script_and_ops_together_is_a_config_error() {
+        let err = try_run(vec![doc("a", "x")], json!({"script": "1", "ops": []})).await.unwrap_err();
+        assert!(matches!(&err, PluginError::InvalidConfig(m) if m.contains("exactly one")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_script_over_64_kib_is_a_config_error() {
+        let big = format!("// {}\n1", "x".repeat(65536));
+        let err = try_run(vec![doc("a", "x")], json!({ "script": big })).await.unwrap_err();
+        assert!(matches!(&err, PluginError::InvalidConfig(m) if m.contains("65536")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_operation_names_its_index() {
+        let err = try_run(vec![doc("a", "x")], json!({"ops": [{"drop": ["a"]}, {"round": {"field": "p", "decimals": 99}}]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PluginError::InvalidConfig(m) if m.contains("ops[1].decimals")), "got {err:?}");
+    }
 }

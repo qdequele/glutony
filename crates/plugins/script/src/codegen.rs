@@ -12,7 +12,6 @@ use serde_json::{Number, Value};
 
 use crate::ops::{CastTarget, DropIf, Op, Presence, PromoteTarget};
 
-#[allow(dead_code)] // Task 7 wires this into `Config`; only tests call it for now.
 pub(crate) fn generate(ops: &[Op]) -> String {
     let mut out = String::new();
     for op in ops {
@@ -83,7 +82,6 @@ fn list(names: &[String]) -> String {
 /// A double-quoted rhai string. Every character outside printable ASCII, and `"` and
 /// `\`, is written as `\U` + 8 hex digits — rhai's only escape wide enough for any
 /// Unicode scalar (it has no `\u{..}` form). Double-quoted strings do not interpolate.
-#[allow(dead_code)] // Task 7 wires this into `Config`; only tests call it for now.
 pub(crate) fn string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -100,7 +98,6 @@ pub(crate) fn string_literal(s: &str) -> String {
 
 /// A rhai literal for a JSON value: `()`, booleans, integers, floats, strings, arrays
 /// and `#{ "key": value }` maps.
-#[allow(dead_code)] // Task 7 wires this into `Config`; only tests call it for now.
 pub(crate) fn value_literal(v: &Value) -> String {
     match v {
         Value::Null => "()".into(),
