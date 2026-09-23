@@ -170,7 +170,8 @@ the document out. Accepts `documents` and `many`. Queue: `workers-general`.
 
 | Key | Default | Description |
 |---|---|---|
-| `script` | *required* | The script, run once per document. |
+| `script` | *one of `script`/`ops` required* | The script, run once per document. |
+| `ops` | *one of `script`/`ops` required* | Builder operations, applied in order — see below. |
 | `on_error` | `"fail"` | What a per-document error does: `fail` the step, `skip` that document, or `keep` it untouched. |
 | `max_ops` | `100000` | Rhai operations one document may use before the script is aborted. |
 | `timeout_ms` | `1000` | Wall-clock milliseconds one document may use before the script is aborted. |
