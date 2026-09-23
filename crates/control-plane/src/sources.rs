@@ -344,7 +344,21 @@ impl SourceRepo {
             .bind(new.fetch_auth.as_deref())
             .bind(&new.schedule_id)
             .fetch_one(&self.pool)
-            .await?;
+            .await
+            .map_err(|e| {
+                let duplicate = matches!(
+                    &e,
+                    sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
+                );
+                if duplicate {
+                    CpError::Validation(format!(
+                        "a source named {:?} already exists in this project",
+                        new.uid
+                    ))
+                } else {
+                    CpError::Db(e)
+                }
+            })?;
         Ok(SourceRecord::from(row))
     }
 
@@ -517,6 +531,201 @@ impl SourceRepo {
         .await?;
         rows.into_iter().map(RunRecord::try_from).collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// `/internal/sources` handlers.
+//
+// Two families: the gateway addresses a source by uid within a tenant; the worker
+// addresses it by id, because that is what a Temporal Schedule's frozen payload
+// carries. The id routes live under their own prefix so a source *named* `by-id` can
+// never collide with them.
+// ---------------------------------------------------------------------------
+
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+
+use crate::{AppState, JsonBody, project_scope};
+
+/// Query of `GET /internal/sources`.
+#[derive(Debug, Default, Deserialize)]
+pub struct SourceListQuery {
+    /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Include archived sources (their pipeline was deleted).
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// Query of the uid routes.
+#[derive(Debug, Default, Deserialize)]
+pub struct SourceScopeQuery {
+    /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Query of `GET /internal/sources-by-id/{id}/runs`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RunsQuery {
+    /// Maximum runs returned, newest first. Clamped to 1..=500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Body of `PUT /internal/sources-by-id/{id}/paused`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct PausedBody {
+    /// New paused flag.
+    pub paused: bool,
+}
+
+fn repo(state: &AppState) -> SourceRepo {
+    SourceRepo::new(state.pool.clone())
+}
+
+fn uid_not_found(uid: &str, project_id: Option<&str>) -> CpError {
+    CpError::NotFound(format!(
+        "source {uid:?} not found (project_id={project_id:?})"
+    ))
+}
+
+fn id_not_found(id: Uuid) -> CpError {
+    CpError::NotFound(format!("source {id} not found or archived"))
+}
+
+/// `GET /internal/sources?project_id=&include_archived=`.
+pub async fn list_sources(
+    State(state): State<AppState>,
+    Query(q): Query<SourceListQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SourceRecord>>, CpError> {
+    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    Ok(Json(
+        repo(&state)
+            .list(project_id.as_deref(), q.include_archived)
+            .await?,
+    ))
+}
+
+/// `POST /internal/sources` body [`NewSource`] → 201 [`SourceRecord`], created paused.
+pub async fn create_source(
+    State(state): State<AppState>,
+    JsonBody(new): JsonBody<NewSource>,
+) -> Result<Response, CpError> {
+    let stored = repo(&state).insert(&new).await?;
+    tracing::info!(
+        uid = %stored.definition.uid,
+        project_id = ?stored.definition.project_id,
+        "source created"
+    );
+    Ok((StatusCode::CREATED, Json(stored)).into_response())
+}
+
+/// `GET /internal/sources/{uid}?project_id=`.
+pub async fn get_source(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<SourceScopeQuery>,
+    headers: HeaderMap,
+) -> Result<Json<SourceRecord>, CpError> {
+    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    repo(&state)
+        .get(&uid, project_id.as_deref())
+        .await?
+        .map(Json)
+        .ok_or_else(|| uid_not_found(&uid, project_id.as_deref()))
+}
+
+/// `PATCH /internal/sources/{uid}?project_id=` body [`SourcePatch`].
+pub async fn patch_source(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<SourceScopeQuery>,
+    headers: HeaderMap,
+    JsonBody(patch): JsonBody<SourcePatch>,
+) -> Result<Json<SourceRecord>, CpError> {
+    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    repo(&state)
+        .update(&uid, project_id.as_deref(), &patch)
+        .await?
+        .map(Json)
+        .ok_or_else(|| uid_not_found(&uid, project_id.as_deref()))
+}
+
+/// `DELETE /internal/sources/{uid}?project_id=` → 204; its runs cascade.
+pub async fn delete_source(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<SourceScopeQuery>,
+    headers: HeaderMap,
+) -> Result<StatusCode, CpError> {
+    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    if repo(&state).delete(&uid, project_id.as_deref()).await? {
+        tracing::info!(uid = %uid, project_id = ?project_id, "source deleted");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(uid_not_found(&uid, project_id.as_deref()))
+    }
+}
+
+/// `GET /internal/sources-by-id/{id}` — load for a run. Archived sources are 404.
+pub async fn load_source_for_run(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SourceRecord>, CpError> {
+    repo(&state)
+        .load_for_run(id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| id_not_found(id))
+}
+
+/// `PUT /internal/sources-by-id/{id}/state` body [`IncrementalState`] → 204.
+pub async fn save_source_state(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    JsonBody(incremental): JsonBody<IncrementalState>,
+) -> Result<StatusCode, CpError> {
+    repo(&state).save_state(id, &incremental).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /internal/sources-by-id/{id}/paused` body [`PausedBody`] → 204, or 404.
+pub async fn set_source_paused(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    JsonBody(body): JsonBody<PausedBody>,
+) -> Result<StatusCode, CpError> {
+    if repo(&state).set_paused(id, body.paused).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(CpError::NotFound(format!("source {id} not found")))
+    }
+}
+
+/// `GET /internal/sources-by-id/{id}/runs?limit=` → newest first.
+pub async fn list_source_runs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<RunsQuery>,
+) -> Result<Json<Vec<RunRecord>>, CpError> {
+    Ok(Json(
+        repo(&state).list_runs(id, q.limit.unwrap_or(50)).await?,
+    ))
+}
+
+/// `POST /internal/source-runs` body [`RunRecord`] → 201. Idempotent on `run_id`, so a
+/// retried activity can record the same run twice safely.
+pub async fn record_source_run(
+    State(state): State<AppState>,
+    JsonBody(run): JsonBody<RunRecord>,
+) -> Result<Response, CpError> {
+    let stored = repo(&state).record_run(&run).await?;
+    Ok((StatusCode::CREATED, Json(stored)).into_response())
 }
 
 #[cfg(test)]
