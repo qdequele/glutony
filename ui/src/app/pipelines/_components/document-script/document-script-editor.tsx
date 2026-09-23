@@ -77,6 +77,7 @@ export function DocumentScriptEditor({
   }
 
   function applyEntry(entry: ReferenceEntry) {
+    if (readOnly) return;
     if (mode === "builder") {
       if (entry.op) onChange(writeOps(config, addOp(readOps(config), entry.op)));
     } else {
@@ -145,7 +146,7 @@ export function DocumentScriptEditor({
           {state === "invalid" ? `${diagnostics.length} ${diagnostics.length === 1 ? "error" : "errors"}` : null}
         </span>
         <div className="ml-auto flex items-center gap-1">
-          <ReferenceButton mode={mode} onUse={applyEntry} />
+          <ReferenceButton mode={mode} onUse={applyEntry} readOnly={readOnly} />
           <Button type="button" variant="ghost" size="xs" onClick={() => setExpanded(true)}>
             <Maximize2 /> Expand
           </Button>
@@ -166,7 +167,7 @@ export function DocumentScriptEditor({
         body(false)
       )}
 
-      <ExpandedEditor open={expanded} onOpenChange={setExpanded} mode={mode} onUse={applyEntry}>
+      <ExpandedEditor open={expanded} onOpenChange={setExpanded} mode={mode} onUse={applyEntry} readOnly={readOnly}>
         {body(true)}
       </ExpandedEditor>
 
@@ -199,7 +200,15 @@ export function DocumentScriptEditor({
   );
 }
 
-function ReferenceButton({ mode, onUse }: { mode: ScriptMode; onUse: (entry: ReferenceEntry) => void }) {
+function ReferenceButton({
+  mode,
+  onUse,
+  readOnly,
+}: {
+  mode: ScriptMode;
+  onUse: (entry: ReferenceEntry) => void;
+  readOnly: boolean;
+}) {
   return (
     <Sheet>
       <SheetTrigger asChild>
@@ -211,11 +220,15 @@ function ReferenceButton({ mode, onUse }: { mode: ScriptMode; onUse: (entry: Ref
         <SheetHeader>
           <SheetTitle>Reference</SheetTitle>
           <SheetDescription>
-            {mode === "code" ? "Insert a snippet at the cursor." : "Add an operation to the builder."}
+            {readOnly
+              ? "Read-only pipeline — browse only."
+              : mode === "code"
+                ? "Insert a snippet at the cursor."
+                : "Add an operation to the builder."}
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 px-4 pb-4">
-          <ScriptReference mode={mode} onUse={onUse} />
+          <ScriptReference mode={mode} onUse={onUse} readOnly={readOnly} />
         </div>
       </SheetContent>
     </Sheet>
@@ -227,12 +240,14 @@ function ExpandedEditor({
   onOpenChange,
   mode,
   onUse,
+  readOnly,
   children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   mode: ScriptMode;
   onUse: (entry: ReferenceEntry) => void;
+  readOnly: boolean;
   children: ReactNode;
 }) {
   return (
@@ -245,7 +260,7 @@ function ExpandedEditor({
         <div className="grid min-h-0 flex-1 gap-4 md:grid-cols-[minmax(0,1fr)_22rem]">
           <div className="min-h-0 overflow-auto">{children}</div>
           <div className="min-h-0 border-t pt-4 md:border-t-0 md:border-l md:pt-0 md:pl-4">
-            <ScriptReference mode={mode} onUse={onUse} />
+            <ScriptReference mode={mode} onUse={onUse} readOnly={readOnly} />
           </div>
         </div>
       </DialogContent>

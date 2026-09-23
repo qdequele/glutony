@@ -15,7 +15,15 @@ import {
   type ReferenceEntry,
 } from "./reference";
 
-export function ScriptReference({ mode, onUse }: { mode: ScriptMode; onUse: (entry: ReferenceEntry) => void }) {
+export function ScriptReference({
+  mode,
+  onUse,
+  readOnly = false,
+}: {
+  mode: ScriptMode;
+  onUse: (entry: ReferenceEntry) => void;
+  readOnly?: boolean;
+}) {
   const [query, setQuery] = useState("");
   const entries = filterEntries(REFERENCE.entries, query);
 
@@ -38,7 +46,7 @@ export function ScriptReference({ mode, onUse }: { mode: ScriptMode; onUse: (ent
                   {REFERENCE_GROUP_LABELS[group]}
                 </h3>
                 {inGroup.map((entry) => {
-                  const usable = mode === "code" || entry.op !== null;
+                  const usable = !readOnly && (mode === "code" || entry.op !== null);
                   return (
                     <article key={entry.id} className="space-y-1.5 rounded-md border p-2.5">
                       <div className="flex items-start justify-between gap-2">
@@ -51,7 +59,7 @@ export function ScriptReference({ mode, onUse }: { mode: ScriptMode; onUse: (ent
                           size="xs"
                           variant="outline"
                           disabled={!usable}
-                          title={usable ? undefined : "Code mode only"}
+                          title={readOnly ? "Read-only step" : usable ? undefined : "Code mode only"}
                           onClick={() => onUse(entry)}
                         >
                           {mode === "code" ? "Insert" : "Add"}

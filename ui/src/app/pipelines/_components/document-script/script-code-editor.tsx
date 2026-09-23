@@ -65,11 +65,16 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorHandle, ScriptCodeEdi
     const host = useRef<HTMLDivElement>(null);
     const view = useRef<EditorView | null>(null);
     const onChangeRef = useRef(onChange);
+    const readOnlyRef = useRef(readOnly);
     const readOnlySlot = useRef(new Compartment());
 
     useEffect(() => {
       onChangeRef.current = onChange;
     }, [onChange]);
+
+    useEffect(() => {
+      readOnlyRef.current = readOnly;
+    }, [readOnly]);
 
     useEffect(() => {
       if (!host.current) return;
@@ -131,7 +136,7 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorHandle, ScriptCodeEdi
     useImperativeHandle(ref, () => ({
       insert(text: string) {
         const editor = view.current;
-        if (!editor) return;
+        if (!editor || readOnlyRef.current) return;
         const { from } = editor.state.selection.main;
         const atLineStart = from === editor.state.doc.lineAt(from).from;
         editor.dispatch(editor.state.replaceSelection(`${atLineStart ? "" : "\n"}${text}\n`));
