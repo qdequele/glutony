@@ -27,6 +27,7 @@ import { ScriptCodeEditor, type ScriptCodeEditorHandle } from "./script-code-edi
 import { ScriptReference } from "./script-reference";
 
 type Confirm = "to-builder" | "to-code-empty" | null;
+type ConfirmKind = Exclude<Confirm, null>;
 
 export function DocumentScriptEditor({
   stepId,
@@ -40,6 +41,11 @@ export function DocumentScriptEditor({
   const mode = deriveMode(config);
   const [switching, setSwitching] = useState(false);
   const [confirm, setConfirm] = useState<Confirm>(null);
+  // The dialog's copy and action: kept separate from `confirm` (which only tracks
+  // open/closed) so the last message stays on screen — instead of flipping to the
+  // other kind's text — while Radix's exit animation keeps the content mounted
+  // after `confirm` has already gone back to `null`.
+  const [confirmKind, setConfirmKind] = useState<ConfirmKind>("to-builder");
   const [expanded, setExpanded] = useState(false);
   const codeRef = useRef<ScriptCodeEditorHandle>(null);
 
@@ -58,6 +64,7 @@ export function DocumentScriptEditor({
   async function switchTo(next: ScriptMode) {
     if (next === mode || readOnly || switching) return;
     if (next === "builder") {
+      setConfirmKind("to-builder");
       setConfirm("to-builder");
       return;
     }
@@ -69,7 +76,10 @@ export function DocumentScriptEditor({
       // builder, or to another config field): a stale result must never overwrite
       // whatever the user has since typed.
       if (JSON.stringify(latest.current.ops) !== JSON.stringify(requested)) return;
-      if (script === undefined) setConfirm("to-code-empty");
+      if (script === undefined) {
+        setConfirmKind("to-code-empty");
+        setConfirm("to-code-empty");
+      }
       else onChange(toCode(latest.current, script));
     } finally {
       setSwitching(false);
@@ -174,9 +184,9 @@ export function DocumentScriptEditor({
       <Dialog open={confirm !== null} onOpenChange={(open) => (open ? null : setConfirm(null))}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{confirm === "to-builder" ? "Discard the script?" : "Start with an empty script?"}</DialogTitle>
+            <DialogTitle>{confirmKind === "to-builder" ? "Discard the script?" : "Start with an empty script?"}</DialogTitle>
             <DialogDescription>
-              {confirm === "to-builder"
+              {confirmKind === "to-builder"
                 ? `This discards your script (${lineCount(config.script)} lines). The builder can't read free-form code.`
                 : "The script for these operations couldn't be generated right now. Code mode would start empty and your operations would be discarded."}
             </DialogDescription>
@@ -187,7 +197,7 @@ export function DocumentScriptEditor({
               type="button"
               variant="destructive"
               onClick={() => {
-                onChange(confirm === "to-builder" ? toBuilder(config) : toCode(config, ""));
+                onChange(confirmKind === "to-builder" ? toBuilder(config) : toCode(config, ""));
                 setConfirm(null);
               }}
             >
