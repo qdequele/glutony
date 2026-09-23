@@ -162,6 +162,68 @@ Accepts `documents` and `many`.
 | `overlap` | `64` | Characters shared between consecutive chunks. |
 | `min_chunk_size` | `32` | Trailing fragments shorter than this are merged into the previous chunk. |
 
+### `document_script`
+
+Runs a sandboxed [rhai](https://rhai.rs) script once per document: rename fields,
+drop them, compute new ones, promote a field into `title` or `content`, or filter
+the document out. Accepts `documents` and `many`. Queue: `workers-general`.
+
+| Key | Default | Description |
+|---|---|---|
+| `script` | *required* | The script, run once per document. |
+| `on_error` | `"fail"` | What a per-document error does: `fail` the step, `skip` that document, or `keep` it untouched. |
+| `max_ops` | `100000` | Rhai operations one document may use before the script is aborted. |
+| `timeout_ms` | `1000` | Wall-clock milliseconds one document may use before the script is aborted. |
+
+The document is bound as `doc`:
+
+| Binding | Type | Writable |
+|---|---|---|
+| `doc.id` | string | yes — re-sanitised afterwards to stay Meilisearch-safe |
+| `doc.title` | string or `()` | yes — set it to `()` to clear the title |
+| `doc.content` | string | yes |
+| `doc.fields` | map | yes |
+| `doc.meta` | map | no — readable, but writes are discarded |
+
+The script mutates `doc` in place. Returning `false` drops the document from the
+output; any other result keeps it.
+
+```yaml
+- id: shape
+  plugin: document_script
+  config:
+    script: |
+      doc.fields.price = doc.fields.prix;     # rename
+      doc.fields.remove("prix");              # drop
+      doc.fields.total_ttc = doc.fields.price * doc.fields.qty * 1.2;
+      doc.title = doc.fields.name;            # promote into title
+      if doc.content.is_empty() { return false; }   # filter out
+      true
+    on_error: skip
+```
+
+<Warning>
+  Rhai's string methods such as `trim()`, `to_upper()` and `pad()` take `&mut self`
+  and return `()` — they edit the string in place rather than returning a copy. So
+  `doc.content.trim() == ""` is always `false`. Write `doc.content.trim();` as its
+  own statement, then test `doc.content.is_empty()`.
+</Warning>
+
+A script that does not compile fails the step immediately with a config error,
+before any document is touched, whatever `on_error` says. A script that exceeds
+`max_ops` or `timeout_ms` is aborted and treated as a per-document error.
+
+Float arithmetic that produces NaN or an infinity is also a per-document error.
+Rhai does not raise on `x / 0.0` the way it does on integer division by zero, and
+JSON has no way to spell those values — without the check they would be indexed as
+`null` and the job would report success.
+
+**Sandbox.** Pipeline configs are tenant-authored, so the engine is built with
+`no_module` (no `import`/`export`), `no_custom_syntax` and `no_time`; rhai has no
+file, network or process API, so a script can only reach `doc`. Every run is
+additionally bounded by the operation and wall-clock budgets above, and by fixed
+caps on expression depth, call depth, and string, array and map sizes.
+
 ### `llm_enricher`
 
 Calls an OpenAI-compatible `/chat/completions` endpoint with

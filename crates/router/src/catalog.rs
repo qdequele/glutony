@@ -10,7 +10,7 @@
 use meili_ingest_plugin_sdk::{InputKind, OutputKind, PipelineDefinition};
 use serde::{Deserialize, Serialize};
 
-/// Every plugin name the catalog is expected to describe: the 17 compiled into
+/// Every plugin name the catalog is expected to describe: the 18 compiled into
 /// the worker plus the 2 provided by external gRPC containers. Kept here rather
 /// than imported because `meili-ingest-control-plane` depends on this crate, not
 /// the other way round; a test in Task 2 asserts the two lists agree.
@@ -28,6 +28,7 @@ pub const ALL_KNOWN_PLUGINS: &[&str] = &[
     "parquet_parser",
     "video_audio_extractor",
     "chunker",
+    "document_script",
     "llm_enricher",
     "image_captioner",
     "whisper_transcriber",
@@ -295,6 +296,19 @@ fn actions() -> Vec<ActionEntry> {
             ],
             "\n- id: chunk\n  plugin: chunker\n  config:\n    strategy: sentence\n    chunk_size: 512\n    overlap: 64\n",
             (&[I::Documents], OutputKind::Documents),
+        ),
+        action(
+            "document_script",
+            "Document script",
+            Transform,
+            "Reshape every document with a sandboxed script: rename fields, drop them, compute new ones, or filter the document out.",
+            &[
+                "Rename incoming columns onto the field names your index already uses",
+                "Compute a total, a margin or a slug from fields the source does not carry",
+                "Drop internal columns and filter out empty records before indexing",
+            ],
+            "\n- id: shape\n  plugin: document_script\n  config:\n    script: |\n      doc.fields.price = doc.fields.prix;\n      doc.fields.remove(\"prix\");\n      doc.fields.total_ttc = doc.fields.price * doc.fields.qty * 1.2;\n      if doc.content.is_empty() { return false; }\n      true\n    on_error: fail\n",
+            (&[I::Documents, I::Many], OutputKind::Documents),
         ),
         action(
             "llm_enricher",

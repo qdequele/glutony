@@ -61,6 +61,9 @@ impl PluginRegistry {
         ));
         reg.register(Arc::new(meili_ingest_plugin_chunker::ChunkerPlugin::new()));
         reg.register(Arc::new(
+            meili_ingest_plugin_script::DocumentScriptPlugin::new(),
+        ));
+        reg.register(Arc::new(
             meili_ingest_plugin_meili_indexer::MeiliIndexerPlugin::new(),
         ));
         reg.register(Arc::new(
@@ -214,6 +217,7 @@ mod tests {
             "avro_parser",
             "parquet_parser",
             "chunker",
+            "document_script",
             "meili_indexer",
             "pptx_extractor",
             "video_audio_extractor",

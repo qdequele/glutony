@@ -28,6 +28,7 @@ meili-ingest-plugin-msgpack.workspace = true
 meili-ingest-plugin-avro.workspace = true
 meili-ingest-plugin-parquet.workspace = true
 meili-ingest-plugin-chunker.workspace = true
+meili-ingest-plugin-script.workspace = true
 meili-ingest-plugin-meili-indexer.workspace = true
 meili-ingest-plugin-llm-enricher.workspace = true
 meili-ingest-plugin-image-captioner.workspace = true
