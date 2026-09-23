@@ -13,6 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 
 import type { ConfigEditorProps } from "../config-editors";
@@ -20,9 +21,10 @@ import { configDiagnostics, scriptDiagnostics, stepCheckState } from "./diagnost
 import { generateScript } from "./generate-script";
 import { deriveMode, lineCount, needsInitialOps, toBuilder, toCode, withInitialOps, type ScriptMode } from "./mode";
 import { OpsBuilder } from "./ops-builder";
+import type { ReferenceEntry } from "./reference";
 import { addOp, readOps, writeOps } from "./rows";
 import { ScriptCodeEditor, type ScriptCodeEditorHandle } from "./script-code-editor";
-import type { ReferenceEntry } from "./reference";
+import { ScriptReference } from "./script-reference";
 
 type Confirm = "to-builder" | "to-code-empty" | null;
 
@@ -197,32 +199,55 @@ export function DocumentScriptEditor({
   );
 }
 
-/** Temporary stand-in: Task 18 replaces this with the real reference sheet. */
 function ReferenceButton({ mode, onUse }: { mode: ScriptMode; onUse: (entry: ReferenceEntry) => void }) {
-  void mode;
-  void onUse;
   return (
-    <Button type="button" variant="ghost" size="xs" disabled>
-      <BookOpen /> Reference
-    </Button>
+    <Sheet>
+      <SheetTrigger asChild>
+        <Button type="button" variant="ghost" size="xs">
+          <BookOpen /> Reference
+        </Button>
+      </SheetTrigger>
+      <SheetContent side="right" className="flex w-full flex-col sm:max-w-md">
+        <SheetHeader>
+          <SheetTitle>Reference</SheetTitle>
+          <SheetDescription>
+            {mode === "code" ? "Insert a snippet at the cursor." : "Add an operation to the builder."}
+          </SheetDescription>
+        </SheetHeader>
+        <div className="min-h-0 flex-1 px-4 pb-4">
+          <ScriptReference mode={mode} onUse={onUse} />
+        </div>
+      </SheetContent>
+    </Sheet>
   );
 }
 
-/** Temporary stand-in: Task 18 replaces this with the real expanded dialog. */
-function ExpandedEditor(props: {
+function ExpandedEditor({
+  open,
+  onOpenChange,
+  mode,
+  onUse,
+  children,
+}: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   mode: ScriptMode;
   onUse: (entry: ReferenceEntry) => void;
   children: ReactNode;
 }) {
-  void props.mode;
-  void props.onUse;
   return (
-    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[90vh] max-w-[min(1200px,95vw)] flex-col sm:max-w-[min(1200px,95vw)]">
-        <DialogHeader><DialogTitle>Document script</DialogTitle></DialogHeader>
-        <div className="min-h-0 flex-1 overflow-auto">{props.children}</div>
+        <DialogHeader>
+          <DialogTitle>Document script</DialogTitle>
+          <DialogDescription>{mode === "code" ? "Code mode" : "Builder mode"}</DialogDescription>
+        </DialogHeader>
+        <div className="grid min-h-0 flex-1 gap-4 md:grid-cols-[minmax(0,1fr)_22rem]">
+          <div className="min-h-0 overflow-auto">{children}</div>
+          <div className="min-h-0 border-t pt-4 md:border-t-0 md:border-l md:pt-0 md:pl-4">
+            <ScriptReference mode={mode} onUse={onUse} />
+          </div>
+        </div>
       </DialogContent>
     </Dialog>
   );
