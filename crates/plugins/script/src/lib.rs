@@ -55,9 +55,13 @@
 
 mod config;
 mod convert;
+mod diagnostic;
 mod helpers;
+mod ops;
 mod resolver;
 mod runner;
+
+pub use diagnostic::Diagnostic;
 
 use meili_ingest_plugin_sdk::prelude::*;
 
