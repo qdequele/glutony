@@ -377,11 +377,11 @@ paths:
           description: |
             Invalid pipeline (unknown plugin, cycle, duplicate step, unsupported
             `fan_out`). A step whose config its plugin rejects returns
-            `invalid_step_config` with `diagnostics` (see `StepConfigError`).
+            `invalid_step_config` with `diagnostics`.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/StepConfigError"
               example: { "error": "step \"enrich\" references unknown plugin \"llm_enrichr\"", "code": "invalid_pipeline" }
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
