@@ -3,8 +3,9 @@
 //! Each operation calls a helper from [`crate::helpers`]. The only config data that
 //! reaches the source goes through [`string_literal`] / [`value_literal`], so no field
 //! name or value can be parsed as code. A `set` expression is the one place authored
-//! code appears: it was compiled on its own by [`crate::ops::check_ops`], and it sits on
-//! its own lines so a trailing `//` comment cannot swallow the closing parenthesis.
+//! code appears: [`crate::ops::check_ops`] compiled it both on its own and in the exact
+//! [`wrap_expr`] form emitted here, and it sits on its own lines so a trailing `//`
+//! comment cannot swallow the closing parenthesis (nor, being complete, can a `/*`).
 
 use std::fmt::Write as _;
 
@@ -20,6 +21,12 @@ pub(crate) fn generate(ops: &[Op]) -> String {
     out
 }
 
+/// How a `set` expression appears in the generated program. `check_ops` compiles this
+/// exact form, so keep the two in lockstep through this one function.
+pub(crate) fn wrap_expr(expr: &str) -> String {
+    format!("(\n{expr}\n)")
+}
+
 fn emit(out: &mut String, op: &Op) {
     let s = string_literal;
     let line = match op {
@@ -27,7 +34,7 @@ fn emit(out: &mut String, op: &Op) {
         Op::Drop(names) => format!("doc.drop_fields({});", list(names)),
         Op::Keep(names) => format!("doc.keep_fields({});", list(names)),
         Op::Copy(ft) => format!("doc.copy_field({}, {});", s(&ft.from), s(&ft.to)),
-        Op::Set(set) => format!("doc.fields[{}] = (\n{}\n);", s(&set.field), set.expr),
+        Op::Set(set) => format!("doc.fields[{}] = {};", s(&set.field), wrap_expr(&set.expr)),
         Op::Filter(filter) => format!("if {} {{ return false; }}", condition(&filter.drop_if)),
         Op::Trim(names) => format!("doc.trim_fields({});", list(names)),
         Op::Lowercase(names) => format!("doc.lowercase_fields({});", list(names)),

@@ -4,6 +4,7 @@ use rhai::Engine;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::codegen::wrap_expr;
 use crate::diagnostic::Diagnostic;
 
 /// One operation. Serialized as a single-key map: `{ "rename": { "from": .., "to": .. } }`.
@@ -235,6 +236,18 @@ fn check_expr(out: &mut Vec<Diagnostic>, path: String, expr: &str, engine: &Engi
     }
     if let Err(e) = engine.compile_expression(expr) {
         out.push(Diagnostic::from_parse_error(path, &e));
+        return;
+    }
+    // Codegen emits the expression as `(\n{expr}\n)` (see `wrap_expr`). rhai accepts
+    // an unterminated `/*` at end of input, so `1 /*` compiles alone but would swallow
+    // the closing `);` and every following line up to a later `*/` — which another
+    // op's field name could supply. Compile the exact emitted form so the expression
+    // must be complete. `check_config` still compiles the whole program afterwards.
+    if engine.compile_expression(wrap_expr(expr)).is_err() {
+        out.push(Diagnostic::at(
+            path,
+            "expression must be complete (unterminated comment or string?)",
+        ));
     }
 }
 
@@ -360,6 +373,22 @@ mod tests {
         ]))
         .unwrap_err();
         assert_eq!(paths(&diags), ["ops[0].expr", "ops[1].expr", "ops[2].expr"]);
+    }
+
+    #[test]
+    fn an_unterminated_comment_in_an_expression_is_rejected() {
+        let diags = check(json!([{"set": {"field": "t", "expr": "1 /*"}}])).unwrap_err();
+        assert_eq!(paths(&diags), ["ops[0].expr"]);
+        assert!(
+            diags[0].message.contains("must be complete"),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_string_in_an_expression_is_rejected() {
+        let diags = check(json!([{"set": {"field": "t", "expr": "`abc"}}])).unwrap_err();
+        assert_eq!(paths(&diags), ["ops[0].expr"]);
     }
 
     #[test]

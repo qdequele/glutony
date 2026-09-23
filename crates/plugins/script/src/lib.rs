@@ -1124,6 +1124,40 @@ mod tests {
         );
     }
 
+    /// A trailing `/*` in a `set` expression must not be able to swallow the generated
+    /// `);` and let a later op's field name smuggle statements into the program. The
+    /// second payload has no quotes, so the generated program would compile and run.
+    #[tokio::test]
+    async fn an_unterminated_comment_cannot_inject_code_through_a_later_op() {
+        for payload in [
+            r#"*/ ); doc.fields["pwned"] = 42; //"#,
+            "*/ ); doc.fields.pwned = 42; //",
+        ] {
+            let config = json!({"ops": [
+                {"set": {"field": "t", "expr": "1 /*"}},
+                {"rename": {"from": payload, "to": "x"}}
+            ]});
+
+            let checked = check_config(&config);
+            assert_eq!(
+                checked
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["ops[0].expr"],
+                "{payload}: got {checked:?}"
+            );
+            assert_eq!(checked.generated_script, None);
+
+            let result = try_run(vec![with_fields(json!({"a": 1}))], config).await;
+            assert!(
+                matches!(&result, Err(PluginError::InvalidConfig(m)) if m.contains("ops[0].expr")),
+                "{payload}: got {result:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_bad_operation_names_its_index() {
         let err = try_run(
