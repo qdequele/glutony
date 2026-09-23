@@ -1,0 +1,111 @@
+---
+title: Meilisearch connections
+description: Name a Meilisearch destination once and pin pipelines to it
+---
+
+By default a pipeline writes to whichever Meilisearch the **request** names: the
+`X-Meili-Host` / `X-Meili-Api-Key` headers, a bearer key, or the gateway's
+`MEILI_URL` fallback (see [multi-tenancy](/concepts/multi-tenancy)). That is
+the right default for a multi-tenant ingest service.
+
+Some pipelines should instead always write to one place: a nightly
+[source](/concepts/sources) has no request at all, and a shared pipeline may
+feed a fixed production index. For those, create a **connection** (a named
+host plus API key) and reference it from the pipeline's `meili_indexer` step.
+
+## Creating a connection
+
+```bash
+curl -X POST $INGEST/connections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "uid": "prod",
+    "name": "Production cluster",
+    "host": "https://ms-1234.meilisearch.io",
+    "api_key": "<a key with documents.add and indexes.create>"
+  }'
+```
+
+Before storing anything, the gateway:
+
+1. checks `host` against the deployment's `MEILI_CONNECTION_HOSTS` policy;
+2. calls `GET {host}/health`;
+3. calls `GET {host}/indexes?limit=1` with the key.
+
+A wrong URL or key is therefore a `422` at save time, not a failed ingest at
+3 a.m. The same checks run on a `PATCH` that changes `host` or `api_key`.
+
+The key is sealed with `SOURCE_SECRET_KEY` and never returned: reads show
+`"api_key": "****"`. `GET /connections/{uid}` also lists `used_by`, the
+pipelines whose indexer step names it.
+
+| Route | |
+|---|---|
+| `GET /connections` | List. |
+| `POST /connections` | Create (validated as above). |
+| `GET /connections/{uid}` | One connection, with `used_by`. |
+| `PATCH /connections/{uid}` | Change `name`, `host` or `api_key`. Omit `api_key` to keep it. |
+| `DELETE /connections/{uid}` | Delete. Never blocked. |
+
+## Pinning a pipeline
+
+```yaml
+- id: index
+  plugin: meili_indexer
+  config:
+    connection: prod           # host and api_key come from the connection
+    index: movies              # optional: pins the index too
+    batch_size: 1000           # max documents per request
+    max_batch_bytes: 52428800  # max request body, default 50 MiB
+```
+
+When `connection` is set it **always wins** over the request's host and key.
+A step without `connection` behaves exactly as before.
+
+A pipeline whose every `meili_indexer` step names a connection is **pinned**:
+
+- `POST /ingest` and `POST /ingest/pipeline/{name}` accept it without any
+  `X-Meili-*` headers or bearer key;
+- it can be used by a [source](/concepts/sources).
+
+### Index resolution
+
+With a connection, the index is the first of: the step's `index`, the
+pipeline trigger's `index_pattern`, the request's index (or a source's
+`index`), `DEFAULT_INDEX`.
+
+### Batching
+
+`batch_size` caps documents per request. `max_batch_bytes` caps the serialized
+size, which is what Meilisearch actually limits (`http_payload_size_limit`,
+100 MB by default). A batch is cut at whichever limit is reached first. One
+document larger than `max_batch_bytes` fails the step without retrying, naming
+the document, rather than looping on `413`.
+
+## Security
+
+- The key is decrypted only inside the indexer activity, just before the
+  plugin runs. The workflow carries the connection's **name**, so the key is
+  never written to Temporal history.
+- The host is re-checked against `MEILI_CONNECTION_HOSTS` at every run, so
+  tightening the policy takes effect immediately.
+- Connections are tenant-scoped like pipelines: a project sees its own
+  connections first, then global ones, and can only modify its own.
+
+`MEILI_CONNECTION_HOSTS` controls where connections may point:
+
+| Value | Accepts |
+|---|---|
+| unset / `public` | `https`, and only hosts whose every resolved address is public |
+| `any` | any `http`/`https` host |
+| `meilisearch:7700,meili.internal` | exactly those hosts (`http` or `https`); an entry without a port matches any port |
+
+The default is safe for a multi-tenant deployment. A self-hosted deployment
+writing to Meilisearch on a private network lists that host; the dev
+`compose.yaml` sets `MEILI_CONNECTION_HOSTS=meilisearch:7700`.
+
+## Deleting
+
+Deleting a connection is never blocked. Pipelines that still name it fail at
+run time with `connection "<uid>" not found` until they are pointed elsewhere.
+Nothing is archived. The pipeline editor flags the dangling reference.

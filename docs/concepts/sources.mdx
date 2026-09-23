@@ -1,0 +1,279 @@
+---
+title: Sources
+description: Fetch content from a URL on a cron schedule and run it through a pipeline
+---
+
+A **source** is a cron schedule plus a place to fetch from. On every tick
+meili-ingest fetches the URL, skips the run if the content has not changed since
+the last one, and otherwise runs the fetched file through a pipeline — the same
+pipelines `POST /ingest` uses.
+
+Use a source when the content lives somewhere else and changes on its own
+schedule: a nightly export, a product feed, a public dataset.
+
+```
+schedule tick ──► fetch URL ──► unchanged? ──yes──► run recorded as "unchanged"
+                                   │
+                                   no
+                                   ▼
+                        one ingest job per file ──► run recorded as "ingested"
+```
+
+## Sources write to a connection
+
+A scheduled run has no request, so there are no `X-Meili-*` headers to say
+which Meilisearch to write to. The destination therefore lives in the pipeline:
+every `meili_indexer` step of a source's pipeline must name a
+[connection](/concepts/connections).
+
+```yaml
+uid: tmdb-movies
+steps:
+  - id: parse
+    plugin: json_flattener
+    config: { id_field: id }
+  - id: index
+    plugin: meili_indexer
+    depends_on: [parse]
+    config:
+      connection: prod        # a named Meilisearch connection
+      index: movies
+      primary_key: id
+```
+
+`POST /sources` returns `422` if the pipeline has a `meili_indexer` step
+without a `connection`. A pipeline edited later to drop its connection makes the
+next run fail with a message saying so.
+
+## Creating a source
+
+```bash
+curl -X POST $INGEST/sources \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "uid": "tmdb",
+    "pipeline": "tmdb-movies",
+    "location": {
+      "kind": "url",
+      "url": "https://files.tmdb.org/p/exports/movie_ids_{{ date:%m_%d_%Y }}.json.gz"
+    },
+    "cron": "0 9 * * *",
+    "timezone": "UTC"
+  }'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `uid` | yes | Handle, unique per project. `[a-zA-Z0-9._-]`. |
+| `name`, `description` | no | Display only. `name` defaults to `uid`. |
+| `pipeline` | yes | Pipeline to run. Its `meili_indexer` steps must name a connection. |
+| `location` | yes | Where to fetch from (see below). |
+| `cron` | yes | Standard 5-field cron. Validated by Temporal; a bad expression is `422`. |
+| `timezone` | no | IANA name, default `UTC`. Applies to the cron **and** to URL templates. |
+| `index` | no | Index override, in the place a request's `?index=` would take. |
+| `auth` | no | Credential for the fetch (see [Security](#security)). Write-only. |
+
+A source starts **active**. Pause and resume it, or run it once off-schedule:
+
+```bash
+curl -X POST $INGEST/sources/tmdb/pause
+curl -X POST $INGEST/sources/tmdb/unpause
+curl -X POST $INGEST/sources/tmdb/run      # 202; skipped if a run is in flight
+```
+
+### Location
+
+v1 supports one kind, a single HTTP(S) URL:
+
+```json
+{
+  "kind": "url",
+  "url": "https://example.com/feed.ndjson",
+  "method": "GET",
+  "headers": { "Accept": "application/x-ndjson" }
+}
+```
+
+`headers` are for non-secret headers only; put tokens in `auth`, which is
+encrypted at rest and never returned by the API.
+
+The response is decompressed when it is gzip (detected from the bytes, not the
+file name), and its MIME type is detected the same way as an upload's. JSON and
+NDJSON files go through pipelines such as `json_flattener` unchanged.
+
+## URL templates
+
+The URL is rendered against the run's **scheduled** time in the source's
+timezone, not the wall clock. A retried or delayed run fetches the same URL as
+the one it replaces.
+
+| Token | Expands to | Example (`2026-09-13T09:00Z`) |
+|---|---|---|
+| `{{ date:FMT }}` | `strftime(FMT)` of the scheduled time | `{{ date:%m_%d_%Y }}` → `09_13_2026` |
+| `{{ date-1d:FMT }}` | Same, shifted by an offset: `±Nd`, `±Nh`, `±Nm` | `{{ date-1d:%Y-%m-%d }}` → `2026-09-12` |
+| `{{ timestamp }}` | Unix seconds | `1789290000` |
+
+An unknown token or a bad format is rejected when the source is saved, not at
+3 a.m. on the first run.
+
+## Runs and change detection
+
+Each tick is one **run**, listed newest first:
+
+```bash
+curl "$INGEST/sources/tmdb/runs?limit=5"
+```
+
+```json
+[
+  {
+    "run_id": "0f9c…",
+    "source_id": "7a1e…",
+    "started_at": "2026-09-14T09:00:00Z",
+    "finished_at": "2026-09-14T09:00:02Z",
+    "outcome": "unchanged",
+    "items": 0,
+    "job_ids": []
+  },
+  {
+    "run_id": "c3b2…",
+    "started_at": "2026-09-13T09:00:00Z",
+    "finished_at": "2026-09-13T09:04:41Z",
+    "outcome": "ingested",
+    "items": 1,
+    "job_ids": ["550e8400-e29b-41d4-a716-446655440000"]
+  }
+]
+```
+
+| Outcome | Meaning |
+|---|---|
+| `ingested` | Content changed; every job it started succeeded. |
+| `unchanged` | Upstream answered `304`, or the bytes hashed the same as last time. No job, nothing billed. |
+| `failed` | The fetch failed, or a job failed. `error` says why. |
+
+A source remembers the last `ETag`, `Last-Modified` and content hash, and sends
+`If-None-Match` / `If-Modified-Since` on the next fetch. That state is saved
+**only** when a run succeeds, so a failed run is retried in full on the next
+tick. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
+`GET /jobs/{id}`.
+
+Runs never overlap: if a run is still going when the next tick fires, that
+tick is skipped.
+
+Sources upsert documents; they never delete. A document that disappears
+upstream stays in the index.
+
+## Deleting
+
+`DELETE /sources/{uid}` removes the schedule and the source. Deleting the
+**pipeline** a source uses does not fail; the source is archived instead:
+its schedule is removed, it shows `archived_at`, and it can no longer be run.
+
+## Security
+
+<Warning>
+Fetching a URL a tenant chose, from inside your cluster, is server-side request
+forgery unless it is restricted. meili-ingest restricts it by default.
+</Warning>
+
+- **Where sources may fetch from** is set per deployment by
+  `SOURCE_FETCH_HOSTS`, with the same syntax as `MEILI_CONNECTION_HOSTS`:
+
+  | `SOURCE_FETCH_HOSTS` | Accepts |
+  |---|---|
+  | unset / `public` | `https` only, and only hosts whose every resolved address is public |
+  | `any` | any `http`/`https` host |
+  | `files.internal,feeds.example.com:8443` | exactly those hosts |
+
+  The policy is checked when the source is saved, at every fetch, and at every
+  redirect hop (at most 5).
+- **Credentials** (`auth`) are sealed with `SOURCE_SECRET_KEY` before they
+  leave the gateway, opened only inside the fetching activity, and never
+  written to Temporal history or returned by the API. On redirect they are sent
+  only to the original origin.
+
+  ```json
+  { "kind": "bearer", "token": "…" }
+  { "kind": "basic", "username": "…", "password": "…" }
+  { "kind": "headers", "headers": { "X-Api-Key": "…" } }
+  ```
+
+  Reads show the kind and header names with values masked as `****`. In
+  `PATCH`, omit `auth` to keep it, send `null` to clear it.
+- **Size**: a response is capped at 512 MiB, both as downloaded and once
+  decompressed. A file over the cap fails the run without being retried.
+
+Without `SOURCE_SECRET_KEY` the gateway answers `501` on every `/sources`
+route.
+
+## Walkthrough: the TMDB daily export
+
+TMDB publishes the list of every movie id each day as gzipped NDJSON at
+`https://files.tmdb.org/p/exports/movie_ids_MM_DD_YYYY.json.gz`, around 08:00
+UTC. Each line looks like:
+
+```json
+{"adult":false,"id":550,"original_title":"Fight Club","popularity":61.4,"video":false}
+```
+
+<Steps>
+  <Step title="Create a connection">
+    ```bash
+    curl -X POST $INGEST/connections \
+      -H 'Content-Type: application/json' \
+      -d '{"uid": "prod", "host": "https://ms-1234.meilisearch.io", "api_key": "<write key>"}'
+    ```
+    The gateway checks the host against `MEILI_CONNECTION_HOSTS`, then that it
+    answers `/health` and accepts the key, before storing anything.
+  </Step>
+  <Step title="Create the pipeline">
+    ```bash
+    curl -X POST $INGEST/pipelines \
+      -H 'Content-Type: application/x-yaml' \
+      --data-binary @- <<'EOF'
+    uid: tmdb-movies
+    name: TMDB movie ids
+    steps:
+      - id: parse
+        plugin: json_flattener
+        config: { id_field: id, title_field: original_title }
+      - id: index
+        plugin: meili_indexer
+        depends_on: [parse]
+        config:
+          connection: prod
+          index: movies
+          primary_key: id
+          max_batch_bytes: 52428800
+    EOF
+    ```
+  </Step>
+  <Step title="Schedule it">
+    ```bash
+    curl -X POST $INGEST/sources \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "uid": "tmdb",
+        "name": "TMDB daily movie ids",
+        "pipeline": "tmdb-movies",
+        "location": {
+          "kind": "url",
+          "url": "https://files.tmdb.org/p/exports/movie_ids_{{ date:%m_%d_%Y }}.json.gz"
+        },
+        "cron": "0 9 * * *",
+        "timezone": "UTC"
+      }'
+    ```
+    It fires at 09:00 UTC, after the day's file is published. To fire earlier,
+    fetch the previous day's file instead: `"cron": "30 0 * * *"` with
+    `{{ date-1d:%m_%d_%Y }}`.
+  </Step>
+  <Step title="Run it now and watch">
+    ```bash
+    curl -X POST $INGEST/sources/tmdb/run
+    curl "$INGEST/sources/tmdb/runs?limit=1"
+    ```
+    The run lists the job it started; follow it with `GET /jobs/{job_id}`.
+  </Step>
+</Steps>

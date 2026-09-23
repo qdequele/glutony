@@ -179,7 +179,8 @@ curl -X POST --data-binary @config/pipelines/pdf-with-enrichment.yaml \
 ```
 
 Other endpoints: `GET /jobs/:id`, `POST /jobs/:id/cancel`, `GET|POST /pipelines`,
-`GET|DELETE /pipelines/:uid`, `GET /plugins`, `GET /health`. Full OpenAPI spec in
+`GET|DELETE /pipelines/:uid`, `/connections`, `/sources`, `GET /plugins`,
+`GET /health`. Full OpenAPI spec in
 [`docs/openapi.yaml`](docs/openapi.yaml).
 
 ## Multi-tenancy
@@ -197,6 +198,36 @@ Resolution order: `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Project-Id` /
 
 User pipelines can be global or scoped to a `project_id`; tenant pipelines
 shadow global ones, which shadow built-ins.
+
+A pipeline can instead **pin** its destination: a `meili_indexer` step with
+`connection: <uid>` writes to a named [Meilisearch connection](docs/concepts/connections.mdx)
+(host + sealed key, `POST /connections`), which wins over the request's context.
+A pinned pipeline needs no `X-Meili-*` headers, and its key never enters Temporal
+history.
+
+## Scheduled sources
+
+A **source** fetches a URL on a cron schedule and runs it through a pinned
+pipeline. It skips unchanged content (ETag / Last-Modified / content hash),
+gunzips transparently, and renders the URL against the scheduled time. For
+example, the TMDB daily export:
+
+```bash
+curl -X POST localhost:8080/sources -H 'Content-Type: application/json' -d '{
+  "uid": "tmdb",
+  "pipeline": "tmdb-movies",
+  "location": { "kind": "url",
+    "url": "https://files.tmdb.org/p/exports/movie_ids_{{ date:%m_%d_%Y }}.json.gz" },
+  "cron": "0 9 * * *"
+}'
+curl -X POST localhost:8080/sources/tmdb/run        # run now
+curl localhost:8080/sources/tmdb/runs               # ingested / unchanged / failed
+```
+
+Schedules are Temporal Schedules; each tick runs a `SourceRunWorkflow` that starts
+ordinary ingest jobs. Fetches are restricted by `SOURCE_FETCH_HOSTS` (public https
+only by default), and credentials are sealed with `SOURCE_SECRET_KEY`. See
+[`docs/concepts/sources.mdx`](docs/concepts/sources.mdx).
 
 ## Plugins
 

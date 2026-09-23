@@ -432,14 +432,21 @@ configuration; a self-hosted operator writing to a private instance sets one lin
 Tenant-supplied URLs are fetched from inside the cluster, where `169.254.169.254`,
 `meili-control-plane:9000` and `temporal-frontend:7233` are all reachable.
 
-- `https` only.
-- Resolve DNS explicitly and reject loopback, private (RFC1918), link-local, CGNAT
-  (100.64/10), ULA (fc00::/7), unspecified and multicast addresses. Check **every**
-  resolved address, not just the first.
-- Redirects followed manually with the guard re-applied at each hop, capped at 5. An
-  allowed host redirecting to `127.0.0.1` is the obvious bypass.
-- Byte cap enforced during streaming.
-- Guard applies to source fetches only in v1 (Decision 8).
+- Governed by `SOURCE_FETCH_HOSTS`, same syntax and same `public` default as
+  `MEILI_CONNECTION_HOSTS`. *(Added in implementation: an allowlist lets a self-hosted
+  deployment, or the local end-to-end test, fetch from an internal file server.)*
+- Under `public`: `https` only, DNS resolved explicitly, and loopback, private
+  (RFC1918), link-local, CGNAT (100.64/10), ULA (fc00::/7), unspecified and multicast
+  addresses rejected. **Every** resolved address is checked, not just the first.
+- Checked on save (gateway), at every fetch and at every redirect hop (worker).
+- Redirects followed manually with the policy re-applied at each hop, capped at 5; the
+  HTTP client never follows redirects itself. An allowed host redirecting to
+  `127.0.0.1` is the obvious bypass. The credential is sent only to the original
+  origin, never to a redirect target.
+- 512 MiB cap enforced during streaming **and on gzip output**, which is bounded by the
+  same cap (a small gzip bomb would otherwise inflate past it). Over-cap is
+  non-retryable.
+- Policy applies to source fetches only in v1 (Decision 8).
 
 Pinning the resolved address to defeat DNS rebinding between the check and the connect
 is noted as a known residual risk, not solved in v1.
@@ -479,6 +486,14 @@ than a schedule firing against a row that does not exist.
 to *archive* every source that references it: the Temporal Schedule is deleted so nothing
 fires again, and the row is stamped `archived_at` with its sealed `fetch_auth`
 retained.
+
+*(Implementation note.)* The control plane archives the rows in the same transaction as
+the pipeline delete, and its internal `DELETE /pipelines/{uid}` now answers `200`
+`{"archived_sources": [<source id>, …]}` instead of `204`. The gateway uses that list to
+delete each archived source's Temporal Schedule (best effort, logged on failure); the
+gateway's public `DELETE /pipelines/{uid}` still answers `204`. A run already in
+flight when its source is deleted records nothing: the control plane answers `404` for
+the run row and the worker treats that as done rather than retrying.
 
 Archive rather than cascade-delete because the source row holds credentials a tenant
 supplied by hand; destroying them as a side effect of an unrelated pipeline delete is

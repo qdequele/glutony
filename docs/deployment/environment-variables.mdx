@@ -23,6 +23,9 @@ inside plugins or workflow code.
 | `BLOB_STORE_URL` | `file://./blobs` | Where uploads above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
 | `INLINE_MAX_BYTES` | `1048576` | Uploads up to this size travel inside the Temporal payload; larger ones are staged. |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
+| `SOURCE_SECRET_KEY` | — | 32 bytes, base64 (`openssl rand -base64 32`). Seals [connection](/concepts/connections) keys and [source](/concepts/sources) credentials. Unset = `/connections` and `/sources` answer `501`. Must match the workers'. Rotating it makes stored secrets unreadable. |
+| `MEILI_CONNECTION_HOSTS` | `public` | Where connections may point: `public` (https, public addresses only), `any`, or a comma list of `host[:port]`. |
+| `SOURCE_FETCH_HOSTS` | `public` | Where sources may fetch from; same syntax. Checked when a source is saved. |
 
 ## Worker (`meili-ingest-worker`)
 
@@ -31,7 +34,7 @@ inside plugins or workflow code.
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
 | `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general`, `workers-llm`, `workers-gpu`, `workers-io`. |
-| `CONTROL_PLANE_URL` | — | If set, plugin manifests are published there at boot (`POST /internal/plugins`). |
+| `CONTROL_PLANE_URL` | — | Plugin manifests are published there at boot (`POST /internal/plugins`). Required for Meilisearch connections and scheduled sources, which the worker loads from it. |
 | `BLOB_STORE_URL` | `file://./blobs` | Same store as the gateway. |
 | `PAYLOAD_SPILL_BYTES` | `1048576` | Step outputs larger than this are spilled to the blob store. |
 | `MAX_CONCURRENT_ACTIVITIES` | `20` | Activities executed concurrently by this process. |
@@ -42,6 +45,10 @@ inside plugins or workflow code.
 | `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-gpu` pool). |
 | `TRANSCRIBE_BASE_URL` | falls back to `LLM_BASE_URL`, then `https://api.openai.com/v1` | OpenAI-compatible endpoint exposing `/audio/transcriptions`. |
 | `TRANSCRIBE_MODEL` | `whisper-1` | Default transcription model. |
+| `SOURCE_SECRET_KEY` | — | Same key as the gateway. Opens connection keys in the indexer activity and source credentials in the fetch activity. |
+| `MEILI_CONNECTION_HOSTS` | `public` | Same policy as the gateway, re-applied every time a connection is used. |
+| `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect. |
+| `DEFAULT_INDEX` | `documents` | Index for a source's documents when nothing more specific resolves. Keep it equal to the gateway's. |
 | `TINYBIRD_TOKEN` | — | Append token for per-tenant [usage analytics](/concepts/usage). Absent disables reporting entirely. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
 | `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |

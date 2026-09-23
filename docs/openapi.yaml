@@ -22,7 +22,10 @@ info:
     `X-Meili-Envoy-Secret` matches the gateway's `ENVOY_TRUSTED_HEADER`), the
     `?index=` query parameter, an `Authorization: Bearer <key>` header, and
     finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables.
-    When none of these yields a host and API key the request fails with `400`.
+    When none of these yields a host and API key the request fails with `400` —
+    unless the pipeline is **pinned**: every `meili_indexer` step names a
+    [Meilisearch connection](/concepts/connections), which then supplies the host
+    and key, and no context is needed.
 
     **Errors** are always `{"error": "<message>", "code": "<snake_case>"}`.
   license:
@@ -56,6 +59,10 @@ tags:
     description: Manage pipeline definitions (built-in and user-defined).
   - name: Plugins
     description: Discover registered plugins.
+  - name: Connections
+    description: Named Meilisearch destinations that pin a pipeline's indexer step.
+  - name: Sources
+    description: Fetch a URL on a cron schedule and run it through a pipeline.
   - name: Catalog
     description: Curated action and workflow catalog.
   - name: System
@@ -407,6 +414,9 @@ paths:
       tags: [Pipelines]
       operationId: deletePipeline
       summary: Delete a user pipeline
+      description: |
+        Never blocked by sources that use the pipeline: they are archived (their
+        schedules removed) and remain readable with `archived_at` set.
       parameters:
         - $ref: "#/components/parameters/PipelineUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -461,6 +471,350 @@ paths:
               schema:
                 $ref: "#/components/schemas/Catalog"
 
+  /connections:
+    get:
+      tags: [Connections]
+      operationId: listConnections
+      summary: List Meilisearch connections
+      description: The caller's project's connections, then global ones. Keys are always masked.
+      parameters:
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "200":
+          description: Connections.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Connection"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+    post:
+      tags: [Connections]
+      operationId: createConnection
+      summary: Create a connection
+      description: |
+        Checks `host` against `MEILI_CONNECTION_HOSTS`, then calls `GET {host}/health`
+        and `GET {host}/indexes?limit=1` with the key. Any failure is `422` and
+        nothing is stored. The key is sealed before it leaves the gateway.
+      parameters:
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConnection"
+            example:
+              uid: prod
+              name: Production cluster
+              host: https://ms-1234.meilisearch.io
+              api_key: "<write key>"
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Connection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
+  /connections/{uid}:
+    parameters:
+      - $ref: "#/components/parameters/ConnectionUid"
+      - $ref: "#/components/parameters/XMeiliProjectId"
+      - $ref: "#/components/parameters/XMeiliEnvoySecret"
+    get:
+      tags: [Connections]
+      operationId: getConnection
+      summary: Get a connection
+      responses:
+        "200":
+          description: The connection, with `used_by`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Connection"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+    patch:
+      tags: [Connections]
+      operationId: updateConnection
+      summary: Update a connection
+      description: Changing `host` or `api_key` re-runs the create-time checks. Omit `api_key` to keep the stored key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateConnection"
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Connection"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+    delete:
+      tags: [Connections]
+      operationId: deleteConnection
+      summary: Delete a connection
+      description: Never blocked. Pipelines that still name it fail at run time with `connection "<uid>" not found`.
+      responses:
+        "204":
+          description: Deleted.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+
+  /sources:
+    get:
+      tags: [Sources]
+      operationId: listSources
+      summary: List sources
+      parameters:
+        - name: include_archived
+          in: query
+          required: false
+          description: Also list sources archived because their pipeline was deleted.
+          schema:
+            type: boolean
+            default: false
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "200":
+          description: Sources.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Source"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+    post:
+      tags: [Sources]
+      operationId: createSource
+      summary: Create a scheduled source
+      description: |
+        Validates the URL template and its host (`SOURCE_FETCH_HOSTS`), checks that
+        the pipeline is pinned (every `meili_indexer` step names a connection), then
+        creates a Temporal schedule. A cron Temporal rejects is `422`. The source
+        starts active.
+      parameters:
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSource"
+            example:
+              uid: tmdb
+              name: TMDB daily movie ids
+              pipeline: tmdb-movies
+              location:
+                kind: url
+                url: "https://files.tmdb.org/p/exports/movie_ids_{{ date:%m_%d_%Y }}.json.gz"
+              cron: "0 9 * * *"
+              timezone: UTC
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
+  /sources/{uid}:
+    parameters:
+      - $ref: "#/components/parameters/SourceUid"
+      - $ref: "#/components/parameters/XMeiliProjectId"
+      - $ref: "#/components/parameters/XMeiliEnvoySecret"
+    get:
+      tags: [Sources]
+      operationId: getSource
+      summary: Get a source
+      responses:
+        "200":
+          description: The source, with `next_run_at`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+    patch:
+      tags: [Sources]
+      operationId: updateSource
+      summary: Update a source
+      description: Any subset of the create fields except `uid`. `auth` omitted keeps it, `null` clears it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSource"
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+    delete:
+      tags: [Sources]
+      operationId: deleteSource
+      summary: Delete a source and its schedule
+      responses:
+        "204":
+          description: Deleted.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+
+  /sources/{uid}/pause:
+    post:
+      tags: [Sources]
+      operationId: pauseSource
+      summary: Pause a source's schedule
+      parameters:
+        - $ref: "#/components/parameters/SourceUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "204":
+          description: Paused.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+
+  /sources/{uid}/unpause:
+    post:
+      tags: [Sources]
+      operationId: unpauseSource
+      summary: Resume a source's schedule
+      parameters:
+        - $ref: "#/components/parameters/SourceUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "204":
+          description: Resumed.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+
+  /sources/{uid}/run:
+    post:
+      tags: [Sources]
+      operationId: runSource
+      summary: Run a source now
+      description: Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+      parameters:
+        - $ref: "#/components/parameters/SourceUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "202":
+          description: Triggered.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: triggered
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: The source is archived (its pipeline was deleted).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+
+  /sources/{uid}/runs:
+    get:
+      tags: [Sources]
+      operationId: listSourceRuns
+      summary: A source's runs, newest first
+      parameters:
+        - $ref: "#/components/parameters/SourceUid"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "200":
+          description: Runs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SourceRun"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -496,6 +850,22 @@ components:
         type: string
         pattern: "^[a-zA-Z0-9._-]+$"
       example: my-pdf-with-enrichment
+    ConnectionUid:
+      name: uid
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-zA-Z0-9._-]+$"
+      example: prod
+    SourceUid:
+      name: uid
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-zA-Z0-9._-]+$"
+      example: tmdb
     XMeiliProjectId:
       name: X-Meili-Project-Id
       in: header
@@ -594,6 +964,26 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
           example: { "error": "job 550e8400-e29b-41d4-a716-446655440000 not found", "code": "not_found" }
+    NotFound:
+      description: Unknown connection or source.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "source \"tmdb\" not found", "code": "not_found" }
+    Unprocessable:
+      description: Validation failed (bad cron or template, forbidden host, unreachable Meilisearch or rejected key, unpinned pipeline).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "pipeline \"movies\" cannot run on a schedule: its meili_indexer step names no Meilisearch `connection`", "code": "validation" }
+    NotEnabled:
+      description: "`SOURCE_SECRET_KEY` is not set on this deployment, so connections and sources are disabled."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
@@ -979,3 +1369,200 @@ components:
             Present only for curated templates that are not deployed as
             pipelines. Absent for builtin.* entries, whose definition comes
             from GET /pipelines.
+
+    Connection:
+      type: object
+      required: [uid, name, host, api_key, created_at, updated_at]
+      properties:
+        uid:
+          type: string
+          description: Name a `meili_indexer` step references in `config.connection`.
+        name:
+          type: string
+        project_id:
+          type: string
+          description: Tenant scope. Absent = global.
+        host:
+          type: string
+          format: uri
+        api_key:
+          type: string
+          const: "****"
+          description: Always masked.
+        used_by:
+          type: array
+          items: { type: string }
+          description: Pipelines whose indexer names this connection (single reads only).
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateConnection:
+      type: object
+      required: [uid, host, api_key]
+      additionalProperties: false
+      properties:
+        uid:
+          type: string
+          pattern: "^[a-zA-Z0-9._-]+$"
+        name:
+          type: string
+          description: Defaults to `uid`.
+        host:
+          type: string
+          format: uri
+        api_key:
+          type: string
+          writeOnly: true
+    UpdateConnection:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        host: { type: string, format: uri }
+        api_key:
+          type: string
+          writeOnly: true
+          description: Omit to keep the stored key.
+
+    SourceLocation:
+      type: object
+      required: [kind, url]
+      properties:
+        kind:
+          type: string
+          const: url
+        url:
+          type: string
+          description: |
+            HTTP(S) URL, rendered against the run's scheduled time in the source's
+            timezone: `{{ date:FMT }}` (strftime), `{{ date-1d:FMT }}` (offset
+            `±Nd`/`±Nh`/`±Nm`), `{{ timestamp }}` (Unix seconds).
+          example: "https://files.tmdb.org/p/exports/movie_ids_{{ date:%m_%d_%Y }}.json.gz"
+        method:
+          type: string
+          default: GET
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: Non-secret headers. Put secrets in `auth`.
+    FetchAuth:
+      description: Credential for the fetch. Write-only; sealed at rest, never returned.
+      oneOf:
+        - type: object
+          required: [kind, token]
+          properties:
+            kind: { type: string, const: bearer }
+            token: { type: string, writeOnly: true }
+        - type: object
+          required: [kind, username, password]
+          properties:
+            kind: { type: string, const: basic }
+            username: { type: string }
+            password: { type: string, writeOnly: true }
+        - type: object
+          required: [kind, headers]
+          properties:
+            kind: { type: string, const: headers }
+            headers:
+              type: object
+              additionalProperties: { type: string }
+      discriminator:
+        propertyName: kind
+    CreateSource:
+      type: object
+      required: [uid, pipeline, location, cron]
+      additionalProperties: false
+      properties:
+        uid:
+          type: string
+          pattern: "^[a-zA-Z0-9._-]+$"
+        name:
+          type: string
+          description: Defaults to `uid`.
+        description: { type: string }
+        pipeline:
+          type: string
+          description: Pipeline uid. Every `meili_indexer` step must name a connection.
+        location:
+          $ref: "#/components/schemas/SourceLocation"
+        cron:
+          type: string
+          description: 5-field cron, validated by Temporal.
+          example: "0 9 * * *"
+        timezone:
+          type: string
+          default: UTC
+          description: IANA timezone for the cron and URL templates.
+        index:
+          type: string
+          description: Index override (in the place of a request's `?index=`).
+        auth:
+          $ref: "#/components/schemas/FetchAuth"
+    UpdateSource:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        description: { type: string }
+        pipeline: { type: string }
+        location:
+          $ref: "#/components/schemas/SourceLocation"
+        cron: { type: string }
+        timezone: { type: string }
+        index: { type: string }
+        auth:
+          description: Omit to keep, `null` to clear, an object to replace.
+          oneOf:
+            - $ref: "#/components/schemas/FetchAuth"
+            - type: "null"
+    SourceRunOutcome:
+      type: string
+      enum: [ingested, unchanged, failed]
+    Source:
+      type: object
+      required: [uid, name, pipeline, location, cron, timezone, paused]
+      properties:
+        uid: { type: string }
+        name: { type: string }
+        description: { type: string }
+        project_id: { type: string }
+        pipeline: { type: string }
+        location:
+          $ref: "#/components/schemas/SourceLocation"
+        cron: { type: string }
+        timezone: { type: string }
+        paused: { type: boolean }
+        index: { type: string }
+        auth:
+          type: object
+          description: Redacted credential, e.g. `{"kind":"bearer","token":"****"}`.
+          additionalProperties: true
+        archived_at:
+          type: string
+          format: date-time
+          description: Set when the source's pipeline was deleted. Archived sources never fire.
+        next_run_at:
+          type: string
+          format: date-time
+          description: Present on single-source reads of an active source.
+        last_run_at: { type: string, format: date-time }
+        last_status:
+          $ref: "#/components/schemas/SourceRunOutcome"
+        last_error: { type: string }
+    SourceRun:
+      type: object
+      required: [run_id, source_id, started_at, outcome, items, job_ids]
+      properties:
+        run_id: { type: string, format: uuid }
+        source_id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        outcome:
+          $ref: "#/components/schemas/SourceRunOutcome"
+        items:
+          type: integer
+          description: Fetched items whose job succeeded.
+        job_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: Ingest jobs the run started; see `GET /jobs/{job_id}`.
+        error: { type: string }
