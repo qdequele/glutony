@@ -24,7 +24,10 @@ pub mod url;
 pub use connector::{Resolution, ResolveRuntime, ResolvedItem, SourceConnector};
 pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
 pub use host_policy::{HOSTS_ENV, HostPolicy, HostPort};
-pub use model::{FetchAuth, IncrementalState, Location, RunOutcome, SourceDefinition, redact};
+pub use model::{
+    FetchAuth, IncrementalState, Location, RunOutcome, SOURCE_RUN_WORKFLOW, SourceDefinition,
+    SourceRunInput, redact,
+};
 pub use secret::{SecretKey, open_json, seal_json};
 pub use template::render;
 pub use url::UrlConnector;

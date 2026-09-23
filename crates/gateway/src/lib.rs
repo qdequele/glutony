@@ -11,6 +11,7 @@ pub mod context;
 pub mod error;
 pub mod extract;
 pub mod handlers;
+pub mod schedules;
 pub mod state;
 pub mod ui;
 

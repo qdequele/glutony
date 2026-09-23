@@ -130,6 +130,36 @@ fn utc() -> String {
     "UTC".to_string()
 }
 
+/// Workflow type a source's Temporal Schedule starts on every tick.
+pub const SOURCE_RUN_WORKFLOW: &str = "SourceRunWorkflow";
+
+/// Input of [`SOURCE_RUN_WORKFLOW`].
+///
+/// Deliberately tiny: a Temporal Schedule freezes its action's input when it is
+/// created, so this must stay valid across every later edit to the source or its
+/// pipeline. Everything else is loaded at run time (spec Decision 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRunInput {
+    /// The source to run.
+    pub source_id: Uuid,
+    /// Its tenant scope, for connection resolution and usage attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+impl SourceRunInput {
+    /// The Temporal Schedule id for a source.
+    pub fn schedule_id(source_id: Uuid) -> String {
+        format!("source-{source_id}")
+    }
+
+    /// The workflow id prefix a source's runs are started under. Temporal appends the
+    /// scheduled time, so each run is distinct.
+    pub fn workflow_id_prefix(source_id: Uuid) -> String {
+        format!("source-run-{source_id}")
+    }
+}
+
 /// Terminal outcome of one source run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
