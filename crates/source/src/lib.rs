@@ -23,7 +23,7 @@ pub mod url;
 
 pub use connector::{Resolution, ResolveRuntime, ResolvedItem, SourceConnector};
 pub use guard::{AddressClass, UrlGuard, check_scheme, classify};
-pub use host_policy::{HOSTS_ENV, HostPolicy, HostPort};
+pub use host_policy::{FETCH_HOSTS_ENV, HOSTS_ENV, HostPolicy, HostPort};
 pub use model::{
     FetchAuth, IncrementalState, Location, RunOutcome, SOURCE_RUN_WORKFLOW, SourceDefinition,
     SourceRunInput, redact,

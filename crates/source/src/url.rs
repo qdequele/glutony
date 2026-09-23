@@ -35,36 +35,72 @@ impl SourceConnector for UrlConnector {
         let parsed = url::Url::parse(&rendered)
             .map_err(|e| SourceError::Template(format!("{rendered:?} is not a url: {e}")))?;
 
-        if let Some(guard) = &rt.guard {
-            guard.check_url(&parsed).await?;
-        }
-        let max_bytes = rt.guard.map(|g| g.max_bytes).unwrap_or(u64::MAX);
-
+        let max_bytes = rt.limits.max_bytes;
         let verb = method.as_deref().unwrap_or("GET");
-        let mut req = rt
-            .http
-            .request(
-                reqwest::Method::from_bytes(verb.as_bytes())
-                    .map_err(|_| SourceError::Blocked(format!("invalid http method {verb:?}")))?,
-                parsed.clone(),
-            )
-            .timeout(std::time::Duration::from_secs(300));
+        let mut method = reqwest::Method::from_bytes(verb.as_bytes())
+            .map_err(|_| SourceError::Blocked(format!("invalid http method {verb:?}")))?;
+        let origin = parsed.origin();
 
-        for (name, value) in headers {
-            req = req.header(name, value);
-        }
-        req = apply_auth(req, auth);
-        if let Some(etag) = &state.etag {
-            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        if let Some(lm) = &state.last_modified {
-            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
-        }
+        // Redirects are followed here, not by the client, so the host policy sees every
+        // hop: a public host redirecting to 169.254.169.254 is the obvious bypass.
+        let mut current = parsed.clone();
+        let mut hops = 0usize;
+        let response = loop {
+            if let Some(policy) = &rt.policy {
+                policy.check(&current).await?;
+            }
+            let mut req = rt
+                .http
+                .request(method.clone(), current.clone())
+                .timeout(std::time::Duration::from_secs(300));
+            for (name, value) in headers {
+                req = req.header(name, value);
+            }
+            // Credentials go to the source's own origin only, the way browsers drop
+            // Authorization on a cross-origin redirect.
+            if current.origin() == origin {
+                req = apply_auth(req, auth);
+            }
+            if let Some(etag) = &state.etag {
+                req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(lm) = &state.last_modified {
+                req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+            }
 
-        let response = req
-            .send()
-            .await
-            .map_err(|e| SourceError::Fetch(format!("GET {parsed}: {e}")))?;
+            let response = req
+                .send()
+                .await
+                .map_err(|e| SourceError::Fetch(format!("{method} {current}: {e}")))?;
+            let status = response.status();
+            if !status.is_redirection() || status == reqwest::StatusCode::NOT_MODIFIED {
+                break response;
+            }
+            if hops >= rt.limits.max_redirects {
+                return Err(SourceError::Fetch(format!(
+                    "{parsed}: more than {} redirects",
+                    rt.limits.max_redirects
+                )));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    SourceError::Fetch(format!("{current}: {status} without a Location header"))
+                })?;
+            let next = current.join(location).map_err(|e| {
+                SourceError::Fetch(format!("{current}: invalid redirect {location:?}: {e}"))
+            })?;
+            // 303 always becomes a GET; 301/302 historically do for non-GET methods.
+            if status == reqwest::StatusCode::SEE_OTHER
+                || (matches!(status.as_u16(), 301 | 302) && method != reqwest::Method::HEAD)
+            {
+                method = reqwest::Method::GET;
+            }
+            current = next;
+            hops += 1;
+        };
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(Resolution::Unchanged);
@@ -235,6 +271,7 @@ fn guess_mime_from_extension(filename: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::guard::UrlGuard;
+    use crate::host_policy::HostPolicy;
     use chrono::{DateTime, TimeZone, Utc};
     use std::io::Write as _;
     use wiremock::matchers::{header, method, path};
@@ -244,11 +281,23 @@ mod tests {
     /// connector tests run with the guard off. The guard has its own tests in guard.rs.
     fn rt_without_guard(scheduled_at: DateTime<Utc>) -> ResolveRuntime {
         ResolveRuntime {
-            http: reqwest::Client::new(),
-            guard: None,
+            http: ResolveRuntime::http_client(),
+            policy: None,
+            limits: UrlGuard::default(),
             scheduled_at,
             timezone: "UTC".to_string(),
         }
+    }
+
+    /// A runtime whose policy allows exactly the given mock servers.
+    fn rt_allowing(servers: &[&MockServer]) -> ResolveRuntime {
+        let hosts: Vec<String> = servers
+            .iter()
+            .map(|s| s.uri().trim_start_matches("http://").to_string())
+            .collect();
+        let mut rt = rt_without_guard(now());
+        rt.policy = Some(HostPolicy::parse(&hosts.join(",")).expect("policy"));
+        rt
     }
 
     fn now() -> DateTime<Utc> {
@@ -472,23 +521,140 @@ mod tests {
             .mount(&server)
             .await;
 
-        // A guard with a tiny cap. `check_url` would reject the loopback mock, so the
-        // cap is exercised through a runtime whose guard is set but whose URL is the
-        // already-allowed mock: build it by hand and skip the address check.
+        // No address policy (the mock is loopback), but a tiny size cap: the cap must be
+        // what rejects this, not the address check.
         let mut rt = rt_without_guard(now());
-        rt.guard = Some(UrlGuard {
+        rt.limits = UrlGuard {
             max_redirects: 5,
             max_bytes: 1024,
-        });
-        let got = UrlConnector
+        };
+        let err = UrlConnector
             .resolve(
                 &url_location(format!("{}/big", server.uri())),
                 None,
                 &IncrementalState::default(),
                 &rt,
             )
+            .await
+            .expect_err("body over max_bytes must be rejected");
+        assert!(err.to_string().contains("byte cap"), "{err}");
+    }
+
+    fn redirect_to(location: &str) -> ResponseTemplate {
+        ResponseTemplate::new(302).insert_header("location", location)
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_followed_and_a_relative_location_resolves() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(redirect_to("/new.json"))
+            .mount(&server)
             .await;
-        assert!(got.is_err(), "body over max_bytes must be rejected");
+        Mock::given(method("GET"))
+            .and(path("/new.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&server)
+            .await;
+        let got = UrlConnector
+            .resolve(
+                &url_location(format!("{}/old", server.uri())),
+                None,
+                &IncrementalState::default(),
+                &rt_allowing(&[&server]),
+            )
+            .await
+            .expect("follows the redirect");
+        assert!(matches!(got, Resolution::Items { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_host_the_policy_forbids_is_not_fetched() {
+        // `allowed` is permitted; it redirects to `forbidden`, which is not. The policy
+        // must see the second hop, so `forbidden` is never contacted.
+        let allowed = MockServer::start().await;
+        let forbidden = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(redirect_to(&format!("{}/secret", forbidden.uri())))
+            .mount(&allowed)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("internal"))
+            .expect(0)
+            .mount(&forbidden)
+            .await;
+
+        let err = UrlConnector
+            .resolve(
+                &url_location(format!("{}/start", allowed.uri())),
+                None,
+                &IncrementalState::default(),
+                &rt_allowing(&[&allowed]),
+            )
+            .await
+            .expect_err("the redirect target is forbidden");
+        assert!(matches!(err, SourceError::Blocked(_)), "{err:?}");
+        // `expect(0)` on `forbidden` is verified when it drops.
+    }
+
+    #[tokio::test]
+    async fn credentials_are_not_forwarded_to_another_origin() {
+        let origin = MockServer::start().await;
+        let other = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer t0ken"))
+            .respond_with(redirect_to(&format!("{}/file.json", other.uri())))
+            .mount(&origin)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&other)
+            .await;
+
+        let auth = FetchAuth::Bearer {
+            token: "t0ken".into(),
+        };
+        UrlConnector
+            .resolve(
+                &url_location(format!("{}/start", origin.uri())),
+                Some(&auth),
+                &IncrementalState::default(),
+                &rt_allowing(&[&origin, &other]),
+            )
+            .await
+            .expect("resolves through the redirect");
+
+        let at_other = other.received_requests().await.expect("recorded");
+        assert_eq!(at_other.len(), 1);
+        assert!(
+            !at_other[0].headers.contains_key("authorization"),
+            "the bearer token must not follow a redirect to another origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_stops_at_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(redirect_to("/again"))
+            .mount(&server)
+            .await;
+        let err = UrlConnector
+            .resolve(
+                &url_location(format!("{}/again", server.uri())),
+                None,
+                &IncrementalState::default(),
+                &rt_allowing(&[&server]),
+            )
+            .await
+            .expect_err("loops forever otherwise");
+        assert!(err.to_string().contains("more than 5 redirects"), "{err}");
+        let requests = server.received_requests().await.expect("recorded").len();
+        assert_eq!(
+            requests, 6,
+            "the first request plus five redirects, then stop"
+        );
     }
 
     #[test]

@@ -20,8 +20,13 @@ use url::Url;
 use crate::SourceError;
 use crate::guard::UrlGuard;
 
-/// Name of the environment variable holding the policy.
+/// Environment variable holding the policy for Meilisearch connection hosts.
 pub const HOSTS_ENV: &str = "MEILI_CONNECTION_HOSTS";
+
+/// Environment variable holding the policy for the URLs scheduled sources fetch from.
+/// Same syntax and the same public-only default; an allowlist lets a self-hosted
+/// deployment (or a local end-to-end test) fetch from an internal file server.
+pub const FETCH_HOSTS_ENV: &str = "SOURCE_FETCH_HOSTS";
 
 /// One allowlist entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +67,14 @@ impl HostPolicy {
 
     /// Read [`HOSTS_ENV`]; unset means [`HostPolicy::Public`].
     pub fn from_env() -> Result<Self, SourceError> {
-        match std::env::var(HOSTS_ENV) {
-            Ok(raw) => Self::parse(&raw),
+        Self::from_env_var(HOSTS_ENV)
+    }
+
+    /// Read the policy from `var`; unset means [`HostPolicy::Public`]. A malformed value
+    /// is an error naming the variable.
+    pub fn from_env_var(var: &str) -> Result<Self, SourceError> {
+        match std::env::var(var) {
+            Ok(raw) => Self::parse(&raw).map_err(|e| SourceError::Blocked(format!("{var}: {e}"))),
             Err(_) => Ok(HostPolicy::Public),
         }
     }
@@ -90,7 +101,7 @@ impl HostPolicy {
                     Ok(())
                 } else {
                     Err(SourceError::Blocked(format!(
-                        "{url} is not in {HOSTS_ENV}; allowed: {}",
+                        "{url} is not an allowed host; allowed: {}",
                         entries
                             .iter()
                             .map(|e| match e.port {
@@ -120,7 +131,7 @@ fn check_http_scheme(url: &Url) -> Result<(), SourceError> {
 fn parse_entry(entry: &str) -> Result<HostPort, SourceError> {
     let bad = |why: &str| {
         SourceError::Blocked(format!(
-            "invalid {HOSTS_ENV} entry {entry:?}: {why}; expected host[:port], \
+            "invalid host policy entry {entry:?}: {why}; expected host[:port], \
              comma-separated, or `public` / `any`"
         ))
     };
@@ -253,6 +264,6 @@ mod tests {
             .expect_err("rejected")
             .to_string();
         assert!(err.contains("meilisearch:7700"), "{err}");
-        assert!(err.contains(HOSTS_ENV), "{err}");
+        assert!(err.contains("allowed"), "{err}");
     }
 }

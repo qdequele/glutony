@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 
 use crate::SourceError;
 use crate::guard::UrlGuard;
+use crate::host_policy::HostPolicy;
 use crate::model::{FetchAuth, IncrementalState, Location};
 
 /// One fetched item, before it is staged into the blob store.
@@ -47,14 +48,19 @@ pub enum Resolution {
 /// Ambient services a connector needs.
 #[derive(Debug, Clone)]
 pub struct ResolveRuntime {
-    /// Shared HTTP client.
+    /// HTTP client. **Must not follow redirects on its own** — the connector follows
+    /// them itself so the host policy is re-applied at every hop. Build it with
+    /// [`ResolveRuntime::http_client`].
     pub http: reqwest::Client,
-    /// Address policy and caps.
+    /// Which hosts may be fetched (`SOURCE_FETCH_HOSTS`), checked before the first
+    /// request and again before every redirect.
     ///
-    /// `None` disables the address check and the size cap — used only by tests against a
-    /// loopback mock server, which the guard would otherwise reject. Production always
-    /// sets it.
-    pub guard: Option<UrlGuard>,
+    /// `None` disables the address check only — used by tests against a loopback mock
+    /// server, which the default policy would otherwise reject. Production always sets
+    /// it.
+    pub policy: Option<HostPolicy>,
+    /// Redirect and body-size caps. Always enforced, independent of `policy`.
+    pub limits: UrlGuard,
     /// The run's scheduled time, used for URL templating (Decision 9).
     pub scheduled_at: DateTime<Utc>,
     /// IANA timezone the templates render in.
@@ -62,14 +68,25 @@ pub struct ResolveRuntime {
 }
 
 impl ResolveRuntime {
-    /// Runtime with the default guard enforced.
-    pub fn new(http: reqwest::Client, scheduled_at: DateTime<Utc>, timezone: String) -> Self {
+    /// Runtime with `policy` enforced and default limits.
+    pub fn new(policy: HostPolicy, scheduled_at: DateTime<Utc>, timezone: String) -> Self {
         Self {
-            http,
-            guard: Some(UrlGuard::default()),
+            http: Self::http_client(),
+            policy: Some(policy),
+            limits: UrlGuard::default(),
             scheduled_at,
             timezone,
         }
+    }
+
+    /// The client a runtime needs: redirects are **not** followed automatically. A
+    /// client that followed them would fetch whatever internal address a public host
+    /// redirects to, without the policy ever seeing it.
+    pub fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default()
     }
 }
 
