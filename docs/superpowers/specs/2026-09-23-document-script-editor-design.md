@@ -148,7 +148,8 @@ Operations apply in order, each seeing the result of the previous one.
 | `cast` → `number` | A string holding an integer literal becomes an integer; any other numeric string becomes a float; booleans become 0/1; anything else is an error. |
 | `cast` → `boolean` | `"true"`/`"false"` (case-insensitive) and the numbers 0/1; anything else is an error. |
 | `cast` → `string` | Numbers and booleans are formatted; arrays and maps are an error. |
-| `filter … equals / not_equals` | JSON equality, type-sensitive: `"1"` does not equal `1`. |
+| `filter … equals / not_equals` | JSON equality, type-sensitive: `"1"` does not equal `1`. A missing field compares as `null`. |
+| `filter` | The names `id`, `title` and `content` mean the document's own attributes; every other name is a field. |
 | every operation | An empty field name is `InvalidConfig`. |
 
 `title`, `content` and `id` are addressed by `promote` and by Code mode, not by the
@@ -161,10 +162,13 @@ the generated source matters: it is what Code mode starts from after a switch.
 
 **No config string ever reaches the source unescaped.** Field names and literal values
 are emitted through one escaper that writes `"`, `\` and every character outside
-printable ASCII as `\u{XXXX}`, inside a double-quoted rhai string. Field access is
-always the index form, `doc.fields["name"]`, never dotted, so a name is never parsed as
-code. `set.expr` is the one place user code appears, and it is compiled on its own
-first (below), then wrapped in parentheses.
+printable ASCII as `\U` followed by 8 hex digits (rhai has no `\u{..}` escape), inside a
+double-quoted rhai string. Field access is always the index form, `doc.fields["name"]`,
+never dotted, so a name is never parsed as code. `set.expr` is the one place user code
+appears, and it is compiled on its own first (below), then wrapped in parentheses. Each
+operation compiles to one call to a helper method registered on the engine
+(`doc.rename_field("prix", "price");`); the helpers implement the semantics in Rust and
+are callable from Code mode too.
 
 ### `set` expressions and the field resolver
 
@@ -181,6 +185,7 @@ first (below), then wrapped in parentheses.
   3. otherwise returns `Ok(None)`, so rhai raises "variable not found".
 - Fields whose names are not identifiers are reached as `doc.fields["unit-price"]`.
 - Consequence for Code mode: `doc.fields.total = price * qty;` now works there too.
+- `round(x, decimals)` is registered on the engine; rhai's own `round` takes one float.
 
 ### `check_config`
 
@@ -283,9 +288,10 @@ and `POST /pipelines` documents the new `invalid_step_config` 422.
 - `ui/src/app/pipelines/_components/config-editors.ts` — a registry
   `Record<pluginName, { Editor: ComponentType<ConfigEditorProps>; ownedKeys: string[] }>`.
   `document_script` registers `DocumentScriptEditor` owning `["script", "ops"]`.
-- `StepCard` renders the registered editor, then `SchemaForm` with a new
-  `omit?: string[]` prop set to `ownedKeys`, so `on_error`, `max_ops` and `timeout_ms`
-  keep their generated controls. Plugins without an entry render exactly as today.
+- `StepCard` renders the registered editor, then `SchemaForm`. `StepCard` strips the
+  owned keys from both the schema and the config before calling `SchemaForm`, which
+  also covers its raw-JSON fallback, so `on_error`, `max_ops` and `timeout_ms` keep
+  their generated controls. Plugins without an entry render exactly as today.
 
 ### `DocumentScriptEditor`
 
@@ -397,8 +403,8 @@ Co-located under `ui/src/app/pipelines/_components/document-script/`.
 - `check_config`: collects all diagnostics; reports `line`/`column` for script errors
   and for errors inside `set.expr`; returns `generated_script` for valid `ops`.
 - `reference.json` (read from `ui/` at test time, not with `include_str!`): every
-  `snippet` and every `op` passes `check_config`, and every builder operation has an
-  entry.
+  `snippet` and every `op` runs on the entry's example document and produces the
+  expected output, and every builder operation has an entry.
 - Mutation checks on the resolver's variable-wins guard and the escaper.
 
 **Rust — control plane and gateway**

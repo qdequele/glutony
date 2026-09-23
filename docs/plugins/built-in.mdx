@@ -203,11 +203,47 @@ output; any other result keeps it.
 ```
 
 <Warning>
-  Rhai's string methods such as `trim()`, `to_upper()` and `pad()` take `&mut self`
-  and return `()` — they edit the string in place rather than returning a copy. So
-  `doc.content.trim() == ""` is always `false`. Write `doc.content.trim();` as its
-  own statement, then test `doc.content.is_empty()`.
+  Some rhai string methods edit the string in place and return `()`: `trim`,
+  `replace`, `pad`, `truncate`, `clear`, `make_upper`, `make_lower`. So
+  `doc.content.trim() == ""` is always `false` — trim as its own statement, then test
+  `is_empty()`. `to_upper()` and `to_lower()` return a new string.
 </Warning>
+
+Instead of `script`, a step can hold `ops` — the list the pipeline editor's
+**Builder** produces. Set exactly one of the two.
+
+```yaml
+config:
+  ops:
+    - rename: { from: prix, to: price }
+    - drop: [raw_html, _internal_ref]
+    - set: { field: total_ttc, expr: "round(price * qty * 1.2, 2)" }
+    - filter: { drop_if: { field: content, is: empty } }
+```
+
+| Operation | Shape |
+|---|---|
+| `rename`, `copy` | `{ from, to }` — overwrites `to` if it exists |
+| `drop`, `keep`, `trim`, `lowercase`, `uppercase` | `[field, ...]` |
+| `set` | `{ field, expr }` — one expression; bare names read fields |
+| `filter` | `{ drop_if: { field, is: empty \| missing } }`, or `equals` / `not_equals` a value |
+| `split`, `join` | `{ field, separator }` |
+| `promote` | `{ field, to: title \| content }` — moves the field |
+| `round` | `{ field, decimals }` — 0 to 15; integers are left unchanged |
+| `cast` | `{ field, to: number \| string \| boolean }` |
+| `default` | `{ field, value }` — fills a missing or null field |
+
+A **missing** field is a no-op; a field that is **present with the wrong type** is a
+per-document error, handled by `on_error`. In `filter`, the names `id`, `title` and
+`content` mean the document's own attributes; a missing field compares as `null`.
+
+Every operation is also a method on `doc` in a script — `doc.rename_field("prix", "price")`,
+`doc.drop_fields([..])`, `doc.field_is_empty("content")`, and so on — and a bare name
+that is not a variable reads the field of that name (`price * qty`). A variable always
+wins over a field. `round(x, decimals)` takes the number of decimals.
+
+Broken scripts and operations are rejected when the pipeline is saved, with the line and
+column of the problem.
 
 A script that does not compile fails the step immediately with a config error,
 before any document is touched, whatever `on_error` says. A script that exceeds

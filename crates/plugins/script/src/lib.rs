@@ -27,10 +27,10 @@
 //! if doc.content.is_empty() { return false; }     // drop this document
 //! ```
 //!
-//! Rhai's string methods (`trim`, `to_upper`, `pad`, ...) take `&mut self` and
-//! return `()`: they edit the string in place rather than returning a copy. So
-//! `doc.content.trim() == ""` is always `false` — trim as its own statement, then
-//! test `is_empty()`.
+//! Some rhai string methods edit the string in place and return `()`: `trim`,
+//! `replace`, `pad`, `truncate`, `clear`, `make_upper`, `make_lower`. So
+//! `doc.content.trim() == ""` is always `false` — trim as its own statement, then test
+//! `is_empty()`. `to_upper()` and `to_lower()` return a new string.
 //!
 //! Float arithmetic that produces NaN or an infinity (`x / 0.0`, which rhai does
 //! not raise on) fails the document rather than writing `null` into the index.
@@ -53,6 +53,7 @@
 //! | `max_ops` | `100000` | rhai operations one document may use |
 //! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
 
+mod check;
 mod codegen;
 mod config;
 mod convert;
@@ -62,6 +63,7 @@ mod ops;
 mod resolver;
 mod runner;
 
+pub use check::{CheckResult, check_config};
 pub use diagnostic::Diagnostic;
 
 use meili_ingest_plugin_sdk::prelude::*;
@@ -101,12 +103,26 @@ impl Plugin for DocumentScriptPlugin {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["script"],
+                "oneOf": [{ "required": ["script"] }, { "required": ["ops"] }],
                 "properties": {
                     "script": {
                         "type": "string",
-                        "minLength": 1,
+                        "maxLength": 65536,
                         "description": "Rhai script run once per document. The document is bound as `doc` (id, title, content, fields, and read-only meta); return false to drop it."
+                    },
+                    "ops": {
+                        "type": "array",
+                        "description": "Builder operations, applied in order. Each item is a single-key object: rename, drop, keep, copy, set, filter, trim, lowercase, uppercase, split, join, promote, round, cast or default.",
+                        "items": {
+                            "type": "object",
+                            "minProperties": 1,
+                            "maxProperties": 1,
+                            "propertyNames": {
+                                "enum": ["rename", "drop", "keep", "copy", "set", "filter", "trim",
+                                         "lowercase", "uppercase", "split", "join", "promote",
+                                         "round", "cast", "default"]
+                            }
+                        }
                     },
                     "on_error": {
                         "type": "string",
@@ -758,10 +774,11 @@ mod tests {
         for key in ["script", "on_error", "max_ops", "timeout_ms"] {
             assert!(props.contains_key(key), "schema missing {key}");
         }
+        assert!(props.contains_key("ops"), "schema missing ops");
+        assert!(m.config_schema.get("required").is_none(), "neither key is required on its own");
         assert_eq!(
-            m.config_schema["required"],
-            json!(["script"]),
-            "script must be required"
+            m.config_schema["oneOf"],
+            json!([{"required": ["script"]}, {"required": ["ops"]}])
         );
     }
 
