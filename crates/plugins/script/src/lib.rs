@@ -55,6 +55,7 @@
 
 mod config;
 mod convert;
+mod helpers;
 mod resolver;
 mod runner;
 
@@ -207,6 +208,131 @@ mod tests {
 
     fn script(src: &str) -> Value {
         json!({ "script": src })
+    }
+
+    fn with_fields(fields: Value) -> Document {
+        let mut d = doc("a", "x");
+        d.fields = fields.as_object().unwrap().clone();
+        d
+    }
+
+    fn fields(d: &Document) -> Value {
+        Value::Object(d.fields.clone())
+    }
+
+    #[tokio::test]
+    async fn rename_field_moves_and_overwrites() {
+        let out = run(
+            vec![with_fields(json!({"prix": 10, "price": 1}))],
+            script(r#"doc.rename_field("prix", "price");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"price": 10}));
+    }
+
+    #[tokio::test]
+    async fn drop_keep_and_copy_fields() {
+        let out = run(
+            vec![with_fields(json!({"a": 1, "b": 2, "c": 3}))],
+            script(r#"doc.drop_fields(["a"]); doc.keep_fields(["b", "zzz"]); doc.copy_field("b", "d");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"b": 2, "d": 2}));
+    }
+
+    #[tokio::test]
+    async fn field_helpers_ignore_a_missing_field() {
+        let out = run(
+            vec![with_fields(json!({"a": 1}))],
+            script(r#"doc.rename_field("nope", "x"); doc.copy_field("nope", "y"); doc.drop_fields(["nope"]);"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn field_names_must_be_strings() {
+        let err = try_run(
+            vec![with_fields(json!({}))],
+            script("doc.drop_fields([1]);"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("must be strings")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_is_empty_covers_missing_null_blank_and_empty_collections() {
+        let docs = vec![
+            with_fields(json!({})),
+            with_fields(json!({"v": null})),
+            with_fields(json!({"v": "   "})),
+            with_fields(json!({"v": []})),
+            with_fields(json!({"v": {}})),
+            with_fields(json!({"v": "x"})),
+            with_fields(json!({"v": 0})),
+        ];
+        let out = run(
+            docs,
+            script(r#"if doc.field_is_empty("v") { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 2, "only \"x\" and 0 are non-empty");
+    }
+
+    #[tokio::test]
+    async fn field_is_missing_distinguishes_null_from_absent() {
+        let out = run(
+            vec![with_fields(json!({})), with_fields(json!({"v": null}))],
+            script(r#"if doc.field_is_missing("v") { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(fields(&out[0]), json!({"v": null}));
+    }
+
+    #[tokio::test]
+    async fn field_equals_is_type_sensitive_and_treats_missing_as_null() {
+        let docs = vec![
+            with_fields(json!({"s": "1"})),
+            with_fields(json!({"s": 1})),
+            with_fields(json!({})),
+        ];
+        let out = run(
+            docs,
+            script(r#"if doc.field_equals("s", 1) { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 2, "only the integer 1 equals 1");
+
+        let out = run(
+            vec![with_fields(json!({})), with_fields(json!({"s": "x"}))],
+            script(r#"if doc.field_equals("s", ()) { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 1, "a missing field equals null");
+    }
+
+    #[tokio::test]
+    async fn filter_helpers_read_id_title_and_content_from_the_document() {
+        let mut d = with_fields(json!({"content": "a field, not the text"}));
+        d.content = "   ".into();
+        let out = run(
+            vec![d],
+            script(r#"if doc.field_is_empty("content") { return false; } true"#),
+        )
+        .await;
+        assert!(out.is_empty(), "`content` means the document's own text");
+
+        let out = run(
+            vec![doc("a", "x")],
+            script(r#"if doc.field_is_missing("title") { return false; } true"#),
+        )
+        .await;
+        assert!(out.is_empty(), "a document without a title is missing one");
     }
 
     #[tokio::test]

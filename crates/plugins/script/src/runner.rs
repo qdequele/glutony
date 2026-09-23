@@ -38,6 +38,7 @@ pub(crate) fn sandboxed_engine(max_ops: u64) -> Engine {
     engine.set_max_array_size(MAX_ARRAY_SIZE);
     engine.set_max_map_size(MAX_MAP_SIZE);
     install_field_resolver(&mut engine);
+    crate::helpers::register(&mut engine);
     engine
 }
 
