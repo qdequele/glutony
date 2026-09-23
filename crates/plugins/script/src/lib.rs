@@ -55,6 +55,7 @@
 
 mod config;
 mod convert;
+mod resolver;
 mod runner;
 
 use meili_ingest_plugin_sdk::prelude::*;
@@ -577,6 +578,41 @@ mod tests {
         let out = run(vec![doc("a", "x")], script("doc.fields.v = 10.0 / 4.0;")).await;
 
         assert_eq!(out[0].fields.get("v"), Some(&json!(2.5)));
+    }
+
+    #[tokio::test]
+    async fn a_bare_name_reads_the_field() {
+        let mut d = doc("a", "x");
+        d.fields.insert("price".into(), json!(10));
+        d.fields.insert("qty".into(), json!(3));
+
+        let out = run(vec![d], script("doc.fields.total = price * qty;")).await;
+
+        assert_eq!(out[0].fields.get("total"), Some(&json!(30)));
+    }
+
+    /// Rhai asks the resolver *before* it searches the scope, so without the guard a
+    /// field named `price` would silently replace the author's `let price`.
+    #[tokio::test]
+    async fn a_variable_wins_over_a_field_of_the_same_name() {
+        let mut d = doc("a", "x");
+        d.fields.insert("price".into(), json!(10));
+
+        let out = run(vec![d], script("let price = 5; doc.fields.out = price;")).await;
+
+        assert_eq!(out[0].fields.get("out"), Some(&json!(5)));
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_neither_variable_nor_field_is_an_error() {
+        let err = try_run(vec![doc("a", "x")], script("doc.fields.x = nope;"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("nope")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

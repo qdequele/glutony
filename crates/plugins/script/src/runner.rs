@@ -10,6 +10,7 @@ use rhai::{AST, Dynamic, Engine, Map, Scope};
 use crate::NAME;
 use crate::config::Config;
 use crate::convert::{from_scope_map, to_scope_map};
+use crate::resolver::install_field_resolver;
 
 /// Longest expression nesting a script may use, inside and outside functions.
 const MAX_EXPR_DEPTH: usize = 64;
@@ -23,6 +24,22 @@ const MAX_ARRAY_SIZE: usize = 10_000;
 const MAX_MAP_SIZE: usize = 10_000;
 /// Operations between two wall-clock checks in `on_progress`.
 const PROGRESS_EVERY: u64 = 1_000;
+
+/// An engine with every sandbox limit and the field resolver installed — everything
+/// but the per-document deadline, which only a [`Runner`] needs. Also used to compile
+/// `set` expressions and whole configs, so they are checked under the limits they run
+/// under.
+pub(crate) fn sandboxed_engine(max_ops: u64) -> Engine {
+    let mut engine = Engine::new();
+    engine.set_max_operations(max_ops);
+    engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
+    engine.set_max_call_levels(MAX_CALL_LEVELS);
+    engine.set_max_string_size(MAX_STRING_SIZE);
+    engine.set_max_array_size(MAX_ARRAY_SIZE);
+    engine.set_max_map_size(MAX_MAP_SIZE);
+    install_field_resolver(&mut engine);
+    engine
+}
 
 /// One step's compiled script and the engine that runs it.
 ///
@@ -47,13 +64,7 @@ impl Runner {
     /// A syntax error surfaces here — before any document is touched — so it fails
     /// the step as `InvalidConfig` whatever `on_error` says.
     pub(crate) fn new(cfg: &Config) -> Result<Self, PluginError> {
-        let mut engine = Engine::new();
-        engine.set_max_operations(cfg.max_ops);
-        engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
-        engine.set_max_call_levels(MAX_CALL_LEVELS);
-        engine.set_max_string_size(MAX_STRING_SIZE);
-        engine.set_max_array_size(MAX_ARRAY_SIZE);
-        engine.set_max_map_size(MAX_MAP_SIZE);
+        let mut engine = sandboxed_engine(cfg.max_ops);
 
         let base = Instant::now();
         let deadline = Arc::new(AtomicU64::new(u64::MAX));
