@@ -17,12 +17,15 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import type { Backoff, JsonObject, PluginManifest } from "@/lib/api/types";
+import type { Backoff, JsonObject, PluginManifest, StepDiagnostic } from "@/lib/api/types";
 import { FAN_OUT_PATHS } from "@/lib/api/types";
 import { DEFAULT_RETRY, DEFAULT_TIMEOUT_SECS, type StepDraft } from "@/lib/pipeline/draft";
 import type { IssueField, ValidationIssue } from "@/lib/pipeline/validate";
 import { SchemaForm } from "@/lib/schema-form";
 import { cn } from "@/lib/utils";
+import { CONFIG_EDITORS } from "./config-editor-registry";
+import { mergeOwnedKeys, withoutOwnedKeys } from "./config-editors";
+import type { ServerState } from "./document-script/diagnostics";
 import { PluginPicker } from "./plugin-picker";
 
 const NO_FAN_OUT = "__none__";
@@ -39,6 +42,8 @@ export interface StepCardProps {
   earlierStepIds: string[];
   plugins: PluginManifest[];
   issues: ValidationIssue[];
+  diagnostics: StepDiagnostic[];
+  serverState: ServerState;
   readOnly: boolean;
   onPatch: (patch: Partial<StepDraft>) => void;
   onRemove: () => void;
@@ -52,6 +57,8 @@ export function StepCard({
   earlierStepIds,
   plugins,
   issues,
+  diagnostics,
+  serverState,
   readOnly,
   onPatch,
   onRemove,
@@ -60,6 +67,11 @@ export function StepCard({
   const manifest = plugins.find((plugin) => plugin.name === step.plugin);
   const idPrefix = `step-${index}`;
   const retryEnabled = step.retry !== undefined;
+  const custom = CONFIG_EDITORS[step.plugin];
+  const CustomEditor = custom?.Editor;
+  const formPart = custom
+    ? withoutOwnedKeys(manifest?.config_schema, step.config, custom.ownedKeys)
+    : { schema: manifest?.config_schema, config: step.config };
 
   function toggleDependency(id: string) {
     const next = step.depends_on.includes(id)
@@ -330,12 +342,25 @@ export function StepCard({
 
         <div className="space-y-2">
           <p className="text-xs font-medium">config</p>
+          {CustomEditor ? (
+            <CustomEditor
+              stepId={step.id}
+              idPrefix={`${idPrefix}-editor`}
+              config={step.config}
+              onChange={(next) => onPatch({ config: next })}
+              diagnostics={diagnostics}
+              serverState={serverState}
+              readOnly={readOnly}
+            />
+          ) : null}
           <SchemaForm
             idPrefix={`${idPrefix}-config`}
-            schema={manifest?.config_schema}
-            value={step.config}
+            schema={formPart.schema}
+            value={formPart.config}
             disabled={readOnly}
-            onChange={(next: JsonObject) => onPatch({ config: next })}
+            onChange={(next: JsonObject) =>
+              onPatch({ config: custom ? mergeOwnedKeys(next, step.config, custom.ownedKeys) : next })
+            }
           />
         </div>
       </CardContent>

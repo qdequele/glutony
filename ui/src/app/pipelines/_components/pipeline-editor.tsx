@@ -12,6 +12,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { diagnosticsForStep } from "@/lib/api/diagnostics";
 import { useUpsertPipeline, usePlugins, useValidatePipeline } from "@/lib/api/hooks";
 import type { PipelineDefinition, PluginManifest } from "@/lib/api/types";
 import {
@@ -23,6 +24,7 @@ import {
 import { issuesByStep, outputToInput, validateDraft } from "@/lib/pipeline/validate";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { PIPELINES_HREF, newPipelineHref } from "../routes";
+import type { ServerState } from "./document-script/diagnostics";
 import { MetadataPanel } from "./metadata-panel";
 import { StepCard } from "./step-card";
 import { YamlPane } from "./yaml-pane";
@@ -89,6 +91,14 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
     return draftToPipeline(debounced);
   }, [debounced, plugins.data]);
   const serverCheck = useValidatePipeline(readOnly ? undefined : candidate);
+  const serverDiagnostics = serverCheck.data?.kind === "invalid" ? serverCheck.data.diagnostics : [];
+  const serverState: ServerState = serverCheck.isFetching
+    ? "checking"
+    : serverCheck.data?.kind === "ok"
+      ? "ok"
+      : serverCheck.data?.kind === "invalid"
+        ? "invalid"
+        : "idle";
 
   // --- edits --------------------------------------------------------------
   const patchDraft = useCallback(
@@ -256,6 +266,8 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
                     earlierStepIds={draft.steps.slice(0, index).map((entry) => entry.id)}
                     plugins={plugins.data ?? []}
                     issues={grouped.get(step.id) ?? []}
+                    diagnostics={diagnosticsForStep(serverDiagnostics, step.id)}
+                    serverState={serverState}
                     readOnly={readOnly}
                     onPatch={(patch) => patchStep(index, patch)}
                     onRemove={() => steps.remove(index)}
