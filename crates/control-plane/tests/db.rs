@@ -443,6 +443,7 @@ async fn jobs_insert_patch_get() {
         error: None,
         started_at: now,
         updated_at: now,
+        source_id: None,
     };
 
     let (status, body) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
@@ -541,6 +542,7 @@ async fn terminal_status_clears_the_current_step() {
         error: None,
         started_at: now,
         updated_at: now,
+        source_id: None,
     };
     let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
     assert_eq!(status, StatusCode::CREATED);

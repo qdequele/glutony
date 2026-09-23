@@ -264,6 +264,32 @@ async fn the_worker_routes_load_by_id_save_state_and_record_runs() {
 }
 
 #[tokio::test]
+async fn a_job_row_remembers_the_source_that_started_it() {
+    let Some(app) = setup("sr-job").await else {
+        return;
+    };
+    let job_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let job = serde_json::json!({
+        "job_id": job_id,
+        "workflow_id": format!("ingest-{job_id}"),
+        "pipeline_uid": "movies",
+        "status": "queued",
+        "started_at": now,
+        "updated_at": now,
+        "source_id": source_id,
+    });
+    let (status, _) = call(&app, with_json("POST", "/internal/jobs", &job)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = call(&app, bare("GET", &format!("/internal/jobs/{job_id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let got: serde_json::Value = json(&body);
+    assert_eq!(got["source_id"], serde_json::json!(source_id));
+}
+
+#[tokio::test]
 async fn an_unknown_id_is_404_on_the_worker_routes() {
     let Some(app) = setup("sr-none").await else {
         return;

@@ -42,6 +42,9 @@ pub struct JobRecord {
     pub started_at: DateTime<Utc>,
     /// Last write.
     pub updated_at: DateTime<Utc>,
+    /// Scheduled source that started this job; `None` for request-driven jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Uuid>,
 }
 
 /// Partial update for `PATCH /internal/jobs/{job_id}`; absent fields are left as-is.
@@ -86,6 +89,7 @@ struct JobRow {
     error: Option<String>,
     started_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    source_id: Option<Uuid>,
 }
 
 impl TryFrom<JobRow> for JobRecord {
@@ -109,6 +113,7 @@ impl TryFrom<JobRow> for JobRecord {
             error: r.error,
             started_at: r.started_at,
             updated_at: r.updated_at,
+            source_id: r.source_id,
         })
     }
 }
@@ -117,15 +122,16 @@ impl TryFrom<JobRow> for JobRecord {
 pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpError> {
     let row: JobRow = sqlx::query_as(
         "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                           current_step, error, started_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                           current_step, error, started_at, updated_at, source_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (job_id) DO UPDATE SET \
             workflow_id = EXCLUDED.workflow_id, pipeline_uid = EXCLUDED.pipeline_uid, \
             project_id = EXCLUDED.project_id, index_name = EXCLUDED.index_name, \
             status = EXCLUDED.status, current_step = EXCLUDED.current_step, \
-            error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now() \
+            error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now(), \
+            source_id = COALESCE(EXCLUDED.source_id, jobs.source_id) \
          RETURNING job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                   current_step, error, started_at, updated_at",
+                   current_step, error, started_at, updated_at, source_id",
     )
     .bind(job.job_id)
     .bind(&job.workflow_id)
@@ -137,6 +143,7 @@ pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpE
     .bind(job.error.as_deref())
     .bind(job.started_at)
     .bind(job.updated_at)
+    .bind(job.source_id)
     .fetch_one(pool)
     .await?;
     JobRecord::try_from(row)
@@ -162,7 +169,7 @@ pub async fn update_job_row(
             updated_at = now() \
          WHERE job_id = $1 \
          RETURNING job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                   current_step, error, started_at, updated_at",
+                   current_step, error, started_at, updated_at, source_id",
     )
     .bind(job_id)
     .bind(upd.status.map(|s| s.as_str()))
@@ -179,7 +186,7 @@ pub async fn update_job_row(
 pub async fn fetch_job(pool: &PgPool, job_id: Uuid) -> Result<Option<JobRecord>, CpError> {
     let row: Option<JobRow> = sqlx::query_as(
         "SELECT job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                current_step, error, started_at, updated_at \
+                current_step, error, started_at, updated_at, source_id \
          FROM jobs WHERE job_id = $1",
     )
     .bind(job_id)
@@ -258,7 +265,7 @@ pub async fn list_jobs(
     // sqlx 0.9 requires, and lets Postgres use the (project_id, started_at) index.
     let rows: Vec<JobRow> = sqlx::query_as(
         "SELECT job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                current_step, error, started_at, updated_at \
+                current_step, error, started_at, updated_at, source_id \
          FROM jobs \
          WHERE ($1::text IS NULL OR project_id = $1) \
            AND ($2::text IS NULL OR status = $2) \
@@ -346,6 +353,7 @@ mod tests {
             error: None,
             started_at: now,
             updated_at: now,
+            source_id: None,
         };
         assert_eq!(JobRecord::try_from(row).unwrap_err().code(), "internal");
     }
@@ -374,8 +382,13 @@ mod tests {
             error: None,
             started_at: now,
             updated_at: now,
+            source_id: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
+        assert!(
+            v.get("source_id").is_none(),
+            "request-driven jobs omit source_id, so older readers are unaffected"
+        );
         assert_eq!(v["status"], "queued");
         assert_eq!(v["project_id"], "t1");
         assert!(v.get("index_name").is_none());
