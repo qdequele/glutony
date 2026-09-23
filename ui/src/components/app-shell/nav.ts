@@ -1,7 +1,17 @@
 import type { LucideIcon } from "lucide-react";
-import { Activity, BarChart3, FlaskConical, Store, Workflow } from "lucide-react";
+import {
+  Activity,
+  BarChart3,
+  CalendarClock,
+  Database,
+  FlaskConical,
+  Store,
+  Workflow,
+} from "lucide-react";
 
+import { CONNECTIONS_HREF } from "@/app/connections/routes";
 import { MARKETPLACE_HREF } from "@/app/marketplace/routes";
+import { SOURCES_HREF } from "@/app/sources/routes";
 
 /** One entry of the left sidebar. */
 export interface NavItem {
@@ -12,7 +22,7 @@ export interface NavItem {
 }
 
 /**
- * The five screens of the admin UI.
+ * The screens of the admin UI.
  */
 export const NAV_ITEMS: NavItem[] = [
   {
@@ -26,6 +36,18 @@ export const NAV_ITEMS: NavItem[] = [
     label: "Pipelines",
     icon: Workflow,
     description: "Author and validate ingestion pipelines",
+  },
+  {
+    href: SOURCES_HREF,
+    label: "Sources",
+    icon: CalendarClock,
+    description: "Fetch a URL on a schedule and feed it to a pipeline",
+  },
+  {
+    href: CONNECTIONS_HREF,
+    label: "Connections",
+    icon: Database,
+    description: "Named Meilisearch destinations pipelines can pin",
   },
   { href: "/jobs", label: "Jobs", icon: Activity, description: "Track ingestion jobs" },
   {

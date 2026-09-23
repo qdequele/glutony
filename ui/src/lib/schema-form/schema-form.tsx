@@ -7,7 +7,7 @@
  * not understand — an unsupported shape, or a config key the schema never
  * mentions — is rendered as raw JSON rather than dropped.
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ComponentType } from "react";
 
 import { Input } from "@/components/ui/input";
 import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
@@ -51,6 +51,19 @@ interface ControlProps {
   disabled?: boolean;
   inputId: string;
 }
+
+/**
+ * Props of a custom widget. Same contract as the built-in controls: `value` is
+ * the config key's current value, `onChange(undefined)` removes the key.
+ */
+export type SchemaWidgetProps = ControlProps;
+
+/**
+ * Custom controls keyed by JSON Schema `format`. A string property whose
+ * `format` has an entry here renders that widget instead of a text input; the
+ * label and description around it stay the form's own.
+ */
+export type SchemaWidgets = Partial<Record<string, ComponentType<SchemaWidgetProps>>>;
 
 /**
  * Text-like control (string, integer, number and the JSON fallback).
@@ -163,9 +176,11 @@ function SchemaFieldRow({
   onChange,
   disabled,
   idPrefix,
-}: Omit<ControlProps, "inputId"> & { idPrefix: string }) {
+  widgets,
+}: Omit<ControlProps, "inputId"> & { idPrefix: string; widgets?: SchemaWidgets }) {
   const inputId = `${idPrefix}-${field.name}`;
   const boolean = field.kind === "boolean";
+  const Widget = field.format ? widgets?.[field.format] : undefined;
 
   return (
     <Field orientation={boolean ? "horizontal" : "vertical"} className="gap-1.5">
@@ -177,7 +192,15 @@ function SchemaFieldRow({
         ) : null}
       </FieldLabel>
 
-      {boolean ? (
+      {Widget ? (
+        <Widget
+          field={field}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          inputId={inputId}
+        />
+      ) : boolean ? (
         <BooleanControl
           field={field}
           value={value}
@@ -293,9 +316,18 @@ export interface SchemaFormProps {
   /** Prefix for generated input ids; must be unique on the page. */
   idPrefix: string;
   disabled?: boolean;
+  /** Custom controls for string properties, keyed by schema `format`. */
+  widgets?: SchemaWidgets;
 }
 
-export function SchemaForm({ schema, value, onChange, idPrefix, disabled }: SchemaFormProps) {
+export function SchemaForm({
+  schema,
+  value,
+  onChange,
+  idPrefix,
+  disabled,
+  widgets,
+}: SchemaFormProps) {
   const fields = schemaToFields(schema);
   const extraKeys = unknownConfigKeys(schema, value);
 
@@ -331,6 +363,7 @@ export function SchemaForm({ schema, value, onChange, idPrefix, disabled }: Sche
             onChange={(next) => onChange(withKey(value, field.name, next))}
             disabled={disabled}
             idPrefix={idPrefix}
+            widgets={widgets}
           />
         </div>
       ))}

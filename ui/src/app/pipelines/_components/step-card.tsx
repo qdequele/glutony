@@ -23,6 +23,7 @@ import { DEFAULT_RETRY, DEFAULT_TIMEOUT_SECS, type StepDraft } from "@/lib/pipel
 import type { IssueField, ValidationIssue } from "@/lib/pipeline/validate";
 import { SchemaForm } from "@/lib/schema-form";
 import { cn } from "@/lib/utils";
+import { STEP_CONFIG_WIDGETS } from "./connection-select";
 import { PluginPicker } from "./plugin-picker";
 
 const NO_FAN_OUT = "__none__";
@@ -335,6 +336,7 @@ export function StepCard({
             schema={manifest?.config_schema}
             value={step.config}
             disabled={readOnly}
+            widgets={STEP_CONFIG_WIDGETS}
             onChange={(next: JsonObject) => onPatch({ config: next })}
           />
         </div>

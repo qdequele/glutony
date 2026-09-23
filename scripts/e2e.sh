@@ -640,7 +640,7 @@ if [ -n "$UI_FEATURES" ]; then
   code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/")
   echo "/ui/ → ${code}"
   [ "$code" = "200" ] || { echo "the trailing-slash UI root did not serve" >&2; exit 1; }
-  for route in pipelines jobs playground usage; do
+  for route in pipelines jobs playground usage sources connections; do
     code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/${route}/")
     echo "/ui/${route}/ → ${code}"
     [ "$code" = "200" ] || { echo "route ${route} did not serve" >&2; exit 1; }

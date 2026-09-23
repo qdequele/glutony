@@ -44,6 +44,24 @@ export class ApiError extends Error {
   get isForbidden(): boolean {
     return this.status === 403;
   }
+
+  /**
+   * True when the feature is switched off on this deployment (501
+   * `not_configured`) — for example sources and connections without a
+   * `SOURCE_SECRET_KEY`. Screens render an explanatory state, not an error.
+   */
+  get isNotConfigured(): boolean {
+    return this.status === 501 || this.code === "not_configured";
+  }
+}
+
+/**
+ * True for the failures a form should show inline rather than as a toast: a 422
+ * (or 400) carries a readable message about a field — an unreachable host, a bad
+ * key, a cron Temporal rejected.
+ */
+export function isFormError(error: unknown): error is ApiError {
+  return error instanceof ApiError && (error.status === 422 || error.status === 400);
 }
 
 function isApiErrorBody(value: unknown): value is ApiErrorBody {
@@ -71,7 +89,7 @@ async function toApiError(response: Response): Promise<ApiError> {
 
 /** Options accepted by {@link request}. */
 export interface RequestOptions {
-  method?: "GET" | "POST" | "DELETE";
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
   /** JSON body. Serialized and sent with `Content-Type: application/json`. */
   json?: unknown;
   signal?: AbortSignal;

@@ -19,9 +19,11 @@ function makeQueryClient(): QueryClient {
         staleTime: 15 * 1000,
         refetchOnWindowFocus: false,
         // 4xx answers are the gateway telling us something true; only retry
-        // transport failures and 5xx.
+        // transport failures and 5xx. A 501 `not_configured` is just as final.
         retry: (failureCount, error) => {
-          if (error instanceof ApiError && error.status < 500) return false;
+          if (error instanceof ApiError && (error.status < 500 || error.isNotConfigured)) {
+            return false;
+          }
           return failureCount < 2;
         },
       },
