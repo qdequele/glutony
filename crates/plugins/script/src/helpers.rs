@@ -6,8 +6,14 @@
 //! **present with the wrong type** is an error, handled by the step's `on_error`.
 //! `default_field` and the `field_is_*` / `field_equals` tests are where absence is
 //! the point.
+//!
+//! rhai checks data sizes only after a helper returns, so a helper whose output can
+//! outgrow its input (`join_field`, `split_field`) checks the projected size against
+//! the sandbox limits first and never allocates past them.
 
 use rhai::{Array, Dynamic, Engine, EvalAltResult, FLOAT, INT, Map};
+
+use crate::runner::{MAX_ARRAY_SIZE, MAX_STRING_SIZE};
 
 pub(crate) type HelperResult<T> = Result<T, Box<EvalAltResult>>;
 
@@ -195,6 +201,12 @@ fn split_field(doc: &mut Map, name: &str, separator: &str) -> HelperResult<()> {
                 ));
             }
         };
+        let parts = text.matches(separator).count().saturating_add(1);
+        if parts > MAX_ARRAY_SIZE {
+            return fail(format!(
+                "split_field: splitting `{name}` would build {parts} parts; the limit is {MAX_ARRAY_SIZE}"
+            ));
+        }
         *value = Dynamic::from_array(
             text.split(separator)
                 .map(|part| Dynamic::from(part.to_string()))
@@ -228,9 +240,30 @@ fn join_field(doc: &mut Map, name: &str, separator: &str) -> HelperResult<()> {
                 }
             })
             .collect::<HelperResult<Vec<_>>>()?;
+        match joined_len(&parts, separator) {
+            Some(len) if len <= MAX_STRING_SIZE => {}
+            Some(len) => {
+                return fail(format!(
+                    "join_field: joining `{name}` would build a {len}-byte string; the limit is {MAX_STRING_SIZE}"
+                ));
+            }
+            None => {
+                return fail(format!(
+                    "join_field: joining `{name}` would build a string past the {MAX_STRING_SIZE}-byte limit"
+                ));
+            }
+        }
         *value = Dynamic::from(parts.join(separator));
         Ok(())
     })
+}
+
+/// Byte length of `parts.join(separator)`, without building it; `None` on overflow.
+fn joined_len(parts: &[String], separator: &str) -> Option<usize> {
+    let separators = separator.len().checked_mul(parts.len().saturating_sub(1))?;
+    parts
+        .iter()
+        .try_fold(separators, |len, part| len.checked_add(part.len()))
 }
 
 /// Move a string field into the document's `title` or `content`.
@@ -378,4 +411,38 @@ fn default_field(doc: &mut Map, name: &str, value: Dynamic) -> HelperResult<()> 
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joined_len_matches_join() {
+        let parts = vec!["ab".to_string(), String::new(), "cde".to_string()];
+        assert_eq!(joined_len(&parts, ", "), Some(parts.join(", ").len()));
+        assert_eq!(joined_len(&[], ", "), Some(0));
+        assert_eq!(joined_len(&["x".to_string()], ", "), Some(1));
+    }
+
+    #[test]
+    fn a_join_at_exactly_the_string_limit_is_allowed_and_one_byte_more_is_not() {
+        let mut fields = Map::new();
+        let half = "p".repeat(MAX_STRING_SIZE / 2 - 1);
+        fields.insert(
+            "l".into(),
+            Dynamic::from_array(vec![half.clone().into(), half.into()]),
+        );
+        let mut doc = Map::new();
+        doc.insert("fields".into(), Dynamic::from_map(fields));
+
+        let mut at_limit = doc.clone();
+        join_field(&mut at_limit, "l", "ab").unwrap();
+        let joined =
+            with_fields(&mut at_limit, |f| Ok(f["l"].clone().into_string().unwrap())).unwrap();
+        assert_eq!(joined.len(), MAX_STRING_SIZE);
+
+        let err = join_field(&mut doc, "l", "abc").unwrap_err();
+        assert!(err.to_string().contains("join_field"), "got {err}");
+    }
 }

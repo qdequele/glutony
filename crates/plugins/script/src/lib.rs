@@ -841,6 +841,39 @@ mod tests {
         );
     }
 
+    /// rhai checks sizes only after a helper returns, so `join_field` must refuse a join
+    /// whose result would exceed the string limit before allocating it. 10,000 empty
+    /// items joined by a 60-byte separator project 599,940 bytes (> 512 KiB) while the
+    /// test itself stays small.
+    #[tokio::test]
+    async fn join_refuses_a_result_over_the_string_limit_before_building_it() {
+        let items = vec![json!(""); 10_000];
+        let err = try_run(
+            vec![with_fields(json!({ "l": items }))],
+            script(&format!(r#"doc.join_field("l", "{}");"#, "x".repeat(60))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("join_field") && m.contains("599940")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_refuses_more_parts_than_the_array_limit_before_building_them() {
+        let err = try_run(
+            vec![with_fields(json!({ "s": ",".repeat(10_000) }))],
+            script(r#"doc.split_field("s", ",");"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("split_field") && m.contains("10001")),
+            "got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn promote_moves_a_field_into_title_or_content() {
         let out = run(

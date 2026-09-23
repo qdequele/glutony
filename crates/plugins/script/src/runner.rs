@@ -16,10 +16,10 @@ use crate::resolver::install_field_resolver;
 const MAX_EXPR_DEPTH: usize = 64;
 /// Deepest function call chain a script may build (bounds recursion).
 const MAX_CALL_LEVELS: usize = 16;
-/// Longest string a script may build, in characters.
-const MAX_STRING_SIZE: usize = 512 * 1024;
+/// Longest string a script may build, in bytes (rhai measures `str::len`).
+pub(crate) const MAX_STRING_SIZE: usize = 512 * 1024;
 /// Largest array a script may build.
-const MAX_ARRAY_SIZE: usize = 10_000;
+pub(crate) const MAX_ARRAY_SIZE: usize = 10_000;
 /// Largest map a script may build.
 const MAX_MAP_SIZE: usize = 10_000;
 /// Operations between two wall-clock checks in `on_progress`.
