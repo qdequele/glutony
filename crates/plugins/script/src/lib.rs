@@ -1159,6 +1159,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_script_of_exactly_64_kib_is_accepted() {
+        let exact = format!("//{}", "x".repeat(65536 - 2));
+        assert_eq!(exact.len(), 65536);
+        let out = run(vec![with_fields(json!({"a": 1}))], script(&exact)).await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+    }
+
+    #[tokio::test]
     async fn a_bad_operation_names_its_index() {
         let err = try_run(
             vec![doc("a", "x")],
