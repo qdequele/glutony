@@ -307,4 +307,24 @@ async fn an_unknown_id_is_404_on_the_worker_routes() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A run finishing after its source was deleted: 404, which the worker treats as
+    // nothing left to record, instead of a 500 it would retry.
+    let run = RunRecord {
+        run_id: Uuid::new_v4(),
+        source_id: id,
+        started_at: chrono::Utc::now(),
+        finished_at: Some(chrono::Utc::now()),
+        outcome: RunOutcome::Failed,
+        items: 0,
+        job_ids: vec![],
+        error: Some("boom".into()),
+    };
+    let (status, body) = call(&app, with_json("POST", "/internal/source-runs", &run)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }

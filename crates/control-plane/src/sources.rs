@@ -499,7 +499,14 @@ impl SourceRepo {
         .bind(&run.job_ids)
         .bind(run.error.as_deref())
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| match &e {
+            // The source was deleted while this run was in flight.
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("23503") => {
+                CpError::NotFound(format!("source {}", run.source_id))
+            }
+            _ => CpError::Db(e),
+        })?;
 
         sqlx::query(
             "UPDATE sources SET last_run_at = $2, last_status = $3, last_error = $4, \
