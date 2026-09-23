@@ -82,11 +82,28 @@ pub struct SourcePatch {
     pub index_name: Option<String>,
     /// `Some(Some(bytes))` replaces the credential, `Some(None)` clears it, `None`
     /// leaves it alone. That three-way distinction is the whole point of the type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// `deserialize_with` is what makes it survive JSON: serde's default reads a
+    /// `null` as the *outer* `None`, which would turn "clear" into "keep".
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub fetch_auth: Option<Option<Vec<u8>>>,
     /// New paused flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
+}
+
+/// Deserialize a present field (including an explicit `null`) as `Some(inner)`. Paired
+/// with `#[serde(default)]`, an absent field stays `None`.
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// A source as stored, including its sealed secrets and incremental state.
@@ -499,5 +516,43 @@ impl SourceRepo {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(RunRecord::try_from).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_distinguishes_absent_null_and_bytes_for_the_credential_over_json() {
+        // The gateway sends patches as JSON, so the three cases must survive the wire.
+        let absent: SourcePatch = serde_json::from_str("{}").expect("absent");
+        assert_eq!(absent.fetch_auth, None, "omitted: keep the credential");
+
+        let null: SourcePatch = serde_json::from_str(r#"{"fetch_auth": null}"#).expect("null");
+        assert_eq!(null.fetch_auth, Some(None), "null: clear the credential");
+
+        let bytes: SourcePatch = serde_json::from_str(r#"{"fetch_auth": [1, 2]}"#).expect("bytes");
+        assert_eq!(
+            bytes.fetch_auth,
+            Some(Some(vec![1, 2])),
+            "bytes: replace it"
+        );
+    }
+
+    #[test]
+    fn a_clearing_patch_round_trips() {
+        let clear = SourcePatch {
+            fetch_auth: Some(None),
+            ..Default::default()
+        };
+        let back: SourcePatch =
+            serde_json::from_str(&serde_json::to_string(&clear).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(
+            back.fetch_auth,
+            Some(None),
+            "a clear must not turn into a keep"
+        );
     }
 }
