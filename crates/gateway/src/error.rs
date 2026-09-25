@@ -2,7 +2,7 @@
 //!
 //! Every handler returns `Result<_, GatewayError>`; the [`IntoResponse`] impl turns the
 //! error into `{"error": "<message>", "code": "<snake_case>"}` with the status code from
-//! the plan (400 missing context / bad request, 403 forbidden, 404 not found, 413 too
+//! the plan (400 missing context / bad request, 401 unauthorized, 403 forbidden, 404 not found, 413 too
 //! large, 415 no pipeline for the MIME type, 422 invalid pipeline, 502 upstream, 500
 //! internal). Messages never contain API keys: they are built from our own strings, from
 //! control-plane error bodies, or from transport errors that carry URLs but no
@@ -22,7 +22,11 @@ pub enum GatewayError {
     /// Malformed request (400).
     #[error("{0}")]
     BadRequest(String),
-    /// The control plane refused the operation, e.g. deleting a built-in pipeline (403).
+    /// The caller's Meilisearch key is missing (401), from the write preflight.
+    #[error("{0}")]
+    Unauthorized(String),
+    /// The control plane refused the operation, e.g. deleting a built-in pipeline, or the
+    /// caller's Meilisearch key may not write the target index (403).
     #[error("{0}")]
     Forbidden(String),
     /// Unknown pipeline, job or resource (404).
@@ -59,6 +63,7 @@ impl GatewayError {
             GatewayError::MissingContext(_) | GatewayError::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -77,6 +82,7 @@ impl GatewayError {
         match self {
             GatewayError::MissingContext(_) => "missing_context",
             GatewayError::BadRequest(_) => "bad_request",
+            GatewayError::Unauthorized(_) => "unauthorized",
             GatewayError::Forbidden(_) => "forbidden",
             GatewayError::NotFound(_) => "not_found",
             GatewayError::TooLarge(_) => "payload_too_large",

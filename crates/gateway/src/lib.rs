@@ -11,6 +11,7 @@ pub mod context;
 pub mod error;
 pub mod extract;
 pub mod handlers;
+pub mod preflight;
 pub mod schedules;
 pub mod sources;
 pub mod state;
@@ -107,6 +108,20 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/ingest/pipeline/{name}",
             post(handlers::pipeline::ingest_with_pipeline),
+        )
+        // Index-scoped aliases, the Meilisearch-style URLs a Cloud project exposes: the
+        // path names the index and nothing in the request can override it.
+        .route(
+            "/indexes/{index_uid}/ingest",
+            post(handlers::ingest::ingest_into_index),
+        )
+        .route(
+            "/indexes/{index_uid}/ingest/batch",
+            post(handlers::ingest::ingest_batch_into_index),
+        )
+        .route(
+            "/indexes/{index_uid}/ingest/pipeline/{name}",
+            post(handlers::pipeline::ingest_into_index_with_pipeline),
         )
         .route("/jobs", get(handlers::jobs::list_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))

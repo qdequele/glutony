@@ -20,12 +20,13 @@ inside plugins or workflow code.
 | `DEFAULT_INDEX` | `documents` | Last resort of the index resolution chain. |
 | `MAX_UPLOAD_MB` | `500` | Maximum request body; larger → `413`. |
 | `ENVOY_TRUSTED_HEADER` | — | Shared secret. When set, `X-Meili-*` headers are honoured only if `X-Meili-Envoy-Secret` matches. Unset = trust headers (dev mode, warned at startup). |
+| `WRITE_PREFLIGHT` | `false` | Before queueing a job, check the request's Meilisearch key can add documents to (and read) the target index; answer `401`/`403` instead of a job that fails at `meili_indexer`. Skipped for pipelines pinned to a connection. Side-effect free: see `crates/gateway/src/preflight.rs`. |
 | `BLOB_STORE_URL` | `file://./blobs` | Where uploads above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
 | `INLINE_MAX_BYTES` | `1048576` | Uploads up to this size travel inside the Temporal payload; larger ones are staged. |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
 | `SOURCE_SECRET_KEY` | — | 32 bytes, base64 (`openssl rand -base64 32`). Seals [connection](/concepts/connections) keys and [source](/concepts/sources) credentials. Unset = `/connections` and `/sources` answer `501`. Must match the workers'. Rotating it makes stored secrets unreadable. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Where connections may point: `public` (https, public addresses only), `any`, or a comma list of `host[:port]`. |
-| `SOURCE_FETCH_HOSTS` | `public` | Where sources may fetch from; same syntax. Checked when a source is saved. |
+| `SOURCE_FETCH_HOSTS` | `public` | Where sources **and `{"url": …}` ingest bodies** may fetch from; same syntax. Checked when a source is saved, and on every ingest URL (a forbidden one is a `422`, no job queued). `public` means `https` and public addresses only, so plain-`http` URLs need an allowlist entry or `any`. |
 
 ## Worker (`meili-ingest-worker`)
 
@@ -45,9 +46,10 @@ inside plugins or workflow code.
 | `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-gpu` pool). |
 | `TRANSCRIBE_BASE_URL` | falls back to `LLM_BASE_URL`, then `https://api.openai.com/v1` | OpenAI-compatible endpoint exposing `/audio/transcriptions`. |
 | `TRANSCRIBE_MODEL` | `whisper-1` | Default transcription model. |
+| `INDEXER_TASK_TIMEOUT_SECS` | `120` | How long `meili_indexer` waits for one Meilisearch task before retrying the step; a step's `task_timeout_secs` overrides it. Raise it when Meilisearch is shared with a busy writer (tasks run one at a time), and keep it below the index step's `timeout_secs` (built-in pipelines: 1800). |
 | `SOURCE_SECRET_KEY` | — | Same key as the gateway. Opens connection keys in the indexer activity and source credentials in the fetch activity. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Same policy as the gateway, re-applied every time a connection is used. |
-| `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect. |
+| `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect hop (at most 5) — for scheduled sources and for URL refs in step inputs alike. A refused URL fails the step as non-retryable. `s3://`/`gs://`/`az://` refs are **not** covered: they are read with the worker's ambient cloud credentials, so scope those to what tenants may read (never the blob store's bucket in a shared deployment). |
 | `DEFAULT_INDEX` | `documents` | Index for a source's documents when nothing more specific resolves. Keep it equal to the gateway's. |
 | `TINYBIRD_TOKEN` | — | Append token for per-tenant [usage analytics](/concepts/usage). Absent disables reporting entirely. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |

@@ -36,11 +36,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(plugins = ?registry.names(), unavailable = ?registry.unavailable(), "plugins registered");
     let registry = Arc::new(registry);
 
+    // URL fetches on a tenant's behalf — scheduled sources AND `{"url": …}` refs in
+    // step inputs — obey SOURCE_FETCH_HOSTS, re-checked on every redirect hop.
+    let fetch_policy =
+        meili_ingest_source::HostPolicy::from_env_var(meili_ingest_source::FETCH_HOSTS_ENV)
+            .context("invalid SOURCE_FETCH_HOSTS")?;
+    tracing::info!(policy = ?fetch_policy, "fetch host policy (sources and URL refs)");
+
     // Blob store
     let blob = match &config.blob_store_url {
         Some(url) => BlobStore::from_url(url).context("invalid BLOB_STORE_URL")?,
         None => BlobStore::from_env()?,
-    };
+    }
+    .with_fetch_guard(meili_ingest_worker::fetch_guard::fetch_guard(
+        fetch_policy.clone(),
+    ));
 
     // Publish manifests to the control plane (best effort).
     if let Some(cp) = &config.control_plane_url {
@@ -82,11 +92,6 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
 
-    // Scheduled sources: fetches obey SOURCE_FETCH_HOSTS, re-checked on every redirect.
-    let fetch_policy =
-        meili_ingest_source::HostPolicy::from_env_var(meili_ingest_source::FETCH_HOSTS_ENV)
-            .context("invalid SOURCE_FETCH_HOSTS")?;
-    tracing::info!(policy = ?fetch_policy, "source fetch host policy");
     let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
         .with_security(connection_key.clone(), fetch_policy)
         .with_default_index(

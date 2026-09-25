@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use meili_ingest_blob::BlobStore;
+use meili_ingest_blob::{BlobError, BlobStore};
 use meili_ingest_plugin_sdk::{
     ActivityContext as PluginContext, JobStatus, PluginError, PluginInput, PluginOutput,
     StepActivityInput, StepActivityOutput,
@@ -172,7 +172,13 @@ impl StepActivities {
             .blob
             .resolve_input(input.input, &self.http)
             .await
-            .map_err(|e| PluginError::Retryable(format!("failed to resolve step input: {e}")))?;
+            .map_err(|e| match e {
+                // A forbidden URL stays forbidden: retrying would only re-run the check.
+                BlobError::Blocked(_) => {
+                    PluginError::NonRetryable(format!("refusing to fetch the step input: {e}"))
+                }
+                other => PluginError::Retryable(format!("failed to resolve step input: {other}")),
+            })?;
         if !manifest.accepts.is_empty() && !manifest.accepts_kind(resolved.kind()) {
             // Be lenient for Many → Documents: most plugins accepting Documents can take a
             // flattened Many.
@@ -702,6 +708,145 @@ mod tests {
         for b in out.branches {
             let resolved = a.blob.resolve_input(b, &a.http).await.unwrap();
             assert_eq!(resolved.into_documents().unwrap().len(), 1);
+        }
+    }
+
+    /// Hands its input straight back, whatever it is: shows what the step received.
+    struct Echo;
+    #[async_trait]
+    impl Plugin for Echo {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("echo", "0")
+        }
+        async fn execute(
+            &self,
+            _ctx: &PluginContext,
+            input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            match input {
+                PluginInput::Bytes(b) => Ok(PluginOutput::Bytes(b)),
+                other => Err(PluginError::InvalidInput(format!("{:?}", other.kind()))),
+            }
+        }
+    }
+
+    fn guarded_acts(policy: &str) -> StepActivities {
+        let mut reg = PluginRegistry::new();
+        reg.register(Arc::new(Echo));
+        let blob = BlobStore::memory().with_fetch_guard(crate::fetch_guard::fetch_guard(
+            meili_ingest_source::HostPolicy::parse(policy).unwrap(),
+        ));
+        StepActivities::new(Arc::new(reg), blob, 1024 * 1024)
+    }
+
+    fn url_input(url: String) -> PluginInput {
+        PluginInput::Ref(meili_ingest_plugin_sdk::ContentRef::Url {
+            url,
+            mime: None,
+            filename: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_loopback_url_ref_is_blocked_non_retryably_under_public() {
+        let internal = wiremock::MockServer::start().await;
+        let a = guarded_acts("public");
+        let err = a
+            .run_step(
+                &PluginContext::noop(),
+                step_input(
+                    "echo",
+                    url_input(format!("{}/?query=SELECT 1", internal.uri())),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::NonRetryable(_)), "{err:?}");
+        assert!(err.to_string().contains("SOURCE_FETCH_HOSTS"), "{err}");
+        assert!(internal.received_requests().await.unwrap().is_empty());
+
+        // https does not help: the address, not the scheme, is what is refused.
+        let err = a
+            .run_step(
+                &PluginContext::noop(),
+                step_input("echo", url_input("https://127.0.0.1:8123/".into())),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Loopback"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_host_outside_the_policy_is_blocked() {
+        use wiremock::matchers::{method, path};
+        let allowed = wiremock::MockServer::start().await;
+        let internal = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/doc.txt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/metrics", internal.uri())),
+            )
+            .mount(&allowed)
+            .await;
+        let a = guarded_acts(allowed.uri().trim_start_matches("http://"));
+        let err = a
+            .run_step(
+                &PluginContext::noop(),
+                step_input("echo", url_input(format!("{}/doc.txt", allowed.uri()))),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::NonRetryable(_)), "{err:?}");
+        assert!(internal.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_host_is_fetched() {
+        use wiremock::matchers::{method, path};
+        let files = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/doc.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("hello"))
+            .mount(&files)
+            .await;
+        let a = guarded_acts(files.uri().trim_start_matches("http://"));
+        let out = a
+            .run_step(
+                &PluginContext::noop(),
+                step_input("echo", url_input(format!("{}/doc.txt", files.uri()))),
+            )
+            .await
+            .unwrap();
+        match out.output {
+            PluginOutput::Bytes(b) => assert_eq!(b.data, b"hello"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_public_address_passes_the_public_policy() {
+        // The check only: no request leaves the test. An IP literal needs no DNS.
+        use meili_ingest_blob::UrlCheck as _;
+        let check = crate::fetch_guard::PolicyCheck(meili_ingest_source::HostPolicy::Public);
+        check
+            .check(&url::Url::parse("https://1.1.1.1/doc.pdf").unwrap())
+            .await
+            .unwrap();
+        for blocked in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.5/",
+            "https://[::1]/",
+            "http://1.1.1.1/doc.pdf",
+        ] {
+            assert!(
+                check
+                    .check(&url::Url::parse(blocked).unwrap())
+                    .await
+                    .is_err(),
+                "{blocked} must be refused under `public`"
+            );
         }
     }
 

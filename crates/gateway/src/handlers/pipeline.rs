@@ -6,7 +6,8 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 
 use super::ingest::{
-    BatchResponse, IngestResponse, PipelineSelection, context_for, submit_batch, submit_one,
+    BatchResponse, IngestResponse, PipelineSelection, context_for, path_index, submit_batch,
+    submit_one,
 };
 use super::{QueryParams, query_param, read_payload};
 use crate::context::resolve_request_context;
@@ -33,6 +34,30 @@ pub async fn ingest_with_pipeline(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
+    ingest_with_pipeline_inner(state, name, query, headers, req, None).await
+}
+
+/// `POST /indexes/{index_uid}/ingest/pipeline/{name}` — explicit pipeline, and the path's
+/// index wins over the pipeline trigger's `index_pattern`.
+pub async fn ingest_into_index_with_pipeline(
+    State(state): State<AppState>,
+    Path((index_uid, name)): Path<(String, String)>,
+    Query(query): Query<QueryParams>,
+    headers: HeaderMap,
+    req: Request,
+) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
+    let index = path_index(&index_uid)?;
+    ingest_with_pipeline_inner(state, name, query, headers, req, Some(index)).await
+}
+
+async fn ingest_with_pipeline_inner(
+    state: AppState,
+    name: String,
+    query: QueryParams,
+    headers: HeaderMap,
+    req: Request,
+    locked_index: Option<&str>,
+) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
     // Only the tenant scope is needed here; the destination is checked once the
     // pipeline is known, since one pinned to a connection needs none.
     let pre = resolve_request_context(&headers, query_param(&query, "index"), &state.config);
@@ -49,11 +74,13 @@ pub async fn ingest_with_pipeline(
             if items.is_empty() {
                 return Err(GatewayError::BadRequest("`items` must not be empty".into()));
             }
-            PipelineIngestResponse::Batch(submit_batch(&state, items, &ctx, &selection).await)
+            PipelineIngestResponse::Batch(
+                submit_batch(&state, items, &ctx, &selection, locked_index).await,
+            )
         }
-        single => {
-            PipelineIngestResponse::Single(submit_one(&state, single, ctx, &selection).await?)
-        }
+        single => PipelineIngestResponse::Single(
+            submit_one(&state, single, ctx, &selection, locked_index).await?,
+        ),
     };
     Ok((StatusCode::ACCEPTED, Json(resp)))
 }

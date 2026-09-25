@@ -12,6 +12,16 @@
 //!
 //! Plugins never see refs: the activity runner resolves them.
 //!
+//! URL refs are fetched under an optional [`FetchGuard`] ([`BlobStore::with_fetch_guard`]):
+//! the guard's [`UrlCheck`] runs before the first request **and before every redirect
+//! hop**, which the guard follows itself so an allowed host cannot bounce the fetch to
+//! a loopback or metadata address. The worker always installs one (`SOURCE_FETCH_HOSTS`).
+//!
+//! `s3://` / `gs://` / `az://` refs are NOT guarded: they are read with the worker's
+//! ambient cloud credentials, so anyone who can submit an ingest can read any object
+//! those credentials reach — including other tenants' staged uploads when the blob
+//! store shares the bucket. Scope the worker's credentials accordingly.
+//!
 //! Supported store URLs: `file://<dir>` (created when missing), `memory://`,
 //! `s3://bucket/prefix`, `gs://bucket/prefix`, `az://container/prefix`. Cloud
 //! credentials come from the usual provider environment variables.
@@ -58,6 +68,92 @@ pub enum BlobError {
     /// The operation is not supported for this input.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The [`FetchGuard`] refused a URL (the first one or a redirect target) before any
+    /// request was sent to it. Permanent: retrying fetches the same forbidden address.
+    #[error("blocked url: {0}")]
+    Blocked(String),
+}
+
+/// Decides whether a URL may be fetched on a tenant's behalf. Implemented by the worker
+/// over its `SOURCE_FETCH_HOSTS` policy; kept as a trait so this crate does not depend on
+/// the policy's crate.
+#[async_trait::async_trait]
+pub trait UrlCheck: Send + Sync {
+    /// `Err(reason)` refuses the URL.
+    async fn check(&self, url: &Url) -> Result<(), String>;
+}
+
+/// Guarded fetching of [`ContentRef::Url`]: a [`UrlCheck`] plus a client that never
+/// follows redirects on its own, so each hop is checked before it is requested.
+#[derive(Clone)]
+pub struct FetchGuard {
+    check: Arc<dyn UrlCheck>,
+    http: reqwest::Client,
+    max_redirects: usize,
+}
+
+impl fmt::Debug for FetchGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchGuard")
+            .field("max_redirects", &self.max_redirects)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FetchGuard {
+    /// Guard every URL fetch with `check`, following at most 5 redirects.
+    pub fn new(check: Arc<dyn UrlCheck>) -> Self {
+        Self {
+            check,
+            // Redirects are followed by `get` below, never by the client: a client that
+            // followed them would fetch whatever internal address a public host
+            // redirects to without the check ever seeing it.
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
+            max_redirects: 5,
+        }
+    }
+
+    /// GET `url`, checking it and every redirect target before requesting it.
+    async fn get(&self, url: &Url) -> Result<reqwest::Response, BlobError> {
+        let mut current = url.clone();
+        let mut hops = 0usize;
+        loop {
+            self.check
+                .check(&current)
+                .await
+                .map_err(BlobError::Blocked)?;
+            let response = self
+                .http
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(|e| BlobError::Http(format!("GET {current}: {e}")))?;
+            let status = response.status();
+            if !status.is_redirection() {
+                return Ok(response);
+            }
+            if hops >= self.max_redirects {
+                return Err(BlobError::Http(format!(
+                    "GET {url}: more than {} redirects",
+                    self.max_redirects
+                )));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    BlobError::Http(format!("GET {current}: {status} without a Location header"))
+                })?;
+            current = current.join(location).map_err(|e| {
+                BlobError::Http(format!("GET {current}: invalid redirect {location:?}: {e}"))
+            })?;
+            hops += 1;
+        }
+    }
 }
 
 impl BlobError {
@@ -78,6 +174,7 @@ pub struct BlobStore {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     url: String,
+    fetch_guard: Option<FetchGuard>,
 }
 
 impl fmt::Debug for BlobStore {
@@ -85,6 +182,7 @@ impl fmt::Debug for BlobStore {
         f.debug_struct("BlobStore")
             .field("url", &self.url)
             .field("prefix", &self.prefix.as_ref())
+            .field("fetch_guard", &self.fetch_guard)
             .finish()
     }
 }
@@ -108,6 +206,7 @@ impl BlobStore {
                 store: Arc::new(InMemory::new()),
                 prefix: Path::from(rest.trim_matches('/')),
                 url: url.to_owned(),
+                fetch_guard: None,
             });
         }
         if let Some(rest) = url.strip_prefix("file://") {
@@ -119,6 +218,7 @@ impl BlobStore {
                 store: Arc::new(fs),
                 prefix: Path::default(),
                 url: url.to_owned(),
+                fetch_guard: None,
             });
         }
         let parsed =
@@ -128,7 +228,15 @@ impl BlobStore {
             store: Arc::from(store),
             prefix,
             url: url.to_owned(),
+            fetch_guard: None,
         })
+    }
+
+    /// Fetch every [`ContentRef::Url`] through `guard`. Without one, URL refs are fetched
+    /// with the caller's client and its redirect policy, unchecked.
+    pub fn with_fetch_guard(mut self, guard: FetchGuard) -> Self {
+        self.fetch_guard = Some(guard);
+        self
     }
 
     /// An in-memory store (for tests and local experiments).
@@ -137,6 +245,7 @@ impl BlobStore {
             store: Arc::new(InMemory::new()),
             prefix: Path::default(),
             url: "memory://".to_owned(),
+            fetch_guard: None,
         }
     }
 
@@ -213,11 +322,14 @@ impl BlobStore {
                         parsed.scheme()
                     )));
                 }
-                let response = http
-                    .get(parsed.clone())
-                    .send()
-                    .await
-                    .map_err(|e| BlobError::Http(format!("GET {url}: {e}")))?;
+                let response = match &self.fetch_guard {
+                    Some(guard) => guard.get(&parsed).await?,
+                    None => http
+                        .get(parsed.clone())
+                        .send()
+                        .await
+                        .map_err(|e| BlobError::Http(format!("GET {url}: {e}")))?,
+                };
                 let status = response.status();
                 if !status.is_success() {
                     return Err(BlobError::Http(format!("GET {url}: status {status}")));
@@ -476,6 +588,132 @@ mod tests {
     use meili_ingest_plugin_sdk::Document;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Allows exactly the listed `host:port` authorities.
+    struct AllowOnly(Vec<String>);
+
+    #[async_trait::async_trait]
+    impl UrlCheck for AllowOnly {
+        async fn check(&self, url: &Url) -> Result<(), String> {
+            let authority = format!(
+                "{}:{}",
+                url.host_str().unwrap_or_default(),
+                url.port_or_known_default().unwrap_or_default()
+            );
+            if self.0.contains(&authority) {
+                Ok(())
+            } else {
+                Err(format!("{url} is not allowed"))
+            }
+        }
+    }
+
+    fn authority(server: &MockServer) -> String {
+        server.uri().trim_start_matches("http://").to_string()
+    }
+
+    fn url_ref(url: String) -> ContentRef {
+        ContentRef::Url {
+            url,
+            mime: None,
+            filename: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_fetch_refuses_a_forbidden_url_without_requesting_it() {
+        let forbidden = MockServer::start().await;
+        let store =
+            BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![]))));
+        let err = store
+            .fetch_ref(
+                &url_ref(format!("{}/secret", forbidden.uri())),
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Blocked(_)), "{err:?}");
+        assert!(forbidden.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guarded_fetch_checks_every_redirect_hop() {
+        let allowed = MockServer::start().await;
+        let forbidden = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc.pdf"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/metrics", forbidden.uri())),
+            )
+            .mount(&allowed)
+            .await;
+        let store =
+            BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+                authority(&allowed),
+            ]))));
+        let err = store
+            .fetch_ref(
+                &url_ref(format!("{}/doc.pdf", allowed.uri())),
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobError::Blocked(_)), "{err:?}");
+        assert!(
+            forbidden.received_requests().await.unwrap().is_empty(),
+            "the redirect target must never be requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_fetch_follows_an_allowed_relative_redirect() {
+        let allowed = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/new.txt"))
+            .mount(&allowed)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .mount(&allowed)
+            .await;
+        let store =
+            BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+                authority(&allowed),
+            ]))));
+        let blob = store
+            .fetch_ref(
+                &url_ref(format!("{}/old", allowed.uri())),
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blob.data, b"hello");
+        assert_eq!(blob.filename.as_deref(), Some("old"));
+    }
+
+    #[tokio::test]
+    async fn guarded_fetch_caps_redirects() {
+        let allowed = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/loop"))
+            .mount(&allowed)
+            .await;
+        let store =
+            BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+                authority(&allowed),
+            ]))));
+        let err = store
+            .fetch_ref(
+                &url_ref(format!("{}/loop", allowed.uri())),
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than 5 redirects"), "{err}");
+    }
 
     fn docs(n: usize) -> Vec<Document> {
         (0..n)
