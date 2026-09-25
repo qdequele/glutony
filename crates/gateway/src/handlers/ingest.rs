@@ -2,7 +2,7 @@
 //! shared with the explicit-pipeline route.
 
 use axum::Json;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use meili_ingest_plugin_sdk::{
@@ -75,17 +75,59 @@ pub fn context_for(
     resolve_request_context(headers, query_index, &state.config)
 }
 
-/// Submit one item: route → resolve index → stage bytes → start workflow → cache job.
+/// Validate an index uid taken from the URL path with Meilisearch's own rule
+/// (alphanumeric, `-` and `_`, at most 400 bytes), so a malformed one is a 400 here
+/// rather than a job that fails at the indexer.
+pub fn path_index(index_uid: &str) -> Result<&str, GatewayError> {
+    let valid = !index_uid.is_empty()
+        && index_uid.len() <= 400
+        && index_uid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid {
+        Ok(index_uid)
+    } else {
+        Err(GatewayError::BadRequest(format!(
+            "invalid index uid {index_uid:?}: only alphanumeric characters, `-` and `_` \
+             are allowed, up to 400 bytes"
+        )))
+    }
+}
+
+/// Submit one item: route → resolve index → preflight → stage bytes → start workflow →
+/// cache job.
+///
+/// `locked_index` is the index named by an `/indexes/{index_uid}/…` path. It wins over
+/// every other source — `?index=`, the `index` field, `X-Meili-Index` and the pipeline
+/// trigger's `index_pattern` — the same way `/indexes/{uid}/documents` can only ever
+/// write to `uid`.
 pub async fn submit_one(
     state: &AppState,
     payload: IngestPayload,
     mut ctx: MeiliContext,
     selection: &PipelineSelection,
+    locked_index: Option<&str>,
 ) -> Result<IngestResponse, GatewayError> {
     let filename = payload.filename();
     let mime = payload
         .mime()
         .ok_or_else(|| GatewayError::BadRequest("nested batches are not supported".into()))?;
+
+    // The worker enforces SOURCE_FETCH_HOSTS on every hop regardless; checking here too
+    // turns an obviously forbidden URL into a 422 now instead of a failed job later.
+    // Only a definite refusal counts: a DNS failure here may be transient, and the
+    // worker re-checks (and re-resolves) at fetch time anyway.
+    if let IngestPayload::Url { url, .. } = &payload {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| GatewayError::BadRequest(format!("invalid url {url:?}: {e}")))?;
+        if let Err(e @ meili_ingest_source::SourceError::Blocked(_)) =
+            state.fetch_policy.check(&parsed).await
+        {
+            return Err(GatewayError::Unprocessable(format!(
+                "{e} (URL refs obey SOURCE_FETCH_HOSTS)"
+            )));
+        }
+    }
 
     let (pipeline, index_pattern) = match selection {
         PipelineSelection::Auto { explicit } => {
@@ -121,12 +163,28 @@ pub async fn submit_one(
         require_destination(&ctx)?;
     }
 
-    let target_index = resolve_index(
-        &mut ctx,
-        index_pattern.as_deref(),
-        &mime,
-        &state.config.default_index,
-    );
+    let target_index = match locked_index {
+        Some(index) => {
+            ctx.index = Some(index.to_string());
+            index.to_string()
+        }
+        None => resolve_index(
+            &mut ctx,
+            index_pattern.as_deref(),
+            &mime,
+            &state.config.default_index,
+        ),
+    };
+
+    // A pinned pipeline writes with its connection's sealed key, which the caller never
+    // sees; only the request's own key is the caller's to prove.
+    if state.config.write_preflight
+        && !pipeline.pins_destination()
+        && let (Some(host), Some(key)) = (&ctx.host, &ctx.api_key)
+    {
+        crate::preflight::check_write(&state.http, host, key, &target_index).await?;
+    }
+
     let job_id = Uuid::new_v4();
 
     let input = match payload {
@@ -204,10 +262,11 @@ pub async fn submit_batch(
     items: Vec<IngestPayload>,
     ctx: &MeiliContext,
     selection: &PipelineSelection,
+    locked_index: Option<&str>,
 ) -> BatchResponse {
     let mut jobs = Vec::with_capacity(items.len());
     for item in items {
-        match submit_one(state, item, ctx.clone(), selection).await {
+        match submit_one(state, item, ctx.clone(), selection, locked_index).await {
             Ok(r) => jobs.push(BatchEntry::Job(r)),
             Err(e) => jobs.push(BatchEntry::Error(ErrorBody {
                 error: e.to_string(),
@@ -225,6 +284,28 @@ pub async fn ingest(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<IngestResponse>), GatewayError> {
+    ingest_inner(state, query, headers, req, None).await
+}
+
+/// `POST /indexes/{index_uid}/ingest` — auto-routing into the index named by the path.
+pub async fn ingest_into_index(
+    State(state): State<AppState>,
+    Path(index_uid): Path<String>,
+    Query(query): Query<QueryParams>,
+    headers: HeaderMap,
+    req: Request,
+) -> Result<(StatusCode, Json<IngestResponse>), GatewayError> {
+    let index = path_index(&index_uid)?;
+    ingest_inner(state, query, headers, req, Some(index)).await
+}
+
+async fn ingest_inner(
+    state: AppState,
+    query: QueryParams,
+    headers: HeaderMap,
+    req: Request,
+    locked_index: Option<&str>,
+) -> Result<(StatusCode, Json<IngestResponse>), GatewayError> {
     let extracted = read_payload(&headers, &query, req).await?;
     let ctx = context_for(&state, &headers, &query, &extracted);
     let explicit = query_param(&query, "pipeline")
@@ -240,6 +321,7 @@ pub async fn ingest(
         extracted.payload,
         ctx,
         &PipelineSelection::Auto { explicit },
+        locked_index,
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(resp)))
@@ -251,6 +333,28 @@ pub async fn ingest_batch(
     Query(query): Query<QueryParams>,
     headers: HeaderMap,
     req: Request,
+) -> Result<(StatusCode, Json<BatchResponse>), GatewayError> {
+    ingest_batch_inner(state, query, headers, req, None).await
+}
+
+/// `POST /indexes/{index_uid}/ingest/batch` — every item goes to the path's index.
+pub async fn ingest_batch_into_index(
+    State(state): State<AppState>,
+    Path(index_uid): Path<String>,
+    Query(query): Query<QueryParams>,
+    headers: HeaderMap,
+    req: Request,
+) -> Result<(StatusCode, Json<BatchResponse>), GatewayError> {
+    let index = path_index(&index_uid)?;
+    ingest_batch_inner(state, query, headers, req, Some(index)).await
+}
+
+async fn ingest_batch_inner(
+    state: AppState,
+    query: QueryParams,
+    headers: HeaderMap,
+    req: Request,
+    locked_index: Option<&str>,
 ) -> Result<(StatusCode, Json<BatchResponse>), GatewayError> {
     let extracted = read_payload(&headers, &query, req).await?;
     let ctx = context_for(&state, &headers, &query, &extracted);
@@ -264,7 +368,14 @@ pub async fn ingest_batch(
     if items.is_empty() {
         return Err(GatewayError::BadRequest("`items` must not be empty".into()));
     }
-    let resp = submit_batch(&state, items, &ctx, &PipelineSelection::Auto { explicit }).await;
+    let resp = submit_batch(
+        &state,
+        items,
+        &ctx,
+        &PipelineSelection::Auto { explicit },
+        locked_index,
+    )
+    .await;
     Ok((StatusCode::ACCEPTED, Json(resp)))
 }
 
@@ -280,6 +391,216 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A JSON-documents ingest the way the qdq Caddy (standing in for Envoy) forwards it:
+    /// host and tenant injected, the caller's own key left in `Authorization`.
+    fn index_scoped_request(uri: &str, host: &str, key: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-meili-host", host)
+            .header("x-meili-project-id", "hackersearch")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(
+                json!({"documents": [{"id": "1"}], "index": "from-field"}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn path_index_beats_query_field_and_index_pattern() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.json", Some("from-pattern")).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app
+            .oneshot(index_scoped_request(
+                "/indexes/movies/ingest?index=from-query",
+                "http://meili",
+                "callerKey",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(resp).await["target_index"], "movies");
+        let ctx = &starter.inputs()[0].context;
+        assert_eq!(ctx.index.as_deref(), Some("movies"));
+        assert_eq!(
+            ctx.api_key.as_deref(),
+            Some("callerKey"),
+            "caller key forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_index_applies_to_every_batch_item() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", Some("from-pattern")).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body =
+            json!({"items": [{"url": "https://e.com/a.pdf"}, {"url": "https://e.com/b.pdf"}]});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/indexes/movies/ingest/batch")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-meili-host", "http://meili")
+            .header("authorization", "Bearer k")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        let inputs = starter.inputs();
+        assert_eq!(inputs.len(), 2);
+        assert!(
+            inputs
+                .iter()
+                .all(|i| i.context.index.as_deref() == Some("movies"))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_path_index_is_rejected_before_anything_runs() {
+        let server = MockServer::start().await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(index_scoped_request(
+                "/indexes/bad.uid/ingest",
+                "http://meili",
+                "k",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_a_key_that_cannot_write_the_index() {
+        let cp = MockServer::start().await;
+        mount_resolve(&cp, "builtin.json", None).await;
+        mount_jobs_ok(&cp).await;
+        let meili = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/indexes/hn/documents"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "message": "The API key cannot acces the index `hn`, authorized indexes are [\"glutony-*\"].",
+                "code": "invalid_api_key"
+            })))
+            .mount(&meili)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes/glutony-demo/documents"))
+            .respond_with(ResponseTemplate::new(415))
+            .mount(&meili)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/indexes/glutony-demo"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&meili)
+            .await;
+        let config = GatewayConfig {
+            write_preflight: true,
+            ..Default::default()
+        };
+        let (app, starter) = test_app(&cp, config).await;
+
+        let resp = app
+            .clone()
+            .oneshot(index_scoped_request(
+                "/indexes/hn/ingest",
+                &meili.uri(),
+                "scoped",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            json_body(resp).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("authorized indexes")
+        );
+        assert!(starter.inputs().is_empty(), "no job for a refused key");
+
+        let resp = app
+            .oneshot(index_scoped_request(
+                "/indexes/glutony-demo/ingest",
+                &meili.uri(),
+                "scoped",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(starter.inputs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_url_outside_the_fetch_policy_is_422_and_queues_nothing() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        for url in [
+            "http://127.0.0.1:8123/?query=SELECT%201",
+            "https://169.254.169.254/latest/meta-data/",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    "/ingest",
+                    "application/json",
+                    json!({ "url": url }).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{url}");
+            assert!(
+                json_body(resp).await["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SOURCE_FETCH_HOSTS")
+            );
+        }
+        assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_items_are_checked_one_by_one() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"items": [
+            {"url": "https://1.1.1.1/a.pdf"},
+            {"url": "http://localhost:9090/api/v1/query"}
+        ]});
+        let resp = app
+            .oneshot(standalone_request(
+                "/indexes/movies/ingest/batch",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let jobs = json_body(resp).await["jobs"].clone();
+        assert!(jobs[0]["job_id"].is_string(), "{jobs}");
+        assert_eq!(jobs[1]["code"], "validation", "{jobs}");
+        assert_eq!(starter.inputs().len(), 1);
+    }
+
+    #[test]
+    fn path_index_follows_meilisearch_uid_rules() {
+        assert!(path_index("glutony-demo_2").is_ok());
+        assert!(path_index("").is_err());
+        assert!(path_index("a b").is_err());
+        assert!(path_index(&"a".repeat(401)).is_err());
+    }
 
     #[tokio::test]
     async fn multipart_pdf_starts_workflow_with_context_pipeline_and_index() {

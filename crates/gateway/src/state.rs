@@ -91,6 +91,9 @@ pub struct GatewayConfig {
     /// same-origin. It exists for `next dev`, which serves the UI from another
     /// port and would otherwise be blocked by the browser.
     pub cors_allow_origins: Vec<String>,
+    /// Check the request's Meilisearch key against the target index before queueing a
+    /// job (`WRITE_PREFLIGHT`, default off). See [`crate::preflight`].
+    pub write_preflight: bool,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -116,6 +119,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("inline_max_bytes", &self.inline_max_bytes)
             .field("usage_api", &self.usage_api)
             .field("cors_allow_origins", &self.cors_allow_origins)
+            .field("write_preflight", &self.write_preflight)
             .finish()
     }
 }
@@ -136,6 +140,7 @@ impl Default for GatewayConfig {
             inline_max_bytes: 1_048_576,
             usage_api: None,
             cors_allow_origins: Vec::new(),
+            write_preflight: false,
         }
     }
 }
@@ -168,6 +173,7 @@ impl GatewayConfig {
             cors_allow_origins: env_opt("CORS_ALLOW_ORIGINS")
                 .map(|v| split_list(&v))
                 .unwrap_or_default(),
+            write_preflight: env_parse("WRITE_PREFLIGHT", d.write_preflight)?,
         })
     }
 

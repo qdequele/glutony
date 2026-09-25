@@ -187,7 +187,9 @@ forgery unless it is restricted. meili-ingest restricts it by default.
   | `files.internal,feeds.example.com:8443` | exactly those hosts |
 
   The policy is checked when the source is saved, at every fetch, and at every
-  redirect hop (at most 5).
+  redirect hop (at most 5). The same policy governs `{"url": …}` bodies sent to
+  the ingest routes: refused at the gateway with a `422`, and re-checked by the
+  worker on every hop.
 - **Credentials** (`auth`) are sealed with `SOURCE_SECRET_KEY` before they
   leave the gateway, opened only inside the fetching activity, and never
   written to Temporal history or returned by the API. On redirect they are sent

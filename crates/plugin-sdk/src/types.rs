@@ -1300,6 +1300,11 @@ pub struct IndexerConfig {
     /// Wait for Meilisearch tasks to complete before returning.
     #[serde(default = "default_true")]
     pub wait_for_completion: bool,
+    /// How long to wait for one Meilisearch task before giving up (retryable). `None`
+    /// means the worker's `INDEXER_TASK_TIMEOUT_SECS`, else 120. Keep it below the step's
+    /// `timeout_secs`, or Temporal cuts the activity first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_timeout_secs: Option<u64>,
 }
 
 fn default_primary_key() -> String {

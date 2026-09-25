@@ -3166,6 +3166,7 @@ name = "meili-ingest-blob"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "meili-ingest-plugin-sdk",
  "mime_guess",

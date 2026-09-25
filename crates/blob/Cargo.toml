@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 meili-ingest-plugin-sdk.workspace = true
 object_store.workspace = true
 reqwest.workspace = true

@@ -138,6 +138,12 @@ paths:
           $ref: "#/components/responses/IngestAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/WriteUnauthorized"
+        "403":
+          $ref: "#/components/responses/WriteForbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -227,8 +233,147 @@ paths:
           $ref: "#/components/responses/IngestAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/WriteUnauthorized"
+        "403":
+          $ref: "#/components/responses/WriteForbidden"
         "404":
           $ref: "#/components/responses/PipelineNotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
+  /indexes/{index_uid}/ingest:
+    post:
+      tags: [Ingest]
+      operationId: ingestIntoIndex
+      summary: Ingest content into a named index (auto-routed)
+      description: |
+        `POST /ingest`, with the target index taken from the path. The path wins over
+        every other index source (`?index=`, the `index` field, `X-Meili-Index` and the
+        pipeline trigger's `index_pattern`), the same way `/indexes/{uid}/documents`
+        only ever writes to `uid`. These are the URLs a Meilisearch Cloud project
+        exposes next to its own `/indexes/{uid}/…` routes.
+      parameters:
+        - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliHost"
+        - $ref: "#/components/parameters/XMeiliApiKey"
+        - $ref: "#/components/parameters/XMeiliRegion"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/MultipartIngest"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonIngest"
+          "*/*":
+            schema:
+              type: string
+              format: binary
+      responses:
+        "202":
+          $ref: "#/components/responses/IngestAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/WriteUnauthorized"
+        "403":
+          $ref: "#/components/responses/WriteForbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/NoPipelineMatches"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
+  /indexes/{index_uid}/ingest/batch:
+    post:
+      tags: [Ingest]
+      operationId: ingestBatchIntoIndex
+      summary: Ingest several items into a named index (one job each)
+      description: Like `POST /ingest/batch`; every item goes to the path's index.
+      parameters:
+        - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliHost"
+        - $ref: "#/components/parameters/XMeiliApiKey"
+        - $ref: "#/components/parameters/XMeiliRegion"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchIngestRequest"
+      responses:
+        "202":
+          description: One job per item, in input order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchIngestResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
+  /indexes/{index_uid}/ingest/pipeline/{name}:
+    post:
+      tags: [Ingest]
+      operationId: ingestIntoIndexWithPipeline
+      summary: Ingest content into a named index with an explicit pipeline
+      description: Like `POST /ingest/pipeline/{name}`; the path's index wins over the pipeline trigger's `index_pattern`.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Pipeline `uid`.
+          schema:
+            type: string
+            pattern: "^[a-zA-Z0-9._-]+$"
+        - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliHost"
+        - $ref: "#/components/parameters/XMeiliApiKey"
+        - $ref: "#/components/parameters/XMeiliRegion"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/MultipartIngest"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonIngest"
+          "*/*":
+            schema:
+              type: string
+              format: binary
+      responses:
+        "202":
+          $ref: "#/components/responses/IngestAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/WriteUnauthorized"
+        "403":
+          $ref: "#/components/responses/WriteForbidden"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
@@ -826,6 +971,15 @@ components:
         `X-Meili-Host` (or the gateway's `MEILI_URL`) to target an instance.
 
   parameters:
+    IndexUid:
+      name: index_uid
+      in: path
+      required: true
+      description: Target index. Wins over every other index source. Meilisearch uid rules apply (alphanumeric, `-`, `_`, at most 400 bytes).
+      schema:
+        type: string
+        pattern: "^[a-zA-Z0-9_-]{1,400}$"
+      example: movies
     IndexQuery:
       name: index
       in: query
@@ -936,6 +1090,20 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
           example: { "error": "no Meilisearch context: set X-Meili-Host/X-Meili-Api-Key headers or MEILI_URL/MEILI_API_KEY", "code": "missing_context" }
+    WriteUnauthorized:
+      description: "`WRITE_PREFLIGHT` is on and the request carries no Meilisearch key Meilisearch accepts (it answered 401)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the API key cannot add documents to index \"movies\": The Authorization header is missing. It must use the bearer authorization method.", "code": "unauthorized" }
+    WriteForbidden:
+      description: "`WRITE_PREFLIGHT` is on and the request's Meilisearch key may not add documents to, or read, the target index. No job was queued."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the API key cannot add documents to index \"hn\": The API key cannot acces the index `hn`, authorized indexes are [\"glutony-*\"].", "code": "forbidden" }
     PayloadTooLarge:
       description: Body exceeds `MAX_UPLOAD_MB`.
       content:
@@ -972,7 +1140,7 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "source \"tmdb\" not found", "code": "not_found" }
     Unprocessable:
-      description: Validation failed (bad cron or template, forbidden host, unreachable Meilisearch or rejected key, unpinned pipeline).
+      description: Validation failed (bad cron or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline).
       content:
         application/json:
           schema:
@@ -1032,10 +1200,13 @@ components:
         url:
           type: string
           format: uri
-          description: HTTP(S) URL fetched by the gateway (small files) or the worker.
+          description: |
+            HTTP(S) URL fetched by the worker. Must satisfy `SOURCE_FETCH_HOSTS` (default
+            `public`: `https`, public addresses only), checked here — a forbidden URL is a
+            `422` — and again at fetch time on every redirect hop.
         s3:
           type: string
-          description: "`s3://bucket/key` (or any URI understood by the configured object store). Streamed by the worker."
+          description: "`s3://bucket/key` (or any URI understood by the configured object store). Streamed by the worker with its ambient cloud credentials: not subject to `SOURCE_FETCH_HOSTS`, so scope those credentials to what callers may read."
         documents:
           type: array
           description: Inline documents, indexed directly (no extraction). Must be JSON objects with an `id`.

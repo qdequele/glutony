@@ -7,6 +7,7 @@ pub mod activity;
 pub mod config;
 pub mod connection;
 pub mod dag;
+pub mod fetch_guard;
 pub mod registry;
 pub mod source_activity;
 pub mod source_workflow;

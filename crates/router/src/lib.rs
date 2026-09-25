@@ -454,9 +454,16 @@ pub(crate) fn chunk_step() -> StepDefinition {
 }
 
 /// The terminal `index` step.
+///
+/// Its time is spent waiting for Meilisearch tasks, and a busy instance processes
+/// other tasks first (one at a time), so the 300s step default is too tight. The
+/// indexer's own per-task budget (`INDEXER_TASK_TIMEOUT_SECS`) must stay below this.
 pub(crate) fn index_step() -> StepDefinition {
-    step("index", INDEXER_PLUGIN)
+    step("index", INDEXER_PLUGIN).timeout_secs(INDEX_STEP_TIMEOUT_SECS)
 }
+
+/// Step timeout of every built-in `index` step: 30 minutes.
+pub const INDEX_STEP_TIMEOUT_SECS: u64 = 1800;
 
 /// Assemble a built-in pipeline (`builtin.<suffix>`), sequential steps.
 fn builtin(

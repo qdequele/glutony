@@ -9,8 +9,12 @@
 //!
 //! Behaviour:
 //! 1. validate the config (`host`, `api_key` and `index` are mandatory);
-//! 2. when `auto_create_index` (default `true`), create the index with
-//!    `primary_key` if `GET /indexes/{uid}` says it does not exist, and wait
+//! 2. when `auto_create_index` (default `true`), enqueue the index creation with
+//!    `primary_key` if `GET /indexes/{uid}` says it does not exist — without waiting:
+//!    Meilisearch runs tasks in enqueue order, so the document additions sent next
+//!    always run after it, and waiting would only double the time spent behind other
+//!    tenants' tasks on a busy instance. Its outcome is checked once the documents are
+//!    done
 //!    for that task;
 //! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it via
 //!    `addOrReplace` in batches cut at whichever of `batch_size` (documents, default
@@ -43,8 +47,25 @@ pub const NAME: &str = INDEXER_PLUGIN;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Waiting is done in slices so a heartbeat is emitted between them.
 const WAIT_SLICE: Duration = Duration::from_secs(10);
-/// Total time to wait for one task before giving up (retryable).
-const TASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default time to wait for one task before giving up (retryable), when neither the
+/// step's `task_timeout_secs` nor the worker's [`TASK_TIMEOUT_ENV`] says otherwise.
+const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Worker-wide default for the per-task wait. A deployment whose Meilisearch is shared
+/// with a busy writer raises it (and keeps it below the index step's timeout).
+pub const TASK_TIMEOUT_ENV: &str = "INDEXER_TASK_TIMEOUT_SECS";
+
+/// The per-task wait: step config, then [`TASK_TIMEOUT_ENV`], then the default.
+fn task_timeout(configured: Option<u64>) -> Duration {
+    configured
+        .or_else(|| {
+            std::env::var(TASK_TIMEOUT_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TASK_TIMEOUT)
+}
 
 /// The Meilisearch indexer plugin. Stateless; construct with [`MeiliIndexerPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -245,12 +266,13 @@ fn task_failed(uid: u32, what: &str, err: &MeilisearchError) -> PluginError {
 }
 
 /// Poll a task until it finishes. `Ok(None)` = succeeded, `Ok(Some(err))` = failed.
-/// Heartbeats between polling slices; gives up (retryable) after [`TASK_TIMEOUT`].
+/// Heartbeats between polling slices; gives up (retryable) after `timeout`.
 async fn wait_for_task(
     client: &Client,
     ctx: &ActivityContext,
     task: &TaskInfo,
     what: &str,
+    timeout: Duration,
 ) -> Result<Option<MeilisearchError>, PluginError> {
     let uid = task.task_uid;
     let mut waited = Duration::ZERO;
@@ -268,38 +290,49 @@ async fn wait_for_task(
             Err(e) => return Err(map_error(e, &format!("polling task {uid} ({what})"))),
         }
         waited += WAIT_SLICE;
-        if waited >= TASK_TIMEOUT {
+        if waited >= timeout {
             return Err(PluginError::Retryable(format!(
-                "{NAME}: task {uid} ({what}) did not finish within {}s",
-                TASK_TIMEOUT.as_secs()
+                "{NAME}: task {uid} ({what}) did not finish within {}s; Meilisearch may \
+                 be busy with other tasks (raise task_timeout_secs or {TASK_TIMEOUT_ENV})",
+                timeout.as_secs()
             )));
         }
     }
 }
 
-/// Create the index (with `primary_key`) when it does not exist yet.
+/// Enqueue the index creation (with `primary_key`) when it does not exist yet, without
+/// waiting for it. Returns the creation task, if one was enqueued.
 async fn ensure_index(
     client: &Client,
-    ctx: &ActivityContext,
     uid: &str,
     primary_key: &str,
-) -> Result<(), PluginError> {
+) -> Result<Option<TaskInfo>, PluginError> {
     match client.get_index(uid).await {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(None),
         Err(e) if is_index_not_found(&e) => {
             tracing::info!(plugin = NAME, index = %uid, primary_key = %primary_key, "creating index");
-            let info = client
+            client
                 .create_index(uid, Some(primary_key))
                 .await
-                .map_err(|e| map_error(e, &format!("creating index {uid:?}")))?;
-            match wait_for_task(client, ctx, &info, "index creation").await? {
-                None => Ok(()),
-                // Another job created it concurrently: fine.
-                Some(err) if matches!(err.error_code, ErrorCode::IndexAlreadyExists) => Ok(()),
-                Some(err) => Err(task_failed(info.task_uid, "index creation", &err)),
-            }
+                .map(Some)
+                .map_err(|e| map_error(e, &format!("creating index {uid:?}")))
         }
         Err(e) => Err(map_error(e, &format!("fetching index {uid:?}"))),
+    }
+}
+
+/// Wait for the index creation and fail on anything but success or "already exists"
+/// (another job, or an earlier attempt of this one, created it first).
+async fn check_creation(
+    client: &Client,
+    ctx: &ActivityContext,
+    task: &TaskInfo,
+    timeout: Duration,
+) -> Result<(), PluginError> {
+    match wait_for_task(client, ctx, task, "index creation", timeout).await? {
+        None => Ok(()),
+        Some(err) if matches!(err.error_code, ErrorCode::IndexAlreadyExists) => Ok(()),
+        Some(err) => Err(task_failed(task.task_uid, "index creation", &err)),
     }
 }
 
@@ -385,6 +418,11 @@ impl Plugin for MeiliIndexerPlugin {
                         "type": "boolean",
                         "default": true,
                         "description": "Poll every task until it succeeds; a failed task fails the step (non-retryable)."
+                    },
+                    "task_timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How long to wait for one Meilisearch task before retrying the step. Defaults to the worker's INDEXER_TASK_TIMEOUT_SECS, else 120. Keep it below the step's timeout_secs."
                     }
                 }
             }))
@@ -417,11 +455,19 @@ impl Plugin for MeiliIndexerPlugin {
         let client = Client::new(host, Some(api_key.as_str()))
             .map_err(|e| map_error(e, "building the Meilisearch client"))?;
 
-        if cfg.auto_create_index {
-            ensure_index(&client, ctx, &index_uid, &cfg.primary_key).await?;
-        }
+        let timeout = task_timeout(cfg.task_timeout_secs);
+        let creation = if cfg.auto_create_index {
+            ensure_index(&client, &index_uid, &cfg.primary_key).await?
+        } else {
+            None
+        };
 
         if docs.is_empty() {
+            if let Some(task) = &creation
+                && cfg.wait_for_completion
+            {
+                check_creation(&client, ctx, task, timeout).await?;
+            }
             return Ok(PluginOutput::Indexed(IndexReport {
                 index: index_uid,
                 document_count: 0,
@@ -472,9 +518,15 @@ impl Plugin for MeiliIndexerPlugin {
 
         if cfg.wait_for_completion {
             for info in &tasks {
-                if let Some(err) = wait_for_task(&client, ctx, info, "document addition").await? {
+                if let Some(err) =
+                    wait_for_task(&client, ctx, info, "document addition", timeout).await?
+                {
                     return Err(task_failed(info.task_uid, "document addition", &err));
                 }
+            }
+            // Enqueued before the additions, so it finished before them: no extra wait.
+            if let Some(task) = &creation {
+                check_creation(&client, ctx, task, timeout).await?;
             }
         }
 
@@ -692,6 +744,63 @@ mod tests {
         assert_eq!(sent[0]["price"], 3);
         assert_eq!(sent[0]["_meta"]["page"], 1);
         assert_eq!(add.headers.get("content-type").unwrap(), "application/json");
+    }
+
+    #[tokio::test]
+    async fn documents_are_sent_before_the_index_creation_is_awaited() {
+        // On a busy Meilisearch the creation can sit behind other tasks for minutes.
+        // Tasks run in enqueue order, so the additions must be enqueued right away,
+        // not after the creation finished.
+        let server = MockServer::start().await;
+        mount_index_creation(&server).await;
+        mount_documents_add(&server, 2, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/tasks/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                2,
+                "succeeded",
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 2, "indexedDocuments": 2}),
+                None,
+            )))
+            .mount(&server)
+            .await;
+        run(
+            &server,
+            PluginInput::Documents(docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        let order: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        let add = order
+            .iter()
+            .position(|r| r == &format!("POST /indexes/{INDEX}/documents"))
+            .expect("documents sent");
+        let first_creation_poll = order
+            .iter()
+            .position(|r| r == "GET /tasks/1")
+            .expect("creation checked");
+        assert!(
+            add < first_creation_poll,
+            "documents must not wait for the creation: {order:?}"
+        );
+    }
+
+    #[test]
+    fn task_timeout_prefers_the_step_config() {
+        assert_eq!(task_timeout(Some(900)), Duration::from_secs(900));
+        // 0 is not a usable budget: fall back rather than time out instantly.
+        if std::env::var(TASK_TIMEOUT_ENV).is_err() {
+            assert_eq!(task_timeout(Some(0)), DEFAULT_TASK_TIMEOUT);
+            assert_eq!(task_timeout(None), DEFAULT_TASK_TIMEOUT);
+        }
     }
 
     #[tokio::test]
