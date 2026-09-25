@@ -4,7 +4,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { AlertTriangle, CheckCircle2, Copy, Loader2, Lock, Plus } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
 
 import { PageHeader } from "@/components/common/page-header";
@@ -20,11 +20,13 @@ import {
   type PipelineDraft,
   type StepDraft,
 } from "@/lib/pipeline/draft";
+import { requiredInputAt } from "@/lib/pipeline/graph";
 import { issuesByStep, outputToInput, validateDraft } from "@/lib/pipeline/validate";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { PIPELINES_HREF, newPipelineHref } from "../routes";
 import { MetadataPanel } from "./metadata-panel";
-import { StepCard } from "./step-card";
+import { PipelineGraph } from "./pipeline-graph";
+import { StepCard, stepCardDomId } from "./step-card";
 import { YamlPane } from "./yaml-pane";
 
 /** Pick a plugin that can actually read what the previous step hands over. */
@@ -134,6 +136,20 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
       config: {},
     });
   }
+
+  // --- graph → form ------------------------------------------------------
+  const [focused, setFocused] = useState<number | undefined>(undefined);
+  const focusTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(focusTimer.current), []);
+
+  const focusStep = useCallback((index: number) => {
+    document
+      .getElementById(stepCardDomId(index))
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setFocused(index);
+    clearTimeout(focusTimer.current);
+    focusTimer.current = setTimeout(() => setFocused(undefined), 1600);
+  }, []);
 
   const blocking = issues.length > 0;
 
@@ -258,8 +274,10 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
                     step={step}
                     earlierStepIds={draft.steps.slice(0, index).map((entry) => entry.id)}
                     plugins={plugins.data ?? []}
+                    requiredInput={requiredInputAt(draft.steps, index, plugins.data ?? [])}
                     issues={grouped.get(step.id) ?? []}
                     readOnly={readOnly}
+                    highlighted={focused === index}
                     onPatch={(patch) => patchStep(index, patch)}
                     onRemove={() => steps.remove(index)}
                     onMove={(direction) => steps.move(index, index + direction)}
@@ -284,9 +302,22 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
           ) : null}
         </div>
 
-        {/* Right: YAML */}
+        {/* Right: graph and YAML */}
         <div className="min-h-0 border-t lg:border-t-0 lg:border-l">
-          <YamlPane draft={draft} onDraftChange={applyYaml} readOnly={readOnly} />
+          <YamlPane
+            draft={draft}
+            onDraftChange={applyYaml}
+            readOnly={readOnly}
+            graph={
+              <PipelineGraph
+                draft={draft}
+                plugins={plugins.data ?? []}
+                issues={grouped}
+                selected={focused}
+                onSelect={focusStep}
+              />
+            }
+          />
         </div>
       </div>
 
