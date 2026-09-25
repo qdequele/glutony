@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import type { Backoff, JsonObject, PluginManifest } from "@/lib/api/types";
+import type { Backoff, InputKind, JsonObject, PluginManifest } from "@/lib/api/types";
 import { FAN_OUT_PATHS } from "@/lib/api/types";
 import { DEFAULT_RETRY, DEFAULT_TIMEOUT_SECS, type StepDraft } from "@/lib/pipeline/draft";
 import type { IssueField, ValidationIssue } from "@/lib/pipeline/validate";
@@ -32,6 +32,11 @@ function fieldHasIssue(issues: ValidationIssue[], field: IssueField): boolean {
   return issues.some((issue) => issue.field === field);
 }
 
+/** DOM id of a step card, so the graph can scroll to it. */
+export function stepCardDomId(index: number): string {
+  return `step-card-${index}`;
+}
+
 export interface StepCardProps {
   index: number;
   total: number;
@@ -39,8 +44,12 @@ export interface StepCardProps {
   /** Ids of the steps listed before this one — the only legal dependencies. */
   earlierStepIds: string[];
   plugins: PluginManifest[];
+  /** What this step will be handed, when the draft makes that knowable. */
+  requiredInput?: InputKind;
   issues: ValidationIssue[];
   readOnly: boolean;
+  /** Briefly outlined when picked from the graph. */
+  highlighted?: boolean;
   onPatch: (patch: Partial<StepDraft>) => void;
   onRemove: () => void;
   onMove: (direction: -1 | 1) => void;
@@ -52,8 +61,10 @@ export function StepCard({
   step,
   earlierStepIds,
   plugins,
+  requiredInput,
   issues,
   readOnly,
+  highlighted,
   onPatch,
   onRemove,
   onMove,
@@ -70,7 +81,14 @@ export function StepCard({
   }
 
   return (
-    <Card className={cn("gap-0 py-0", issues.length > 0 && "border-destructive/50")}>
+    <Card
+      id={stepCardDomId(index)}
+      className={cn(
+        "scroll-mt-4 gap-0 py-0 transition-shadow",
+        issues.length > 0 && "border-destructive/50",
+        highlighted && "ring-2 ring-ring",
+      )}
+    >
       <CardHeader className="flex flex-row items-center gap-2 border-b px-3 py-2 [.border-b]:pb-2">
         <Badge variant="ghost" className="tabular-nums text-muted-foreground">
           {index + 1}
@@ -101,6 +119,8 @@ export function StepCard({
               value={step.plugin}
               plugins={plugins}
               disabled={readOnly}
+              stepId={step.id}
+              required={requiredInput}
               onChange={(name) => onPatch({ plugin: name })}
             />
           </div>

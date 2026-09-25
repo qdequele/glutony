@@ -1,7 +1,7 @@
 "use client";
 
 import { Check, Copy } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -11,10 +11,11 @@ import { Textarea } from "@/components/ui/textarea";
 import type { PipelineDraft } from "@/lib/pipeline/draft";
 import { draftToYaml, yamlToDraft } from "@/lib/pipeline/yaml";
 
-type Mode = "preview" | "edit";
+type Mode = "graph" | "preview" | "edit";
 
 /**
- * The YAML view of the draft, and the second way to author it.
+ * The graph and YAML views of the draft; YAML is also the second way to
+ * author it.
  *
  * Preview always mirrors the form. In edit mode the text is local: every
  * keystroke is parsed, a valid document is pushed back into the form, and an
@@ -26,12 +27,15 @@ export function YamlPane({
   draft,
   onDraftChange,
   readOnly,
+  graph,
 }: {
   draft: PipelineDraft;
   onDraftChange: (draft: PipelineDraft) => void;
   readOnly: boolean;
+  /** Rendered under the Graph tab. */
+  graph: ReactNode;
 }) {
-  const [mode, setMode] = useState<Mode>("preview");
+  const [mode, setMode] = useState<Mode>("graph");
   const rendered = draftToYaml(draft);
   const [text, setText] = useState(rendered);
   const [error, setError] = useState<string | undefined>(undefined);
@@ -74,6 +78,9 @@ export function YamlPane({
       <div className="flex items-center gap-2 border-b px-3 py-2">
         <Tabs value={mode} onValueChange={(value) => setMode(value as Mode)}>
           <TabsList className="h-7">
+            <TabsTrigger value="graph" className="text-xs">
+              Graph
+            </TabsTrigger>
             <TabsTrigger value="preview" className="text-xs">
               YAML
             </TabsTrigger>
@@ -83,8 +90,13 @@ export function YamlPane({
           </TabsList>
         </Tabs>
         <p className="truncate text-xs text-muted-foreground">
-          {mode === "edit" ? "Typing here rewrites the form." : "Mirrors the form."}
+          {mode === "edit"
+            ? "Typing here rewrites the form."
+            : mode === "graph"
+              ? "Click a box to jump to its step."
+              : "Mirrors the form."}
         </p>
+        {mode === "graph" ? null : (
         <Button
           type="button"
           variant="ghost"
@@ -95,6 +107,7 @@ export function YamlPane({
         >
           {copied ? <Check aria-hidden /> : <Copy aria-hidden />}
         </Button>
+        )}
       </div>
 
       {error ? (
@@ -104,7 +117,9 @@ export function YamlPane({
         </Alert>
       ) : null}
 
-      {mode === "edit" ? (
+      {mode === "graph" ? (
+        <div className="min-h-0 flex-1 p-3">{graph}</div>
+      ) : mode === "edit" ? (
         <Textarea
           value={text}
           spellCheck={false}
