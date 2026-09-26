@@ -1,8 +1,6 @@
 "use client";
 
 import { AlertTriangle, Inbox, Layers } from "lucide-react";
-import { useMemo } from "react";
-
 import { useCatalog } from "@/lib/api/hooks";
 import type { PluginManifest } from "@/lib/api/types";
 import type { PipelineDraft } from "@/lib/pipeline/draft";
@@ -32,7 +30,11 @@ export function PipelineGraph({
   onSelect: (index: number) => void;
 }) {
   const catalog = useCatalog();
-  const layout = useMemo(() => layoutPipeline(draft.steps), [draft.steps]);
+  // Not memoized on `draft.steps`: a step-card edit (`setValue("steps.N")`)
+  // replaces the step inside react-hook-form's array without replacing the
+  // array, so a memo keyed on it would keep drawing the old edges. The layout
+  // is linear in the step count; recomputing it every render is cheap.
+  const layout = layoutPipeline(draft.steps);
 
   const manifestOf = (index: number) =>
     plugins.find((plugin) => plugin.name === draft.steps[index]?.plugin);
