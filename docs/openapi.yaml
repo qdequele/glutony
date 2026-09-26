@@ -256,7 +256,9 @@ paths:
         every other index source (`?index=`, the `index` field, `X-Meili-Index` and the
         pipeline trigger's `index_pattern`), the same way `/indexes/{uid}/documents`
         only ever writes to `uid`. These are the URLs a Meilisearch Cloud project
-        exposes next to its own `/indexes/{uid}/…` routes.
+        exposes next to its own `/indexes/{uid}/…` routes. A pipeline whose
+        `meili_indexer` step names a different `index` in its own config is a `422`:
+        that step would write there, not to the path's index.
       parameters:
         - $ref: "#/components/parameters/IndexUid"
         - $ref: "#/components/parameters/XMeiliProjectId"

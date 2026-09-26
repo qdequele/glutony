@@ -1023,6 +1023,37 @@ impl PipelineDefinition {
         indexers.peek().is_some() && indexers.all(|s| pinned_connection(&s.config).is_some())
     }
 
+    /// The `index` each `meili_indexer` step names in its own config, in step order.
+    ///
+    /// A step-level `index` beats the request's ([`inject_meili_context`] only fills an
+    /// unset one), so these are where the pipeline writes whatever the request says.
+    pub fn step_indexes(&self) -> impl Iterator<Item = &str> {
+        self.steps
+            .iter()
+            .filter(|s| s.plugin == INDEXER_PLUGIN)
+            .filter_map(|s| s.config.get("index").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The one index this pipeline always writes to: every `meili_indexer` step names
+    /// it itself. `None` when there is no indexer, or any indexer leaves its index to
+    /// the request, or two indexers disagree.
+    pub fn fixed_index(&self) -> Option<&str> {
+        let indexers = self
+            .steps
+            .iter()
+            .filter(|s| s.plugin == INDEXER_PLUGIN)
+            .count();
+        let named: Vec<&str> = self.step_indexes().collect();
+        match named.first() {
+            Some(first) if named.len() == indexers && named.iter().all(|i| i == first) => {
+                Some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this pipeline's trigger matches a MIME type / filename.
     pub fn trigger_matches(&self, mime: &str, filename: Option<&str>) -> bool {
         let Some(t) = &self.trigger else { return false };
@@ -1641,6 +1672,38 @@ steps:
         assert!(
             !pipeline_with(vec![StepDefinition::new("p", "json_parser")]).pins_destination(),
             "a pipeline without an indexer keeps today's requirement"
+        );
+    }
+
+    #[test]
+    fn fixed_index_needs_every_indexer_to_name_the_same_index() {
+        let named = |id: &str, index: &str| {
+            StepDefinition::new(id, INDEXER_PLUGIN).config(serde_json::json!({"index": index}))
+        };
+        let unnamed = || StepDefinition::new("u", INDEXER_PLUGIN);
+
+        let one = pipeline_with(vec![
+            StepDefinition::new("p", "json_parser"),
+            named("i", "movies"),
+        ]);
+        assert_eq!(one.fixed_index(), Some("movies"));
+        assert_eq!(one.step_indexes().collect::<Vec<_>>(), ["movies"]);
+        assert_eq!(
+            pipeline_with(vec![named("a", "movies"), named("b", "movies")]).fixed_index(),
+            Some("movies")
+        );
+        assert_eq!(
+            pipeline_with(vec![named("a", "movies"), named("b", "hn")]).fixed_index(),
+            None
+        );
+        assert_eq!(
+            pipeline_with(vec![named("a", "movies"), unnamed()]).fixed_index(),
+            None
+        );
+        assert_eq!(pipeline_with(vec![named("a", "  ")]).fixed_index(), None);
+        assert_eq!(
+            pipeline_with(vec![StepDefinition::new("p", "json_parser")]).fixed_index(),
+            None
         );
     }
 
