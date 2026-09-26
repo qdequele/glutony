@@ -128,6 +128,17 @@ pub async fn submit_one(
             )));
         }
     }
+    // `{"s3": …}` refs must name a cloud object store; the worker refuses the rest
+    // (`file://` would read its own filesystem), so say so now instead of queueing.
+    if let IngestPayload::S3 { uri, .. } = &payload {
+        match meili_ingest_blob::check_object_ref(uri) {
+            Ok(_) => {}
+            Err(e @ meili_ingest_blob::BlobError::Blocked(_)) => {
+                return Err(GatewayError::Unprocessable(e.to_string()));
+            }
+            Err(e) => return Err(GatewayError::BadRequest(e.to_string())),
+        }
+    }
 
     let (pipeline, index_pattern) = match selection {
         PipelineSelection::Auto { explicit } => {
@@ -565,6 +576,27 @@ mod tests {
                     .unwrap()
                     .contains("SOURCE_FETCH_HOSTS")
             );
+        }
+        assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_object_ref_outside_cloud_stores_is_422_and_queues_nothing() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.text", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        for uri in ["file:///etc/passwd", "memory:///k"] {
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    "/ingest",
+                    "application/json",
+                    json!({ "s3": uri, "filename": "x.txt" }).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
         }
         assert!(starter.inputs().is_empty());
     }
