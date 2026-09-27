@@ -256,7 +256,9 @@ paths:
         every other index source (`?index=`, the `index` field, `X-Meili-Index` and the
         pipeline trigger's `index_pattern`), the same way `/indexes/{uid}/documents`
         only ever writes to `uid`. These are the URLs a Meilisearch Cloud project
-        exposes next to its own `/indexes/{uid}/…` routes.
+        exposes next to its own `/indexes/{uid}/…` routes. A pipeline whose
+        `meili_indexer` step names a different `index` in its own config is a `422`:
+        that step would write there, not to the path's index.
       parameters:
         - $ref: "#/components/parameters/IndexUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -1206,7 +1208,7 @@ components:
             `422` — and again at fetch time on every redirect hop.
         s3:
           type: string
-          description: "`s3://bucket/key` (or any URI understood by the configured object store). Streamed by the worker with its ambient cloud credentials: not subject to `SOURCE_FETCH_HOSTS`, so scope those credentials to what callers may read."
+          description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. Streamed by the worker with its ambient cloud credentials: not subject to `SOURCE_FETCH_HOSTS`, so scope those credentials to what callers may read."
         documents:
           type: array
           description: Inline documents, indexed directly (no extraction). Must be JSON objects with an `id`.

@@ -128,6 +128,17 @@ pub async fn submit_one(
             )));
         }
     }
+    // `{"s3": …}` refs must name a cloud object store; the worker refuses the rest
+    // (`file://` would read its own filesystem), so say so now instead of queueing.
+    if let IngestPayload::S3 { uri, .. } = &payload {
+        match meili_ingest_blob::check_object_ref(uri) {
+            Ok(_) => {}
+            Err(e @ meili_ingest_blob::BlobError::Blocked(_)) => {
+                return Err(GatewayError::Unprocessable(e.to_string()));
+            }
+            Err(e) => return Err(GatewayError::BadRequest(e.to_string())),
+        }
+    }
 
     let (pipeline, index_pattern) = match selection {
         PipelineSelection::Auto { explicit } => {
@@ -163,12 +174,31 @@ pub async fn submit_one(
         require_destination(&ctx)?;
     }
 
-    let target_index = match locked_index {
-        Some(index) => {
+    // An indexer step that names its own `index` writes there whatever the request says
+    // (the worker only fills an unset one). Under `/indexes/{uid}/…` that would write
+    // somewhere other than the path promises, so refuse rather than queue; overriding
+    // the step instead would let a caller aim a pinned connection's key at any index.
+    if let Some(index) = locked_index
+        && let Some(other) = pipeline.step_indexes().find(|named| *named != index)
+    {
+        return Err(GatewayError::Unprocessable(format!(
+            "pipeline {:?} writes to index {other:?}, not {index:?}; send it to \
+             /ingest/pipeline/{} instead",
+            pipeline.uid, pipeline.uid
+        )));
+    }
+
+    let target_index = match (locked_index, pipeline.fixed_index()) {
+        (Some(index), _) => {
             ctx.index = Some(index.to_string());
             index.to_string()
         }
-        None => resolve_index(
+        // Report (and preflight) the index the job will actually write to.
+        (None, Some(fixed)) => {
+            ctx.index = Some(fixed.to_string());
+            fixed.to_string()
+        }
+        (None, None) => resolve_index(
             &mut ctx,
             index_pattern.as_deref(),
             &mime,
@@ -434,6 +464,63 @@ mod tests {
         );
     }
 
+    /// Mount `POST /internal/resolve` → a pipeline whose indexer step names `index`.
+    async fn mount_resolve_step_index(server: &MockServer, index: &str) {
+        let mut pipeline = sample_pipeline("p", None);
+        pipeline.steps[0].config = json!({ "index": index });
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pipeline": pipeline})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn path_index_refuses_a_pipeline_that_writes_elsewhere() {
+        // The worker keeps a step's own `index`, so `/indexes/hn/…` would say `hn` and
+        // write to `movies`: refuse instead of queueing.
+        let server = MockServer::start().await;
+        mount_resolve_step_index(&server, "movies").await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app
+            .oneshot(index_scoped_request(
+                "/indexes/hn/ingest",
+                "http://meili",
+                "k",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            json_body(resp).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("movies")
+        );
+        assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_step_index_is_the_reported_target() {
+        let server = MockServer::start().await;
+        mount_resolve_step_index(&server, "movies").await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        for uri in ["/indexes/movies/ingest", "/ingest?index=from-query"] {
+            let resp = app
+                .clone()
+                .oneshot(index_scoped_request(uri, "http://meili", "k"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{uri}");
+            assert_eq!(json_body(resp).await["target_index"], "movies", "{uri}");
+        }
+        assert_eq!(starter.inputs().len(), 2);
+    }
+
     #[tokio::test]
     async fn path_index_applies_to_every_batch_item() {
         let server = MockServer::start().await;
@@ -565,6 +652,27 @@ mod tests {
                     .unwrap()
                     .contains("SOURCE_FETCH_HOSTS")
             );
+        }
+        assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_object_ref_outside_cloud_stores_is_422_and_queues_nothing() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.text", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        for uri in ["file:///etc/passwd", "memory:///k"] {
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    "/ingest",
+                    "application/json",
+                    json!({ "s3": uri, "filename": "x.txt" }).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
         }
         assert!(starter.inputs().is_empty());
     }

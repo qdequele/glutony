@@ -20,7 +20,9 @@
 //! `s3://` / `gs://` / `az://` refs are NOT guarded: they are read with the worker's
 //! ambient cloud credentials, so anyone who can submit an ingest can read any object
 //! those credentials reach — including other tenants' staged uploads when the blob
-//! store shares the bucket. Scope the worker's credentials accordingly.
+//! store shares the bucket. Scope the worker's credentials accordingly. Only cloud
+//! object-store schemes are accepted ([`check_object_ref`]): `file://` and `memory://`
+//! would otherwise read the worker's own filesystem or process memory.
 //!
 //! Supported store URLs: `file://<dir>` (created when missing), `memory://`,
 //! `s3://bucket/prefix`, `gs://bucket/prefix`, `az://container/prefix`. Cloud
@@ -72,6 +74,31 @@ pub enum BlobError {
     /// request was sent to it. Permanent: retrying fetches the same forbidden address.
     #[error("blocked url: {0}")]
     Blocked(String),
+}
+
+/// Schemes a [`ContentRef::S3`] ref may use: cloud object stores, each with a bucket or
+/// container as host. Everything else [`object_store::parse_url`] understands is refused,
+/// above all `file://` (the worker's filesystem) and `memory://`.
+pub const OBJECT_REF_SCHEMES: &[&str] = &["s3", "s3a", "gs", "az", "adl", "azure", "abfs", "abfss"];
+
+/// Parse a tenant-supplied object-store URI (`{"s3": …}` ingest bodies) and refuse any
+/// scheme outside [`OBJECT_REF_SCHEMES`], or one without a bucket. A refusal is
+/// [`BlobError::Blocked`]: permanent, retrying reads the same forbidden location.
+pub fn check_object_ref(uri: &str) -> Result<Url, BlobError> {
+    let parsed = Url::parse(uri).map_err(|e| BlobError::Url(format!("{uri:?}: {e}")))?;
+    if !OBJECT_REF_SCHEMES.contains(&parsed.scheme()) {
+        return Err(BlobError::Blocked(format!(
+            "object ref scheme {:?} is not allowed in {uri:?} (expected one of {})",
+            parsed.scheme(),
+            OBJECT_REF_SCHEMES.join(", ")
+        )));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(BlobError::Blocked(format!(
+            "object ref {uri:?} names no bucket"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// Decides whether a URL may be fetched on a tenant's behalf. Implemented by the worker
@@ -299,9 +326,10 @@ impl BlobStore {
     /// * [`ContentRef::Url`] → HTTP GET with `http`; MIME from the hint or the
     ///   `Content-Type` header (parameters stripped); filename from the hint or the
     ///   last URL path segment.
-    /// * [`ContentRef::S3`] → any URI understood by [`object_store::parse_url`]
-    ///   (`s3://`, `gs://`, `az://`, ...), a fresh store per call, credentials from
+    /// * [`ContentRef::S3`] → a cloud object-store URI ([`OBJECT_REF_SCHEMES`]:
+    ///   `s3://`, `gs://`, `az://`, ...), a fresh store per call, credentials from
     ///   the environment; MIME from the hint or guessed from the key's extension.
+    ///   Other schemes (`file://`, `memory://`) are [`BlobError::Blocked`].
     /// * [`ContentRef::Staged`] → read from this store.
     pub async fn fetch_ref(
         &self,
@@ -358,8 +386,7 @@ impl BlobStore {
                 mime,
                 filename,
             } => {
-                let parsed =
-                    Url::parse(uri).map_err(|e| BlobError::Url(format!("{uri:?}: {e}")))?;
+                let parsed = check_object_ref(uri)?;
                 let (store, path) =
                     object_store::parse_url(&parsed).map_err(BlobError::from_store)?;
                 let result = store.get(&path).await.map_err(BlobError::from_store)?;
@@ -1109,6 +1136,59 @@ mod tests {
         assert!(matches!(
             store.fetch_ref(&r, &http).await,
             Err(BlobError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_ref_object_ref_refuses_the_local_filesystem() {
+        // `object_store::parse_url` maps `file://` to the worker's own filesystem: an
+        // `{"s3": "file:///…"}` ingest body must not read (and index) a local file.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"do not index me").unwrap();
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        for uri in [
+            format!("file://{}", secret.display()),
+            "memory:///anything".to_owned(),
+            "https://example.com/a.txt".to_owned(),
+        ] {
+            let r = ContentRef::S3 {
+                uri: uri.clone(),
+                mime: None,
+                filename: None,
+            };
+            assert!(
+                matches!(store.fetch_ref(&r, &http).await, Err(BlobError::Blocked(_))),
+                "{uri} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn check_object_ref_accepts_cloud_schemes_only() {
+        for ok in [
+            "s3://bucket/key.mp4",
+            "gs://b/k",
+            "az://container/k",
+            "abfss://c/k",
+        ] {
+            assert!(check_object_ref(ok).is_ok(), "{ok}");
+        }
+        for blocked in [
+            "file:///etc/passwd",
+            "file:/etc/passwd",
+            "memory:///k",
+            "http://h/k",
+        ] {
+            assert!(
+                matches!(check_object_ref(blocked), Err(BlobError::Blocked(_))),
+                "{blocked}"
+            );
+        }
+        assert!(matches!(
+            check_object_ref("not a uri"),
+            Err(BlobError::Url(_))
         ));
     }
 

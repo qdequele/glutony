@@ -173,7 +173,8 @@ impl StepActivities {
             .resolve_input(input.input, &self.http)
             .await
             .map_err(|e| match e {
-                // A forbidden URL stays forbidden: retrying would only re-run the check.
+                // A forbidden URL or object ref stays forbidden: retrying would only
+                // re-run the check.
                 BlobError::Blocked(_) => {
                     PluginError::NonRetryable(format!("refusing to fetch the step input: {e}"))
                 }

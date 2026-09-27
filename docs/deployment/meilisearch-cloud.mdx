@@ -102,7 +102,9 @@ project's own routes without clashing:
 | `POST /indexes/{index_uid}/ingest/pipeline/{name}` | `POST /ingest/pipeline/{name}` |
 
 The path's index wins over `?index=`, the `index` field, `X-Meili-Index` and the
-pipeline trigger's `index_pattern`.
+pipeline trigger's `index_pattern`. It does not override an `index` that a pipeline's
+`meili_indexer` step sets in its own config: such a request is a `422` unless the two
+match (send it to `/ingest/pipeline/{name}` instead).
 
 Instead of injecting a project key, the edge can leave the caller's
 `Authorization: Bearer <key>` untouched and inject only `X-Meili-Host`,
