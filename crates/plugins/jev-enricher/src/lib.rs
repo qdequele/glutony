@@ -410,6 +410,8 @@ fn config_schema() -> serde_json::Value {
         "properties": {
             "questions": {
                 "type": "object",
+                // UI hint: the step editor renders its questions editor for this format.
+                "format": "jev-questions",
                 "description": "Named Jev questions; each key is the output field name",
                 "minProperties": 1,
                 "additionalProperties": {
@@ -1224,6 +1226,10 @@ mod tests {
         assert_eq!(
             m.config_schema["required"],
             serde_json::json!(["questions"])
+        );
+        assert_eq!(
+            m.config_schema["properties"]["questions"]["format"], "jev-questions",
+            "the UI picks its questions editor by this format"
         );
         assert_eq!(
             m.config_schema["properties"]["max_input_chars"]["default"],

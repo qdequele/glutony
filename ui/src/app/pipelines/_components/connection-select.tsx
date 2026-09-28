@@ -21,7 +21,7 @@ import { CONNECTIONS_HREF } from "@/app/connections/routes";
 import { ApiError } from "@/lib/api/client";
 import { useConnections } from "@/lib/api/connections";
 import { errorMessage } from "@/lib/api/hooks";
-import type { SchemaWidgetProps, SchemaWidgets } from "@/lib/schema-form";
+import type { SchemaWidgetProps } from "@/lib/schema-form";
 
 /** Sentinel for "no connection": Radix Select forbids an empty value. */
 const NONE = "__none__";
@@ -92,8 +92,3 @@ export function ConnectionSelect({ value, onChange, disabled, inputId }: SchemaW
     </>
   );
 }
-
-/** Widgets the step editor hands to every step's config form. */
-export const STEP_CONFIG_WIDGETS: SchemaWidgets = {
-  "meili-connection": ConnectionSelect,
-};

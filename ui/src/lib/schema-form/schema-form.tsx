@@ -59,9 +59,9 @@ interface ControlProps {
 export type SchemaWidgetProps = ControlProps;
 
 /**
- * Custom controls keyed by JSON Schema `format`. A string property whose
- * `format` has an entry here renders that widget instead of a text input; the
- * label and description around it stay the form's own.
+ * Custom controls keyed by JSON Schema `format`. A string or JSON-fallback
+ * property whose `format` has an entry here renders that widget instead of the
+ * form's own control; the label and description around it stay the form's own.
  */
 export type SchemaWidgets = Partial<Record<string, ComponentType<SchemaWidgetProps>>>;
 
@@ -73,7 +73,7 @@ export type SchemaWidgets = Partial<Record<string, ComponentType<SchemaWidgetPro
  * valid, and the text resets when the value changes from the outside — which
  * is what happens when the YAML pane rewrites the draft.
  */
-function TextControl({ field, value, onChange, disabled, inputId }: ControlProps) {
+export function TextControl({ field, value, onChange, disabled, inputId }: ControlProps) {
   const [text, setText] = useState(() => formatFieldValue(field, value));
   const [error, setError] = useState<string | undefined>(undefined);
   const emitted = useRef<JsonValue | undefined>(value);
@@ -316,7 +316,7 @@ export interface SchemaFormProps {
   /** Prefix for generated input ids; must be unique on the page. */
   idPrefix: string;
   disabled?: boolean;
-  /** Custom controls for string properties, keyed by schema `format`. */
+  /** Custom controls, keyed by schema `format`. */
   widgets?: SchemaWidgets;
 }
 

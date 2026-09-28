@@ -293,6 +293,11 @@ usually used with `fan_out: "$.documents"`. Queue: `workers-llm`. Requires
 | `noul` | optional `{ "true": …, "false": … }` | a boolean |
 | `score` | list of levels, lowest first, 2–10 levels | Jev's probability-weighted position on the scale |
 
+In the admin UI's pipeline editor, `questions` gets its own editor: one row per
+question with its key, type and instructions, then the options (choice), levels
+(score) or yes/no descriptions (noul). Jev's limits are checked as you type, and
+a block the plugin would reject blocks Save.
+
 HTTP 429, 529 (overloaded) and 5xx are retried; 401/403 (bad key) and 400/422
 (invalid questions) fail the step. Usage is reported as LLM tokens.
 

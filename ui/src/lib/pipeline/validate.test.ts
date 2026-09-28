@@ -42,6 +42,20 @@ const PLUGINS: PluginManifest[] = [
     accepts: ["bytes"],
     produces: "documents",
   },
+  {
+    name: "jev_enricher",
+    version: "0.1.0",
+    accepts: ["documents", "many"],
+    produces: "documents",
+    config_schema: {
+      type: "object",
+      required: ["questions"],
+      properties: {
+        questions: { type: "object", format: "jev-questions" },
+        max_concurrent: { type: "integer", minimum: 1, default: 8 },
+      },
+    },
+  },
 ];
 
 function step(id: string, plugin: string, extra: Partial<StepDraft> = {}): StepDraft {
@@ -323,5 +337,47 @@ describe("helpers", () => {
     const grouped = issuesByStep(validateDraft(draft([step("a", "nope")], "bad uid!"), PLUGINS));
     expect(grouped.get("")?.[0].rule).toBe("invalid_uid");
     expect(grouped.get("a")?.[0].rule).toBe("unknown_plugin");
+  });
+});
+
+describe("rule: invalid config", () => {
+  const jev = (config: StepDraft["config"]) =>
+    validateDraft(draft([step("classify", "jev_enricher", { config })]), PLUGINS);
+
+  it("accepts a valid questions block", () => {
+    expect(
+      jev({ questions: { lang: { type: "noul", instructions: "Is it in English?" } } }),
+    ).toEqual([]);
+  });
+
+  it("reports a questions block the plugin would reject, on the config", () => {
+    const issues = jev({
+      questions: {
+        category: { type: "choice", instructions: "", criteria: { only: "one" } },
+      },
+    });
+    expect(issues.map((i) => [i.stepId, i.field, i.rule])).toEqual([
+      ["classify", "config", "invalid_config"],
+      ["classify", "config", "invalid_config"],
+    ]);
+    expect(issues.map((i) => i.message)).toEqual([
+      "questions.category: Instructions are required.",
+      "questions.category: A choice needs 2 to 255 options.",
+    ]);
+  });
+
+  it("requires at least one question, including when the key is missing", () => {
+    expect(jev({}).map((i) => i.message)).toEqual(["questions: Add at least one question."]);
+  });
+
+  it("reports a shape the editor cannot read", () => {
+    const [issue] = jev({ questions: { q: { type: "rank", instructions: "x" } } });
+    expect(issue.rule).toBe("invalid_config");
+    expect(issue.message).toMatch(/^questions: "q" has an unknown type/);
+  });
+
+  it("checks root steps too, which the type rules skip", () => {
+    // `classify` has no depends_on: the config rule must still run.
+    expect(rules(jev({ questions: {} }))).toEqual(["invalid_config"]);
   });
 });
