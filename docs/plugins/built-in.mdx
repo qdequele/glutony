@@ -242,6 +242,60 @@ reply into the document. Accepts `documents` and `many`; usually used with
 Reply keys are merged into `fields`; `title` → `title`, `summary` →
 `fields.summary`, `keywords` → `fields.keywords`, `language` → `meta.language`.
 
+### `jev_enricher`
+
+Classifies each document with TypeSafe's [Jev](https://docs.typesafe.ai/api)
+decision model. Jev returns typed answers with a confidence score rather than
+generated text. The plugin sends the document's title and content as `state` to
+`POST {TYPESAFE_BASE_URL}/systemone` with the questions from your config, and
+writes each answer into `fields.<question key>`. Accepts `documents` and `many`;
+usually used with `fan_out: "$.documents"`. Queue: `workers-llm`. Requires
+`TYPESAFE_API_KEY`.
+
+```yaml
+- id: classify
+  plugin: jev_enricher
+  depends_on: [chunk]
+  fan_out: $.documents
+  config:
+    include_confidence: true
+    questions:
+      category:
+        type: choice
+        instructions: What is this page about?
+        criteria:
+          billing: Invoices, plans and payments
+          api: API reference
+          guide: Tutorials and how-tos
+      is_outdated:
+        type: noul
+        instructions: Does this describe a deprecated feature?
+        criteria: { "true": Mentions a removed or deprecated API, "false": Current }
+      quality:
+        type: score
+        instructions: How complete is this page?
+        criteria: [stub, partial, complete]
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `questions` | required | Named questions; each key is also the output field. |
+| `model` | `"jev-latest"` (or `JEV_MODEL`) | Jev model or versioned id such as `jev-1.13.0`. |
+| `include_confidence` | `false` | Also write `fields.<key>_confidence` when Jev reports one. |
+| `noul_threshold` | `0.5` | A `noul` answer is `true` when Jev's probability is at or above this. |
+| `merge_strategy` | `"merge"` | `merge` keeps existing fields; `replace` overwrites them. |
+| `max_concurrent` | `8` | Parallel requests inside one activity. |
+| `max_input_chars` | `48000` | `state` is truncated to this many characters (Jev's context is 32k tokens). |
+
+| Question `type` | `criteria` | Written to `fields.<key>` |
+|---|---|---|
+| `choice` | map of option key → description, 2–255 options | the chosen option key |
+| `noul` | optional `{ "true": …, "false": … }` | a boolean |
+| `score` | list of levels, lowest first, 2–10 levels | Jev's probability-weighted position on the scale |
+
+HTTP 429, 529 (overloaded) and 5xx are retried; 401/403 (bad key) and 400/422
+(invalid questions) fail the step. Usage is reported as LLM tokens.
+
 ## Sink (documents → indexed)
 
 ### `meili_indexer`

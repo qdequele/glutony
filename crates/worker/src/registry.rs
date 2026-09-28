@@ -76,6 +76,10 @@ impl PluginRegistry {
             Ok(p) => reg.register(Arc::new(p)),
             Err(e) => reg.mark_unavailable(meili_ingest_plugin_llm_enricher::NAME, e.to_string()),
         }
+        match meili_ingest_plugin_jev_enricher::JevEnricherPlugin::from_env() {
+            Ok(p) => reg.register(Arc::new(p)),
+            Err(e) => reg.mark_unavailable(meili_ingest_plugin_jev_enricher::NAME, e.to_string()),
+        }
         match meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::from_env() {
             Ok(p) => reg.register(Arc::new(p)),
             Err(e) => {
@@ -225,7 +229,12 @@ mod tests {
             assert!(r.get(name).is_some(), "missing {name}");
         }
         // llm plugins are either available or explicitly unavailable
-        for name in ["llm_enricher", "image_captioner", "whisper_transcriber"] {
+        for name in [
+            "llm_enricher",
+            "jev_enricher",
+            "image_captioner",
+            "whisper_transcriber",
+        ] {
             assert!(r.get(name).is_some() || r.unavailable().contains_key(name));
         }
     }
@@ -251,6 +260,9 @@ mod builtin_pipeline_compat {
         let mut reg = PluginRegistry::builtin();
         reg.register(Arc::new(
             meili_ingest_plugin_llm_enricher::LlmEnricherPlugin::new(),
+        ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_jev_enricher::JevEnricherPlugin::new(),
         ));
         reg.register(Arc::new(
             meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::new(),

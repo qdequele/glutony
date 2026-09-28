@@ -255,7 +255,7 @@ pub fn mime_to_default_index(mime: &str) -> &'static str {
 pub fn plugin_task_queue(plugin: &str) -> &'static str {
     match plugin {
         "whisper_transcriber" | "ocr" | "video_audio_extractor" => "workers-gpu",
-        "llm_enricher" | "image_captioner" => "workers-llm",
+        "llm_enricher" | "jev_enricher" | "image_captioner" => "workers-llm",
         "s3_downloader" => "workers-io",
         _ => "workers-general",
     }
@@ -1163,6 +1163,7 @@ mod tests {
         assert_eq!(plugin_task_queue("ocr"), "workers-gpu");
         assert_eq!(plugin_task_queue("video_audio_extractor"), "workers-gpu");
         assert_eq!(plugin_task_queue("llm_enricher"), "workers-llm");
+        assert_eq!(plugin_task_queue("jev_enricher"), "workers-llm");
         assert_eq!(plugin_task_queue("image_captioner"), "workers-llm");
         assert_eq!(plugin_task_queue("s3_downloader"), "workers-io");
         assert_eq!(plugin_task_queue("pdf_extractor"), "workers-general");

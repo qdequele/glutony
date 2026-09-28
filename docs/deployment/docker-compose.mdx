@@ -65,6 +65,7 @@ to change:
 | `LLM_API_KEY` | worker-llm | `${LLM_API_KEY:-}` from your shell / `.env` | required for `llm_enricher` / `image_captioner` |
 | `LLM_BASE_URL` | worker-llm | `https://api.openai.com/v1` | any OpenAI-compatible endpoint (Ollama, vLLM, …) |
 | `LLM_MODEL` | worker-llm | `gpt-4o-mini` | default model |
+| `TYPESAFE_API_KEY` | worker-llm | `${TYPESAFE_API_KEY:-}` from your shell / `.env` | required for `jev_enricher` |
 | `MEILI_URL` / `MEILI_API_KEY` | gateway | local Meilisearch | standalone fallback |
 | `INLINE_MAX_BYTES` | gateway | 1 MiB | above this, uploads are staged in the blob store |
 | `PAYLOAD_SPILL_BYTES` | workers | 1 MiB | above this, step outputs are spilled |

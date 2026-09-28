@@ -3332,6 +3332,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "meili-ingest-plugin-jev-enricher"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "meili-ingest-plugin-sdk",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "meili-ingest-plugin-json"
 version = "0.1.0"
 dependencies = [
@@ -3596,6 +3612,7 @@ dependencies = [
  "meili-ingest-plugin-docx",
  "meili-ingest-plugin-html",
  "meili-ingest-plugin-image-captioner",
+ "meili-ingest-plugin-jev-enricher",
  "meili-ingest-plugin-json",
  "meili-ingest-plugin-llm-enricher",
  "meili-ingest-plugin-markdown",
