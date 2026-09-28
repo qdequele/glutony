@@ -21,6 +21,7 @@ members = [
     "crates/plugins/script",
     "crates/plugins/meili-indexer",
     "crates/plugins/llm-enricher",
+    "crates/plugins/jev-enricher",
     "crates/plugins/image-captioner",
     "crates/plugins/pptx",
     "crates/plugins/audio-transcriber",
@@ -55,6 +56,7 @@ meili-ingest-plugin-chunker = { path = "crates/plugins/chunker" }
 meili-ingest-plugin-script = { path = "crates/plugins/script" }
 meili-ingest-plugin-meili-indexer = { path = "crates/plugins/meili-indexer" }
 meili-ingest-plugin-llm-enricher = { path = "crates/plugins/llm-enricher" }
+meili-ingest-plugin-jev-enricher = { path = "crates/plugins/jev-enricher" }
 meili-ingest-plugin-image-captioner = { path = "crates/plugins/image-captioner" }
 meili-ingest-plugin-pptx = { path = "crates/plugins/pptx" }
 meili-ingest-plugin-audio-transcriber = { path = "crates/plugins/audio-transcriber" }

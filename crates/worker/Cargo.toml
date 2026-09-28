@@ -31,6 +31,7 @@ meili-ingest-plugin-chunker.workspace = true
 meili-ingest-plugin-script.workspace = true
 meili-ingest-plugin-meili-indexer.workspace = true
 meili-ingest-plugin-llm-enricher.workspace = true
+meili-ingest-plugin-jev-enricher.workspace = true
 meili-ingest-plugin-image-captioner.workspace = true
 meili-ingest-plugin-pptx.workspace = true
 meili-ingest-plugin-audio-transcriber.workspace = true

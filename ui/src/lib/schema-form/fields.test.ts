@@ -235,7 +235,13 @@ describe("schema format", () => {
     expect(byName.max_batch_bytes.kind).toBe("integer");
   });
 
-  it("ignores a format on a non-string property", () => {
+  it("carries an object property's format, so a structured value can get a widget too", () => {
+    const field = schemaToField("questions", { type: "object", format: "jev-questions" });
+    expect(field.kind).toBe("json");
+    expect(field.format).toBe("jev-questions");
+  });
+
+  it("ignores a format on a numeric property", () => {
     expect(schemaToField("n", { type: "integer", format: "int64" }).format).toBeUndefined();
   });
 });

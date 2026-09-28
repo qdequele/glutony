@@ -55,6 +55,8 @@ stringData:
   # Tinybird append token for the usage data source. Omit the key entirely to run
   # without usage analytics: the worker logs it once and the reporting step no-ops.
   TINYBIRD_TOKEN: "CHANGE_ME"
+  # TypeSafe key for jev_enricher. Optional: omit it to run without the plugin.
+  TYPESAFE_API_KEY: "CHANGE_ME"
   # Speech-to-text endpoint key for whisper_transcriber; falls back to LLM_API_KEY.
   TRANSCRIBE_API_KEY: "CHANGE_ME"
   # Shared secret Envoy must send in `X-Meili-Envoy-Secret` for X-Meili-*

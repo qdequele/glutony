@@ -23,7 +23,7 @@ import { DEFAULT_RETRY, DEFAULT_TIMEOUT_SECS, type StepDraft } from "@/lib/pipel
 import type { IssueField, ValidationIssue } from "@/lib/pipeline/validate";
 import { SchemaForm } from "@/lib/schema-form";
 import { cn } from "@/lib/utils";
-import { STEP_CONFIG_WIDGETS } from "./connection-select";
+import { STEP_CONFIG_WIDGETS } from "./step-config-widgets";
 import { PluginPicker } from "./plugin-picker";
 
 const NO_FAN_OUT = "__none__";

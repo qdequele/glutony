@@ -10,7 +10,7 @@
 use meili_ingest_plugin_sdk::{InputKind, OutputKind, PipelineDefinition};
 use serde::{Deserialize, Serialize};
 
-/// Every plugin name the catalog is expected to describe: the 18 compiled into
+/// Every plugin name the catalog is expected to describe: the 19 compiled into
 /// the worker plus the 2 provided by external gRPC containers. Kept here rather
 /// than imported because `meili-ingest-control-plane` depends on this crate, not
 /// the other way round; a test in Task 2 asserts the two lists agree.
@@ -30,6 +30,7 @@ pub const ALL_KNOWN_PLUGINS: &[&str] = &[
     "chunker",
     "document_script",
     "llm_enricher",
+    "jev_enricher",
     "image_captioner",
     "whisper_transcriber",
     "ocr",
@@ -320,6 +321,19 @@ fn actions() -> Vec<ActionEntry> {
                 "Classify documents into facets you can filter on",
             ],
             "\n- id: enrich\n  plugin: llm_enricher\n  depends_on: [chunk]\n  fan_out: $.documents\n  config:\n    model: gpt-4o-mini\n    max_concurrent: 20\n    merge_strategy: merge\n",
+            (&[I::Documents], OutputKind::Documents),
+        ),
+        action(
+            "jev_enricher",
+            "Jev classifier",
+            Enrich,
+            "Ask TypeSafe's Jev typed questions about each document and store the answers as filterable fields.",
+            &[
+                "Tag documents with a category facet from a fixed list",
+                "Flag outdated or off-topic pages with a yes/no check",
+                "Score content quality on a rubric to boost the best pages",
+            ],
+            "\n- id: classify\n  plugin: jev_enricher\n  depends_on: [chunk]\n  fan_out: $.documents\n  config:\n    questions:\n      category:\n        type: choice\n        instructions: What is this page about?\n        criteria:\n          billing: Invoices, plans and payments\n          api: API reference\n          guide: Tutorials and how-tos\n      is_outdated:\n        type: noul\n        instructions: Does this describe a deprecated feature?\n",
             (&[I::Documents], OutputKind::Documents),
         ),
         action(

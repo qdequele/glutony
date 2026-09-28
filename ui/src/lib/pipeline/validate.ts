@@ -2,9 +2,10 @@
  * Client-side pipeline validation.
  *
  * These run on every keystroke and are reported inline on the offending step.
- * They mirror `PipelineDefinition::validate` in the Rust SDK, plus one rule the
+ * They mirror `PipelineDefinition::validate` in the Rust SDK, plus two rules the
  * SDK cannot express on its own: **type compatibility** between a step's plugin
- * and what the step before it produces. That is the bug class that broke
+ * and what the step before it produces, and **config checks** for the config
+ * formats the editor understands (`jev-questions`). That is the bug class that broke
  * `builtin.text` — a pipeline that sends raw `bytes` into a plugin declaring
  * only `documents` is structurally perfect and fails at runtime.
  *
@@ -13,10 +14,19 @@
  */
 import type { InputKind, OutputKind, PluginManifest } from "@/lib/api/types";
 import { FAN_OUT_PATHS } from "@/lib/api/types";
+import type { JsonObject } from "@/lib/api/types";
 import { UID_PATTERN, type PipelineDraft, type StepDraft } from "./draft";
+import { questionsConfigIssues } from "./jev-questions";
 
 /** Which part of a step card an issue belongs to. */
-export type IssueField = "uid" | "steps" | "id" | "plugin" | "depends_on" | "fan_out";
+export type IssueField =
+  | "uid"
+  | "steps"
+  | "id"
+  | "plugin"
+  | "depends_on"
+  | "fan_out"
+  | "config";
 
 /** One problem found in the draft. */
 export interface ValidationIssue {
@@ -37,7 +47,8 @@ export interface ValidationIssue {
     | "fan_out_path"
     | "fan_out_source"
     | "unknown_plugin"
-    | "type_mismatch";
+    | "type_mismatch"
+    | "invalid_config";
   message: string;
 }
 
@@ -109,6 +120,18 @@ function findCycle(steps: StepDraft[]): string[] | undefined {
     if (cycle) return cycle;
   }
   return undefined;
+}
+
+/**
+ * Problems in the config properties whose schema `format` this UI knows how to
+ * check. Keyed by format, like the step editor's widgets, so any plugin that
+ * declares `format: "jev-questions"` gets the same checks.
+ */
+function configIssues(manifest: PluginManifest, config: JsonObject): string[] {
+  const properties = manifest.config_schema?.properties ?? {};
+  return Object.entries(properties).flatMap(([name, property]) =>
+    property?.format === "jev-questions" ? questionsConfigIssues(name, config[name]) : [],
+  );
 }
 
 /**
@@ -230,6 +253,11 @@ export function validateDraft(
         message: `unknown plugin "${step.plugin}"`,
       });
       return;
+    }
+
+    // --- config ----------------------------------------------------------
+    for (const message of configIssues(manifest, step.config)) {
+      issues.push({ stepId: step.id, field: "config", rule: "invalid_config", message });
     }
 
     // --- type compatibility ----------------------------------------------

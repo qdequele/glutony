@@ -3,6 +3,7 @@
 #
 #   workers-general  pdf/docx/xlsx/html/markdown/csv/json/chunker/meili_indexer
 #   workers-llm      llm_enricher, image_captioner        (needs LLM_API_KEY)
+#                    jev_enricher                         (needs TYPESAFE_API_KEY)
 #   workers-gpu      whisper_transcriber, video_audio_extractor  (compiled in),
 #                    plus ocr and any other heavy plugin supplied as a gRPC
 #                    sidecar via EXTERNAL_PLUGINS. The in-repo media plugins are
@@ -170,6 +171,14 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: LLM_API_KEY
+            # jev_enricher (TypeSafe Jev). Optional: without it the plugin
+            # registers as unavailable and llm_enricher keeps working.
+            - name: TYPESAFE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: TYPESAFE_API_KEY
+                  optional: true
             # Usage analytics. Optional: without the key the reporting step no-ops.
             - name: TINYBIRD_TOKEN
               valueFrom:

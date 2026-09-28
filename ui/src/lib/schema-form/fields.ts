@@ -51,9 +51,11 @@ export interface SchemaField {
   /** Inclusive bounds, for numeric kinds. */
   max?: number;
   /**
-   * The schema `format`, for string fields. The form renders a caller-supplied
-   * widget for a format it was given one for (`meili-connection` → a Select of
-   * the tenant's connections), and a plain input otherwise.
+   * The schema `format`, for string fields and for the JSON fallback (objects,
+   * arrays). The form renders a caller-supplied widget for a format it was
+   * given one for (`meili-connection` → a Select of the tenant's connections,
+   * `jev-questions` → the Jev questions editor), and its own control otherwise.
+   * Numeric formats such as `int64` are standard JSON Schema, not widget hints.
    */
   format?: string;
   /** The original property schema, kept for the JSON fallback. */
@@ -141,7 +143,8 @@ export function schemaToField(
     if (typeof schema.minimum === "number") field.min = schema.minimum;
     if (typeof schema.maximum === "number") field.max = schema.maximum;
   }
-  if (kind === "string" && typeof schema.format === "string" && schema.format.length > 0) {
+  const formatted = kind === "string" || kind === "json";
+  if (formatted && typeof schema.format === "string" && schema.format.length > 0) {
     field.format = schema.format;
   }
 

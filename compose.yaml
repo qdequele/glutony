@@ -26,8 +26,8 @@
 # - All Rust services share one `target-cache` volume so dependencies are built
 #   once. Cargo serialises concurrent builds with a file lock, so the very first
 #   `watch` can take several minutes.
-# - LLM_API_KEY is read from your shell environment (or a .env file) and is only
-#   needed by worker-llm.
+# - LLM_API_KEY and TYPESAFE_API_KEY are read from your shell environment (or a
+#   .env file) and are only needed by worker-llm.
 
 name: meili-ingest
 
@@ -240,6 +240,9 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      TYPESAFE_BASE_URL: ${TYPESAFE_BASE_URL:-https://api.typesafe.ai/v1}
+      JEV_MODEL: ${JEV_MODEL:-jev-latest}
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
