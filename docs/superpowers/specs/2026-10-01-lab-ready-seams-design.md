@@ -329,6 +329,11 @@ glutony's services has one today):
 - `glutony_lab_events_failed_total{reason}`, `reason` in `connect`, `timeout`,
   `auth`, `status`, `malformed`, `not_accepted`
 
+Alert, same threshold as Lumen's: `glutony_lab_events_oldest_pending_seconds >
+900` for 5 minutes. Glutony has no Prometheus rules of its own, so the rule is
+documented in `docs/deployment/meilisearch-lab.mdx` for the deployment's
+monitoring (qdq-server's `monitoring/`) to load.
+
 ### 5.6 Configuration
 
 | Variable | Service | Notes |
@@ -347,12 +352,18 @@ glutony's services has one today):
 ### 5.7 Contract
 
 - Glutony vendors the Lab-owned schema at
-  `contracts/vendor/lab/lab-events.schema.json`, extended with
-  `product: "glutony"` and a `glutonyUsageData` definition matching §5.2.
-  Until the Lab publishes a schema that includes glutony, this copy is the
-  proposal the Lab adopts.
-- A unit test validates `lab_event_for_job` output against it
-  (`jsonschema` crate).
+  `contracts/vendor/lab/lab-events.schema.json`. The starting point is
+  **Lumen's vendored copy** (Lumen `contracts/lab-events.schema.json`, ADR 015,
+  `$id` `https://lab.meilisearch.com/contracts/lab-events.schema.json`),
+  unchanged except for three additions: `"glutony"` in the `product` enum,
+  a `glutonyUsageData` definition matching §5.2 (`cost_micro_usd` minimum 0,
+  since a zero-cost job still carries billable units), and two `if/then`
+  rules (glutony `usage.recorded` data is `glutonyUsageData`; glutony only
+  sends `usage.recorded`). The result is the one three-product schema the Lab
+  adopts, rather than two diverging proposals.
+- A unit test validates `lab_event_for_job` output against it, with the same
+  dev dependency and format validation Lumen uses
+  (`jsonschema = { version = "0.45", default-features = false }`).
 - A CI job diffs the vendored copy against the Lab's published file. It is
   added now but disabled (`if: false`, with a comment) until the Lab publishes.
 
@@ -490,3 +501,12 @@ refuses to run while `lab_events` has undelivered rows unless it is given
 - Deleting `ui/`.
 - Per-model cost breakdown in events.
 - All Lab-side work (§5.8).
+- **Spend enforcement.** Unlike Lumen (a lease the Lab tops up, `402` when it
+  runs out) and Scrapix (a balance pre-check, `402`), glutony never refuses
+  work for lack of credits: it bills after the fact. Because glutony pays the
+  LLM and transcription providers itself, an account at zero credits can
+  still run up real cost, which the Lab can only record as debt. Accepted
+  while glutony is not sold through the Lab. The follow-up is a tenant
+  suspend switch or a Lumen-style lease, decided before the first paying
+  Lab account uses glutony. `docs/deployment/meilisearch-lab.mdx` states
+  this limit.
