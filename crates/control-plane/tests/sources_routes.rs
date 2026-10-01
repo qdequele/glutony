@@ -65,7 +65,7 @@ fn new_source(uid: &str, project: &str) -> NewSource {
         uid: uid.to_string(),
         name: uid.to_string(),
         description: None,
-        project_id: Some(project.to_string()),
+        tenant_id: Some(project.to_string()),
         pipeline_uid: "movies".into(),
         location: Location::Url {
             url: "https://files.example/movie_ids_{{ date:%m_%d_%Y }}.json.gz".into(),
@@ -105,7 +105,7 @@ async fn create_get_patch_delete_roundtrip() {
 
     let (status, body) = call(
         &app,
-        bare("GET", "/internal/sources/sr-crud-1?project_id=sp-1"),
+        bare("GET", "/internal/sources/sr-crud-1?tenant_id=sp-1"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -119,7 +119,7 @@ async fn create_get_patch_delete_roundtrip() {
         &app,
         with_json(
             "PATCH",
-            "/internal/sources/sr-crud-1?project_id=sp-1",
+            "/internal/sources/sr-crud-1?tenant_id=sp-1",
             &serde_json::json!({ "paused": false, "fetch_auth": null }),
         ),
     )
@@ -131,13 +131,13 @@ async fn create_get_patch_delete_roundtrip() {
 
     let (status, _) = call(
         &app,
-        bare("DELETE", "/internal/sources/sr-crud-1?project_id=sp-1"),
+        bare("DELETE", "/internal/sources/sr-crud-1?tenant_id=sp-1"),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, body) = call(
         &app,
-        bare("GET", "/internal/sources/sr-crud-1?project_id=sp-1"),
+        bare("GET", "/internal/sources/sr-crud-1?tenant_id=sp-1"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -165,7 +165,7 @@ async fn list_hides_archived_unless_asked() {
         return;
     };
     create(&app, &new_source("sr-list-a", "sp-3")).await;
-    let (status, body) = call(&app, bare("GET", "/internal/sources?project_id=sp-3")).await;
+    let (status, body) = call(&app, bare("GET", "/internal/sources?tenant_id=sp-3")).await;
     assert_eq!(status, StatusCode::OK);
     let uids: Vec<String> = json::<Vec<SourceRecord>>(&body)
         .into_iter()
@@ -177,7 +177,7 @@ async fn list_hides_archived_unless_asked() {
         &app,
         bare(
             "GET",
-            "/internal/sources?project_id=sp-3&include_archived=true",
+            "/internal/sources?tenant_id=sp-3&include_archived=true",
         ),
     )
     .await;

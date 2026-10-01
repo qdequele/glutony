@@ -351,7 +351,7 @@ impl Plugin for MeiliIndexerPlugin {
             .config_schema(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                // `host`, `api_key`, `project_id` and `region` are NOT listed as
+                // `host`, `api_key`, `tenant_id` and `region` are NOT listed as
                 // required and are marked `readOnly`: they are injected just before the
                 // step runs, from the named `connection` or from the tenant's
                 // MeiliContext. A pipeline author must never type them, least of all the
@@ -380,7 +380,7 @@ impl Plugin for MeiliIndexerPlugin {
                         "type": "string",
                         "description": "Optional: pin the target index uid. When unset it is resolved from the pipeline's `trigger.index_pattern`, then the request, then the deployment default (SPEC §3.4)."
                     },
-                    "project_id": {
+                    "tenant_id": {
                         "type": ["string", "null"],
                         "default": null,
                         "readOnly": true,
@@ -552,7 +552,7 @@ mod tests {
             "host": host,
             "api_key": "test-key",
             "index": INDEX,
-            "project_id": "proj-1",
+            "tenant_id": "proj-1",
             "region": "eu"
         })
     }
@@ -1155,7 +1155,7 @@ mod tests {
             .as_object()
             .expect("properties");
         // Destination credentials and tenant tags are injected, never typed.
-        for key in ["host", "api_key", "project_id", "region"] {
+        for key in ["host", "api_key", "tenant_id", "region"] {
             assert_eq!(
                 props[key]["readOnly"],
                 serde_json::json!(true),

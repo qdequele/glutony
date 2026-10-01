@@ -409,8 +409,8 @@ pub struct JobRecord {
     /// Pipeline that was run.
     pub pipeline_uid: String,
     /// Tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Target index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_name: Option<String>,
@@ -455,8 +455,8 @@ pub struct ResolveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     /// Tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Explicit pipeline uid (skips MIME routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
@@ -504,9 +504,9 @@ impl ControlPlaneClient {
         format!("{}{}", self.base_url, path)
     }
 
-    pub(crate) fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
-        project_id
-            .map(|p| vec![("project_id", p.to_string())])
+    pub(crate) fn tenant_query(tenant_id: Option<&str>) -> Vec<(&'static str, String)> {
+        tenant_id
+            .map(|p| vec![("tenant_id", p.to_string())])
             .unwrap_or_default()
     }
 
@@ -567,13 +567,13 @@ impl ControlPlaneClient {
         &self,
         mime: &str,
         filename: Option<&str>,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         pipeline: Option<&str>,
     ) -> Result<ResolveResponse, GatewayError> {
         let body = ResolveRequest {
             mime: mime.to_string(),
             filename: filename.map(str::to_string),
-            project_id: project_id.map(str::to_string),
+            tenant_id: tenant_id.map(str::to_string),
             pipeline: pipeline.map(str::to_string),
         };
         self.send_json(
@@ -583,30 +583,30 @@ impl ControlPlaneClient {
         .await
     }
 
-    /// `GET /pipelines/{uid}?project_id=`.
+    /// `GET /pipelines/{uid}?tenant_id=`.
     pub async fn get_pipeline(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<PipelineDefinition, GatewayError> {
         self.send_json(
             self.http
                 .get(self.url(&format!("/pipelines/{uid}")))
-                .query(&Self::project_query(project_id)),
+                .query(&Self::tenant_query(tenant_id)),
             "get pipeline",
         )
         .await
     }
 
-    /// `GET /pipelines?project_id=`.
+    /// `GET /pipelines?tenant_id=`.
     pub async fn list_pipelines(
         &self,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<PipelineDefinition>, GatewayError> {
         self.send_json(
             self.http
                 .get(self.url("/pipelines"))
-                .query(&Self::project_query(project_id)),
+                .query(&Self::tenant_query(tenant_id)),
             "list pipelines",
         )
         .await
@@ -645,19 +645,19 @@ impl ControlPlaneClient {
             .await
     }
 
-    /// `DELETE /pipelines/{uid}?project_id=`.
+    /// `DELETE /pipelines/{uid}?tenant_id=`.
     ///
     /// Returns the ids of the sources the delete archived, whose Temporal schedules the
     /// caller must delete. An older control plane answering `204` reports none.
     pub async fn delete_pipeline(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<Uuid>, GatewayError> {
         let resp = self
             .http
             .delete(self.url(&format!("/pipelines/{uid}")))
-            .query(&Self::project_query(project_id))
+            .query(&Self::tenant_query(tenant_id))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -825,7 +825,7 @@ mod tests {
                 "meili_indexer",
             )],
             builtin: true,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -951,7 +951,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/pipelines/builtin.pdf"))
-            .and(query_param("project_id", "tenant-a"))
+            .and(query_param("tenant_id", "tenant-a"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&def))
             .mount(&server)
             .await;
@@ -1011,7 +1011,7 @@ mod tests {
             job_id,
             workflow_id: format!("ingest-{job_id}"),
             pipeline_uid: "builtin.pdf".into(),
-            project_id: None,
+            tenant_id: None,
             index_name: Some("documents".into()),
             status: JobStatus::Queued,
             current_step: None,

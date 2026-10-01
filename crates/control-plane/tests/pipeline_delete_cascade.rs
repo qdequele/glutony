@@ -44,7 +44,7 @@ fn pipeline(uid: &str, project: &str) -> PipelineDefinition {
         trigger: None,
         steps: vec![StepDefinition::new("parse", "json_parser")],
         builtin: false,
-        project_id: Some(project.to_string()),
+        tenant_id: Some(project.to_string()),
     }
 }
 
@@ -54,7 +54,7 @@ fn source(uid: &str, pipeline_uid: &str, project: &str) -> NewSource {
         uid: uid.to_string(),
         name: uid.to_string(),
         description: None,
-        project_id: Some(project.to_string()),
+        tenant_id: Some(project.to_string()),
         pipeline_uid: pipeline_uid.to_string(),
         location: Location::Url {
             url: "https://example.test/feed.json".into(),

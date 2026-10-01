@@ -138,7 +138,7 @@ mod tests {
                 StepDefinition::new("d", "x").depends_on(["b", "c"]),
             ],
             builtin: false,
-            project_id: None,
+            tenant_id: None,
         };
         p.normalize();
         p

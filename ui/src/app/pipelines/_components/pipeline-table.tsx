@@ -72,7 +72,7 @@ export function PipelineTable({ pipelines }: { pipelines: PipelineDefinition[] }
           {pipelines.map((pipeline) => {
             const builtin = pipeline.builtin === true;
             return (
-              <TableRow key={`${pipeline.project_id ?? ""}:${pipeline.uid}`}>
+              <TableRow key={`${pipeline.tenant_id ?? ""}:${pipeline.uid}`}>
                 <TableCell className="font-mono text-xs">
                   <div className="flex items-center gap-1.5">
                     <Link href={editPipelineHref(pipeline.uid)} className="hover:underline">
@@ -83,9 +83,9 @@ export function PipelineTable({ pipelines }: { pipelines: PipelineDefinition[] }
                         <Lock aria-hidden /> built-in
                       </Badge>
                     ) : null}
-                    {pipeline.project_id ? (
+                    {pipeline.tenant_id ? (
                       <Badge variant="outline" className="text-[10px]">
-                        {pipeline.project_id}
+                        {pipeline.tenant_id}
                       </Badge>
                     ) : null}
                   </div>

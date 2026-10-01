@@ -127,7 +127,7 @@ pub struct RouteRequest<'a> {
     /// Original filename, if any (matched against `trigger.filename_pattern`).
     pub filename: Option<&'a str>,
     /// Tenant id; tenant-scoped pipelines are only visible to their tenant.
-    pub project_id: Option<&'a str>,
+    pub tenant_id: Option<&'a str>,
 }
 
 /// The pipeline selected by [`PipelineRouter::resolve`].
@@ -149,7 +149,7 @@ pub struct PipelineRouter {
 fn tier(p: &PipelineDefinition) -> u8 {
     if p.builtin {
         2
-    } else if p.project_id.is_some() {
+    } else if p.tenant_id.is_some() {
         0
     } else {
         1
@@ -158,10 +158,10 @@ fn tier(p: &PipelineDefinition) -> u8 {
 
 /// Whether a pipeline is visible to a tenant: global pipelines always are,
 /// tenant-scoped ones only to their own tenant.
-fn visible_to(p: &PipelineDefinition, project_id: Option<&str>) -> bool {
-    match p.project_id.as_deref() {
+fn visible_to(p: &PipelineDefinition, tenant_id: Option<&str>) -> bool {
+    match p.tenant_id.as_deref() {
         None => true,
-        Some(owner) => Some(owner) == project_id,
+        Some(owner) => Some(owner) == tenant_id,
     }
 }
 
@@ -185,7 +185,7 @@ impl PipelineRouter {
         self.pipelines
             .iter()
             .enumerate()
-            .filter(|(_, p)| visible_to(p, req.project_id))
+            .filter(|(_, p)| visible_to(p, req.tenant_id))
             .filter(|(_, p)| p.trigger_matches(req.mime, req.filename))
             .min_by_key(|(i, p)| {
                 let has_pattern = p
@@ -203,11 +203,11 @@ impl PipelineRouter {
 
     /// Look a pipeline up by uid. A tenant-scoped pipeline shadows a global one
     /// (or a builtin) with the same uid.
-    pub fn by_uid(&self, uid: &str, project_id: Option<&str>) -> Option<&PipelineDefinition> {
+    pub fn by_uid(&self, uid: &str, tenant_id: Option<&str>) -> Option<&PipelineDefinition> {
         self.pipelines
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.uid == uid && visible_to(p, project_id))
+            .filter(|(_, p)| p.uid == uid && visible_to(p, tenant_id))
             .min_by_key(|(i, p)| (tier(p), *i))
             .map(|(_, p)| p)
     }
@@ -215,20 +215,20 @@ impl PipelineRouter {
     /// Every pipeline visible to a tenant (built-ins, global user pipelines and the
     /// tenant's own), in list order. When a tenant pipeline shadows a global one with
     /// the same uid, only the tenant's version is returned.
-    pub fn all(&self, project_id: Option<&str>) -> Vec<&PipelineDefinition> {
+    pub fn all(&self, tenant_id: Option<&str>) -> Vec<&PipelineDefinition> {
         let visible: Vec<&PipelineDefinition> = self
             .pipelines
             .iter()
-            .filter(|p| visible_to(p, project_id))
+            .filter(|p| visible_to(p, tenant_id))
             .collect();
         visible
             .iter()
             .copied()
             .filter(|p| {
-                p.project_id.is_some()
+                p.tenant_id.is_some()
                     || !visible
                         .iter()
-                        .any(|other| other.project_id.is_some() && other.uid == p.uid)
+                        .any(|other| other.tenant_id.is_some() && other.uid == p.uid)
             })
             .collect()
     }
@@ -485,7 +485,7 @@ fn builtin(
         }),
         steps,
         builtin: true,
-        project_id: None,
+        tenant_id: None,
     };
     p.normalize();
     p
@@ -642,7 +642,7 @@ mod tests {
 
     fn user_pipeline(
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         content_types: &[&str],
         pattern: Option<&str>,
     ) -> PipelineDefinition {
@@ -658,7 +658,7 @@ mod tests {
             }),
             steps: vec![StepDefinition::new("index", INDEXER_PLUGIN)],
             builtin: false,
-            project_id: project_id.map(str::to_owned),
+            tenant_id: tenant_id.map(str::to_owned),
         }
     }
 
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(uids, expected);
         for p in &all {
             assert!(p.builtin, "{} must be builtin", p.uid);
-            assert!(p.project_id.is_none(), "{} must be global", p.uid);
+            assert!(p.tenant_id.is_none(), "{} must be global", p.uid);
             assert_eq!(p.version, 1);
             assert!(!p.name.is_empty());
             let trigger = p
@@ -866,7 +866,7 @@ mod tests {
                 .resolve(RouteRequest {
                     mime,
                     filename: None,
-                    project_id: None,
+                    tenant_id: None,
                 })
                 .unwrap_or_else(|| panic!("no route for {mime}"));
             assert_eq!(m.pipeline.uid, uid, "{mime}");
@@ -877,7 +877,7 @@ mod tests {
                 .resolve(RouteRequest {
                     mime: "application/octet-stream",
                     filename: None,
-                    project_id: None
+                    tenant_id: None
                 })
                 .is_none()
         );
@@ -886,7 +886,7 @@ mod tests {
                 .resolve(RouteRequest {
                     mime: "application/zip",
                     filename: Some("a.zip"),
-                    project_id: None
+                    tenant_id: None
                 })
                 .is_none()
         );
@@ -921,7 +921,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: Some("x.pdf"),
-                project_id: Some("acme"),
+                tenant_id: Some("acme"),
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "tenant-pdf");
@@ -932,7 +932,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: None,
-                project_id: Some("initech"),
+                tenant_id: Some("initech"),
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "global-pdf");
@@ -942,7 +942,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: None,
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "global-pdf");
@@ -952,7 +952,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "text/csv",
                 filename: None,
-                project_id: Some("acme"),
+                tenant_id: Some("acme"),
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "builtin.csv");
@@ -974,7 +974,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: Some("contract_2024.pdf"),
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "pdf-contracts");
@@ -983,7 +983,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: Some("invoice.pdf"),
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "pdf-any");
@@ -993,7 +993,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: None,
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "pdf-any");
@@ -1015,7 +1015,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "application/pdf",
                 filename: Some("a.pdf"),
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "user-pdf");
@@ -1032,7 +1032,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "image/png",
                 filename: None,
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         assert_eq!(m.pipeline.uid, "first");
@@ -1048,7 +1048,7 @@ mod tests {
                 .resolve(RouteRequest {
                     mime: "application/pdf",
                     filename: Some("a.pdf"),
-                    project_id: None
+                    tenant_id: None
                 })
                 .is_none()
         );
@@ -1066,15 +1066,15 @@ mod tests {
             router
                 .by_uid("shared", Some("acme"))
                 .unwrap()
-                .project_id
+                .tenant_id
                 .as_deref(),
             Some("acme")
         );
         assert_eq!(
-            router.by_uid("shared", Some("globex")).unwrap().project_id,
+            router.by_uid("shared", Some("globex")).unwrap().tenant_id,
             None
         );
-        assert_eq!(router.by_uid("shared", None).unwrap().project_id, None);
+        assert_eq!(router.by_uid("shared", None).unwrap().tenant_id, None);
         assert_eq!(
             router.by_uid("builtin.pdf", Some("acme")).unwrap().uid,
             "builtin.pdf"
@@ -1111,14 +1111,14 @@ mod tests {
         assert_eq!(acme.len(), 16);
         let shared: Vec<_> = acme.iter().filter(|p| p.uid == "shared").collect();
         assert_eq!(shared.len(), 1);
-        assert_eq!(shared[0].project_id.as_deref(), Some("acme"));
+        assert_eq!(shared[0].tenant_id.as_deref(), Some("acme"));
         assert!(acme.iter().all(|p| p.uid != "globex-only"));
 
         let anon = router.all(None);
         assert_eq!(anon.len(), 16);
         assert!(
             anon.iter()
-                .any(|p| p.uid == "shared" && p.project_id.is_none())
+                .any(|p| p.uid == "shared" && p.tenant_id.is_none())
         );
 
         let globex = router.all(Some("globex"));
@@ -1487,7 +1487,7 @@ mod tests {
                 .resolve(RouteRequest {
                     mime: &mime,
                     filename,
-                    project_id: None,
+                    tenant_id: None,
                 })
                 .unwrap_or_else(|| panic!("no route for {mime}"));
             assert_eq!(m.pipeline.uid, uid);
@@ -1499,7 +1499,7 @@ mod tests {
                 .resolve(RouteRequest {
                     mime: &mime,
                     filename: None,
-                    project_id: None
+                    tenant_id: None
                 })
                 .unwrap()
                 .pipeline
@@ -1515,7 +1515,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: "text/csv",
                 filename: None,
-                project_id: None,
+                tenant_id: None,
             })
             .unwrap();
         let json = serde_json::to_value(m).unwrap();
@@ -1571,7 +1571,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: &detected,
                 filename: Some("clip.wav"),
-                project_id: None,
+                tenant_id: None,
             })
             .expect("a wav upload must route somewhere");
         assert_eq!(m.pipeline.uid, "builtin.audio");
@@ -1586,7 +1586,7 @@ mod tests {
             .resolve(RouteRequest {
                 mime: &detected,
                 filename: Some("voice.m4a"),
-                project_id: None,
+                tenant_id: None,
             })
             .expect("an m4a upload must route somewhere");
         assert_eq!(m.pipeline.uid, "builtin.audio");

@@ -39,7 +39,7 @@
 //!
 //! ## What is *not* in a usage row
 //!
-//! Never the Meilisearch API key. [`JobUsageInput`] deliberately takes `project_id` and
+//! Never the Meilisearch API key. [`JobUsageInput`] deliberately takes `tenant_id` and
 //! `region` as plain strings rather than a whole
 //! [`MeiliContext`](meili_ingest_plugin_sdk::MeiliContext), so a credential cannot
 //! reach this crate, its logs, or the analytics store by accident. `error` carries a
@@ -234,7 +234,7 @@ impl UsageEventKind {
 /// `tinybird/datasources/meili_ingest_usage.datasource` one for one; the JSON path of
 /// every column there is `$.<field>`. Nothing is ever skipped on serialization and
 /// nothing is ever `null` — ClickHouse `LowCardinality(String)` columns take `""` for
-/// "not applicable" (a self-hosted deployment has no `project_id`, a job row has no
+/// "not applicable" (a self-hosted deployment has no `tenant_id`, a job row has no
 /// `step_id`). Adding, renaming or retyping a field here **must** be mirrored in the
 /// datafile, otherwise Tinybird quarantines the rows and
 /// [`UsageError::Quarantined`] fires.
@@ -254,8 +254,11 @@ pub struct UsageEvent {
     pub job_id: String,
     /// Temporal workflow id (`ingest-<job_id>`).
     pub workflow_id: String,
-    /// Tenant id. `""` when self-hosted — never `null`.
-    pub project_id: String,
+    /// Tenant id. `""` when self-hosted, never `null`. Serialized as `project_id`
+    /// because that is the Tinybird column: renaming a Tinybird column means a new
+    /// datasource and a backfill (spec §3.5).
+    #[serde(rename = "project_id")]
+    pub tenant_id: String,
     /// Meilisearch Cloud region tag, `""` when unknown.
     pub region: String,
     /// Pipeline uid that ran.
@@ -327,7 +330,7 @@ impl UsageEvent {
 ///
 /// Assembled by the worker from [`PipelineWorkflowInput`] and
 /// [`PipelineWorkflowOutput`]; it is itself the payload of the reporting Temporal
-/// activity, hence `Serialize`/`Deserialize`. It carries `project_id` and `region` as
+/// activity, hence `Serialize`/`Deserialize`. It carries `tenant_id` and `region` as
 /// plain strings rather than the tenant
 /// [`MeiliContext`](meili_ingest_plugin_sdk::MeiliContext) so the Meilisearch API key
 /// cannot travel with usage data.
@@ -345,7 +348,8 @@ pub struct JobUsageInput {
     /// Whether the pipeline is built in.
     pub pipeline_builtin: bool,
     /// Tenant id; empty string when self-hosted.
-    pub project_id: String,
+    #[serde(alias = "project_id")]
+    pub tenant_id: String,
     /// Region tag; empty string when unknown.
     pub region: String,
     /// Resolved target index; empty string when the pipeline did not index.
@@ -436,7 +440,7 @@ fn base_event(input: &JobUsageInput, job_id: &str) -> UsageEvent {
         ts: input.finished_at,
         job_id: job_id.to_string(),
         workflow_id: input.workflow_id.clone(),
-        project_id: input.project_id.clone(),
+        tenant_id: input.tenant_id.clone(),
         region: input.region.clone(),
         pipeline_uid: input.pipeline_uid.clone(),
         pipeline_builtin: input.pipeline_builtin,
@@ -900,7 +904,7 @@ mod tests {
             workflow_id: format!("ingest-{JOB}"),
             pipeline_uid: "builtin.pdf".into(),
             pipeline_builtin: true,
-            project_id: "acme".into(),
+            tenant_id: "acme".into(),
             region: "us-west".into(),
             index_name: "documents".into(),
             task_queue: "workers-general".into(),
@@ -1280,9 +1284,9 @@ mod tests {
         assert_eq!(job.llm_requests, 1);
         assert_eq!(job.error_kind, ERROR_KIND_UPSTREAM);
 
-        // Tenant columns are on every row: billing filters by project_id first.
+        // Tenant columns are on every row: billing filters by tenant_id first.
         for e in &events {
-            assert_eq!(e.project_id, "acme");
+            assert_eq!(e.tenant_id, "acme");
             assert_eq!(e.region, "us-west");
             assert_eq!(e.pipeline_uid, "builtin.pdf");
             assert!(e.pipeline_builtin);
@@ -1336,7 +1340,7 @@ mod tests {
     #[test]
     fn self_hosted_jobs_use_empty_strings_not_nulls() {
         let mut input = job_input();
-        input.project_id = String::new();
+        input.tenant_id = String::new();
         input.region = String::new();
         input.index_name = String::new();
         let events = events_for_job(&input);

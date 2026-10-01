@@ -147,7 +147,7 @@ pub async fn submit_one(
                 .resolve(
                     &mime,
                     filename.as_deref(),
-                    ctx.project_id.as_deref(),
+                    ctx.tenant_id.as_deref(),
                     explicit.as_deref(),
                 )
                 .await
@@ -266,7 +266,7 @@ pub async fn submit_one(
         job_id,
         workflow_id: started.workflow_id,
         pipeline_uid: pipeline_uid.clone(),
-        project_id: ctx.project_id.clone(),
+        tenant_id: ctx.tenant_id.clone(),
         index_name: Some(target_index.clone()),
         status: JobStatus::Queued,
         current_step: None,
@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(
             wf.context,
             MeiliContext {
-                project_id: Some("xxx".into()),
+                tenant_id: Some("xxx".into()),
                 host: Some("https://xxx.us-west.meilisearch.io".into()),
                 api_key: Some("envoyKey".into()),
                 index: Some("from-query".into()),
@@ -773,7 +773,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&resolve.body).unwrap();
         assert_eq!(body["mime"], "application/pdf");
         assert_eq!(body["filename"], "report.pdf");
-        assert_eq!(body["project_id"], "xxx");
+        assert_eq!(body["tenant_id"], "xxx");
         // job was cached
         let created = requests
             .iter()

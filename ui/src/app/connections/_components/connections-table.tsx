@@ -57,7 +57,7 @@ export function ConnectionsTable({ connections, onEdit, onDelete }: ConnectionsT
       </TableHeader>
       <TableBody>
         {connections.map((connection) => (
-          <TableRow key={`${connection.project_id ?? ""}:${connection.uid}`}>
+          <TableRow key={`${connection.tenant_id ?? ""}:${connection.uid}`}>
             <TableCell className="font-mono text-xs">
               <div className="flex items-center gap-1.5">
                 <button
@@ -67,9 +67,9 @@ export function ConnectionsTable({ connections, onEdit, onDelete }: ConnectionsT
                 >
                   {connection.uid}
                 </button>
-                {connection.project_id ? (
+                {connection.tenant_id ? (
                   <Badge variant="outline" className="text-[10px]">
-                    {connection.project_id}
+                    {connection.tenant_id}
                   </Badge>
                 ) : null}
               </div>

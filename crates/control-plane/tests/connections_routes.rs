@@ -58,12 +58,12 @@ fn bare(method: &str, uri: &str) -> Request<Body> {
         .expect("request")
 }
 
-fn new_connection(uid: &str, project_id: &str) -> NewConnection {
+fn new_connection(uid: &str, tenant_id: &str) -> NewConnection {
     NewConnection {
         id: Uuid::new_v4(),
         uid: uid.to_string(),
         name: uid.to_string(),
-        project_id: Some(project_id.to_string()),
+        tenant_id: Some(tenant_id.to_string()),
         host: "https://movies.example".into(),
         api_key: vec![1, 2, 3],
     }
@@ -100,7 +100,7 @@ async fn create_get_patch_delete_roundtrip() {
 
     let (status, body) = call(
         &app,
-        bare("GET", "/internal/connections/cr-crud-1?project_id=rp-1"),
+        bare("GET", "/internal/connections/cr-crud-1?tenant_id=rp-1"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -110,7 +110,7 @@ async fn create_get_patch_delete_roundtrip() {
         &app,
         with_json(
             "PATCH",
-            "/internal/connections/cr-crud-1?project_id=rp-1",
+            "/internal/connections/cr-crud-1?tenant_id=rp-1",
             &serde_json::json!({ "name": "Movies" }),
         ),
     )
@@ -122,14 +122,14 @@ async fn create_get_patch_delete_roundtrip() {
 
     let (status, _) = call(
         &app,
-        bare("DELETE", "/internal/connections/cr-crud-1?project_id=rp-1"),
+        bare("DELETE", "/internal/connections/cr-crud-1?tenant_id=rp-1"),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, body) = call(
         &app,
-        bare("GET", "/internal/connections/cr-crud-1?project_id=rp-1"),
+        bare("GET", "/internal/connections/cr-crud-1?tenant_id=rp-1"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -163,7 +163,7 @@ async fn missing_connections_are_404_for_patch_and_delete() {
         &app,
         with_json(
             "PATCH",
-            "/internal/connections/cr-miss-none?project_id=rp-3",
+            "/internal/connections/cr-miss-none?tenant_id=rp-3",
             &serde_json::json!({ "name": "x" }),
         ),
     )
@@ -173,7 +173,7 @@ async fn missing_connections_are_404_for_patch_and_delete() {
         &app,
         bare(
             "DELETE",
-            "/internal/connections/cr-miss-none?project_id=rp-3",
+            "/internal/connections/cr-miss-none?tenant_id=rp-3",
         ),
     )
     .await;
@@ -198,7 +198,7 @@ async fn used_by_and_list_are_exposed() {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    let (status, body) = call(&app, bare("GET", "/internal/connections?project_id=rp-4")).await;
+    let (status, body) = call(&app, bare("GET", "/internal/connections?tenant_id=rp-4")).await;
     assert_eq!(status, StatusCode::OK);
     let uids: Vec<String> = json::<Vec<ConnectionRecord>>(&body)
         .into_iter()
@@ -211,7 +211,7 @@ async fn used_by_and_list_are_exposed() {
         &app,
         bare(
             "GET",
-            "/internal/connections/cr-list-a/used_by?project_id=rp-4",
+            "/internal/connections/cr-list-a/used_by?tenant_id=rp-4",
         ),
     )
     .await;

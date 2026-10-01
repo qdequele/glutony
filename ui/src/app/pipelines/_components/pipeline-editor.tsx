@@ -56,7 +56,7 @@ export interface PipelineEditorProps {
   mode: "create" | "edit";
   initialDraft: PipelineDraft;
   /** Server-owned metadata of the pipeline being edited. */
-  stored?: Pick<PipelineDefinition, "version" | "builtin" | "project_id">;
+  stored?: Pick<PipelineDefinition, "version" | "builtin" | "tenant_id">;
 }
 
 export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorProps) {
@@ -174,7 +174,7 @@ export function PipelineEditor({ mode, initialDraft, stored }: PipelineEditorPro
             : mode === "create"
               ? "Author a DAG of plugin steps, in the form or in YAML."
               : `version ${stored?.version ?? 1}${
-                  stored?.project_id ? ` · project ${stored.project_id}` : ""
+                  stored?.tenant_id ? ` · project ${stored.tenant_id}` : ""
                 }`
         }
         actions={

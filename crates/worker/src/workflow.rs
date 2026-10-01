@@ -331,7 +331,7 @@ impl PipelineWorkflow {
             workflow_id: PipelineWorkflowInput::workflow_id(input.job_id),
             pipeline_uid: input.pipeline.uid.clone(),
             pipeline_builtin: input.pipeline.builtin,
-            project_id: input.context.project_id.clone().unwrap_or_default(),
+            tenant_id: input.context.tenant_id.clone().unwrap_or_default(),
             region: input.context.region.clone().unwrap_or_default(),
             index_name: input.context.index.clone().unwrap_or_default(),
             task_queue: "workers-general".to_string(),
@@ -416,7 +416,7 @@ impl PipelineWorkflow {
                 input: branch_input,
                 branch,
                 branch_total: total,
-                project_id: input.context.project_id.clone(),
+                tenant_id: input.context.tenant_id.clone(),
             }
         };
 

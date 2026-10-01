@@ -87,8 +87,8 @@ pub struct ConnectionRecord {
     /// Display name.
     pub name: String,
     /// Tenant scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Meilisearch URL.
     pub host: String,
     /// Sealed key.
@@ -105,7 +105,7 @@ struct NewConnection<'a> {
     uid: &'a str,
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    project_id: Option<&'a str>,
+    tenant_id: Option<&'a str>,
     host: &'a str,
     api_key: &'a [u8],
 }
@@ -162,8 +162,8 @@ pub struct ConnectionView {
     /// Display name.
     pub name: String,
     /// Tenant scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Meilisearch URL.
     pub host: String,
     /// Always [`MASK`].
@@ -183,7 +183,7 @@ impl ConnectionView {
         Self {
             uid: r.uid,
             name: r.name,
-            project_id: r.project_id,
+            tenant_id: r.tenant_id,
             host: r.host,
             api_key: MASK.into(),
             used_by,
@@ -293,12 +293,12 @@ impl ControlPlaneClient {
     /// `GET /internal/connections`.
     pub async fn list_connections(
         &self,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<ConnectionRecord>, GatewayError> {
         let req = self
             .http
             .get(self.url("/internal/connections"))
-            .query(&Self::project_query(project_id));
+            .query(&Self::tenant_query(tenant_id));
         self.send_json(req, "list connections").await
     }
 
@@ -306,12 +306,12 @@ impl ControlPlaneClient {
     pub async fn get_connection(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Option<ConnectionRecord>, GatewayError> {
         let req = self
             .http
             .get(self.connection_url(uid, "")?)
-            .query(&Self::project_query(project_id));
+            .query(&Self::tenant_query(tenant_id));
         match self.send_json(req, "get connection").await {
             Ok(r) => Ok(Some(r)),
             Err(GatewayError::NotFound(_)) => Ok(None),
@@ -323,12 +323,12 @@ impl ControlPlaneClient {
     pub async fn connection_used_by(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<String>, GatewayError> {
         let req = self
             .http
             .get(self.connection_url(uid, "used_by")?)
-            .query(&Self::project_query(project_id));
+            .query(&Self::tenant_query(tenant_id));
         self.send_json(req, "list connection users").await
     }
 
@@ -337,7 +337,7 @@ impl ControlPlaneClient {
         &self,
         uid: &str,
         name: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         host: &str,
         sealed_key: &[u8],
     ) -> Result<ConnectionRecord, GatewayError> {
@@ -345,7 +345,7 @@ impl ControlPlaneClient {
             id: Uuid::new_v4(),
             uid,
             name,
-            project_id,
+            tenant_id,
             host,
             api_key: sealed_key,
         };
@@ -363,7 +363,7 @@ impl ControlPlaneClient {
     pub async fn update_connection(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         name: Option<&str>,
         host: Option<&str>,
         sealed_key: Option<&[u8]>,
@@ -376,7 +376,7 @@ impl ControlPlaneClient {
         let req = self
             .http
             .patch(self.connection_url(uid, "")?)
-            .query(&Self::project_query(project_id))
+            .query(&Self::tenant_query(tenant_id))
             .json(&body);
         match self.send_json(req, "update connection").await {
             Ok(r) => Ok(Some(r)),
@@ -389,12 +389,12 @@ impl ControlPlaneClient {
     pub async fn delete_connection(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<(), GatewayError> {
         let req = self
             .http
             .delete(self.connection_url(uid, "")?)
-            .query(&Self::project_query(project_id));
+            .query(&Self::tenant_query(tenant_id));
         self.send_empty(req, "delete connection").await
     }
 
@@ -555,7 +555,7 @@ mod tests {
                 id: Uuid::nil(),
                 uid: "prod".into(),
                 name: "Prod".into(),
-                project_id: None,
+                tenant_id: None,
                 host: "https://m.example".into(),
                 api_key: vec![1, 2, 3],
                 created_at: Utc::now(),

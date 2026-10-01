@@ -12,7 +12,7 @@ use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::context::resolve_project_id;
+use crate::context::resolve_tenant_id;
 use crate::error::GatewayError;
 use crate::state::{AppState, JobRecord, JobUpdate};
 
@@ -56,7 +56,7 @@ fn parse_job_id(id: &str) -> Result<Uuid, GatewayError> {
 
 /// `GET /jobs?status=&pipeline_uid=&limit=&offset=` — recent jobs, newest first.
 ///
-/// Scoped to the caller's tenant: the `project_id` filter is taken from the resolved
+/// Scoped to the caller's tenant: the `tenant_id` filter is taken from the resolved
 /// context, never from the query string, so one tenant cannot list another's jobs.
 pub async fn list_jobs(
     State(state): State<AppState>,
@@ -69,8 +69,8 @@ pub async fn list_jobs(
             query.push((key.to_string(), v.clone()));
         }
     }
-    if let Some(project_id) = resolve_project_id(&headers, &state.config) {
-        query.push(("project_id".to_string(), project_id));
+    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config) {
+        query.push(("tenant_id".to_string(), tenant_id));
     }
     Ok(Json(state.control_plane.list_jobs(&query).await?))
 }
@@ -170,7 +170,7 @@ mod tests {
             job_id,
             workflow_id: format!("ingest-{job_id}"),
             pipeline_uid: "builtin.pdf".into(),
-            project_id: None,
+            tenant_id: None,
             index_name: Some("documents".into()),
             status: JobStatus::Queued,
             current_step: None,

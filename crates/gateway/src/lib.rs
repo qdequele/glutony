@@ -40,7 +40,7 @@ async fn health(
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "project_id": context::resolve_project_id(&headers, &state.config),
+        "tenant_id": context::resolve_tenant_id(&headers, &state.config),
         "features": {
             "usage_analytics": state.config.usage_api.is_some(),
             "embedded_ui": ui::is_embedded(),
@@ -305,7 +305,7 @@ pub mod test_support {
             }),
             steps: vec![StepDefinition::new("index", "meili_indexer")],
             builtin: uid.starts_with("builtin."),
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(body["status"], "ok");
         // The UI reads these to render the tenant and to hide features that are off.
         assert_eq!(body["features"]["usage_analytics"], false);
-        assert!(body["project_id"].is_null());
+        assert!(body["tenant_id"].is_null());
     }
 
     #[tokio::test]
@@ -429,7 +429,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(json_body(resp).await["project_id"], "acme");
+        assert_eq!(json_body(resp).await["tenant_id"], "acme");
     }
 
     #[tokio::test]
@@ -452,7 +452,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(json_body(resp).await["project_id"].is_null());
+        assert!(json_body(resp).await["tenant_id"].is_null());
     }
 
     #[tokio::test]

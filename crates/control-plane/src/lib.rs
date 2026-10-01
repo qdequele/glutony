@@ -172,7 +172,7 @@ pub fn app(state: AppState) -> Router {
 
 /// Resolve the tenant scope of a request: an explicit value (query param or body
 /// field) wins over the `X-Meili-Project-Id` header. Empty strings count as absent.
-pub fn project_scope(explicit: Option<&str>, headers: &axum::http::HeaderMap) -> Option<String> {
+pub fn tenant_scope(explicit: Option<&str>, headers: &axum::http::HeaderMap) -> Option<String> {
     explicit
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -193,12 +193,12 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
-    fn project_scope_prefers_explicit_then_header() {
+    fn tenant_scope_prefers_explicit_then_header() {
         let mut headers = HeaderMap::new();
         headers.insert("x-meili-project-id", HeaderValue::from_static("hdr"));
-        assert_eq!(project_scope(Some("q"), &headers).as_deref(), Some("q"));
-        assert_eq!(project_scope(None, &headers).as_deref(), Some("hdr"));
-        assert_eq!(project_scope(Some("  "), &headers).as_deref(), Some("hdr"));
-        assert_eq!(project_scope(None, &HeaderMap::new()), None);
+        assert_eq!(tenant_scope(Some("q"), &headers).as_deref(), Some("q"));
+        assert_eq!(tenant_scope(None, &headers).as_deref(), Some("hdr"));
+        assert_eq!(tenant_scope(Some("  "), &headers).as_deref(), Some("hdr"));
+        assert_eq!(tenant_scope(None, &HeaderMap::new()), None);
     }
 }

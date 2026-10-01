@@ -97,7 +97,7 @@ export function SourcesTable({ sources }: { sources: SourceView[] }) {
             const archived = isArchived(source);
             return (
               <TableRow
-                key={`${source.project_id ?? ""}:${source.uid}`}
+                key={`${source.tenant_id ?? ""}:${source.uid}`}
                 className={archived ? "opacity-70" : undefined}
               >
                 <TableCell>

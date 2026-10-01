@@ -111,7 +111,7 @@ fn get(uri: &str) -> Request<Body> {
     Request::get(uri).body(Body::empty()).unwrap()
 }
 
-fn pdf_pipeline(uid: &str, project_id: Option<&str>) -> PipelineDefinition {
+fn pdf_pipeline(uid: &str, tenant_id: Option<&str>) -> PipelineDefinition {
     PipelineDefinition {
         uid: uid.into(),
         name: format!("{uid} name"),
@@ -127,7 +127,7 @@ fn pdf_pipeline(uid: &str, project_id: Option<&str>) -> PipelineDefinition {
             StepDefinition::new("index", "meili_indexer"),
         ],
         builtin: false,
-        project_id: project_id.map(str::to_owned),
+        tenant_id: tenant_id.map(str::to_owned),
     }
 }
 
@@ -150,13 +150,13 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
     // Create global, then the same uid for a tenant.
     let global = repo.upsert(&pdf_pipeline("shared", None)).await.unwrap();
     assert_eq!(global.version, 1);
-    assert_eq!(global.project_id, None);
+    assert_eq!(global.tenant_id, None);
     assert!(!global.builtin);
     let tenant = repo
         .upsert(&pdf_pipeline("shared", Some("t1")))
         .await
         .unwrap();
-    assert_eq!(tenant.project_id.as_deref(), Some("t1"));
+    assert_eq!(tenant.tenant_id.as_deref(), Some("t1"));
 
     // Update bumps version.
     let mut v2 = pdf_pipeline("shared", None);
@@ -169,13 +169,13 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
 
     // get: tenant row first, then global.
     let got = repo.get("shared", Some("t1")).await.unwrap().unwrap();
-    assert_eq!(got.project_id.as_deref(), Some("t1"));
+    assert_eq!(got.tenant_id.as_deref(), Some("t1"));
     assert_eq!(got.version, 1);
     let got = repo.get("shared", Some("t2")).await.unwrap().unwrap();
-    assert_eq!(got.project_id, None);
+    assert_eq!(got.tenant_id, None);
     assert_eq!(got.version, 3);
     let got = repo.get("shared", None).await.unwrap().unwrap();
-    assert_eq!(got.project_id, None);
+    assert_eq!(got.tenant_id, None);
     assert!(repo.get("missing", None).await.unwrap().is_none());
 
     // list: tenant rows first, then global; other tenants excluded.
@@ -185,7 +185,7 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
     let list = repo.list(Some("t1")).await.unwrap();
     let ids: Vec<(String, Option<String>)> = list
         .iter()
-        .map(|p| (p.uid.clone(), p.project_id.clone()))
+        .map(|p| (p.uid.clone(), p.tenant_id.clone()))
         .collect();
     assert_eq!(
         ids,
@@ -205,7 +205,7 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
             .await
             .unwrap()
             .unwrap()
-            .project_id
+            .tenant_id
             .is_none()
     );
     assert!(repo.delete("shared", None).await.unwrap());
@@ -234,7 +234,7 @@ async fn pipeline_routes_end_to_end() {
         String::from_utf8_lossy(&body)
     );
     let stored: PipelineDefinition = json(&body);
-    assert_eq!(stored.project_id.as_deref(), Some("t1"));
+    assert_eq!(stored.tenant_id.as_deref(), Some("t1"));
     assert_eq!(stored.version, 1);
     assert_eq!(stored.steps[1].depends_on, vec!["extract"]);
 
@@ -272,7 +272,7 @@ async fn pipeline_routes_end_to_end() {
     // GET list: the two user rows first, then every built-in. Counted from
     // `builtin_pipelines()` rather than hardcoded: the literal that used to live
     // here went stale the moment parquet/avro/msgpack were added.
-    let (status, body) = call(app(state.clone()), get("/pipelines?project_id=t1")).await;
+    let (status, body) = call(app(state.clone()), get("/pipelines?tenant_id=t1")).await;
     assert_eq!(status, StatusCode::OK);
     let list: Vec<PipelineDefinition> = json(&body);
     assert_eq!(list[0].uid, "hdr-scoped");
@@ -286,7 +286,7 @@ async fn pipeline_routes_end_to_end() {
     // GET one (scoped) / 404 for other tenant / builtin fallback.
     let (status, body) = call(
         app(state.clone()),
-        get("/pipelines/hdr-scoped?project_id=t1"),
+        get("/pipelines/hdr-scoped?tenant_id=t1"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -294,7 +294,7 @@ async fn pipeline_routes_end_to_end() {
     assert_eq!(one.version, 2);
     let (status, _) = call(
         app(state.clone()),
-        get("/pipelines/hdr-scoped?project_id=t2"),
+        get("/pipelines/hdr-scoped?tenant_id=t2"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -308,7 +308,7 @@ async fn pipeline_routes_end_to_end() {
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t1"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t1"}),
         ),
     )
     .await;
@@ -321,7 +321,7 @@ async fn pipeline_routes_end_to_end() {
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t2"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t2"}),
         ),
     )
     .await;
@@ -337,7 +337,7 @@ async fn pipeline_routes_end_to_end() {
         .unwrap();
     let (status, _) = call(app(state.clone()), req).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let req = Request::delete("/pipelines/hdr-scoped?project_id=t1")
+    let req = Request::delete("/pipelines/hdr-scoped?tenant_id=t1")
         .body(Body::empty())
         .unwrap();
     let (status, body) = call(app(state.clone()), req).await;
@@ -353,7 +353,7 @@ async fn pipeline_routes_end_to_end() {
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t1"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t1"}),
         ),
     )
     .await;
@@ -371,7 +371,7 @@ async fn pipeline_routes_end_to_end() {
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t1"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t1"}),
         ),
     )
     .await;
@@ -436,7 +436,7 @@ async fn jobs_insert_patch_get() {
         job_id: id,
         workflow_id: format!("ingest-{id}"),
         pipeline_uid: "builtin.pdf".into(),
-        project_id: Some("t1".into()),
+        tenant_id: Some("t1".into()),
         index_name: Some("documents".into()),
         status: JobStatus::Queued,
         current_step: None,
@@ -456,7 +456,7 @@ async fn jobs_insert_patch_get() {
     let stored: JobRecord = json(&body);
     assert_eq!(stored.job_id, id);
     assert_eq!(stored.status, JobStatus::Queued);
-    assert_eq!(stored.project_id.as_deref(), Some("t1"));
+    assert_eq!(stored.tenant_id.as_deref(), Some("t1"));
 
     let upd = JobUpdate {
         status: Some(JobStatus::Running),
@@ -535,7 +535,7 @@ async fn terminal_status_clears_the_current_step() {
         job_id: id,
         workflow_id: format!("ingest-{id}"),
         pipeline_uid: "builtin.pdf".into(),
-        project_id: None,
+        tenant_id: None,
         index_name: Some("documents".into()),
         status: JobStatus::Queued,
         current_step: None,
@@ -575,6 +575,60 @@ async fn terminal_status_clears_the_current_step() {
         stored.current_step, None,
         "a finished job must not keep a current step"
     );
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn tenant_id_replaces_project_id() {
+    let Some(t) = setup().await else { return };
+
+    let cols: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND column_name IN ('project_id', 'tenant_id') \
+         ORDER BY 1",
+    )
+    .fetch_all(&t.pool)
+    .await
+    .unwrap();
+    let expected: Vec<(String, String)> = ["jobs", "meili_connections", "pipelines", "sources"]
+        .into_iter()
+        .map(|table| (table.to_string(), "tenant_id".to_string()))
+        .collect();
+    assert_eq!(cols, expected);
+
+    let indexes: Vec<(String,)> = sqlx::query_as(
+        "SELECT indexname::text FROM pg_indexes \
+         WHERE schemaname = current_schema() AND indexname LIKE '%tenant%' ORDER BY 1",
+    )
+    .fetch_all(&t.pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = indexes.iter().map(|(n,)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "jobs_tenant_started",
+            "meili_connections_uid_tenant",
+            "pipelines_uid_tenant",
+            "sources_pipeline_tenant",
+            "sources_uid_tenant"
+        ]
+    );
+
+    // Still one row per (uid, tenant), NULL counting as one global scope.
+    let insert = |tenant: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO pipelines (uid, name, definition, tenant_id) \
+             VALUES ('dup', 'dup', '{}'::jsonb, $1)",
+        )
+        .bind(tenant)
+    };
+    insert(Some("t1")).execute(&t.pool).await.unwrap();
+    assert!(insert(Some("t1")).execute(&t.pool).await.is_err());
+    insert(Some("t2")).execute(&t.pool).await.unwrap();
+    insert(None).execute(&t.pool).await.unwrap();
+    assert!(insert(None).execute(&t.pool).await.is_err());
 
     t.drop_schema().await;
 }

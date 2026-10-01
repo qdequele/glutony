@@ -35,8 +35,8 @@ pub struct NewSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Tenant scope; `None` = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Pipeline this source feeds.
     pub pipeline_uid: String,
     /// Where the content comes from.
@@ -155,7 +155,7 @@ pub struct RunRecord {
 }
 
 /// Columns selected by every source query, in the order [`SourceRow`] declares them.
-const SOURCE_COLUMNS: &str = "id, uid, name, description, project_id, pipeline_uid, location, \
+const SOURCE_COLUMNS: &str = "id, uid, name, description, tenant_id, pipeline_uid, location, \
      cron, timezone, paused, index_name, schedule_id, archived_at, fetch_auth, \
      last_etag, last_modified, last_hash, last_run_at, last_status, last_error";
 
@@ -166,7 +166,7 @@ struct SourceRow {
     uid: String,
     name: String,
     description: Option<String>,
-    project_id: Option<String>,
+    tenant_id: Option<String>,
     pipeline_uid: String,
     location: SqlJson<Location>,
     cron: String,
@@ -192,7 +192,7 @@ impl From<SourceRow> for SourceRecord {
                 uid: r.uid,
                 name: r.name,
                 description: r.description,
-                project_id: r.project_id,
+                tenant_id: r.tenant_id,
                 pipeline_uid: r.pipeline_uid,
                 location: r.location.0,
                 cron: r.cron,
@@ -263,45 +263,45 @@ impl SourceRepo {
         Self { pool }
     }
 
-    /// Global sources plus the ones scoped to `project_id`.
+    /// Global sources plus the ones scoped to `tenant_id`.
     ///
     /// Archived sources are hidden unless `include_archived`; they never fire, so a list
     /// that showed them by default would read as a set of broken schedules.
     pub async fn list(
         &self,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<SourceRecord>, CpError> {
         let sql = format!(
             "SELECT {SOURCE_COLUMNS} FROM sources \
-             WHERE (project_id IS NULL OR project_id = $1) \
+             WHERE (tenant_id IS NULL OR tenant_id = $1) \
                AND ($2 OR archived_at IS NULL) \
-             ORDER BY (project_id IS NULL), uid"
+             ORDER BY (tenant_id IS NULL), uid"
         );
         let rows: Vec<SourceRow> = sqlx::query_as(AssertSqlSafe(sql))
-            .bind(project_id)
+            .bind(tenant_id)
             .bind(include_archived)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(SourceRecord::from).collect())
     }
 
-    /// Fetch one source by uid: the tenant-scoped row when `project_id` is given and
+    /// Fetch one source by uid: the tenant-scoped row when `tenant_id` is given and
     /// exists, otherwise the global row.
     pub async fn get(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Option<SourceRecord>, CpError> {
         let sql = format!(
             "SELECT {SOURCE_COLUMNS} FROM sources \
-             WHERE uid = $1 AND (project_id IS NULL OR project_id = $2) \
-             ORDER BY (project_id IS NULL) \
+             WHERE uid = $1 AND (tenant_id IS NULL OR tenant_id = $2) \
+             ORDER BY (tenant_id IS NULL) \
              LIMIT 1"
         );
         let row: Option<SourceRow> = sqlx::query_as(AssertSqlSafe(sql))
             .bind(uid)
-            .bind(project_id)
+            .bind(tenant_id)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(SourceRecord::from))
@@ -324,7 +324,7 @@ impl SourceRepo {
     /// a schedule firing against a row that does not exist.
     pub async fn insert(&self, new: &NewSource) -> Result<SourceRecord, CpError> {
         let sql = format!(
-            "INSERT INTO sources (id, uid, name, description, project_id, pipeline_uid, \
+            "INSERT INTO sources (id, uid, name, description, tenant_id, pipeline_uid, \
                                   location, cron, timezone, paused, index_name, fetch_auth, \
                                   schedule_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12) \
@@ -335,7 +335,7 @@ impl SourceRepo {
             .bind(&new.uid)
             .bind(&new.name)
             .bind(new.description.as_deref())
-            .bind(new.project_id.as_deref())
+            .bind(new.tenant_id.as_deref())
             .bind(&new.pipeline_uid)
             .bind(SqlJson(&new.location))
             .bind(&new.cron)
@@ -352,7 +352,7 @@ impl SourceRepo {
                 );
                 if duplicate {
                     CpError::Validation(format!(
-                        "a source named {:?} already exists in this project",
+                        "a source named {:?} already exists for this tenant",
                         new.uid
                     ))
                 } else {
@@ -362,7 +362,7 @@ impl SourceRepo {
         Ok(SourceRecord::from(row))
     }
 
-    /// Apply a partial update to the row in exactly `project_id`'s scope. `None` when no
+    /// Apply a partial update to the row in exactly `tenant_id`'s scope. `None` when no
     /// such row exists.
     ///
     /// Writes never fall back to the global row the way [`SourceRepo::get`] does: a
@@ -370,7 +370,7 @@ impl SourceRepo {
     pub async fn update(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         patch: &SourcePatch,
     ) -> Result<Option<SourceRecord>, CpError> {
         // `$10` distinguishes "clear the credential" from "leave it alone": COALESCE
@@ -391,12 +391,12 @@ impl SourceRepo {
                 fetch_auth = CASE WHEN $10 THEN $11 ELSE fetch_auth END, \
                 paused = COALESCE($12, paused), \
                 updated_at = now() \
-             WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '') \
+             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '') \
              RETURNING {SOURCE_COLUMNS}"
         );
         let row: Option<SourceRow> = sqlx::query_as(AssertSqlSafe(sql))
             .bind(uid)
-            .bind(project_id)
+            .bind(tenant_id)
             .bind(patch.name.as_deref())
             .bind(patch.description.as_deref())
             .bind(patch.pipeline_uid.as_deref())
@@ -422,16 +422,16 @@ impl SourceRepo {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Delete the source in exactly `project_id`'s scope. Its runs cascade.
+    /// Delete the source in exactly `tenant_id`'s scope. Its runs cascade.
     ///
-    /// Exact scope matters: a looser `project_id IS NULL OR project_id = $2` would make a
+    /// Exact scope matters: a looser `tenant_id IS NULL OR tenant_id = $2` would make a
     /// tenant's delete remove the global source of the same uid as well.
-    pub async fn delete(&self, uid: &str, project_id: Option<&str>) -> Result<bool, CpError> {
+    pub async fn delete(&self, uid: &str, tenant_id: Option<&str>) -> Result<bool, CpError> {
         let done = sqlx::query(
-            "DELETE FROM sources WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '')",
+            "DELETE FROM sources WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() > 0)
@@ -446,17 +446,17 @@ impl SourceRepo {
     pub async fn archive_for_pipeline(
         &self,
         pipeline_uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<Uuid>, CpError> {
         let rows: Vec<(Uuid,)> = sqlx::query_as(
             "UPDATE sources SET archived_at = now(), paused = true, updated_at = now() \
              WHERE pipeline_uid = $1 \
-               AND COALESCE(project_id, '') = COALESCE($2, '') \
+               AND COALESCE(tenant_id, '') = COALESCE($2, '') \
                AND archived_at IS NULL \
              RETURNING id",
         )
         .bind(pipeline_uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -554,14 +554,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::{AppState, JsonBody, project_scope};
+use crate::{AppState, JsonBody, tenant_scope};
 
 /// Query of `GET /internal/sources`.
 #[derive(Debug, Default, Deserialize)]
 pub struct SourceListQuery {
     /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
-    #[serde(default)]
-    pub project_id: Option<String>,
+    #[serde(default, alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Include archived sources (their pipeline was deleted).
     #[serde(default)]
     pub include_archived: bool,
@@ -571,8 +571,8 @@ pub struct SourceListQuery {
 #[derive(Debug, Default, Deserialize)]
 pub struct SourceScopeQuery {
     /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
-    #[serde(default)]
-    pub project_id: Option<String>,
+    #[serde(default, alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Query of `GET /internal/sources-by-id/{id}/runs`.
@@ -594,9 +594,9 @@ fn repo(state: &AppState) -> SourceRepo {
     SourceRepo::new(state.pool.clone())
 }
 
-fn uid_not_found(uid: &str, project_id: Option<&str>) -> CpError {
+fn uid_not_found(uid: &str, tenant_id: Option<&str>) -> CpError {
     CpError::NotFound(format!(
-        "source {uid:?} not found (project_id={project_id:?})"
+        "source {uid:?} not found (tenant_id={tenant_id:?})"
     ))
 }
 
@@ -604,16 +604,16 @@ fn id_not_found(id: Uuid) -> CpError {
     CpError::NotFound(format!("source {id} not found or archived"))
 }
 
-/// `GET /internal/sources?project_id=&include_archived=`.
+/// `GET /internal/sources?tenant_id=&include_archived=`.
 pub async fn list_sources(
     State(state): State<AppState>,
     Query(q): Query<SourceListQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SourceRecord>>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     Ok(Json(
         repo(&state)
-            .list(project_id.as_deref(), q.include_archived)
+            .list(tenant_id.as_deref(), q.include_archived)
             .await?,
     ))
 }
@@ -626,28 +626,28 @@ pub async fn create_source(
     let stored = repo(&state).insert(&new).await?;
     tracing::info!(
         uid = %stored.definition.uid,
-        project_id = ?stored.definition.project_id,
+        tenant_id = ?stored.definition.tenant_id,
         "source created"
     );
     Ok((StatusCode::CREATED, Json(stored)).into_response())
 }
 
-/// `GET /internal/sources/{uid}?project_id=`.
+/// `GET /internal/sources/{uid}?tenant_id=`.
 pub async fn get_source(
     State(state): State<AppState>,
     Path(uid): Path<String>,
     Query(q): Query<SourceScopeQuery>,
     headers: HeaderMap,
 ) -> Result<Json<SourceRecord>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     repo(&state)
-        .get(&uid, project_id.as_deref())
+        .get(&uid, tenant_id.as_deref())
         .await?
         .map(Json)
-        .ok_or_else(|| uid_not_found(&uid, project_id.as_deref()))
+        .ok_or_else(|| uid_not_found(&uid, tenant_id.as_deref()))
 }
 
-/// `PATCH /internal/sources/{uid}?project_id=` body [`SourcePatch`].
+/// `PATCH /internal/sources/{uid}?tenant_id=` body [`SourcePatch`].
 pub async fn patch_source(
     State(state): State<AppState>,
     Path(uid): Path<String>,
@@ -655,27 +655,27 @@ pub async fn patch_source(
     headers: HeaderMap,
     JsonBody(patch): JsonBody<SourcePatch>,
 ) -> Result<Json<SourceRecord>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     repo(&state)
-        .update(&uid, project_id.as_deref(), &patch)
+        .update(&uid, tenant_id.as_deref(), &patch)
         .await?
         .map(Json)
-        .ok_or_else(|| uid_not_found(&uid, project_id.as_deref()))
+        .ok_or_else(|| uid_not_found(&uid, tenant_id.as_deref()))
 }
 
-/// `DELETE /internal/sources/{uid}?project_id=` → 204; its runs cascade.
+/// `DELETE /internal/sources/{uid}?tenant_id=` → 204; its runs cascade.
 pub async fn delete_source(
     State(state): State<AppState>,
     Path(uid): Path<String>,
     Query(q): Query<SourceScopeQuery>,
     headers: HeaderMap,
 ) -> Result<StatusCode, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
-    if repo(&state).delete(&uid, project_id.as_deref()).await? {
-        tracing::info!(uid = %uid, project_id = ?project_id, "source deleted");
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    if repo(&state).delete(&uid, tenant_id.as_deref()).await? {
+        tracing::info!(uid = %uid, tenant_id = ?tenant_id, "source deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(uid_not_found(&uid, project_id.as_deref()))
+        Err(uid_not_found(&uid, tenant_id.as_deref()))
     }
 }
 

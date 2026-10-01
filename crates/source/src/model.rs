@@ -102,8 +102,8 @@ pub struct SourceDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Tenant scope; `None` = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Pipeline this source feeds.
     pub pipeline_uid: String,
     /// Where the content comes from.
@@ -143,8 +143,8 @@ pub struct SourceRunInput {
     /// The source to run.
     pub source_id: Uuid,
     /// Its tenant scope, for connection resolution and usage attribution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 impl SourceRunInput {
@@ -315,5 +315,18 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&def).expect("serialize"))
                 .expect("deserialize");
         assert_eq!(back, def);
+    }
+
+    #[test]
+    fn a_schedule_frozen_before_the_rename_still_runs() {
+        let input: SourceRunInput = serde_json::from_value(serde_json::json!({
+            "source_id": "11111111-2222-3333-4444-555555555555",
+            "project_id": "acme"
+        }))
+        .unwrap();
+        assert_eq!(input.tenant_id.as_deref(), Some("acme"));
+        let written = serde_json::to_value(&input).unwrap();
+        assert_eq!(written["tenant_id"], "acme");
+        assert!(written.get("project_id").is_none());
     }
 }

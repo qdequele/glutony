@@ -28,7 +28,7 @@ fn schedule(cron: &str, timezone: &str) -> SourceSchedule {
     SourceSchedule {
         schedule_id: SourceRunInput::schedule_id(source_id),
         source_id,
-        project_id: Some("tenant-1".into()),
+        tenant_id: Some("tenant-1".into()),
         cron: cron.into(),
         timezone: timezone.into(),
         paused: true,

@@ -32,7 +32,7 @@ import { errorMessage } from "./hooks";
 export interface ConnectionView {
   uid: string;
   name: string;
-  project_id?: string;
+  tenant_id?: string;
   host: string;
   /** Always `"****"`: the key never leaves the gateway. */
   api_key: string;

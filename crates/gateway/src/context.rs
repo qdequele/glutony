@@ -4,7 +4,7 @@
 //!
 //! 1. `X-Meili-Host` → host
 //! 2. `X-Meili-Api-Key` → api_key
-//! 3. `X-Meili-Project-Id` → project_id
+//! 3. `X-Meili-Project-Id` → tenant_id
 //! 4. `X-Meili-Index` → index (starting point)
 //! 5. `?index=` query param → index (overrides the header)
 //! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback)
@@ -64,7 +64,7 @@ pub fn trusted_header(headers: &HeaderMap, config: &GatewayConfig, name: &str) -
 
 /// Tenant id of the request, if any (honours the Envoy trust rule). Used by routes that
 /// only need scoping (pipelines, plugins, jobs) and must not require credentials.
-pub fn resolve_project_id(headers: &HeaderMap, config: &GatewayConfig) -> Option<String> {
+pub fn resolve_tenant_id(headers: &HeaderMap, config: &GatewayConfig) -> Option<String> {
     trusted_header(headers, config, H_PROJECT_ID)
 }
 
@@ -136,7 +136,7 @@ pub fn resolve_request_context(
     // 1–4: Envoy headers.
     let mut host = envoy(H_HOST);
     let mut api_key = envoy(H_API_KEY);
-    let project_id = envoy(H_PROJECT_ID);
+    let tenant_id = envoy(H_PROJECT_ID);
     let mut index = envoy(H_INDEX);
     let region = envoy(H_REGION);
 
@@ -159,7 +159,7 @@ pub fn resolve_request_context(
     }
 
     MeiliContext {
-        project_id,
+        tenant_id,
         host,
         api_key,
         index,
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(
             ctx,
             MeiliContext {
-                project_id: Some("xxx".into()),
+                tenant_id: Some("xxx".into()),
                 host: Some("https://xxx.us-west.meilisearch.io".into()),
                 api_key: Some("envoyKey".into()),
                 index: Some("from-header".into()),
@@ -272,7 +272,7 @@ mod tests {
         let ctx = resolve_context(&h, None, &cfg()).unwrap();
         assert_eq!(ctx.host.as_deref(), Some("http://h"));
         assert_eq!(ctx.api_key.as_deref(), Some("k"));
-        assert_eq!(ctx.project_id, None);
+        assert_eq!(ctx.tenant_id, None);
         assert_eq!(ctx.index, None);
         assert_eq!(ctx.region, None);
     }
@@ -355,7 +355,7 @@ mod tests {
         let ctx = resolve_context(&HeaderMap::new(), None, &cfg_env()).unwrap();
         assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
         assert_eq!(ctx.api_key.as_deref(), Some("envKey"));
-        assert_eq!(ctx.project_id, None);
+        assert_eq!(ctx.tenant_id, None);
         assert_eq!(ctx.index, None);
     }
 
@@ -439,7 +439,7 @@ mod tests {
         h.insert(H_ENVOY_SECRET, HeaderValue::from_static("s3cret"));
         assert!(envoy_headers_trusted(&h, &cfg_secret()));
         let ctx = resolve_context(&h, None, &cfg_secret()).unwrap();
-        assert_eq!(ctx.project_id.as_deref(), Some("xxx"));
+        assert_eq!(ctx.tenant_id.as_deref(), Some("xxx"));
         assert_eq!(ctx.api_key.as_deref(), Some("envoyKey"));
     }
 
@@ -475,7 +475,7 @@ mod tests {
         let ctx = resolve_context(&h, Some("q"), &cfg).unwrap();
         assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
         assert_eq!(ctx.api_key.as_deref(), Some("envKey"));
-        assert_eq!(ctx.project_id, None, "tenant header must not be honoured");
+        assert_eq!(ctx.tenant_id, None, "tenant header must not be honoured");
         assert_eq!(ctx.region, None);
         assert_eq!(
             ctx.index.as_deref(),
@@ -499,26 +499,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_id_follows_trust_rule() {
+    fn resolve_tenant_id_follows_trust_rule() {
         assert_eq!(
-            resolve_project_id(&envoy_headers(), &cfg()).as_deref(),
+            resolve_tenant_id(&envoy_headers(), &cfg()).as_deref(),
             Some("xxx")
         );
-        assert_eq!(resolve_project_id(&envoy_headers(), &cfg_secret()), None);
+        assert_eq!(resolve_tenant_id(&envoy_headers(), &cfg_secret()), None);
         let mut h = envoy_headers();
         h.insert(H_ENVOY_SECRET, HeaderValue::from_static("s3cret"));
-        assert_eq!(
-            resolve_project_id(&h, &cfg_secret()).as_deref(),
-            Some("xxx")
-        );
-        assert_eq!(resolve_project_id(&HeaderMap::new(), &cfg()), None);
+        assert_eq!(resolve_tenant_id(&h, &cfg_secret()).as_deref(), Some("xxx"));
+        assert_eq!(resolve_tenant_id(&HeaderMap::new(), &cfg()), None);
     }
 
     // --- index chain (SPEC §3.4) --------------------------------------------------------
 
     fn ctx_with_index(index: Option<&str>) -> MeiliContext {
         MeiliContext {
-            project_id: None,
+            tenant_id: None,
             host: Some("http://h".into()),
             api_key: Some("k".into()),
             index: index.map(str::to_string),

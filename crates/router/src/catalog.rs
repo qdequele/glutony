@@ -541,7 +541,7 @@ fn workflows() -> Vec<WorkflowEntry> {
                     crate::index_step(),
                 ],
                 builtin: false,
-                project_id: None,
+                tenant_id: None,
             }),
         },
     ]

@@ -90,7 +90,7 @@ export interface UsageRow extends Partial<Record<UsageMetricKey, number>> {
 /** 200 body of `GET /usage`. */
 export interface UsageResponse {
   /** Tenant the rows belong to; empty string when self-hosted. */
-  project_id: string;
+  tenant_id: string;
   /** Daily rows, oldest first. */
   data: UsageRow[];
 }
@@ -155,7 +155,7 @@ export async function fetchUsage(
   const query = new URLSearchParams({ date_from: range.from, date_to: range.to });
   try {
     const body = await request<UsageResponse>(`/usage?${query.toString()}`, { signal });
-    return { kind: "ready", projectId: body.project_id ?? "", rows: body.data ?? [] };
+    return { kind: "ready", projectId: body.tenant_id ?? "", rows: body.data ?? [] };
   } catch (error) {
     if (error instanceof ApiError && (error.status === 501 || error.code === "not_configured")) {
       return { kind: "not_configured", message: error.message };

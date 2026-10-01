@@ -100,7 +100,7 @@ async fn meili_connections_schema_exists_after_migration() {
 
     let insert = |id: &'static str, project: Option<&'static str>| {
         sqlx::query(
-            "INSERT INTO meili_connections (id, uid, name, project_id, host, api_key) \
+            "INSERT INTO meili_connections (id, uid, name, tenant_id, host, api_key) \
              VALUES ($1::uuid, 'mig-conn', 'Movies', $2, 'https://m.example', '\\x01'::bytea)",
         )
         .bind(id)

@@ -64,7 +64,7 @@ async fn ingest_with_pipeline_inner(
     // 404 before reading the body when the pipeline does not exist.
     let pipeline = state
         .control_plane
-        .get_pipeline(&name, pre.project_id.as_deref())
+        .get_pipeline(&name, pre.tenant_id.as_deref())
         .await?;
     let extracted = read_payload(&headers, &query, req).await?;
     let ctx = context_for(&state, &headers, &query, &extracted);
@@ -226,7 +226,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/pipelines/ghost"))
-            .and(wq("project_id", "xxx"))
+            .and(wq("tenant_id", "xxx"))
             .respond_with(
                 ResponseTemplate::new(404)
                     .set_body_json(json!({"error": "pipeline ghost not found"})),

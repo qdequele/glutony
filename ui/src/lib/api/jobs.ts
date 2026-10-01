@@ -40,7 +40,7 @@ export interface JobRecord {
   job_id: string;
   workflow_id: string;
   pipeline_uid: string;
-  project_id?: string;
+  tenant_id?: string;
   index_name?: string;
   status: JobStatus;
   current_step?: string;
@@ -92,7 +92,7 @@ export interface CancelJobResponse {
 /**
  * Filters of the Jobs list.
  *
- * There is deliberately no `project_id`: the gateway derives the tenant from
+ * There is deliberately no `tenant_id`: the gateway derives the tenant from
  * the request context and appends it itself, so sending one from the browser is
  * at best ignored and at worst misleading.
  */
@@ -136,7 +136,7 @@ export function isTerminalStatus(status: JobStatus): boolean {
  * is nothing to send).
  *
  * Empty filters are dropped rather than sent blank, `offset=0` is left implicit,
- * and `project_id` is never emitted — see {@link JobFilters}.
+ * and `tenant_id` is never emitted — see {@link JobFilters}.
  */
 export function jobListSearch(filters: JobFilters): string {
   const params = new URLSearchParams();

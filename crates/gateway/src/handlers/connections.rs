@@ -15,7 +15,7 @@ use crate::connections::{
     ConnectionView, CreateConnection, UpdateConnection, normalize_host, valid_uid,
     validate_destination,
 };
-use crate::context::resolve_project_id;
+use crate::context::resolve_tenant_id;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -48,10 +48,10 @@ pub async fn list_connections(
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionView>>, GatewayError> {
     state.connections.key()?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config);
     let rows = state
         .control_plane
-        .list_connections(project_id.as_deref())
+        .list_connections(tenant_id.as_deref())
         .await?;
     Ok(Json(
         rows.into_iter()
@@ -81,12 +81,12 @@ pub async fn create_connection(
         .seal(api_key.as_bytes())
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
     let name = non_blank(req.name).unwrap_or_else(|| uid.clone());
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config);
     let record = state
         .control_plane
-        .create_connection(&uid, &name, project_id.as_deref(), &host, &sealed)
+        .create_connection(&uid, &name, tenant_id.as_deref(), &host, &sealed)
         .await?;
-    tracing::info!(uid = %uid, host = %host, project_id = ?project_id, "connection created");
+    tracing::info!(uid = %uid, host = %host, tenant_id = ?tenant_id, "connection created");
     Ok((
         StatusCode::CREATED,
         Json(ConnectionView::from_record(record, Some(Vec::new()))),
@@ -101,15 +101,15 @@ pub async fn get_connection(
 ) -> Result<Json<ConnectionView>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config);
     let record = state
         .control_plane
-        .get_connection(&uid, project_id.as_deref())
+        .get_connection(&uid, tenant_id.as_deref())
         .await?
         .ok_or_else(|| not_found(&uid))?;
     let used_by = state
         .control_plane
-        .connection_used_by(&uid, project_id.as_deref())
+        .connection_used_by(&uid, tenant_id.as_deref())
         .await?;
     Ok(Json(ConnectionView::from_record(record, Some(used_by))))
 }
@@ -125,15 +125,15 @@ pub async fn patch_connection(
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateConnection = parse_body(&body)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config);
 
     // Reads fall back to the global row, writes never do: a tenant must not reach a
     // global connection, so anything outside the caller's exact scope is "not found".
     let stored = state
         .control_plane
-        .get_connection(&uid, project_id.as_deref())
+        .get_connection(&uid, tenant_id.as_deref())
         .await?
-        .filter(|r| r.project_id == project_id)
+        .filter(|r| r.tenant_id == tenant_id)
         .ok_or_else(|| not_found(&uid))?;
 
     let new_host = req.host.as_deref().map(normalize_host).transpose()?;
@@ -173,7 +173,7 @@ pub async fn patch_connection(
         .control_plane
         .update_connection(
             &uid,
-            project_id.as_deref(),
+            tenant_id.as_deref(),
             name.as_deref(),
             new_host.as_ref().map(|(h, _)| h.as_str()),
             sealed.as_deref(),
@@ -182,7 +182,7 @@ pub async fn patch_connection(
         .ok_or_else(|| not_found(&uid))?;
     let used_by = state
         .control_plane
-        .connection_used_by(&uid, project_id.as_deref())
+        .connection_used_by(&uid, tenant_id.as_deref())
         .await?;
     Ok(Json(ConnectionView::from_record(record, Some(used_by))))
 }
@@ -196,10 +196,10 @@ pub async fn delete_connection(
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config);
     state
         .control_plane
-        .delete_connection(&uid, project_id.as_deref())
+        .delete_connection(&uid, tenant_id.as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -502,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_cannot_patch_a_global_connection() {
         let cp = MockServer::start().await;
-        // The read falls back to the global row (no project_id)…
+        // The read falls back to the global row (no tenant_id)…
         Mock::given(method("GET"))
             .and(path("/internal/connections/prod"))
             .respond_with(ResponseTemplate::new(200).set_body_json(record(
