@@ -632,3 +632,26 @@ async fn tenant_id_replaces_project_id() {
 
     t.drop_schema().await;
 }
+
+#[tokio::test]
+async fn a_tenant_delete_never_reaches_the_global_pipeline() {
+    let Some(t) = setup().await else { return };
+    let app = app(AppState::new(t.pool.clone()));
+    let def = serde_json::json!({
+        "uid": "shared", "name": "shared",
+        "steps": [{"id": "index", "plugin": "meili_indexer"}]
+    });
+    let (status, _) = call(app.clone(), req_json("POST", "/pipelines", &def)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        Request::delete("/pipelines/shared?tenant_id=t1")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(app, get("/pipelines/shared")).await;
+    assert_eq!(status, StatusCode::OK, "the global pipeline is still there");
+    t.drop_schema().await;
+}

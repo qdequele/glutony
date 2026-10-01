@@ -52,7 +52,7 @@ pub mod wasm;
 pub use async_trait::async_trait;
 pub use context::ActivityContext;
 pub use error::PluginError;
-pub use tenant::{MAX_TENANT_ID_LEN, validate_tenant_id};
+pub use tenant::{MAX_TENANT_ID_LEN, RowScope, validate_tenant_id};
 pub use types::*;
 
 /// The plugin contract. Implement this for every processing step.

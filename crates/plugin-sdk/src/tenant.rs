@@ -26,6 +26,30 @@ pub fn validate_tenant_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whose a pipeline, source or connection is, as seen by the caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowScope {
+    /// Owned by the caller's tenant.
+    Tenant,
+    /// Shared by every tenant; read-only for tenants.
+    #[default]
+    Global,
+    /// Compiled into glutony; read-only for everyone.
+    Builtin,
+}
+
+impl RowScope {
+    /// The scope of a row from its flags.
+    pub fn of(builtin: bool, tenant_id: Option<&str>) -> Self {
+        match (builtin, tenant_id) {
+            (true, _) => RowScope::Builtin,
+            (false, Some(_)) => RowScope::Tenant,
+            (false, None) => RowScope::Global,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +82,13 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn row_scope_of_a_row() {
+        assert_eq!(RowScope::of(true, None), RowScope::Builtin);
+        assert_eq!(RowScope::of(false, None), RowScope::Global);
+        assert_eq!(RowScope::of(false, Some("t1")), RowScope::Tenant);
+        assert_eq!(serde_json::to_value(RowScope::Tenant).unwrap(), "tenant");
     }
 }

@@ -197,6 +197,13 @@ pub async fn delete_connection(
     state.connections.key()?;
     check_uid(&uid)?;
     let tenant_id = scope.tenant_id.clone();
+    // Writes never reach a row outside the caller's exact scope (spec §4.3).
+    state
+        .control_plane
+        .get_connection(&uid, tenant_id.as_deref())
+        .await?
+        .filter(|r| r.tenant_id == tenant_id)
+        .ok_or_else(|| not_found(&uid))?;
     state
         .control_plane
         .delete_connection(&uid, tenant_id.as_deref())
@@ -542,5 +549,53 @@ mod tests {
             StatusCode::NOT_FOUND,
             "…but the write must not reach it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_delete_a_global_connection() {
+        let cp = MockServer::start().await;
+        let global = record("prod", "https://m.example", b"sealed"); // no tenant_id
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(global))
+            .mount(&cp)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/internal/connections/prod"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let app = app(&cp, Some(secret()));
+        let req = Request::delete("/connections/prod")
+            .header("x-meili-project-id", "tenant-1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rows_say_whose_they_are() {
+        let cp = MockServer::start().await;
+        let mut own = record("mine", "https://m.example", b"sealed");
+        own["tenant_id"] = "tenant-1".into();
+        let global = record("prod", "https://m.example", b"sealed");
+        Mock::given(method("GET"))
+            .and(path("/internal/connections"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([own, global])),
+            )
+            .mount(&cp)
+            .await;
+        let app = app(&cp, Some(secret()));
+        let req = Request::get("/connections")
+            .header("x-meili-project-id", "tenant-1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["scope"], "tenant");
+        assert_eq!(body[1]["scope"], "global");
     }
 }

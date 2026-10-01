@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use meili_ingest_plugin_sdk::RowScope;
 use meili_ingest_source::{HostPolicy, SecretKey, SourceError};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -168,6 +169,9 @@ pub struct ConnectionView {
     pub host: String,
     /// Always [`MASK`].
     pub api_key: String,
+    /// Whose row this is (spec §4.3).
+    #[serde(default)]
+    pub scope: RowScope,
     /// Pipelines whose indexer names this connection, on single-connection reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_by: Option<Vec<String>>,
@@ -183,6 +187,7 @@ impl ConnectionView {
         Self {
             uid: r.uid,
             name: r.name,
+            scope: RowScope::of(false, r.tenant_id.as_deref()),
             tenant_id: r.tenant_id,
             host: r.host,
             api_key: MASK.into(),

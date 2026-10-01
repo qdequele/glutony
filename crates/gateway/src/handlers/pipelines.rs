@@ -8,11 +8,29 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
-use meili_ingest_plugin_sdk::PipelineDefinition;
+use meili_ingest_plugin_sdk::{PipelineDefinition, RowScope};
+use serde::Serialize;
 
 use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::AppState;
+
+/// A pipeline as the API returns it: the definition plus whose it is.
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineView {
+    /// The definition, flattened into the response object.
+    #[serde(flatten)]
+    pub pipeline: PipelineDefinition,
+    /// Whose it is.
+    pub scope: RowScope,
+}
+
+impl From<PipelineDefinition> for PipelineView {
+    fn from(pipeline: PipelineDefinition) -> Self {
+        let scope = RowScope::of(pipeline.builtin, pipeline.tenant_id.as_deref());
+        Self { pipeline, scope }
+    }
+}
 
 /// Whether a content type denotes YAML.
 pub fn is_yaml(content_type: Option<&str>) -> bool {
@@ -66,7 +84,7 @@ pub async fn create_pipeline(
     scope: Scope,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<PipelineDefinition>), GatewayError> {
+) -> Result<(StatusCode, Json<PipelineView>), GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
     def.validate()
@@ -81,21 +99,20 @@ pub async fn create_pipeline(
     }
     let stored = state.control_plane.upsert_pipeline(&def).await?;
     tracing::info!(pipeline = %stored.uid, tenant_id = ?stored.tenant_id, version = stored.version, "pipeline upserted");
-    Ok((StatusCode::CREATED, Json(stored)))
+    Ok((StatusCode::CREATED, Json(stored.into())))
 }
 
 /// `GET /pipelines`.
 pub async fn list_pipelines(
     State(state): State<AppState>,
     scope: Scope,
-) -> Result<Json<Vec<PipelineDefinition>>, GatewayError> {
+) -> Result<Json<Vec<PipelineView>>, GatewayError> {
     let tenant_id = scope.tenant_id.clone();
-    Ok(Json(
-        state
-            .control_plane
-            .list_pipelines(tenant_id.as_deref())
-            .await?,
-    ))
+    let rows = state
+        .control_plane
+        .list_pipelines(tenant_id.as_deref())
+        .await?;
+    Ok(Json(rows.into_iter().map(PipelineView::from).collect()))
 }
 
 /// `POST /pipelines/validate` — check a definition without saving it.
@@ -122,14 +139,13 @@ pub async fn get_pipeline(
     State(state): State<AppState>,
     scope: Scope,
     Path(name): Path<String>,
-) -> Result<Json<PipelineDefinition>, GatewayError> {
+) -> Result<Json<PipelineView>, GatewayError> {
     let tenant_id = scope.tenant_id.clone();
-    Ok(Json(
-        state
-            .control_plane
-            .get_pipeline(&name, tenant_id.as_deref())
-            .await?,
-    ))
+    let row = state
+        .control_plane
+        .get_pipeline(&name, tenant_id.as_deref())
+        .await?;
+    Ok(Json(row.into()))
 }
 
 /// `DELETE /pipelines/{name}` → 204.
@@ -472,5 +488,38 @@ steps:
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn pipelines_say_whose_they_are() {
+        let server = MockServer::start().await;
+        let mut own = sample_pipeline("mine", None);
+        own.tenant_id = Some("t1".into());
+        let global = sample_pipeline("shared", None);
+        let mut builtin = sample_pipeline("builtin.pdf", None);
+        builtin.builtin = true;
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![own, global, builtin]))
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(
+                Request::get("/pipelines")
+                    .header("x-meili-project-id", "t1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = json_body(resp).await;
+        assert_eq!(json[0]["scope"], "tenant");
+        assert_eq!(json[1]["scope"], "global");
+        assert_eq!(json[2]["scope"], "builtin");
+        assert_eq!(
+            json[0]["uid"], "mine",
+            "the definition is flattened, not nested"
+        );
     }
 }

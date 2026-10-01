@@ -6,7 +6,7 @@
 //! Meilisearch connection its pipeline's `meili_indexer` step names (spec Decision 6).
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::PipelineDefinition;
+use meili_ingest_plugin_sdk::{PipelineDefinition, RowScope};
 use meili_ingest_source::{
     FetchAuth, HostPolicy, IncrementalState, Location, RunOutcome, SecretKey, SourceDefinition,
     SourceError, open_json, redact, render,
@@ -225,6 +225,9 @@ pub struct SourceView {
     /// Tenant scope.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
     pub tenant_id: Option<String>,
+    /// Whose row this is (spec §4.3).
+    #[serde(default)]
+    pub scope: RowScope,
     /// Pipeline fed.
     pub pipeline: String,
     /// Where it fetches from.
@@ -277,6 +280,7 @@ impl SourceView {
             uid: d.uid,
             name: d.name,
             description: d.description,
+            scope: RowScope::of(false, d.tenant_id.as_deref()),
             tenant_id: d.tenant_id,
             pipeline: d.pipeline_uid,
             location: d.location,
