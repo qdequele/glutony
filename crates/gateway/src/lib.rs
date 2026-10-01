@@ -13,6 +13,7 @@ pub mod error;
 pub mod extract;
 pub mod handlers;
 pub mod preflight;
+pub mod routes;
 pub mod schedules;
 pub mod sources;
 pub mod state;
