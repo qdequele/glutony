@@ -136,7 +136,15 @@ impl IntoResponse for GatewayError {
             error: self.to_string(),
             code: self.code().to_string(),
         };
-        (status, Json(body)).into_response()
+        let is_unauthorized = status == StatusCode::UNAUTHORIZED;
+        let mut response = (status, Json(body)).into_response();
+        if is_unauthorized {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 

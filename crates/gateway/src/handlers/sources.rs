@@ -11,14 +11,14 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use meili_ingest_source::{SecretKey, SourceRunInput, seal_json};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::auth::Scope;
 use crate::connections::valid_uid;
-use crate::context::resolve_tenant_id;
 use crate::error::GatewayError;
 use crate::schedules::SourceSchedule;
 use crate::sources::{
@@ -111,11 +111,11 @@ pub struct ListQuery {
 /// `GET /sources`.
 pub async fn list_sources(
     State(state): State<AppState>,
+    scope: Scope,
     Query(q): Query<ListQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Vec<SourceView>>, GatewayError> {
     let key = state.connections.key()?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let rows = state
         .control_plane
         .list_sources(tenant_id.as_deref(), q.include_archived)
@@ -130,14 +130,14 @@ pub async fn list_sources(
 /// `POST /sources`.
 pub async fn create_source(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     body: Bytes,
 ) -> Result<(StatusCode, Json<SourceView>), GatewayError> {
     let key = state.connections.key()?;
     let req: CreateSource = parse_body(&body)?;
     let uid = req.uid.trim().to_owned();
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
 
     validate_location(&req.location, &req.timezone, &state.fetch_policy).await?;
     schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
@@ -227,12 +227,12 @@ async fn undo_create(state: &AppState, record: &SourceRecord, schedule_created: 
 /// `GET /sources/{uid}` — includes the next run from Temporal.
 pub async fn get_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<SourceView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
         .get_source(&uid, tenant_id.as_deref())
@@ -257,14 +257,14 @@ pub async fn get_source(
 /// `PATCH /sources/{uid}`.
 pub async fn patch_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SourceView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateSource = parse_body(&body)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     let d = &stored.definition;
 
@@ -315,13 +315,12 @@ pub async fn patch_source(
 async fn set_paused(
     state: &AppState,
     uid: &str,
-    headers: &HeaderMap,
+    tenant_id: Option<&str>,
     paused: bool,
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(uid)?;
-    let tenant_id = resolve_tenant_id(headers, &state.config)?;
-    let stored = owned(state, uid, tenant_id.as_deref()).await?;
+    let stored = owned(state, uid, tenant_id).await?;
     state
         .schedules
         .set_paused(&stored.definition.schedule_id, paused)
@@ -336,31 +335,31 @@ async fn set_paused(
 /// `POST /sources/{uid}/pause`.
 pub async fn pause_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    set_paused(&state, &uid, &headers, true).await
+    set_paused(&state, &uid, scope.tenant(), true).await
 }
 
 /// `POST /sources/{uid}/unpause`.
 pub async fn unpause_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    set_paused(&state, &uid, &headers, false).await
+    set_paused(&state, &uid, scope.tenant(), false).await
 }
 
 /// `POST /sources/{uid}/run` — run now, off-schedule. Skipped by Temporal if a run is
 /// already in flight.
 pub async fn run_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     if stored.definition.archived_at.is_some() {
         return Err(GatewayError::Unprocessable(format!(
@@ -381,12 +380,12 @@ pub async fn run_source(
 /// is about to disappear.
 pub async fn delete_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     state
         .schedules
@@ -411,13 +410,13 @@ pub struct RunsQuery {
 /// `GET /sources/{uid}/runs`.
 pub async fn list_runs(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
     Query(q): Query<RunsQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Vec<RunRecord>>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
         .get_source(&uid, tenant_id.as_deref())

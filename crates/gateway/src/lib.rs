@@ -6,6 +6,7 @@
 //! starts one Temporal `PipelineWorkflow` per job. The binary lives in `main.rs`; this
 //! library exposes the router so it can be exercised in tests without a network.
 
+pub mod auth;
 pub mod connections;
 pub mod context;
 pub mod error;

@@ -8,14 +8,14 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
 
+use crate::auth::Scope;
 use crate::connections::{
     ConnectionView, CreateConnection, UpdateConnection, normalize_host, valid_uid,
     validate_destination,
 };
-use crate::context::resolve_tenant_id;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -45,10 +45,10 @@ fn not_found(uid: &str) -> GatewayError {
 /// `GET /connections` — the tenant's connections plus global ones, keys masked.
 pub async fn list_connections(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
 ) -> Result<Json<Vec<ConnectionView>>, GatewayError> {
     state.connections.key()?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let rows = state
         .control_plane
         .list_connections(tenant_id.as_deref())
@@ -63,7 +63,7 @@ pub async fn list_connections(
 /// `POST /connections` — validate, seal and store a connection.
 pub async fn create_connection(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ConnectionView>), GatewayError> {
     let key = state.connections.key()?;
@@ -81,7 +81,7 @@ pub async fn create_connection(
         .seal(api_key.as_bytes())
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
     let name = non_blank(req.name).unwrap_or_else(|| uid.clone());
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
         .create_connection(&uid, &name, tenant_id.as_deref(), &host, &sealed)
@@ -96,12 +96,12 @@ pub async fn create_connection(
 /// `GET /connections/{uid}` — one connection, key masked, with the pipelines using it.
 pub async fn get_connection(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ConnectionView>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
         .get_connection(&uid, tenant_id.as_deref())
@@ -118,14 +118,14 @@ pub async fn get_connection(
 /// `api_key` is re-validated against Meilisearch; omitting `api_key` keeps it.
 pub async fn patch_connection(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ConnectionView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateConnection = parse_body(&body)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
 
     // Reads fall back to the global row, writes never do: a tenant must not reach a
     // global connection, so anything outside the caller's exact scope is "not found".
@@ -191,12 +191,12 @@ pub async fn patch_connection(
 /// Decision 15); they fail at run time naming the missing connection.
 pub async fn delete_connection(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     state
         .control_plane
         .delete_connection(&uid, tenant_id.as_deref())

@@ -5,11 +5,15 @@
 //! removes a hop and a 502 path from data that cannot fail to load.
 
 use axum::Json;
+use axum::extract::State;
 use meili_ingest_router::catalog::{Catalog, catalog};
 
-/// `GET /catalog`. Takes no state and cannot fail — the one infallible endpoint
-/// in the gateway, hence no `Result`.
-pub async fn get_catalog() -> Json<Catalog> {
+use crate::auth::Scope;
+use crate::state::AppState;
+
+/// `GET /catalog`. Cannot fail once the caller is authenticated, hence no `Result`.
+/// It takes the state only so the [`Scope`] extractor can read the auth config.
+pub async fn get_catalog(State(_state): State<AppState>, _scope: Scope) -> Json<Catalog> {
     Json(catalog())
 }
 

@@ -172,6 +172,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+subtle = "2.6"
 
 # testing
 tempfile = "3"

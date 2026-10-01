@@ -11,10 +11,9 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
-use crate::context::resolve_tenant_id;
+use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -61,7 +60,7 @@ pub struct UsageResponse {
 /// honest "not enabled" state instead of an error.
 pub async fn get_usage(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsageResponse>, GatewayError> {
     let Some(usage) = &state.config.usage_api else {
@@ -71,7 +70,7 @@ pub async fn get_usage(
     };
     validate_date(&q.date_from, "date_from")?;
     validate_date(&q.date_to, "date_to")?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?.unwrap_or_default();
+    let tenant_id = scope.tenant_id.clone().unwrap_or_default();
 
     let url = format!("{}/v0/pipes/{}.json", usage.base_url, usage.pipe);
     let resp = state

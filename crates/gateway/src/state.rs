@@ -94,6 +94,11 @@ pub struct GatewayConfig {
     /// Check the request's Meilisearch key against the target index before queueing a
     /// job (`WRITE_PREFLIGHT`, default off). See [`crate::preflight`].
     pub write_preflight: bool,
+    /// Bearer token the Meilisearch Lab uses on management routes (`LAB_SERVICE_TOKEN`).
+    /// Setting it (or `admin_api_key`) closes open mode. See [`crate::auth`].
+    pub lab_service_token: Option<String>,
+    /// Bearer token an operator uses on management routes (`ADMIN_API_KEY`).
+    pub admin_api_key: Option<String>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -120,6 +125,14 @@ impl std::fmt::Debug for GatewayConfig {
             .field("usage_api", &self.usage_api)
             .field("cors_allow_origins", &self.cors_allow_origins)
             .field("write_preflight", &self.write_preflight)
+            .field(
+                "lab_service_token",
+                &self.lab_service_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -141,6 +154,8 @@ impl Default for GatewayConfig {
             usage_api: None,
             cors_allow_origins: Vec::new(),
             write_preflight: false,
+            lab_service_token: None,
+            admin_api_key: None,
         }
     }
 }
@@ -174,6 +189,8 @@ impl GatewayConfig {
                 .map(|v| split_list(&v))
                 .unwrap_or_default(),
             write_preflight: env_parse("WRITE_PREFLIGHT", d.write_preflight)?,
+            lab_service_token: env_opt("LAB_SERVICE_TOKEN"),
+            admin_api_key: env_opt("ADMIN_API_KEY"),
         })
     }
 
@@ -898,11 +915,15 @@ mod tests {
         let cfg = GatewayConfig {
             meili_api_key: Some("SUPERSECRET".into()),
             envoy_trusted_header: Some("ENVOYSECRET".into()),
+            lab_service_token: Some("lab-secret-value".into()),
+            admin_api_key: Some("admin-secret-value".into()),
             ..Default::default()
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SUPERSECRET"));
         assert!(!dbg.contains("ENVOYSECRET"));
+        assert!(!dbg.contains("lab-secret-value"));
+        assert!(!dbg.contains("admin-secret-value"));
         assert_eq!(cfg.max_upload_bytes(), 500 * 1024 * 1024);
     }
 

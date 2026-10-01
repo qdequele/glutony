@@ -10,7 +10,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use meili_ingest_plugin_sdk::PipelineDefinition;
 
-use crate::context::resolve_tenant_id;
+use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -63,6 +63,7 @@ pub fn parse_pipeline(
 /// `POST /pipelines` — create or update.
 pub async fn create_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<PipelineDefinition>), GatewayError> {
@@ -75,7 +76,7 @@ pub async fn create_pipeline(
             "user pipelines cannot be marked builtin".into(),
         ));
     }
-    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config)? {
+    if let Some(tenant_id) = scope.tenant_id.clone() {
         def.tenant_id = Some(tenant_id);
     }
     let stored = state.control_plane.upsert_pipeline(&def).await?;
@@ -86,9 +87,9 @@ pub async fn create_pipeline(
 /// `GET /pipelines`.
 pub async fn list_pipelines(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
 ) -> Result<Json<Vec<PipelineDefinition>>, GatewayError> {
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     Ok(Json(
         state
             .control_plane
@@ -104,12 +105,13 @@ pub async fn list_pipelines(
 /// while the author is still typing.
 pub async fn validate_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
-    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config)? {
+    if let Some(tenant_id) = scope.tenant_id.clone() {
         def.tenant_id = Some(tenant_id);
     }
     Ok(Json(state.control_plane.validate_pipeline(&def).await?))
@@ -118,10 +120,10 @@ pub async fn validate_pipeline(
 /// `GET /pipelines/{name}`.
 pub async fn get_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     Path(name): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<PipelineDefinition>, GatewayError> {
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     Ok(Json(
         state
             .control_plane
@@ -133,10 +135,10 @@ pub async fn get_pipeline(
 /// `DELETE /pipelines/{name}` → 204.
 pub async fn delete_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     Path(name): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
+    let tenant_id = scope.tenant_id.clone();
     let archived = state
         .control_plane
         .delete_pipeline(&name, tenant_id.as_deref())
@@ -229,6 +231,44 @@ steps:
             parse_pipeline(b"{", Some("application/x-yaml")),
             Err(GatewayError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn management_routes_need_the_token_when_auth_is_on() {
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            lab_service_token: Some("lab-secret".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/pipelines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer");
+
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .and(wq("tenant_id", "acct-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resp = app
+            .oneshot(
+                Request::get("/pipelines")
+                    .header("authorization", "Bearer lab-secret")
+                    .header("x-glutony-tenant-id", "acct-1")
+                    // A trusted edge header for another tenant must not win.
+                    .header("x-meili-project-id", "someone-else")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

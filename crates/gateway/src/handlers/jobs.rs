@@ -7,12 +7,12 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::context::resolve_tenant_id;
+use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::{AppState, JobRecord, JobUpdate};
 
@@ -60,7 +60,7 @@ fn parse_job_id(id: &str) -> Result<Uuid, GatewayError> {
 /// context, never from the query string, so one tenant cannot list another's jobs.
 pub async fn list_jobs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let mut query: Vec<(String, String)> = Vec::new();
@@ -69,7 +69,7 @@ pub async fn list_jobs(
             query.push((key.to_string(), v.clone()));
         }
     }
-    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config)? {
+    if let Some(tenant_id) = scope.tenant_id.clone() {
         query.push(("tenant_id".to_string(), tenant_id));
     }
     Ok(Json(state.control_plane.list_jobs(&query).await?))
@@ -138,6 +138,7 @@ pub async fn get_job(
 /// `POST /jobs/{id}/cancel`.
 pub async fn cancel_job(
     State(state): State<AppState>,
+    _scope: Scope,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<CancelResponse>), GatewayError> {
     let job_id = parse_job_id(&id)?;
