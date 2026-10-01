@@ -4,7 +4,7 @@
 //!
 //! 1. `X-Meili-Host` → host
 //! 2. `X-Meili-Api-Key` → api_key
-//! 3. `X-Meili-Project-Id` → tenant_id
+//! 3. `X-Meili-Tenant-Id`, else `X-Meili-Project-Id` → tenant_id
 //! 4. `X-Meili-Index` → index (starting point)
 //! 5. `?index=` query param → index (overrides the header)
 //! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback)
@@ -26,6 +26,8 @@ use crate::state::GatewayConfig;
 pub const H_HOST: &str = "x-meili-host";
 /// Envoy-injected header: Meilisearch API key.
 pub const H_API_KEY: &str = "x-meili-api-key";
+/// Edge-injected header: tenant id (the Lab's account id). Wins over `X-Meili-Project-Id`.
+pub const H_TENANT_ID: &str = "x-meili-tenant-id";
 /// Envoy-injected header: project (tenant) id.
 pub const H_PROJECT_ID: &str = "x-meili-project-id";
 /// Envoy-injected header: index name.
@@ -36,7 +38,7 @@ pub const H_REGION: &str = "x-meili-region";
 pub const H_ENVOY_SECRET: &str = "x-meili-envoy-secret";
 
 /// Non-empty, trimmed header value.
-fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -62,14 +64,27 @@ pub fn trusted_header(headers: &HeaderMap, config: &GatewayConfig, name: &str) -
     }
 }
 
-/// Tenant id of the request, if any (honours the Envoy trust rule). Used by routes that
-/// only need scoping (pipelines, plugins, jobs) and must not require credentials.
-pub fn resolve_tenant_id(headers: &HeaderMap, config: &GatewayConfig) -> Option<String> {
-    trusted_header(headers, config, H_PROJECT_ID)
+/// Tenant id of the request from a trusted edge: `X-Meili-Tenant-Id`, else
+/// `X-Meili-Project-Id` (kept for Cloud's Envoy contract). Both follow the Envoy trust
+/// rule. An invalid value is a `400 invalid_tenant`, never silently dropped.
+pub fn resolve_tenant_id(
+    headers: &HeaderMap,
+    config: &GatewayConfig,
+) -> Result<Option<String>, GatewayError> {
+    let raw = trusted_header(headers, config, H_TENANT_ID)
+        .or_else(|| trusted_header(headers, config, H_PROJECT_ID));
+    match raw {
+        None => Ok(None),
+        Some(tenant) => {
+            meili_ingest_plugin_sdk::validate_tenant_id(&tenant)
+                .map_err(GatewayError::InvalidTenant)?;
+            Ok(Some(tenant))
+        }
+    }
 }
 
 /// `Authorization: Bearer <token>` → token.
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let raw = header(headers, "authorization")?;
     let (scheme, token) = raw.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
@@ -92,7 +107,7 @@ pub fn resolve_context(
     query_index: Option<&str>,
     config: &GatewayConfig,
 ) -> Result<MeiliContext, GatewayError> {
-    let ctx = resolve_request_context(headers, query_index, config);
+    let ctx = resolve_request_context(headers, query_index, config)?;
     require_destination(&ctx)?;
     Ok(ctx)
 }
@@ -126,7 +141,7 @@ pub fn resolve_request_context(
     headers: &HeaderMap,
     query_index: Option<&str>,
     config: &GatewayConfig,
-) -> MeiliContext {
+) -> Result<MeiliContext, GatewayError> {
     let trusted = envoy_headers_trusted(headers, config);
     if !trusted && headers.contains_key(H_HOST) {
         tracing::debug!("ignoring X-Meili-* headers: missing or wrong X-Meili-Envoy-Secret");
@@ -136,7 +151,7 @@ pub fn resolve_request_context(
     // 1–4: Envoy headers.
     let mut host = envoy(H_HOST);
     let mut api_key = envoy(H_API_KEY);
-    let tenant_id = envoy(H_PROJECT_ID);
+    let tenant_id = resolve_tenant_id(headers, config)?;
     let mut index = envoy(H_INDEX);
     let region = envoy(H_REGION);
 
@@ -158,13 +173,13 @@ pub fn resolve_request_context(
         api_key = config.meili_api_key.clone();
     }
 
-    MeiliContext {
+    Ok(MeiliContext {
         tenant_id,
         host,
         api_key,
         index,
         region,
-    }
+    })
 }
 
 /// Finish the index chain of SPEC §3.4 and write the result into `ctx.index`.
@@ -501,14 +516,67 @@ mod tests {
     #[test]
     fn resolve_tenant_id_follows_trust_rule() {
         assert_eq!(
-            resolve_tenant_id(&envoy_headers(), &cfg()).as_deref(),
+            resolve_tenant_id(&envoy_headers(), &cfg())
+                .unwrap()
+                .as_deref(),
             Some("xxx")
         );
-        assert_eq!(resolve_tenant_id(&envoy_headers(), &cfg_secret()), None);
+        assert_eq!(
+            resolve_tenant_id(&envoy_headers(), &cfg_secret()).unwrap(),
+            None
+        );
         let mut h = envoy_headers();
         h.insert(H_ENVOY_SECRET, HeaderValue::from_static("s3cret"));
-        assert_eq!(resolve_tenant_id(&h, &cfg_secret()).as_deref(), Some("xxx"));
-        assert_eq!(resolve_tenant_id(&HeaderMap::new(), &cfg()), None);
+        assert_eq!(
+            resolve_tenant_id(&h, &cfg_secret()).unwrap().as_deref(),
+            Some("xxx")
+        );
+        assert_eq!(resolve_tenant_id(&HeaderMap::new(), &cfg()).unwrap(), None);
+    }
+
+    #[test]
+    fn tenant_header_beats_project_header() {
+        let h = headers(&[
+            ("x-meili-tenant-id", "acct-1"),
+            ("x-meili-project-id", "proj-1"),
+        ]);
+        assert_eq!(
+            resolve_tenant_id(&h, &cfg()).unwrap().as_deref(),
+            Some("acct-1")
+        );
+        let h = headers(&[("x-meili-project-id", "proj-1")]);
+        assert_eq!(
+            resolve_tenant_id(&h, &cfg()).unwrap().as_deref(),
+            Some("proj-1")
+        );
+        assert_eq!(resolve_tenant_id(&HeaderMap::new(), &cfg()).unwrap(), None);
+    }
+
+    #[test]
+    fn tenant_headers_need_the_envoy_secret_when_one_is_set() {
+        let h = headers(&[("x-meili-tenant-id", "acct-1")]);
+        assert_eq!(resolve_tenant_id(&h, &cfg_secret()).unwrap(), None);
+    }
+
+    #[test]
+    fn an_invalid_tenant_from_a_trusted_edge_is_400() {
+        let h = headers(&[("x-meili-tenant-id", "a/b")]);
+        let err = resolve_tenant_id(&h, &cfg()).unwrap_err();
+        assert_eq!(err.code(), "invalid_tenant");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        let err = resolve_request_context(&h, None, &cfg()).unwrap_err();
+        assert_eq!(err.code(), "invalid_tenant");
+    }
+
+    #[test]
+    fn request_context_carries_the_tenant_header() {
+        let h = headers(&[
+            ("x-meili-host", "http://m:7700"),
+            ("x-meili-api-key", "k"),
+            ("x-meili-tenant-id", "acct-1"),
+        ]);
+        let ctx = resolve_request_context(&h, None, &cfg()).unwrap();
+        assert_eq!(ctx.tenant_id.as_deref(), Some("acct-1"));
     }
 
     // --- index chain (SPEC §3.4) --------------------------------------------------------

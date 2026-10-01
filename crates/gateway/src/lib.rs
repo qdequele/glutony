@@ -40,7 +40,7 @@ async fn health(
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "tenant_id": context::resolve_tenant_id(&headers, &state.config),
+        "tenant_id": context::resolve_tenant_id(&headers, &state.config).ok().flatten(),
         "features": {
             "usage_analytics": state.config.usage_api.is_some(),
             "embedded_ui": ui::is_embedded(),

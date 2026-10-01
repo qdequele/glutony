@@ -75,7 +75,7 @@ pub async fn create_pipeline(
             "user pipelines cannot be marked builtin".into(),
         ));
     }
-    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config) {
+    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config)? {
         def.tenant_id = Some(tenant_id);
     }
     let stored = state.control_plane.upsert_pipeline(&def).await?;
@@ -88,7 +88,7 @@ pub async fn list_pipelines(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PipelineDefinition>>, GatewayError> {
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     Ok(Json(
         state
             .control_plane
@@ -109,7 +109,7 @@ pub async fn validate_pipeline(
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
-    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config) {
+    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config)? {
         def.tenant_id = Some(tenant_id);
     }
     Ok(Json(state.control_plane.validate_pipeline(&def).await?))
@@ -121,7 +121,7 @@ pub async fn get_pipeline(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<PipelineDefinition>, GatewayError> {
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     Ok(Json(
         state
             .control_plane
@@ -136,7 +136,7 @@ pub async fn delete_pipeline(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let archived = state
         .control_plane
         .delete_pipeline(&name, tenant_id.as_deref())

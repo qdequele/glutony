@@ -48,7 +48,7 @@ pub async fn list_connections(
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionView>>, GatewayError> {
     state.connections.key()?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let rows = state
         .control_plane
         .list_connections(tenant_id.as_deref())
@@ -81,7 +81,7 @@ pub async fn create_connection(
         .seal(api_key.as_bytes())
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
     let name = non_blank(req.name).unwrap_or_else(|| uid.clone());
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let record = state
         .control_plane
         .create_connection(&uid, &name, tenant_id.as_deref(), &host, &sealed)
@@ -101,7 +101,7 @@ pub async fn get_connection(
 ) -> Result<Json<ConnectionView>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let record = state
         .control_plane
         .get_connection(&uid, tenant_id.as_deref())
@@ -125,7 +125,7 @@ pub async fn patch_connection(
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateConnection = parse_body(&body)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
 
     // Reads fall back to the global row, writes never do: a tenant must not reach a
     // global connection, so anything outside the caller's exact scope is "not found".
@@ -196,7 +196,7 @@ pub async fn delete_connection(
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     state
         .control_plane
         .delete_connection(&uid, tenant_id.as_deref())

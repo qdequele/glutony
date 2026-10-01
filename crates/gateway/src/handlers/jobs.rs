@@ -69,7 +69,7 @@ pub async fn list_jobs(
             query.push((key.to_string(), v.clone()));
         }
     }
-    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config) {
+    if let Some(tenant_id) = resolve_tenant_id(&headers, &state.config)? {
         query.push(("tenant_id".to_string(), tenant_id));
     }
     Ok(Json(state.control_plane.list_jobs(&query).await?))

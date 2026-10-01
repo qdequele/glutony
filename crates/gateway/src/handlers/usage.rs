@@ -71,7 +71,7 @@ pub async fn get_usage(
     };
     validate_date(&q.date_from, "date_from")?;
     validate_date(&q.date_to, "date_to")?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config).unwrap_or_default();
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?.unwrap_or_default();
 
     let url = format!("{}/v0/pipes/{}.json", usage.base_url, usage.pipe);
     let resp = state

@@ -22,6 +22,9 @@ pub enum GatewayError {
     /// Malformed request (400).
     #[error("{0}")]
     BadRequest(String),
+    /// A tenant id failed validation (400).
+    #[error("invalid tenant id: {0}")]
+    InvalidTenant(String),
     /// The caller's Meilisearch key is missing (401), from the write preflight.
     #[error("{0}")]
     Unauthorized(String),
@@ -60,9 +63,9 @@ impl GatewayError {
     /// HTTP status for this error.
     pub fn status(&self) -> StatusCode {
         match self {
-            GatewayError::MissingContext(_) | GatewayError::BadRequest(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            GatewayError::MissingContext(_)
+            | GatewayError::BadRequest(_)
+            | GatewayError::InvalidTenant(_) => StatusCode::BAD_REQUEST,
             GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -82,6 +85,7 @@ impl GatewayError {
         match self {
             GatewayError::MissingContext(_) => "missing_context",
             GatewayError::BadRequest(_) => "bad_request",
+            GatewayError::InvalidTenant(_) => "invalid_tenant",
             GatewayError::Unauthorized(_) => "unauthorized",
             GatewayError::Forbidden(_) => "forbidden",
             GatewayError::NotFound(_) => "not_found",
@@ -189,6 +193,14 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
+            GatewayError::InvalidTenant("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            GatewayError::InvalidTenant("x".into()).code(),
+            "invalid_tenant"
+        );
+        assert_eq!(
             GatewayError::Forbidden("x".into()).status(),
             StatusCode::FORBIDDEN
         );
@@ -223,6 +235,7 @@ mod tests {
         let all = [
             GatewayError::MissingContext("x".into()),
             GatewayError::BadRequest("x".into()),
+            GatewayError::InvalidTenant("x".into()),
             GatewayError::Forbidden("x".into()),
             GatewayError::NotFound("x".into()),
             GatewayError::TooLarge("x".into()),

@@ -115,7 +115,7 @@ pub async fn list_sources(
     headers: HeaderMap,
 ) -> Result<Json<Vec<SourceView>>, GatewayError> {
     let key = state.connections.key()?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let rows = state
         .control_plane
         .list_sources(tenant_id.as_deref(), q.include_archived)
@@ -137,7 +137,7 @@ pub async fn create_source(
     let req: CreateSource = parse_body(&body)?;
     let uid = req.uid.trim().to_owned();
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
 
     validate_location(&req.location, &req.timezone, &state.fetch_policy).await?;
     schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
@@ -232,7 +232,7 @@ pub async fn get_source(
 ) -> Result<Json<SourceView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let record = state
         .control_plane
         .get_source(&uid, tenant_id.as_deref())
@@ -264,7 +264,7 @@ pub async fn patch_source(
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateSource = parse_body(&body)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     let d = &stored.definition;
 
@@ -320,7 +320,7 @@ async fn set_paused(
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(uid)?;
-    let tenant_id = resolve_tenant_id(headers, &state.config);
+    let tenant_id = resolve_tenant_id(headers, &state.config)?;
     let stored = owned(state, uid, tenant_id.as_deref()).await?;
     state
         .schedules
@@ -360,7 +360,7 @@ pub async fn run_source(
 ) -> Result<(StatusCode, Json<serde_json::Value>), GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     if stored.definition.archived_at.is_some() {
         return Err(GatewayError::Unprocessable(format!(
@@ -386,7 +386,7 @@ pub async fn delete_source(
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     state
         .schedules
@@ -417,7 +417,7 @@ pub async fn list_runs(
 ) -> Result<Json<Vec<RunRecord>>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let tenant_id = resolve_tenant_id(&headers, &state.config);
+    let tenant_id = resolve_tenant_id(&headers, &state.config)?;
     let record = state
         .control_plane
         .get_source(&uid, tenant_id.as_deref())

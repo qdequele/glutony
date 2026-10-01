@@ -44,6 +44,7 @@
 
 pub mod context;
 pub mod error;
+pub mod tenant;
 pub mod types;
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -51,6 +52,7 @@ pub mod wasm;
 pub use async_trait::async_trait;
 pub use context::ActivityContext;
 pub use error::PluginError;
+pub use tenant::{MAX_TENANT_ID_LEN, validate_tenant_id};
 pub use types::*;
 
 /// The plugin contract. Implement this for every processing step.

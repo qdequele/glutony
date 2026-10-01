@@ -70,7 +70,7 @@ pub fn context_for(
     headers: &HeaderMap,
     query: &QueryParams,
     extracted: &Extracted,
-) -> MeiliContext {
+) -> Result<MeiliContext, GatewayError> {
     let query_index = query_param(query, "index").or(extracted.index.as_deref());
     resolve_request_context(headers, query_index, &state.config)
 }
@@ -337,7 +337,7 @@ async fn ingest_inner(
     locked_index: Option<&str>,
 ) -> Result<(StatusCode, Json<IngestResponse>), GatewayError> {
     let extracted = read_payload(&headers, &query, req).await?;
-    let ctx = context_for(&state, &headers, &query, &extracted);
+    let ctx = context_for(&state, &headers, &query, &extracted)?;
     let explicit = query_param(&query, "pipeline")
         .map(str::to_string)
         .or(extracted.pipeline);
@@ -387,7 +387,7 @@ async fn ingest_batch_inner(
     locked_index: Option<&str>,
 ) -> Result<(StatusCode, Json<BatchResponse>), GatewayError> {
     let extracted = read_payload(&headers, &query, req).await?;
-    let ctx = context_for(&state, &headers, &query, &extracted);
+    let ctx = context_for(&state, &headers, &query, &extracted)?;
     let explicit = query_param(&query, "pipeline")
         .map(str::to_string)
         .or(extracted.pipeline);
