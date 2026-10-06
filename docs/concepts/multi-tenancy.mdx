@@ -147,6 +147,10 @@ A caller that acts as a tenant sees only its own data:
   `"scope": "tenant" | "global"` (`"builtin"` for built-in pipelines).
 - **Writes** create or change the tenant's own rows only. PATCH, DELETE, pause,
   unpause and run on a global row answer `404`.
+- **Using** a connection is stricter than reading one. A tenant's jobs only
+  write through connections the tenant owns, never a global one. A pipeline,
+  source or ingest that would do so is `422`, and a run that would do so fails.
+  See [Tenants and global connections](/concepts/connections#tenants-and-global-connections).
 - `GET /jobs`, `/sources/{uid}/runs`, `POST /jobs/{id}/cancel` and `/usage` are
   always filtered to the tenant.
 - Another tenant's row answers `404`, the same as a row that does not exist.

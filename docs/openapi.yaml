@@ -612,7 +612,7 @@ paths:
                 $ref: "#/components/schemas/Error"
               example: { "error": "builtin pipelines are read-only", "code": "forbidden" }
         "422":
-          description: Invalid pipeline (unknown plugin, cycle, duplicate step, unsupported `fan_out`).
+          description: Invalid pipeline (unknown plugin, cycle, duplicate step, unsupported `fan_out`), or a tenant's pipeline whose `meili_indexer` names a global connection (`code` `validation`).
           content:
             application/json:
               schema:
@@ -1380,7 +1380,7 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "source \"tmdb\" not found", "code": "not_found" }
     Unprocessable:
-      description: Validation failed (bad cron or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline).
+      description: Validation failed (bad cron or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline, or a tenant's job whose pipeline names a global connection).
       content:
         application/json:
           schema:

@@ -20,6 +20,11 @@ arrives on a Meilisearch hostname, so the Lab's edge injects it:
 `X-Meili-Project-Id` still works (Meilisearch Cloud's Envoy sends it);
 `X-Meili-Tenant-Id` wins when both are present.
 
+A tenant's jobs only write through Meilisearch connections that the tenant owns.
+A tenant can see a global connection but never use it, so an operator's global
+connections are safe in a Lab deployment. See
+[Tenants and global connections](/concepts/connections#tenants-and-global-connections).
+
 ## Management auth
 
 | `LAB_SERVICE_TOKEN` | `ADMIN_API_KEY` | Caller sends | Acts as |
@@ -118,13 +123,6 @@ glutony bills after the fact and never refuses work for lack of credits (Lumen a
 Scrapix answer `402`). Because glutony pays the LLM and transcription providers
 itself, an account at zero credits can still run up real cost. Do not sell glutony
 through the Lab to paying accounts until a suspend switch or a lease exists.
-
-## Before connecting a Lab
-
-- A Lab deployment must hold no global Meilisearch connections and no global
-  pipelines pinned to a connection: a tenant's pipeline that names a global
-  connection uid resolves to the global row and writes with its key. Until glutony
-  restricts tenant jobs to tenant-owned connections, keep connections tenant-scoped.
 
 ## What the Lab has to do
 

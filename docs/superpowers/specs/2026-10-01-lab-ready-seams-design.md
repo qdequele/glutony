@@ -547,12 +547,30 @@ Recorded while implementing:
 
 Recorded in the final review:
 
-8. **§3, §4 (known gap, tracked):** a Lab deployment must hold no global Meilisearch
-   connections and no global pipelines pinned to a connection. A tenant's pipeline that
-   names a global connection uid resolves to the global row and writes with its key.
-   Until glutony restricts tenant jobs to tenant-owned connections, keep connections
-   tenant-scoped (documented in `docs/deployment/meilisearch-lab.mdx`; no code change in
-   this branch).
+8. **§3, §4 (closed 2026-10-06):** a tenant's job only uses connections the tenant
+   owns. Before this, a tenant's pipeline naming a global connection uid resolved to
+   the global row and wrote with the operator's key, so the interim rule was "no
+   global connections in a Lab deployment".
+   - **Run time:** the worker resolves through `GET /internal/connections/{uid}/resolve`
+     (`ConnectionRepo::resolve`), which returns the row in exactly the job's scope: the
+     tenant's row for a tenant job, the global row for a job without a tenant. The
+     worker also refuses a row whose owner is not the job's tenant, so an older control
+     plane that falls back cannot undo it. Either way the step fails non-retryably,
+     saying the connection is global. Reads (`GET /internal/connections/{uid}`) still
+     fall back, so a tenant can see global connections.
+   - **Submit time:** the gateway answers `422` (`validation`) when a tenant's pipeline
+     names a global connection: `POST /pipelines` and `/pipelines/validate` (caller's
+     tenant or a body `tenant_id`), `POST /sources` and a `PATCH /sources/{uid}` that
+     changes `pipeline` (source's tenant), and tenant-tagged ingest. A connection uid
+     that does not exist yet is not refused; it fails at run time (Decision 15).
+   - **A tenant job on a global pipeline pinned to a global connection** is refused
+     at submit time and fails at run time. The same pipeline keeps working without a
+     tenant. A tenant can use it by creating its own connection with the same uid,
+     which shadows the global one.
+   - `used_by` of a global connection lists only global pipelines.
+   - Not affected: the qdq-server deployment (Caddy stamps one tenant on both
+     hostnames, so its pipelines and connections are tenant-owned) and `scripts/e2e.sh`
+     (a global connection with untagged ingest).
 9. **§4.2:** the gateway refuses to start with `LAB_SERVICE_TOKEN` and no
    `ENVOY_TRUSTED_HEADER` (`GatewayConfig::validate`). `ADMIN_API_KEY` alone only warns.
 10. **§5.1:** a `PROVIDER_COSTS_FILE` that cannot be read or parsed stops the worker at
