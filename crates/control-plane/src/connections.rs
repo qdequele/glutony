@@ -11,7 +11,9 @@
 //! Scoping follows [`crate::pipelines::PipelineRepo`]: reads return the tenant's row
 //! when it exists and fall back to the global one, while writes touch exactly the
 //! caller's scope — a tenant must never be able to repoint or delete a global
-//! connection.
+//! connection. **Use** is stricter than reads: a job resolves a connection in exactly
+//! its own scope ([`ConnectionRepo::resolve`]), so a tenant's job can never write with
+//! a global connection's key.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -114,8 +116,8 @@ impl ConnectionRepo {
     /// Fetch one connection by uid: the tenant's row when `tenant_id` is given and it
     /// exists, otherwise the global row.
     ///
-    /// This is the lookup the worker uses to resolve an indexer step's `connection`, so
-    /// a global connection is usable by every tenant and a tenant can shadow it.
+    /// This is a **read**: a tenant may see a global connection. What a job may use is
+    /// [`ConnectionRepo::resolve`], which never falls back.
     pub async fn get(
         &self,
         uid: &str,
@@ -127,6 +129,28 @@ impl ConnectionRepo {
              WHERE uid = $1 AND (tenant_id IS NULL OR tenant_id = $2) \
              ORDER BY (tenant_id IS NULL) \
              LIMIT 1",
+        )
+        .bind(uid)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Fetch the connection a job may **use**: the row in exactly `tenant_id`'s scope.
+    ///
+    /// Unlike [`ConnectionRepo::get`], a tenant never falls back to a global row: a
+    /// tenant's job writing with the operator's global key would cross tenants. A job
+    /// without a tenant (standalone, or a global pipeline run untagged) gets the global
+    /// row, as before.
+    pub async fn resolve(
+        &self,
+        uid: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<ConnectionRecord>, CpError> {
+        Ok(sqlx::query_as(
+            "SELECT id, uid, name, tenant_id, host, api_key, created_at, updated_at \
+             FROM meili_connections \
+             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
         )
         .bind(uid)
         .bind(tenant_id)
@@ -213,10 +237,9 @@ impl ConnectionRepo {
     ///
     /// For a tenant connection that is the tenant's pipelines plus global ones (a global
     /// pipeline run for that tenant resolves the name in its scope). For a global
-    /// connection it is every pipeline naming it, since any tenant without its own
-    /// connection of that name falls back to the global one. That can over-report a
-    /// pipeline whose tenant shadows the name, which is the safe direction for a "what
-    /// will this delete break" hint.
+    /// connection it is the global pipelines only: a tenant's job never resolves a
+    /// global connection ([`ConnectionRepo::resolve`]), so only runs without a tenant
+    /// use it.
     pub async fn used_by(
         &self,
         uid: &str,
@@ -229,7 +252,7 @@ impl ConnectionRepo {
                      AS s(step) \
                  WHERE s.step ->> 'plugin' = $3 \
                    AND s.step -> 'config' ->> 'connection' = $1) \
-               AND ($2::text IS NULL OR p.tenant_id IS NULL OR p.tenant_id = $2) \
+               AND (p.tenant_id IS NULL OR p.tenant_id = $2) \
              ORDER BY p.uid",
         )
         .bind(uid)
@@ -243,7 +266,8 @@ impl ConnectionRepo {
 
 // ---------------------------------------------------------------------------
 // `/internal/connections` handlers. Internal only: the gateway owns validation, sealing
-// and redaction, and the worker resolves an indexer step's connection through `get`.
+// and redaction, and the worker resolves an indexer step's connection through
+// `resolve`.
 // ---------------------------------------------------------------------------
 
 /// `GET /internal/connections?tenant_id=` → the tenant's plus global connections.
@@ -280,6 +304,30 @@ pub async fn get_connection(
         .await?
         .map(Json)
         .ok_or_else(|| not_found(&uid, tenant_id.as_deref()))
+}
+
+/// `GET /internal/connections/{uid}/resolve?tenant_id=` → the row in exactly that
+/// scope, else 404. The lookup the worker uses for an indexer step: a tenant's job
+/// never gets a global connection.
+pub async fn resolve_connection(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<TenantQuery>,
+    headers: HeaderMap,
+) -> Result<Json<ConnectionRecord>, CpError> {
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    state
+        .connections()
+        .resolve(&uid, tenant_id.as_deref())
+        .await?
+        .map(Json)
+        .ok_or_else(|| match tenant_id.as_deref() {
+            Some(t) => CpError::NotFound(format!(
+                "connection {uid:?} not found for tenant {t:?}; a tenant's job can only \
+                 use a connection that tenant owns, never a global one"
+            )),
+            None => not_found(&uid, None),
+        })
 }
 
 /// `PATCH /internal/connections/{uid}?tenant_id=` body [`ConnectionPatch`].

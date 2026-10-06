@@ -221,3 +221,41 @@ async fn used_by_and_list_are_exposed() {
         "no pipeline uses it yet"
     );
 }
+
+#[tokio::test]
+async fn resolve_never_hands_a_global_connection_to_a_tenant() {
+    let Some(app) = setup("cr-res").await else {
+        return;
+    };
+    let mut global = new_connection("cr-res-1", "unused");
+    global.tenant_id = None;
+    let (status, _) = call(&app, with_json("POST", "/internal/connections", &global)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The read route still falls back to the global row ...
+    let (status, _) = call(
+        &app,
+        bare("GET", "/internal/connections/cr-res-1?tenant_id=rp-9"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // ... but the lookup a job uses does not.
+    let (status, body) = call(
+        &app,
+        bare(
+            "GET",
+            "/internal/connections/cr-res-1/resolve?tenant_id=rp-9",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let err: ErrorBody = json(&body);
+    assert!(err.error.contains("cr-res-1"), "{}", err.error);
+
+    // Without a tenant, the global row is the answer.
+    let (status, body) = call(&app, bare("GET", "/internal/connections/cr-res-1/resolve")).await;
+    assert_eq!(status, StatusCode::OK);
+    let row: ConnectionRecord = json(&body);
+    assert_eq!(row.tenant_id, None);
+}

@@ -314,3 +314,87 @@ async fn used_by_ignores_a_connection_key_on_a_non_indexer_step() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn a_tenant_job_resolves_only_the_tenants_own_connection() {
+    let Some(pool) = pool("cn-own").await else {
+        return;
+    };
+    let repo = ConnectionRepo::new(pool);
+    let mut global = new_connection("cn-own-1", None);
+    global.host = "https://global.example".into();
+    repo.insert(&global).await.expect("global");
+
+    // Readable by the tenant, but never usable by its jobs.
+    assert!(
+        repo.get("cn-own-1", Some("cp-own"))
+            .await
+            .expect("get")
+            .is_some()
+    );
+    assert!(
+        repo.resolve("cn-own-1", Some("cp-own"))
+            .await
+            .expect("resolve")
+            .is_none(),
+        "a tenant job must not fall back to the operator's global connection"
+    );
+
+    // A job without a tenant keeps using the global row.
+    let standalone = repo
+        .resolve("cn-own-1", None)
+        .await
+        .expect("resolve")
+        .expect("global row");
+    assert_eq!(standalone.host, "https://global.example");
+
+    // Once the tenant has its own row of that name, its jobs use it.
+    let mut tenant = new_connection("cn-own-1", Some("cp-own"));
+    tenant.host = "https://tenant.example".into();
+    repo.insert(&tenant).await.expect("tenant");
+    let own = repo
+        .resolve("cn-own-1", Some("cp-own"))
+        .await
+        .expect("resolve")
+        .expect("tenant row");
+    assert_eq!(own.host, "https://tenant.example");
+    assert_eq!(own.tenant_id.as_deref(), Some("cp-own"));
+    assert!(
+        repo.resolve("cn-own-1", Some("cp-own-other"))
+            .await
+            .expect("resolve")
+            .is_none(),
+        "another tenant's row is never reachable"
+    );
+}
+
+#[tokio::test]
+async fn used_by_a_global_connection_lists_only_global_pipelines() {
+    let Some(pool) = pool("cn-gused").await else {
+        return;
+    };
+    let repo = ConnectionRepo::new(pool.clone());
+    let pipelines = PipelineRepo::new(pool);
+    repo.insert(&new_connection("cn-gused-1", None))
+        .await
+        .expect("global");
+    pipelines
+        .upsert(&pipeline_using("cn-gused-global", None, "cn-gused-1"))
+        .await
+        .expect("global pipeline");
+    pipelines
+        .upsert(&pipeline_using(
+            "cn-gused-tenant",
+            Some("cp-12"),
+            "cn-gused-1",
+        ))
+        .await
+        .expect("tenant pipeline naming the global uid");
+
+    // A tenant's pipeline can never use a global connection, so deleting it breaks
+    // only the global pipelines run without a tenant.
+    assert_eq!(
+        repo.used_by("cn-gused-1", None).await.expect("used_by"),
+        vec!["cn-gused-global".to_string()]
+    );
+}

@@ -173,6 +173,10 @@ pub fn app(state: AppState) -> Router {
                 .delete(connections::delete_connection),
         )
         .route(
+            "/internal/connections/{uid}/resolve",
+            get(connections::resolve_connection),
+        )
+        .route(
             "/internal/connections/{uid}/used_by",
             get(connections::connection_used_by),
         )
