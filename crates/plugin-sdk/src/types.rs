@@ -619,6 +619,12 @@ pub struct UsageUnits {
     /// Any other billable call to a third-party service.
     #[serde(default)]
     pub external_requests: u64,
+    /// What glutony paid providers for these units, in micro-USD (spec §5.1).
+    #[serde(default)]
+    pub cost_micro_usd: u64,
+    /// Provider calls the cost table could not price (billed at 0, flagged).
+    #[serde(default)]
+    pub unpriced_calls: u64,
 }
 
 impl UsageUnits {
@@ -641,6 +647,8 @@ impl UsageUnits {
         self.pages += other.pages;
         self.images += other.images;
         self.external_requests += other.external_requests;
+        self.cost_micro_usd += other.cost_micro_usd;
+        self.unpriced_calls += other.unpriced_calls;
     }
 
     /// One LLM call with its token counts.
@@ -1429,6 +1437,25 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_fields_merge_and_default_for_old_payloads() {
+        let mut a = UsageUnits {
+            cost_micro_usd: 100,
+            unpriced_calls: 1,
+            ..UsageUnits::llm(10, 2)
+        };
+        a.merge(UsageUnits {
+            cost_micro_usd: 50,
+            ..UsageUnits::llm(1, 1)
+        });
+        assert_eq!(a.cost_micro_usd, 150);
+        assert_eq!(a.unpriced_calls, 1);
+        // A payload written before the fields existed.
+        let old: UsageUnits =
+            serde_json::from_value(serde_json::json!({"llm_requests": 1})).unwrap();
+        assert_eq!((old.cost_micro_usd, old.unpriced_calls), (0, 0));
+    }
 
     fn step(id: &str, deps: &[&str]) -> StepDefinition {
         StepDefinition::new(id, "noop").depends_on(deps.iter().copied())
