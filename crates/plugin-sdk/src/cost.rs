@@ -90,42 +90,75 @@ impl ProviderCosts {
     /// count it in `units.unpriced_calls` when the table cannot price it.
     pub fn apply(&self, plugin: &str, model: &str, units: &mut UsageUnits) {
         let Some(price) = self.price(plugin, model) else {
-            warn_unpriced_once(plugin, model);
-            units.unpriced_calls += 1;
+            warn_unpriced_once(plugin, model, UnpricedReason::UnknownModel);
+            units.unpriced_calls = units.unpriced_calls.saturating_add(1);
             return;
         };
         let prices_tokens = price.input_per_mtok > 0 || price.output_per_mtok > 0;
         let no_tokens = units.llm_input_tokens == 0 && units.llm_output_tokens == 0;
-        let no_seconds = units.audio_seconds <= 0.0;
+        // NaN and infinity are as unusable as a missing duration.
+        let no_seconds = !(units.audio_seconds.is_finite() && units.audio_seconds > 0.0);
         if (prices_tokens && no_tokens) || (price.per_audio_second > 0 && no_seconds) {
             // The table knows the model but the provider did not report the quantity.
-            units.unpriced_calls += 1;
+            warn_unpriced_once(plugin, model, UnpricedReason::MissingQuantity);
+            units.unpriced_calls = units.unpriced_calls.saturating_add(1);
             return;
         }
-        let tokens = u128::from(units.llm_input_tokens) * u128::from(price.input_per_mtok)
-            + u128::from(units.llm_output_tokens) * u128::from(price.output_per_mtok);
+        // Saturating throughout: an absurd quantity must over-charge, never panic (debug)
+        // or wrap into an under-charge (release).
+        let tokens = u128::from(units.llm_input_tokens)
+            .saturating_mul(u128::from(price.input_per_mtok))
+            .saturating_add(
+                u128::from(units.llm_output_tokens)
+                    .saturating_mul(u128::from(price.output_per_mtok)),
+            );
         let token_cost = tokens.div_ceil(1_000_000);
+        // A float-to-int `as` cast saturates at the target's bounds and maps NaN to 0.
         let audio_cost = (units.audio_seconds * price.per_audio_second as f64).ceil() as u128;
-        let requests = u128::from(units.llm_requests + units.external_requests).max(1);
-        let request_cost = requests * u128::from(price.per_request);
-        let total = token_cost + audio_cost + request_cost;
-        units.cost_micro_usd += u64::try_from(total).unwrap_or(u64::MAX);
+        let requests = units
+            .llm_requests
+            .saturating_add(units.external_requests)
+            .max(1);
+        let request_cost = u128::from(requests).saturating_mul(u128::from(price.per_request));
+        let total = token_cost
+            .saturating_add(audio_cost)
+            .saturating_add(request_cost);
+        units.cost_micro_usd = units
+            .cost_micro_usd
+            .saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
     }
 }
 
-/// Log once per `(plugin, model)` that it has no price.
-fn warn_unpriced_once(plugin: &str, model: &str) {
-    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+/// Why a call could not be priced; each reason warns once per `(plugin, model)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UnpricedReason {
+    UnknownModel,
+    MissingQuantity,
+}
+
+/// Log once per `(plugin, model, reason)`. Returns whether this call was the first.
+fn warn_unpriced_once(plugin: &str, model: &str, reason: UnpricedReason) -> bool {
+    static SEEN: OnceLock<Mutex<HashSet<(String, String, UnpricedReason)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut seen) = seen.lock()
-        && seen.insert((plugin.to_string(), model.to_string()))
-    {
-        tracing::warn!(
+    let Ok(mut seen) = seen.lock() else {
+        return false;
+    };
+    if !seen.insert((plugin.to_string(), model.to_string(), reason)) {
+        return false;
+    }
+    match reason {
+        UnpricedReason::UnknownModel => tracing::warn!(
             plugin,
             model,
             "no provider price for this model; its calls are billed at 0 and flagged"
-        );
+        ),
+        UnpricedReason::MissingQuantity => tracing::warn!(
+            plugin,
+            model,
+            "the provider did not report token counts or audio duration; these calls are billed at 0 and flagged"
+        ),
     }
+    true
 }
 
 #[cfg(test)]
@@ -192,6 +225,54 @@ mod tests {
             (no_seconds.cost_micro_usd, no_seconds.unpriced_calls),
             (0, 1)
         );
+    }
+
+    #[test]
+    fn a_missing_quantity_warns_once_per_reason_and_still_counts() {
+        // Unique names: the dedupe set is process-wide.
+        let reason = UnpricedReason::MissingQuantity;
+        assert!(warn_unpriced_once("p_warn", "m_warn", reason));
+        assert!(!warn_unpriced_once("p_warn", "m_warn", reason));
+        assert!(
+            warn_unpriced_once("p_warn", "m_warn", UnpricedReason::UnknownModel),
+            "a different reason is not suppressed"
+        );
+        let mut u = UsageUnits {
+            llm_requests: 2,
+            ..UsageUnits::default()
+        };
+        costs().apply("llm_enricher", "gpt-4o-mini", &mut u);
+        assert_eq!((u.cost_micro_usd, u.unpriced_calls), (0, 1));
+    }
+
+    #[test]
+    fn absurd_quantities_saturate_instead_of_panicking_or_wrapping() {
+        let mut huge = UsageUnits::transcription(1e300);
+        costs().apply("whisper_transcriber", "whisper-1", &mut huge);
+        assert_eq!(huge.cost_micro_usd, u64::MAX);
+
+        let mut nan = UsageUnits {
+            audio_seconds: f64::NAN,
+            external_requests: 1,
+            ..UsageUnits::default()
+        };
+        costs().apply("whisper_transcriber", "whisper-1", &mut nan);
+        assert_eq!((nan.cost_micro_usd, nan.unpriced_calls), (0, 1));
+
+        let mut near_max = UsageUnits {
+            cost_micro_usd: u64::MAX - 1,
+            ..UsageUnits::llm(1_000, 100)
+        };
+        costs().apply("llm_enricher", "gpt-4o-mini", &mut near_max);
+        assert_eq!(near_max.cost_micro_usd, u64::MAX);
+
+        let mut many = UsageUnits {
+            llm_requests: u64::MAX,
+            external_requests: u64::MAX,
+            ..UsageUnits::llm(u64::MAX, u64::MAX)
+        };
+        costs().apply("jev_enricher", "jev-latest", &mut many);
+        assert_eq!(many.cost_micro_usd, u64::MAX);
     }
 
     #[test]
