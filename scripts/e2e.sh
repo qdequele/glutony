@@ -6,8 +6,19 @@
 # PDF and a JSON document through the gateway, and checks that documents land in
 # Meilisearch. Everything is torn down at the end.
 #
+# Pass --lab to also run the Meilisearch Lab leg: a fake Lab event receiver, a second
+# gateway with management auth on (LAB_SERVICE_TOKEN), per-tenant isolation checks and
+# a signed usage event delivered to the fake Lab for one job.
+#
 # Requirements: docker, temporal CLI, curl, jq, python3, cargo.
 set -euo pipefail
+
+LAB=0
+[ "${1:-}" = "--lab" ] && LAB=1
+LAB_PORT=${LAB_PORT:-58191}
+GW_LAB_PORT=${GW_LAB_PORT:-58081}
+LAB_EVENTS_SECRET_VALUE=e2e-lab-events-secret
+LAB_TOKEN=e2e-lab-service-token
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -78,16 +89,30 @@ for _ in $(seq 1 60); do temporal operator cluster health --address "localhost:$
 echo "temporal ready"
 
 echo "--- services"
-BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
+CP_LAB_ENV=()
+WORKER_LAB_ENV=()
+if [ "$LAB" = 1 ]; then
+  python3 scripts/fake_lab.py "${LAB_PORT}" "${LAB_EVENTS_SECRET_VALUE}" "${WORK}/lab-events.ndjson" >"${WORK}/lab.log" 2>&1 &
+  PIDS+=($!)
+  CP_LAB_ENV=(LAB_URL="http://127.0.0.1:${LAB_PORT}" LAB_EVENTS_SECRET="${LAB_EVENTS_SECRET_VALUE}")
+  WORKER_LAB_ENV=(LAB_EVENTS_ENABLED=true)
+fi
+env ${CP_LAB_ENV[@]+"${CP_LAB_ENV[@]}"} BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
 PIDS+=($!)
 wait_for "${CONTROL_PLANE_URL}/health" control-plane
 BIND="0.0.0.0:${GW_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" ./target/debug/meili-ingest-gateway >"${WORK}/gw.log" 2>&1 &
 PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
+if [ "$LAB" = 1 ]; then
+  BIND="0.0.0.0:${GW_LAB_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" LAB_SERVICE_TOKEN="${LAB_TOKEN}" \
+    ./target/debug/meili-ingest-gateway >"${WORK}/gw-lab.log" 2>&1 &
+  PIDS+=($!)
+  wait_for "http://localhost:${GW_LAB_PORT}/health" gateway-lab
+fi
 export TINYBIRD_TOKEN=e2e-tinybird-token
 export TINYBIRD_BASE_URL="http://localhost:${TINYBIRD_PORT:-58122}"
 export TINYBIRD_DATASOURCE=meili_ingest_usage
-TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
+env ${WORKER_LAB_ENV[@]+"${WORKER_LAB_ENV[@]}"} TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
 PIDS+=($!)
 
 # Mock OpenAI-compatible transcription endpoint so the audio pipeline can be tested
@@ -653,5 +678,49 @@ fi
 
 echo "--- health advertises the tenant and enabled features"
 curl -fsS "${GW}/health" | jq -c .
+
+if [ "$LAB" = 1 ]; then
+  echo "--- Meilisearch Lab: tenants, management auth, billing events"
+  GWL="http://localhost:${GW_LAB_PORT}"
+  TA=0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61
+  TB=0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "${GWL}/pipelines")
+  [ "$code" = 401 ] || { echo "management without a token → ${code}, expected 401" >&2; exit 1; }
+
+  curl -fsS -X POST -H "Authorization: Bearer ${LAB_TOKEN}" -H "X-Glutony-Tenant-Id: ${TA}" \
+    -H 'Content-Type: application/json' \
+    -d '{"uid":"e2e-lab-docs","name":"Lab docs","steps":[{"id":"index","plugin":"meili_indexer"}]}' \
+    "${GWL}/pipelines" | jq -e ".tenant_id == \"${TA}\" and .scope == \"tenant\"" >/dev/null \
+    || { echo "tenant A could not create its pipeline" >&2; exit 1; }
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${LAB_TOKEN}" \
+    -H "X-Glutony-Tenant-Id: ${TB}" "${GWL}/pipelines/e2e-lab-docs")
+  [ "$code" = 404 ] || { echo "tenant B saw tenant A's pipeline (${code})" >&2; exit 1; }
+
+  EDGE=(-H "X-Meili-Envoy-Secret: ${ENVOY_SECRET}" -H "X-Meili-Host: ${MEILI_URL}" -H 'X-Meili-Api-Key: masterKey')
+  RESPL=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" -H 'Content-Type: application/json' \
+    -d '{"documents":[{"id":"lab-1","title":"billed through the Lab"}]}' \
+    "${GWL}/ingest/pipeline/e2e-lab-docs?index=e2e_lab")
+  JOBL=$(echo "$RESPL" | jq -r .job_id)
+  for _ in $(seq 1 60); do
+    S=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" "${GWL}/jobs/${JOBL}" | jq -r .status)
+    [ "$S" = succeeded ] && break
+    [ "$S" = failed ] && { echo "lab job failed" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
+    sleep 1
+  done
+  [ "$S" = succeeded ] || { echo "lab job state ${S}" >&2; exit 1; }
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TB}" "${GWL}/jobs/${JOBL}")
+  [ "$code" = 404 ] || { echo "tenant B saw tenant A's job (${code})" >&2; exit 1; }
+
+  for _ in $(seq 1 30); do
+    N=$(curl -fsS "http://127.0.0.1:${LAB_PORT}/events" \
+      | jq "[.[] | select(.data.job_id == \"${JOBL}\" and .account_id == \"${TA}\" and .product == \"glutony\")] | length")
+    [ "$N" = 1 ] && break
+    sleep 1
+  done
+  [ "$N" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBL} (${N})" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
+  curl -fsS "http://localhost:${CP_PORT}/metrics" | grep -q '^glutony_lab_events_delivered_total [1-9]' \
+    || { echo "delivered_total did not move" >&2; exit 1; }
+  echo "Lab leg passed"
+fi
 
 echo "=== E2E PASSED ==="
