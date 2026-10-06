@@ -98,7 +98,12 @@ pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> 
     if input.tenant_id.is_empty() {
         return Err(SkipReason::NoTenant);
     }
-    let account = Uuid::parse_str(&input.tenant_id).map_err(|_| SkipReason::NotAUuid)?;
+    // Only the canonical lower-case hyphenated form is a Lab account id: other spellings
+    // of the same UUID (upper-case, simple, braced, URN) would bill a different string.
+    let account = Uuid::parse_str(&input.tenant_id)
+        .ok()
+        .filter(|a| a.hyphenated().to_string() == input.tenant_id)
+        .ok_or(SkipReason::NotAUuid)?;
     let mut totals = UsageUnits::none();
     for step in &input.steps {
         totals.merge(step.usage);
@@ -120,7 +125,8 @@ pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> 
             pipeline_uid: input.pipeline_uid.clone(),
             status: input.status.as_str().to_string(),
             duration_ms,
-            cost_micro_usd: totals.cost_micro_usd,
+            // The Lab's ledger is a signed bigint; the schema caps the value too.
+            cost_micro_usd: totals.cost_micro_usd.min(i64::MAX as u64),
             cost_complete: totals.unpriced_calls == 0,
             units: LabUnits {
                 documents_out: input
@@ -131,7 +137,12 @@ pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> 
                 input_bytes: input.input_bytes,
                 pages: totals.pages,
                 images: totals.images,
-                audio_seconds: totals.audio_seconds,
+                // NaN and infinity serialize to null, which the Lab would never accept.
+                audio_seconds: if totals.audio_seconds.is_finite() {
+                    totals.audio_seconds
+                } else {
+                    0.0
+                },
                 llm_input_tokens: totals.llm_input_tokens,
                 llm_output_tokens: totals.llm_output_tokens,
                 llm_requests: totals.llm_requests,
@@ -239,6 +250,15 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.id, lab_event_id(input().job_id));
         assert_eq!(a.id.get_version_num(), 5);
+        // Golden value, computed independently (Python uuid5 over GLUTONY_LAB_NAMESPACE and
+        // "job:<id>:usage"). Changing GLUTONY_LAB_NAMESPACE or the name format re-ids every
+        // redelivered event, so the Lab would count them again and double-bill.
+        assert_eq!(
+            lab_event_id("11111111-2222-3333-4444-555555555555".parse().unwrap()),
+            "eb3df490-5f14-59b7-9cad-c97f959127ae"
+                .parse::<Uuid>()
+                .unwrap()
+        );
         let mut other = input();
         other.job_id = Uuid::new_v4();
         assert_ne!(lab_event_for_job(&other).unwrap().id, a.id);
@@ -252,6 +272,68 @@ mod tests {
         let mut cloud = input();
         cloud.tenant_id = "hackersearch".into();
         assert_eq!(lab_event_for_job(&cloud), Err(SkipReason::NotAUuid));
+    }
+
+    #[test]
+    fn only_the_canonical_uuid_form_is_a_lab_account() {
+        let upper = ACCOUNT.to_uppercase();
+        let simple = ACCOUNT.replace('-', "");
+        let braced = format!("{{{ACCOUNT}}}");
+        let urn = format!("urn:uuid:{ACCOUNT}");
+        for form in [upper, simple, braced, urn] {
+            let mut i = input();
+            i.tenant_id = form.clone();
+            assert_eq!(
+                lab_event_for_job(&i),
+                Err(SkipReason::NotAUuid),
+                "{form} must be skipped"
+            );
+        }
+        // The canonical form still passes.
+        assert_eq!(lab_event_for_job(&input()).unwrap().account_id, ACCOUNT);
+    }
+
+    #[test]
+    fn the_cost_is_capped_at_i64_max_for_a_signed_ledger() {
+        let mut i = input();
+        i.steps = vec![step(
+            "enrich",
+            1,
+            UsageUnits {
+                cost_micro_usd: u64::MAX,
+                ..UsageUnits::default()
+            },
+        )];
+        let event = lab_event_for_job(&i).unwrap();
+        assert_eq!(event.data.cost_micro_usd, i64::MAX as u64);
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["data"]["cost_micro_usd"], i64::MAX);
+        let errors: Vec<String> = validator().iter_errors(&v).map(|e| e.to_string()).collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        // The schema itself refuses what a signed ledger cannot hold.
+        let mut over = v.clone();
+        over["data"]["cost_micro_usd"] = serde_json::json!(u64::MAX);
+        assert!(!validator().is_valid(&over));
+    }
+
+    #[test]
+    fn non_finite_audio_seconds_still_make_a_valid_event() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut i = input();
+            i.steps = vec![step(
+                "transcribe",
+                1,
+                UsageUnits {
+                    audio_seconds: bad,
+                    ..UsageUnits::default()
+                },
+            )];
+            let event = lab_event_for_job(&i).unwrap();
+            assert_eq!(event.data.units.audio_seconds, 0.0, "{bad}");
+            let v = serde_json::to_value(&event).unwrap();
+            let errors: Vec<String> = validator().iter_errors(&v).map(|e| e.to_string()).collect();
+            assert!(errors.is_empty(), "{errors:?}\n{v:#}");
+        }
     }
 
     #[test]

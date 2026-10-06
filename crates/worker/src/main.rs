@@ -28,6 +28,13 @@ async fn main() -> anyhow::Result<()> {
         "starting meili-ingest worker"
     );
 
+    // The provider cost table loads lazily on the first paid call; load it now so a bad
+    // PROVIDER_COSTS_FILE stops the worker before it takes traffic instead of surfacing
+    // mid-run as unpriced events.
+    meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
+        .map_err(anyhow::Error::msg)
+        .context("invalid PROVIDER_COSTS_FILE")?;
+
     // Plugins
     let mut registry = PluginRegistry::builtin();
     if let Some(spec) = &config.external_plugins {

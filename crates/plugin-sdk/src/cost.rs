@@ -56,27 +56,47 @@ impl ProviderCosts {
         Self::from_toml(BUNDLED).unwrap_or_default()
     }
 
-    /// The process-wide table: `PROVIDER_COSTS_FILE` if set, else the bundled one.
-    /// An unreadable or invalid file logs an error and falls back to the bundled table.
+    /// Load the table: the bundled one for `None`, else the file at `path` (an unreadable
+    /// or invalid file is an `Err`, never a silent fallback).
+    pub fn load(path: Option<&str>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self::bundled());
+        };
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read provider cost file {path}: {e}"))?;
+        Self::from_toml(&source).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// The table to use when loading failed: EMPTY, so every call is flagged unpriced
+    /// (`cost_complete: false`) instead of being billed at the bundled placeholder rates.
+    pub fn or_unpriced(loaded: Result<Self, String>) -> Self {
+        loaded.unwrap_or_default()
+    }
+
+    /// `PROVIDER_COSTS_FILE`, when set and non-blank.
+    pub fn env_path() -> Option<String> {
+        std::env::var("PROVIDER_COSTS_FILE")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+    }
+
+    /// Load the table `PROVIDER_COSTS_FILE` selects. The worker calls this at boot so a
+    /// bad file stops it before it takes traffic.
+    pub fn load_from_env() -> Result<Self, String> {
+        Self::load(Self::env_path().as_deref())
+    }
+
+    /// The process-wide table: `PROVIDER_COSTS_FILE` if set, else the bundled one. If the
+    /// file turns out unusable after boot, this logs an error and prices nothing (every
+    /// call is flagged unpriced); it never falls back to the bundled placeholder rates.
     pub fn global() -> &'static ProviderCosts {
         static GLOBAL: OnceLock<ProviderCosts> = OnceLock::new();
         GLOBAL.get_or_init(|| {
-            let Some(path) = std::env::var("PROVIDER_COSTS_FILE")
-                .ok()
-                .filter(|p| !p.trim().is_empty())
-            else {
-                return Self::bundled();
-            };
-            match std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|s| Self::from_toml(&s))
-            {
-                Ok(costs) => costs,
-                Err(e) => {
-                    tracing::error!(path, error = %e, "cannot load PROVIDER_COSTS_FILE; using the bundled table");
-                    Self::bundled()
-                }
+            let loaded = Self::load_from_env();
+            if let Err(e) = &loaded {
+                tracing::error!(error = %e, "cannot load PROVIDER_COSTS_FILE; every call will be flagged unpriced");
             }
+            Self::or_unpriced(loaded)
         })
     }
 
@@ -279,6 +299,41 @@ mod tests {
     fn a_bad_table_is_an_error() {
         assert!(ProviderCosts::from_toml("[llm_enricher.m]\ninput_per_mtok = -1").is_err());
         assert!(ProviderCosts::from_toml("[llm_enricher.m]\ntypo = 1").is_err());
+    }
+
+    #[test]
+    fn load_none_is_the_bundled_table() {
+        assert_eq!(ProviderCosts::load(None).unwrap(), ProviderCosts::bundled());
+    }
+
+    #[test]
+    fn load_reads_a_file_and_rejects_a_missing_or_invalid_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("costs.toml");
+        std::fs::write(&good, TABLE).unwrap();
+        let loaded = ProviderCosts::load(Some(good.to_str().unwrap())).unwrap();
+        assert_eq!(loaded, costs());
+        assert_ne!(loaded, ProviderCosts::bundled());
+
+        let missing = dir.path().join("nope.toml");
+        let err = ProviderCosts::load(Some(missing.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("nope.toml"), "{err}");
+
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[llm_enricher.m]\ntypo = 1").unwrap();
+        let err = ProviderCosts::load(Some(bad.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("invalid provider cost table"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_load_prices_nothing_instead_of_using_the_bundled_rates() {
+        let table = ProviderCosts::or_unpriced(Err("boom".into()));
+        assert_eq!(table, ProviderCosts::default());
+        let mut u = UsageUnits::llm(1_000, 100);
+        table.apply("llm_enricher", "gpt-4o-mini", &mut u);
+        assert_eq!((u.cost_micro_usd, u.unpriced_calls), (0, 1));
+        // A successful load is passed through untouched.
+        assert_eq!(ProviderCosts::or_unpriced(Ok(costs())), costs());
     }
 
     #[test]
