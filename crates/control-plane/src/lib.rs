@@ -19,6 +19,7 @@ pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
+pub mod lab_events;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
@@ -43,6 +44,8 @@ pub struct AppState {
     pub pool: PgPool,
     /// Short-lived cache of user pipelines used by the resolver.
     pub cache: PipelineCache,
+    /// Wakes the Lab events sender right after an insert.
+    pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -51,6 +54,7 @@ impl AppState {
         Self {
             pool,
             cache: PipelineCache::default(),
+            lab_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -166,6 +170,7 @@ pub fn app(state: AppState) -> Router {
             get(sources::list_source_runs),
         )
         .route("/internal/source-runs", post(sources::record_source_run))
+        .route("/internal/lab-events", post(lab_events::ingest_lab_events))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
