@@ -12,8 +12,7 @@ use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::Scope;
-use crate::context::resolve_tenant_id;
+use crate::auth::{Scope, authorize_job_read};
 use crate::error::GatewayError;
 use crate::state::{AppState, JobRecord, JobUpdate};
 
@@ -95,14 +94,15 @@ pub async fn list_jobs(
     Ok(Json(state.control_plane.list_jobs(&query).await?))
 }
 
-/// `GET /jobs/{id}`.
+/// `GET /jobs/{id}`. Scoped by [`authorize_job_read`]: the management tenant or the
+/// trusted edge tenant; with management auth on, a caller with neither is a `401`.
 pub async fn get_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<JobResponse>, GatewayError> {
+    let tenant = authorize_job_read(&headers, &state.config)?;
     let job_id = parse_job_id(&id)?;
-    let tenant = resolve_tenant_id(&headers, &state.config)?;
     ensure_job_visible(&state, job_id, tenant.as_deref()).await?;
     match state.temporal.progress(job_id).await? {
         Some(snapshot) => {
@@ -491,5 +491,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(without.status(), StatusCode::OK);
+    }
+
+    fn get(job_id: Uuid, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut req = Request::get(format!("/jobs/{job_id}"));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.body(Body::empty()).unwrap()
+    }
+
+    /// Lab token, admin key and an edge secret, so trusted `X-Meili-*` needs the secret.
+    fn auth_on_config() -> GatewayConfig {
+        GatewayConfig {
+            lab_service_token: Some("lab-secret".into()),
+            admin_api_key: Some("admin-secret".into()),
+            envoy_trusted_header: Some("edge-secret".into()),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_on_scopes_job_reads_to_the_callers_tenant() {
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        mount_job(&server, job_id, Some("acct-a")).await;
+        let (app, _) = test_app(&server, auth_on_config()).await;
+        let read = |headers: &[(&str, &str)]| app.clone().oneshot(get(job_id, headers));
+
+        // Another tenant: 404, through the management credential or the trusted edge.
+        let resp = read(&[
+            ("authorization", "Bearer lab-secret"),
+            ("x-glutony-tenant-id", "acct-b"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = read(&[
+            ("x-meili-tenant-id", "acct-b"),
+            ("x-meili-envoy-secret", "edge-secret"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // An admin naming another tenant is scoped like the Lab.
+        let resp = read(&[
+            ("authorization", "Bearer admin-secret"),
+            ("x-glutony-tenant-id", "acct-b"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // The owner, both ways, and an admin without a tenant: visible.
+        for headers in [
+            &[
+                ("authorization", "Bearer lab-secret"),
+                ("x-glutony-tenant-id", "acct-a"),
+            ][..],
+            &[
+                ("x-meili-tenant-id", "acct-a"),
+                ("x-meili-envoy-secret", "edge-secret"),
+            ][..],
+            &[("authorization", "Bearer admin-secret")][..],
+        ] {
+            let resp = read(headers).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{headers:?}");
+            let json = json_body(resp).await;
+            assert_eq!(json["job_id"], job_id.to_string());
+            assert_eq!(json["pipeline_used"], "builtin.pdf");
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_on_refuses_an_untenanted_unauthenticated_job_read() {
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        mount_job(&server, job_id, Some("acct-a")).await;
+        let (app, starter) = test_app(&server, auth_on_config()).await;
+        starter.set_snapshot(
+            job_id,
+            JobSnapshot {
+                status: JobStatus::Running,
+                progress: None,
+            },
+        );
+        for headers in [
+            &[][..],
+            &[("authorization", "Bearer nope")][..],
+            // The owner's tenant, but no or the wrong edge secret.
+            &[("x-meili-tenant-id", "acct-a")][..],
+            &[
+                ("x-meili-tenant-id", "acct-a"),
+                ("x-meili-envoy-secret", "wrong"),
+            ][..],
+        ] {
+            let resp = app.clone().oneshot(get(job_id, headers)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{headers:?}");
+            assert_eq!(json_body(resp).await["code"], "unauthorized");
+        }
+        // Nothing was read on the caller's behalf.
+        let reads = server.received_requests().await.unwrap();
+        assert!(reads.is_empty(), "{reads:?}");
+    }
+
+    #[tokio::test]
+    async fn open_mode_job_reads_are_unchanged() {
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        mount_job(&server, job_id, Some("acct-a")).await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        // No tenant: no check.
+        let resp = app.clone().oneshot(get(job_id, &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // An edge tenant still scopes the read.
+        let resp = app
+            .clone()
+            .oneshot(get(job_id, &[("x-meili-tenant-id", "acct-a")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .oneshot(get(job_id, &[("x-meili-tenant-id", "acct-b")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
