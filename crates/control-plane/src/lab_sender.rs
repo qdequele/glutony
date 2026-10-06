@@ -5,6 +5,7 @@
 //! rest off. Rows are never dropped. A Lab `401` is logged and retried: the Lab can
 //! never stop glutony from starting or serving.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,8 @@ pub const BATCH_SIZE: i64 = 500;
 pub const TICK: Duration = Duration::from_secs(2);
 /// How long a claimed batch is leased before it is due again.
 pub const LEASE: Duration = Duration::from_secs(30);
+/// Largest acknowledgement body read from the Lab.
+pub const MAX_ACK_BYTES: usize = 1024 * 1024;
 /// Delivered rows are kept this long.
 pub const RETENTION: Duration = Duration::from_secs(7 * 86_400);
 
@@ -93,6 +96,22 @@ pub fn sign(secret: &[u8], body: &[u8]) -> String {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC takes any key length");
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Read a response body, or `None` if it is larger than `cap` bytes or cannot be read.
+/// The body is never buffered past `cap`, so a hostile Lab cannot exhaust memory.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if buf.len() + chunk.len() > cap {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
 }
 
 /// Outcome of one delivery attempt, for tests and logs.
@@ -203,14 +222,17 @@ impl LabSender {
         struct Ack {
             accepted: Vec<Uuid>,
         }
-        let Ok(ack) = resp.json::<Ack>().await else {
+        let Some(bytes) = read_capped(resp, MAX_ACK_BYTES).await else {
+            tracing::warn!("the Lab answered 200 with an oversized or unreadable body");
+            return self.fail(&ids, "malformed").await;
+        };
+        let Ok(ack) = serde_json::from_slice::<Ack>(&bytes) else {
             tracing::warn!("the Lab answered 200 with a malformed body");
             return self.fail(&ids, "malformed").await;
         };
-        let (done, rest): (Vec<Uuid>, Vec<Uuid>) = ids
-            .iter()
-            .copied()
-            .partition(|id| ack.accepted.contains(id));
+        let accepted: HashSet<Uuid> = ack.accepted.into_iter().collect();
+        let (done, rest): (Vec<Uuid>, Vec<Uuid>) =
+            ids.iter().copied().partition(|id| accepted.contains(id));
         if let Err(e) = self.repo.mark_delivered(&done).await {
             // Not marked: they will be sent again and the Lab ignores the duplicates.
             tracing::error!(error = %e, "cannot mark lab events delivered");

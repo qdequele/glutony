@@ -260,3 +260,21 @@ async fn the_internal_route_inserts_and_is_idempotent() {
     );
     t.drop_schema().await;
 }
+
+#[tokio::test]
+async fn metrics_reflect_the_outbox_without_a_sender() {
+    let Some(t) = setup().await else { return };
+    let repo = LabEventRepo::new(t.pool.clone());
+    repo.insert_many(&[event(Uuid::new_v4()), event(Uuid::new_v4())])
+        .await
+        .unwrap();
+    let res = app(AppState::new(t.pool.clone()))
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("glutony_lab_events_pending 2"), "{text}");
+    t.drop_schema().await;
+}

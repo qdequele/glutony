@@ -292,3 +292,29 @@ async fn batches_hold_at_most_500_events() {
     );
     t.drop_schema().await;
 }
+
+#[tokio::test]
+async fn an_oversized_ack_is_malformed_and_stays_pending() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    let padding = "x".repeat(2 * 1024 * 1024);
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"accepted": [], "note": padding})),
+        )
+        .mount(&lab)
+        .await;
+    let (s, repo, metrics) = sender(&t, &lab).await;
+    repo.insert_many(&[event(Uuid::new_v4())]).await.unwrap();
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Failed {
+            reason: "malformed",
+            pending: 1
+        }
+    );
+    assert_eq!(repo.stats().await.unwrap().pending, 1);
+    assert!(render(&metrics).contains("glutony_lab_events_failed_total{reason=\"malformed\"} 1"));
+    t.drop_schema().await;
+}
