@@ -635,8 +635,9 @@ mod tests {
 
         let control_plane = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/internal/connections/prod-movies"))
+            .and(path("/internal/connections/prod-movies/resolve"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tenant_id": "tenant-1",
                 "host": "http://meilisearch:7700",
                 "api_key": sealed,
             })))
