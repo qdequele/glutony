@@ -142,8 +142,8 @@ curl $INGEST/pipelines/my-pdf-with-enrichment
 curl -X DELETE $INGEST/pipelines/my-pdf-with-enrichment     # 403 for builtin.*
 ```
 
-Upserts are keyed by `(uid, project_id)`. Behind Meilisearch Cloud the project
-id comes from Envoy, so each tenant has its own namespace of uids and can shadow
+Upserts are keyed by `(uid, tenant_id)`. Behind Meilisearch Cloud the tenant id
+comes from Envoy, so each tenant has its own namespace of uids and can shadow
 a global pipeline (or a built-in's trigger) without affecting others.
 
 Examples: [`config/pipelines/`](https://github.com/meilisearch/meili-ingest/tree/main/config/pipelines).

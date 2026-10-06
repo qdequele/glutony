@@ -1,12 +1,26 @@
 ---
 title: Multi-tenancy
-description: How one deployment serves every Meilisearch project through MeiliContext
+description: How one deployment serves many tenants through MeiliContext
 ---
 
-meili-ingest serves **many Meilisearch projects from one shared deployment**.
-Each project has its own Meilisearch host, API key and possibly its own
+meili-ingest serves **many tenants from one shared deployment**.
+Each tenant has its own Meilisearch host, API key and possibly its own
 pipelines. The design goal: tenants never put credentials in request bodies,
 and workers never hold credentials in their environment.
+
+## Tenants
+
+A **tenant** is an opaque string that glutony never interprets. Behind the
+[Meilisearch Lab](/deployment/meilisearch-lab) it is the Lab account id (a UUID),
+behind Meilisearch Cloud's Envoy it is the project id, and standalone there is
+none.
+
+A tenant id is 1 to 128 characters of `[A-Za-z0-9._:-]`. It is validated wherever
+it enters, and anything else is rejected with `400 invalid_tenant`.
+
+Every pipeline, source, connection and job belongs to one tenant or to the global
+scope (no tenant). The JSON field is `tenant_id`. Requests that still send
+`project_id` are read as `tenant_id`, but responses always say `tenant_id`.
 
 ## MeiliContext
 
@@ -14,7 +28,7 @@ Every operation is scoped to a `MeiliContext`:
 
 ```rust
 pub struct MeiliContext {
-    pub project_id: Option<String>, // tenant id
+    pub tenant_id:  Option<String>, // opaque: Lab account, Cloud project, or none
     pub host:       String,         // https://xxx.us-west.meilisearch.io
     pub api_key:    String,         // write-capable key
     pub index:      Option<String>, // fully resolved before the workflow starts
@@ -33,13 +47,13 @@ ever sees the key, and logs print `MeiliContext::redacted()`.
 Meilisearch Cloud's Envoy gateway (project *glutony*) sits in front of all
 traffic. For a request to `xxx.us-west.meilisearch.com/ingest` it:
 
-1. Extracts the project id from the subdomain (`xxx`).
+1. Extracts the project id from the subdomain (`xxx`). That is the tenant id.
 2. Looks up the project's Meilisearch host and API key.
 3. Optionally extracts an index name from the path.
 4. Injects headers and forwards to meili-ingest:
 
 ```
-X-Meili-Project-Id:   xxx
+X-Meili-Project-Id:   xxx                   # or X-Meili-Tenant-Id
 X-Meili-Host:         https://xxx.us-west.meilisearch.io
 X-Meili-Api-Key:      <master_or_ingest_key>
 X-Meili-Index:        <index_name>          # optional
@@ -61,7 +75,8 @@ development, never for an exposed deployment.
 ```
 1. X-Meili-Host                      → host
 2. X-Meili-Api-Key                   → api_key
-3. X-Meili-Project-Id                → project_id
+3. X-Meili-Tenant-Id                 → tenant_id
+   X-Meili-Project-Id                → tenant_id (when X-Meili-Tenant-Id is absent)
 4. X-Meili-Index                     → index (starting point)
 5. ?index= query param               → index (overrides header)
 6. Authorization: Bearer <key>       → api_key (self-hosted fallback)
@@ -74,7 +89,7 @@ pipeline is pinned.
 A **pinned** pipeline names a [Meilisearch connection](/concepts/connections)
 on every `meili_indexer` step. The connection's host and key always win over
 steps 1, 2, 6 and 7, so such a pipeline accepts requests with no context at
-all; `project_id` and `index` still resolve as above.
+all; `tenant_id` and `index` still resolve as above.
 
 ## Index resolution
 
@@ -92,8 +107,8 @@ starts; the indexer never has to guess.
 
 ## Tenant-scoped pipelines
 
-User pipelines carry an optional `project_id`. When a request has a project id
-the resolver considers `project_id = <id> OR project_id IS NULL` and applies
+User pipelines carry an optional `tenant_id`. When a request has a tenant
+the resolver considers `tenant_id = <id> OR tenant_id IS NULL` and applies
 this precedence:
 
 1. tenant-scoped user pipeline
@@ -102,12 +117,54 @@ this precedence:
 
 Within a tier, a trigger with a matching `filename_pattern` beats a MIME-only
 trigger. `POST /pipelines` behind Envoy stores the pipeline under the calling
-project; `GET /pipelines/:uid` returns the tenant's version when it shadows a
+tenant; `GET /pipelines/:uid` returns the tenant's version when it shadows a
 global one.
+
+## Management routes
+
+Data routes (`/ingest…`, `/indexes/{index_uid}/ingest…`, `/health`) use the
+caller's Meilisearch key and the trusted edge headers, as described above.
+Management routes sit behind an optional token check:
+
+| Configuration | Caller sends | Acts as |
+|---|---|---|
+| `LAB_SERVICE_TOKEN` set | `Authorization: Bearer <token>` and a required `X-Glutony-Tenant-Id` | that tenant |
+| `ADMIN_API_KEY` set | `Authorization: Bearer <key>`, `X-Glutony-Tenant-Id` optional | the global scope, or that tenant |
+| neither | nothing | open: the tenant comes from the trusted edge headers |
+
+Management routes are `/pipelines…` (including `/pipelines/validate`),
+`/connections…`, `/sources…`, `GET /jobs`, `POST /jobs/{id}/cancel`, `/usage`,
+`/plugins` and `/catalog`. Both secrets may be set at once. Once either is set,
+trusted `X-Meili-*` headers grant no management access and never set the tenant
+of a management request. A missing or wrong token is `401`; a Lab token without a
+valid tenant header is `400 invalid_tenant`. The setup is described in
+[Meilisearch Lab](/deployment/meilisearch-lab).
+
+A caller that acts as a tenant sees only its own data:
+
+- **Reads** return the tenant's rows plus global rows (no tenant), the same way
+  built-in pipelines are always visible. Each row carries
+  `"scope": "tenant" | "global"` (`"builtin"` for built-in pipelines).
+- **Writes** create or change the tenant's own rows only. PATCH, DELETE, pause,
+  unpause and run on a global row answer `404`.
+- `GET /jobs`, `/sources/{uid}/runs`, `POST /jobs/{id}/cancel` and `/usage` are
+  always filtered to the tenant.
+- Another tenant's row answers `404`, the same as a row that does not exist.
+
+An admin without a tenant header is the global scope: it reads and writes global
+rows and reads every tenant's jobs.
 
 ## Jobs
 
-Job rows in the control plane record `project_id`, so status endpoints can be
+Job rows in the control plane record `tenant_id`, so status endpoints are
 filtered per tenant. Temporal workflow ids are `ingest-<job_id>` (UUID v4),
-which are unguessable but not tenant-checked by themselves — front them with
-Envoy in multi-tenant deployments.
+which are unguessable, but the job id is not the only protection:
+
+- `GET /jobs/{id}` answers `404` for another tenant's job. With management auth
+  off, the tenant is the one from the trusted edge. With auth on, it accepts
+  either a valid management token (scoped by its `X-Glutony-Tenant-Id`; an admin
+  without one sees every job) or a trusted edge tenant, and anything else gets
+  `401`. It is the one data route that follows the management rules when auth is
+  on, so ingest callers can still poll their jobs on the public hostname.
+- `POST /jobs/{id}/cancel` is a management route and answers `404` for another
+  tenant's job.

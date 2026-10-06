@@ -99,6 +99,6 @@ this policy. Non-retryable ones (`InvalidInput`, `InvalidConfig`,
 - **Temporal UI** shows every job (`ingest-<job_id>`), its activities, retries
   and payloads.
 - **Logs** are structured JSON (`tracing`) with `job_id`, `step_id`, `plugin`
-  and `project_id` fields. API keys are never logged.
+  and `tenant_id` fields. API keys are never logged.
 - **Metrics**: worker pools scale on Temporal task-queue backlog; see
   [Kubernetes](/deployment/kubernetes).

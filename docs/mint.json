@@ -69,7 +69,8 @@
         "deployment/docker-compose",
         "deployment/kubernetes",
         "deployment/environment-variables",
-        "deployment/meilisearch-cloud"
+        "deployment/meilisearch-cloud",
+        "deployment/meilisearch-lab"
       ]
     },
     {

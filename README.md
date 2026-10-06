@@ -185,18 +185,19 @@ Other endpoints: `GET /jobs/:id`, `POST /jobs/:id/cancel`, `GET|POST /pipelines`
 
 ## Multi-tenancy
 
-Every request is scoped to a `MeiliContext` (`project_id`, `host`, `api_key`,
+Every request is scoped to a `MeiliContext` (`tenant_id`, `host`, `api_key`,
 `index`, `region`) resolved **once** at the gateway and carried immutably
 through the Temporal workflow. Workers never read Meilisearch credentials from
 the environment; only the `meili_indexer` plugin touches Meilisearch, using the
 context the workflow injects into its config.
 
-Resolution order: `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Project-Id` /
-`X-Meili-Index` headers (injected by Meilisearch Cloud's Envoy, trusted only when
+Resolution order: `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Tenant-Id` (or the older
+`X-Meili-Project-Id`) / `X-Meili-Index` headers (injected by Meilisearch Cloud's
+Envoy or the Lab's edge, trusted only when
 `X-Meili-Envoy-Secret` matches `ENVOY_TRUSTED_HEADER`) → `?index=` →
 `Authorization: Bearer` → `MEILI_URL` / `MEILI_API_KEY` env vars → `400`.
 
-User pipelines can be global or scoped to a `project_id`; tenant pipelines
+User pipelines can be global or scoped to a `tenant_id`; tenant pipelines
 shadow global ones, which shadow built-ins.
 
 A pipeline can instead **pin** its destination: a `meili_indexer` step with
@@ -253,6 +254,10 @@ pub trait Plugin: Send + Sync + 'static {
 
 ## Admin UI
 
+> **Frozen.** This admin UI takes bug fixes only. New screens go to the Meilisearch
+> Lab console, built from `docs/openapi.yaml`. It works in open mode only (no
+> `LAB_SERVICE_TOKEN` / `ADMIN_API_KEY`), or behind a proxy that injects the admin key.
+
 The gateway can serve a built-in admin UI at `/ui`: a pipeline editor whose config
 forms are generated from each plugin's JSON Schema, job monitoring with a per-step
 timeline and cancellation, an ingest playground that shows which pipeline auto-routed
@@ -276,6 +281,14 @@ binary. The trade-off is that the UI is no longer same-origin, so the dev gatewa
 allows its origin with `CORS_ALLOW_ORIGINS` (set in `compose.yaml`). That variable is
 unset in production — no `CorsLayer` is mounted at all — because the embedded UI
 needs no cross-origin grant.
+
+## Meilisearch Lab
+
+glutony plugs into the Meilisearch Lab through three seams: an opaque tenant on every
+owned row, a token-protected management API, and signed billing events from a durable
+outbox. All three are off by default, so a deployment that sets none of the `LAB_*`
+variables behaves as a standalone one. See
+[docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx).
 
 ## Usage & metering
 

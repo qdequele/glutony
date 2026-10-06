@@ -490,8 +490,11 @@ migration, so going back to the previous binary needs
 `scripts/rollback-lab-seams.sql`: it renames the columns and indexes back,
 drops `lab_events`, and deletes the `0003` and `0004` rows from
 `_sqlx_migrations`. A rollback loses undelivered events, so the script
-refuses to run while `lab_events` has undelivered rows unless it is given
-`-v force=1`.
+refuses to run while `lab_events` has undelivered rows unless the session setting
+`glutony.rollback_force = on` is set (`PGOPTIONS='-c glutony.rollback_force=on'`; see
+the amendments in §12). It is run with
+`psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql`,
+once, with every glutony service stopped: it is not idempotent.
 
 ## 11. Out of scope
 
@@ -510,3 +513,30 @@ refuses to run while `lab_events` has undelivered rows unless it is given
   suspend switch or a Lumen-style lease, decided before the first paying
   Lab account uses glutony. `docs/deployment/meilisearch-lab.mdx` states
   this limit.
+
+## 12. Amendments made while planning (2026-10-01)
+
+1. **§5.2:** `data.source_uid` is dropped. No workflow input carries the source, and
+   billing does not need it.
+2. **§5.1:** `UsageUnits` carries an additive `unpriced_calls: u64` instead of a
+   `cost_complete: bool`, because units merge by addition from an all-zero start. The
+   event's `cost_complete` is `unpriced_calls == 0`.
+3. **§5.3:** the usage activity's retry policy changes in every deployment, not only
+   with lab events on: workflow code cannot read configuration, and a new activity
+   would break replay of in-flight workflows. It retries without an attempt limit,
+   5-minute maximum interval, within a 7-day `schedule_to_close` window.
+4. **§10:** the rollback guard is the session setting `glutony.rollback_force = on`
+   (`PGOPTIONS='-c glutony.rollback_force=on'`), not `-v force=1`, so the script is
+   plain SQL a test can run; it is run with `psql --single-transaction`.
+5. **§5.7:** the Jev enricher is left out of the bundled cost table, so its calls are
+   flagged as unpriced until a price is set, rather than billed at a placeholder 0.
+
+Recorded while implementing:
+
+6. **§4.1:** with management auth on, `GET /jobs/{id}` accepts either a valid
+   management token (scoped by its `X-Glutony-Tenant-Id`; an admin without one sees
+   every job) or a trusted edge tenant, and anything else is `401`. With auth off it
+   is scoped by the trusted edge tenant as described in §4.1.
+7. **§5.4, §5.5:** the control plane refreshes the pending gauges on every
+   `GET /metrics` scrape, so they are correct even when `LAB_URL` is unset, and the
+   sender reads at most 1 MiB of the Lab's acknowledgement body.

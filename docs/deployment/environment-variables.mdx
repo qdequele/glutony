@@ -26,6 +26,8 @@ inside plugins or workflow code.
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
 | `SOURCE_SECRET_KEY` | — | 32 bytes, base64 (`openssl rand -base64 32`). Seals [connection](/concepts/connections) keys and [source](/concepts/sources) credentials. Unset = `/connections` and `/sources` answer `501`. Must match the workers'. Rotating it makes stored secrets unreadable. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Where connections may point: `public` (https, public addresses only), `any`, or a comma list of `host[:port]`. |
+| `LAB_SERVICE_TOKEN` | — | Bearer token the Meilisearch Lab console sends to the management routes, together with a required `X-Glutony-Tenant-Id`. Setting it closes open mode. See [Meilisearch Lab](/deployment/meilisearch-lab). |
+| `ADMIN_API_KEY` | — | Operator bearer key for the management routes; `X-Glutony-Tenant-Id` is optional (without it the caller acts on the global scope). Setting it closes open mode. |
 | `SOURCE_FETCH_HOSTS` | `public` | Where sources **and `{"url": …}` ingest bodies** may fetch from; same syntax. Checked when a source is saved, and on every ingest URL (a forbidden one is a `422`, no job queued). `public` means `https` and public addresses only, so plain-`http` URLs need an allowlist entry or `any`. |
 
 ## Worker (`meili-ingest-worker`)
@@ -54,6 +56,8 @@ inside plugins or workflow code.
 | `MEILI_CONNECTION_HOSTS` | `public` | Same policy as the gateway, re-applied every time a connection is used. |
 | `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect hop (at most 5) — for scheduled sources and for URL refs in step inputs alike. A refused URL fails the step as non-retryable. `s3://`/`gs://`/`az://` refs are **not** covered (other object-store schemes such as `file://` are refused outright): they are read with the worker's ambient cloud credentials, so scope those to what tenants may read (never the blob store's bucket in a shared deployment). |
 | `DEFAULT_INDEX` | `documents` | Index for a source's documents when nothing more specific resolves. Keep it equal to the gateway's. |
+| `LAB_EVENTS_ENABLED` | `false` | `true` makes the usage step write one billing event per Lab job to the control plane's outbox. See [Meilisearch Lab](/deployment/meilisearch-lab). |
+| `PROVIDER_COSTS_FILE` | bundled `config/provider-costs.toml` | Provider cost table (micro-USD) used to price each job. A call it cannot price costs 0 and sets `cost_complete: false`. |
 | `TINYBIRD_TOKEN` | — | Append token for per-tenant [usage analytics](/concepts/usage). Absent disables reporting entirely. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
 | `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |
@@ -68,6 +72,8 @@ arrive in the workflow input as `MeiliContext`.
 |---|---|---|
 | `DATABASE_URL` | — (required) | Postgres connection string. Migrations run at boot. |
 | `BIND` | `0.0.0.0:9000` | Internal listen address. Do not expose publicly. |
+| `LAB_URL` | — | Meilisearch Lab base URL. Enables the sender that posts lab events to `{LAB_URL}/internal/events`. Must be `https` unless the host is loopback or private. |
+| `LAB_EVENTS_SECRET` | — | HMAC key that signs each batch (`X-Lab-Signature`). Required with `LAB_URL` and the reverse is a boot error. Never logged. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 ## Object store credentials
