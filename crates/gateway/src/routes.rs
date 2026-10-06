@@ -11,6 +11,9 @@ pub enum RouteClass {
     Data,
     /// `ManagementAuth`: Lab service token, admin key, or open mode.
     Management,
+    /// Either: the trusted edge tenant or a management credential, and with management
+    /// auth on, one of them is required (`auth::authorize_job_read`).
+    Shared,
 }
 
 /// One mounted route.
@@ -31,6 +34,13 @@ const fn data(method: &'static str, path: &'static str) -> RouteSpec {
         class: RouteClass::Data,
     }
 }
+const fn shared(method: &'static str, path: &'static str) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        class: RouteClass::Shared,
+    }
+}
 const fn mgmt(method: &'static str, path: &'static str) -> RouteSpec {
     RouteSpec {
         method,
@@ -48,7 +58,7 @@ pub const ROUTES: &[RouteSpec] = &[
     data("POST", "/indexes/{index_uid}/ingest"),
     data("POST", "/indexes/{index_uid}/ingest/batch"),
     data("POST", "/indexes/{index_uid}/ingest/pipeline/{name}"),
-    data("GET", "/jobs/{id}"),
+    shared("GET", "/jobs/{id}"),
     mgmt("GET", "/jobs"),
     mgmt("POST", "/jobs/{id}/cancel"),
     mgmt("GET", "/pipelines"),
@@ -154,7 +164,7 @@ mod tests {
             let management = schemes.contains("LabServiceToken") && schemes.contains("AdminKey");
             assert_eq!(
                 management,
-                r.class == RouteClass::Management,
+                r.class != RouteClass::Data,
                 "{} {}: security {schemes:?}",
                 r.method,
                 r.path
@@ -170,14 +180,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_management_route_is_guarded() {
+    async fn every_guarded_route_refuses_an_anonymous_call() {
         let server = MockServer::start().await;
         let config = GatewayConfig {
             admin_api_key: Some("admin-secret".into()),
             ..GatewayConfig::default()
         };
         let (app, _) = test_app(&server, config).await;
-        for r in ROUTES.iter().filter(|r| r.class == RouteClass::Management) {
+        for r in ROUTES.iter().filter(|r| r.class != RouteClass::Data) {
             let req = Request::builder()
                 .method(r.method)
                 .uri(concrete(r.path))
@@ -195,10 +205,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_data_route_is_mounted() {
+    async fn every_open_route_is_mounted() {
         let server = MockServer::start().await;
         let (app, _) = test_app(&server, GatewayConfig::default()).await;
-        for r in ROUTES.iter().filter(|r| r.class == RouteClass::Data) {
+        for r in ROUTES.iter().filter(|r| r.class != RouteClass::Management) {
             let req = Request::builder()
                 .method(r.method)
                 .uri(concrete(r.path))

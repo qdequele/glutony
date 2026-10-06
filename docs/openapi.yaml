@@ -424,13 +424,31 @@ paths:
       tags: [Jobs]
       operationId: getJob
       summary: Job status and progress
-      security: [{ MeiliKey: [] }, {}]
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Combines Temporal `describe` with the workflow's `progress` query. Falls
         back to the control plane's job cache when the workflow is no longer
         known to Temporal (retention expired).
+
+        Read by ingest clients through the edge and by the Lab, so it accepts
+        either caller. The job is visible only to the tenant it belongs to
+        (`404` otherwise); the tenant comes from:
+
+        - a management token (`LabServiceToken` or `AdminKey`): `X-Glutony-Tenant-Id`.
+          An `AdminKey` without it sees every job. Trusted `X-Meili-*` tenant
+          headers are ignored for this caller.
+        - otherwise, the trusted edge: `X-Meili-Tenant-Id`, else `X-Meili-Project-Id`,
+          honoured only with a matching `X-Meili-Envoy-Secret` when
+          `ENVOY_TRUSTED_HEADER` is set. A bearer that is not a management token
+          (a Meilisearch key) is ignored.
+
+        When management auth is configured (`LAB_SERVICE_TOKEN` or `ADMIN_API_KEY`),
+        a call with neither a management token nor a trusted edge tenant is a
+        `401`. In open mode (neither secret set) the tenant, if any, comes from the
+        trusted edge, and a call without one sees every job.
       parameters:
         - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
@@ -457,6 +475,20 @@ paths:
                   cancel_requested: false
                 pipeline_used: my-pdf-with-enrichment
                 target_index: contracts
+        "400":
+          $ref: "#/components/responses/InvalidTenant"
+        "401":
+          description: |
+            Management auth is configured and the call carries neither a valid
+            management token nor a trusted edge tenant (no `X-Meili-Tenant-Id` /
+            `X-Meili-Project-Id`, or a missing or wrong `X-Meili-Envoy-Secret`).
+          headers:
+            WWW-Authenticate:
+              schema: { type: string, const: Bearer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "missing or invalid management token, and no trusted edge tenant", "code": "unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
         "502":
@@ -1198,8 +1230,9 @@ components:
       in: header
       required: false
       description: |
-        Tenant a management call acts for. Required with `LabServiceToken`, optional
-        with `AdminKey`, ignored in open mode. 1-128 characters of `[A-Za-z0-9._:-]`.
+        Tenant a management call (or a job read with a management token) acts for.
+        Required with `LabServiceToken`, optional with `AdminKey`, ignored in open
+        mode. 1-128 characters of `[A-Za-z0-9._:-]`.
       schema:
         type: string
         pattern: "^[A-Za-z0-9._:-]{1,128}$"
