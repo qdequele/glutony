@@ -110,12 +110,14 @@ impl LabEventRepo {
         .rows_affected())
     }
 
-    /// Count a failed delivery and back off: `min(2^attempts s, 300 s)` ± 20 %.
+    /// Count a failed delivery and back off: `min(2^attempts s, 300 s)` ± 20 %. The
+    /// exponent is clamped at 9 (2^9 > 300) because Postgres' `power` errors on float
+    /// overflow, which would otherwise make a long-failing row unschedulable.
     pub async fn reschedule(&self, ids: &[Uuid]) -> Result<u64, CpError> {
         Ok(sqlx::query(
             "UPDATE lab_events SET attempts = attempts + 1, \
                  next_attempt = now() + make_interval(secs => \
-                     LEAST(power(2, attempts + 1), 300) * (0.8 + random() * 0.4)) \
+                     LEAST(power(2, LEAST(attempts + 1, 9)), 300) * (0.8 + random() * 0.4)) \
              WHERE id = ANY($1) AND delivered_at IS NULL",
         )
         .bind(ids)

@@ -174,6 +174,29 @@ async fn backoff_is_capped_at_five_minutes() {
 }
 
 #[tokio::test]
+async fn backoff_does_not_overflow_after_thousands_of_failures() {
+    let Some(t) = setup().await else { return };
+    let repo = LabEventRepo::new(t.pool.clone());
+    let id = Uuid::new_v4();
+    repo.insert_many(&[event(id)]).await.unwrap();
+    sqlx::query("UPDATE lab_events SET attempts = 5000 WHERE id = $1")
+        .bind(id)
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    assert_eq!(repo.reschedule(&[id]).await.unwrap(), 1);
+    let wait: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM next_attempt - now())::float8 FROM lab_events WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&t.pool)
+    .await
+    .unwrap();
+    assert!((240.0..=360.0).contains(&wait), "{wait}");
+    t.drop_schema().await;
+}
+
+#[tokio::test]
 async fn purge_only_touches_old_delivered_rows() {
     let Some(t) = setup().await else { return };
     let repo = LabEventRepo::new(t.pool.clone());
