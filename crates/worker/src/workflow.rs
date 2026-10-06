@@ -26,9 +26,9 @@ use temporalio_common::protos::temporal::api::failure::v1::Failure;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::workflows::join_all;
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, ApplicationFailure, SyncWorkflowContext,
-    WorkflowCancellationToken, WorkflowContext, WorkflowContextView, WorkflowResult,
-    WorkflowTermination,
+    ActivityCloseTimeouts, ActivityExecutionError, ActivityOptions, ApplicationFailure,
+    SyncWorkflowContext, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
+    WorkflowResult, WorkflowTermination,
 };
 
 use crate::activity::{FanOutActivityInput, JobStartedInput, StepActivities};
@@ -38,9 +38,10 @@ use crate::dag::{FanOut, fan_out_branches, ready_steps, resolve_input, retry_par
 /// workflow history well under Temporal's event limits).
 pub const MAX_FAN_OUT_BRANCHES: usize = 500;
 
-/// Attempts allowed for the usage-reporting activity before the job gives up on it.
-/// Generous, because these rows are billed from; the job still succeeds either way.
-const USAGE_MAX_ATTEMPTS: u32 = 10;
+/// How long the usage activity keeps retrying. Its rows are what the Lab bills from,
+/// so a control-plane or analytics outage must not lose them; the job's own status is
+/// written first and does not wait on this (spec §5.3).
+const USAGE_RETRY_WINDOW: Duration = Duration::from_secs(7 * 24 * 3_600);
 
 /// Heartbeat timeout for every step activity. The activity keeps itself alive every
 /// 20 s independently of the plugin.
@@ -343,7 +344,11 @@ impl PipelineWorkflow {
             steps,
             error,
         };
-        let opts = ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
+        let opts =
+            ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::ScheduleAndStartToClose {
+                schedule_to_close: USAGE_RETRY_WINDOW,
+                start_to_close: Duration::from_secs(60),
+            })
             .task_queue("workers-general".to_string())
             // Detached from the workflow's cancellation token. Activities inherit
             // workflow cancellation, so on a cancelled job this one would be killed
@@ -352,9 +357,9 @@ impl PipelineWorkflow {
             .cancellation_token(WorkflowCancellationToken::new())
             .retry_policy(
                 RetryPolicy::builder()
-                    .maximum_attempts(USAGE_MAX_ATTEMPTS)
                     .initial_interval(Duration::from_secs(2))
                     .backoff_coefficient(2.0)
+                    .maximum_interval(Duration::from_secs(300))
                     .build(),
             )
             .build();

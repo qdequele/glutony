@@ -62,6 +62,30 @@ pub struct FanOutActivityOutput {
     pub branches: Vec<PluginInput>,
 }
 
+/// Why reporting a job's usage failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UsageReportError {
+    /// Try again (control plane or analytics store unavailable).
+    #[error("{0}")]
+    Retryable(String),
+    /// A human must fix something (rejected payload, bad token).
+    #[error("{0}")]
+    Permanent(String),
+}
+
+/// Map a usage-reporting error onto Temporal's retry semantics. A function rather than
+/// a `From` impl: the SDK's blanket `From<E: Error>` for `ActivityError` would conflict.
+fn usage_activity_error(e: UsageReportError) -> ActivityError {
+    match e {
+        UsageReportError::Retryable(m) => {
+            ActivityError::application(ApplicationFailure::new(anyhow::anyhow!(m)))
+        }
+        UsageReportError::Permanent(m) => {
+            ActivityError::application(ApplicationFailure::non_retryable(anyhow::anyhow!(m)))
+        }
+    }
+}
+
 /// Shared state of the activities running on this worker.
 pub struct StepActivities {
     /// Plugins available here.
@@ -79,6 +103,8 @@ pub struct StepActivities {
     pub control_plane_url: Option<String>,
     /// Key and host policy for resolving an indexer step's Meilisearch connection.
     pub connections: ConnectionSettings,
+    /// Post Lab billing events to the control plane (spec §5.3).
+    pub lab_events: bool,
 }
 
 impl StepActivities {
@@ -92,6 +118,7 @@ impl StepActivities {
             usage: None,
             control_plane_url: None,
             connections: ConnectionSettings::default(),
+            lab_events: false,
         }
     }
 
@@ -112,6 +139,80 @@ impl StepActivities {
     pub fn with_control_plane(mut self, url: Option<String>) -> Self {
         self.control_plane_url = url.map(|u| u.trim_end_matches('/').to_string());
         self
+    }
+
+    /// Post each finished Lab job's billing event to the control plane's outbox.
+    pub fn with_lab_events(mut self, enabled: bool) -> Self {
+        self.lab_events = enabled;
+        self
+    }
+
+    /// Record a finished job: status write-back, then the Lab billing event, then
+    /// analytics. The bill goes first so an analytics outage cannot hold it back;
+    /// every step is idempotent, so a retry repeats them harmlessly.
+    pub async fn report_usage(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
+        let job_id = input.job_id;
+
+        // Write the outcome back to the cached job row first. Without this the job
+        // list shows "queued" for finished work until someone opens that job, because
+        // the gateway only refreshes a row when it serves that job's detail.
+        self.patch_job(job_id, input.status, None, input.error.clone())
+            .await
+            .map_err(|e| UsageReportError::Retryable(e.to_string()))?;
+
+        if self.lab_events {
+            self.post_lab_event(input).await?;
+        }
+
+        let Some(client) = &self.usage else {
+            // Usage reporting is off; the writes above still happened.
+            return Ok(());
+        };
+        let events = events_for_job(input);
+        match client.send(&events).await {
+            Ok(()) => {
+                tracing::info!(job_id = %job_id, events = events.len(), "usage recorded");
+                Ok(())
+            }
+            Err(e) if e.is_retryable() => Err(UsageReportError::Retryable(format!(
+                "usage store unavailable: {e}"
+            ))),
+            Err(e) => Err(UsageReportError::Permanent(format!("usage rejected: {e}"))),
+        }
+    }
+
+    async fn post_lab_event(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
+        let event = match meili_ingest_usage::lab::lab_event_for_job(input) {
+            Ok(e) => e,
+            Err(reason) => {
+                tracing::debug!(
+                    job_id = %input.job_id,
+                    reason = reason.as_str(),
+                    "no Lab event for this job"
+                );
+                return Ok(());
+            }
+        };
+        let Some(base) = &self.control_plane_url else {
+            return Err(UsageReportError::Permanent(
+                "LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL".into(),
+            ));
+        };
+        let resp = self
+            .http
+            .post(format!("{base}/internal/lab-events"))
+            .json(&serde_json::json!({ "events": [event] }))
+            .send()
+            .await
+            .map_err(|e| UsageReportError::Retryable(format!("control plane unreachable: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(UsageReportError::Retryable(format!(
+                "control plane refused the lab event: {}",
+                resp.status()
+            )));
+        }
+        tracing::info!(job_id = %input.job_id, "lab event recorded");
+        Ok(())
     }
 
     /// Patch the cached job row. Returns `Ok(false)` when no control plane is
@@ -395,7 +496,8 @@ impl StepActivities {
         self.run_fan_out(input).await.map_err(to_activity_error)
     }
 
-    /// Ship one job's usage rows to the analytics store.
+    /// Ship one job's usage rows to the analytics store and, for Lab jobs, its billing
+    /// event to the control plane's outbox (see [`StepActivities::report_usage`]).
     ///
     /// Runs as an activity so Temporal retries it: that is what turns best-effort
     /// telemetry into billing-grade metering. Rows carry deterministic ids, so a
@@ -406,32 +508,9 @@ impl StepActivities {
         _ctx: ActivityContext,
         input: JobUsageInput,
     ) -> Result<(), ActivityError> {
-        let job_id = input.job_id;
-
-        // Write the outcome back to the cached job row first. Without this the job
-        // list shows "queued" for finished work until someone opens that job, because
-        // the gateway only refreshes a row when it serves that job's detail.
-        self.patch_job(job_id, input.status, None, input.error.clone())
+        self.report_usage(&input)
             .await
-            .map_err(to_activity_error)?;
-
-        let Some(client) = &self.usage else {
-            // Usage reporting is off; the status write above still happened.
-            return Ok(());
-        };
-        let events = events_for_job(&input);
-        match client.send(&events).await {
-            Ok(()) => {
-                tracing::info!(job_id = %job_id, events = events.len(), "usage recorded");
-                Ok(())
-            }
-            Err(e) if e.is_retryable() => Err(ActivityError::application(ApplicationFailure::new(
-                anyhow::anyhow!("usage store unavailable: {e}"),
-            ))),
-            Err(e) => Err(ActivityError::application(
-                ApplicationFailure::non_retryable(anyhow::anyhow!("usage rejected: {e}")),
-            )),
-        }
+            .map_err(usage_activity_error)
     }
 
     /// Mark a job as running in the cached job row.
@@ -849,6 +928,107 @@ mod tests {
                 "{blocked} must be refused under `public`"
             );
         }
+    }
+
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn lab_usage_input(tenant: &str) -> meili_ingest_usage::JobUsageInput {
+        meili_ingest_usage::JobUsageInput {
+            job_id: Uuid::new_v4(),
+            workflow_id: "ingest-x".into(),
+            pipeline_uid: "builtin.json".into(),
+            tenant_id: tenant.into(),
+            status: meili_ingest_plugin_sdk::JobStatus::Succeeded,
+            ..Default::default()
+        }
+    }
+
+    async fn control_plane_with_lab_events(status: u16, expect: u64) -> MockServer {
+        let cp = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/internal/lab-events"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({"inserted": 1})),
+            )
+            .expect(expect)
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    fn acts_with(cp: &MockServer, lab: bool) -> StepActivities {
+        StepActivities::new(
+            Arc::new(PluginRegistry::builtin()),
+            BlobStore::memory(),
+            1 << 20,
+        )
+        .with_control_plane(Some(cp.uri()))
+        .with_lab_events(lab)
+    }
+
+    #[tokio::test]
+    async fn a_lab_job_posts_its_event_to_the_outbox() {
+        let cp = control_plane_with_lab_events(202, 1).await;
+        let input = lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61");
+        acts_with(&cp, true).report_usage(&input).await.unwrap();
+        let posted = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path() == "/internal/lab-events")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&posted.body).unwrap();
+        assert_eq!(
+            body["events"][0]["id"],
+            meili_ingest_usage::lab::lab_event_id(input.job_id).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_event_without_the_flag_or_a_lab_tenant() {
+        let cp = control_plane_with_lab_events(202, 0).await;
+        acts_with(&cp, false)
+            .report_usage(&lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"))
+            .await
+            .unwrap();
+        acts_with(&cp, true)
+            .report_usage(&lab_usage_input("hackersearch"))
+            .await
+            .unwrap();
+        acts_with(&cp, true)
+            .report_usage(&lab_usage_input(""))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_outbox_failure_is_retryable_and_comes_before_analytics() {
+        let cp = control_plane_with_lab_events(500, 1).await;
+        let tinybird = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&tinybird)
+            .await;
+        let usage = meili_ingest_usage::UsageClient::new(
+            tinybird.uri(),
+            "token",
+            "meili_ingest_usage",
+            reqwest::Client::new(),
+        );
+        let acts = acts_with(&cp, true).with_usage(Some(usage));
+        let err = acts
+            .report_usage(&lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
     }
 
     #[test]

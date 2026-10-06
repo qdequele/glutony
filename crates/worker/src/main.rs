@@ -101,8 +101,16 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| "documents".to_string()),
         );
 
+    if config.lab_events_enabled && config.control_plane_url.is_none() {
+        anyhow::bail!("LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL: the events go to its outbox");
+    }
+    if config.lab_events_enabled {
+        tracing::info!("Lab billing events enabled");
+    }
+
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
         .with_usage(usage)
+        .with_lab_events(config.lab_events_enabled)
         .with_control_plane(config.control_plane_url.clone())
         .with_connections(meili_ingest_worker::connection::ConnectionSettings {
             key: connection_key,
