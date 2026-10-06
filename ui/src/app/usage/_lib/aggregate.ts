@@ -11,7 +11,7 @@
  * step **plus** one job event, and the job event repeats the whole job's cost
  * units as a per-job total. Summing steps and jobs together therefore counts
  * every token, second and page twice. The rollup
- * (`tinybird/pipes/usage_daily_billing.pipe`) already defends against that by
+ * (`tinybird/pipes/usage_daily_billing_hourly.pipe`) already defends against that by
  * zeroing each family on the other's rows:
  *
  * | columns | filled from | non-zero on |

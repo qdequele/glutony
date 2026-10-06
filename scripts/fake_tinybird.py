@@ -9,7 +9,7 @@ Implements just enough of two APIs:
   redelivery does not double-count here either.
 * ``GET /v0/pipes/tenant_usage.json`` — the read path the gateway proxies for the
   dashboard. Aggregates the stored rows with the same partition rule as
-  ``tinybird/pipes/usage_daily_billing.pipe``: job counters come only from
+  ``tinybird/pipes/usage_daily_billing_hourly.pipe``: job counters come only from
   ``kind='job'`` rows and work/cost counters only from ``kind='step'`` rows.
 
 This exists for local development and the e2e script. Production points at a real

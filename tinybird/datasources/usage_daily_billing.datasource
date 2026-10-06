@@ -1,7 +1,7 @@
 #
 # usage_daily_billing — invoice-grade daily rollup of meili_ingest_usage.
 #
-# Written only by `pipes/usage_daily_billing.pipe`, a scheduled COPY that reads the
+# Written only by `pipes/usage_daily_billing_hourly.pipe`, a scheduled COPY that reads the
 # raw table with FINAL, so it reflects ReplacingMergeTree deduplication. This is the
 # table to bill from.
 #

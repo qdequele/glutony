@@ -1,7 +1,7 @@
 #
 # usage_daily — daily per-tenant rollup of meili_ingest_usage.
 #
-# Target of the materialized pipe `pipes/usage_daily.pipe`; never written directly.
+# Target of the materialized pipe `pipes/usage_daily_mv.pipe`; never written directly.
 # Columns hold aggregate STATES, so every read must merge them
 # (`sumMerge`, `countMerge`) — see `pipes/tenant_usage.pipe`.
 #
@@ -10,7 +10,7 @@
 # Job-level rows (kind = 'job') carry no plugin, so their counters land in the
 # `plugin = ''` bucket.
 #
-# CAVEAT (see pipes/usage_daily.pipe): a materialized view fires per INSERT and does not
+# CAVEAT (see pipes/usage_daily_mv.pipe): a materialized view fires per INSERT and does not
 # see the ReplacingMergeTree deduplication of the source, so a redelivered event would
 # be counted twice HERE while the raw table stays correct. The raw data source remains
 # the source of truth for an invoice; this rollup is for dashboards and estimates.
