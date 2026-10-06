@@ -12,6 +12,7 @@ use meili_ingest_plugin_sdk::{PipelineDefinition, RowScope};
 use serde::Serialize;
 
 use crate::auth::Scope;
+use crate::connections::require_tenant_connections;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -112,6 +113,7 @@ pub async fn create_pipeline(
         ));
     }
     apply_scope(&scope, &mut def)?;
+    require_tenant_connections(&state.control_plane, &def, def.tenant_id.as_deref()).await?;
     let stored = state.control_plane.upsert_pipeline(&def).await?;
     tracing::info!(pipeline = %stored.uid, tenant_id = ?stored.tenant_id, version = stored.version, "pipeline upserted");
     Ok((StatusCode::CREATED, Json(stored.into())))
@@ -144,6 +146,7 @@ pub async fn validate_pipeline(
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
     apply_scope(&scope, &mut def)?;
+    require_tenant_connections(&state.control_plane, &def, def.tenant_id.as_deref()).await?;
     Ok(Json(state.control_plane.validate_pipeline(&def).await?))
 }
 
@@ -619,5 +622,126 @@ steps:
             json[0]["uid"], "mine",
             "the definition is flattened, not nested"
         );
+    }
+
+    const PINNED_JSON: &str = r#"{"uid": "pinned", "steps": [
+        {"id": "index", "plugin": "meili_indexer", "config": {"connection": "prod-movies"}}
+    ]}"#;
+
+    fn post_pinned(uri: &str, tenant: Option<&str>) -> Request<Body> {
+        let mut req = Request::post(uri).header(CONTENT_TYPE, "application/json");
+        if let Some(t) = tenant {
+            req = req.header("x-meili-project-id", t);
+        }
+        req.body(Body::from(PINNED_JSON)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_pipeline_cannot_name_a_global_connection() {
+        let server = MockServer::start().await;
+        mount_connection(&server, "prod-movies", None).await;
+        for route in ["/pipelines", "/pipelines/validate"] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        for route in ["/pipelines", "/pipelines/validate"] {
+            let resp = app
+                .clone()
+                .oneshot(post_pinned(route, Some("acme")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{route}");
+            let json = json_body(resp).await;
+            let msg = json["error"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("prod-movies") && msg.contains("global"),
+                "{route}: {json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_pipeline_may_name_its_own_or_a_not_yet_created_connection() {
+        let server = MockServer::start().await;
+        mount_connection(&server, "prod-movies", Some("acme")).await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "uid": "pinned", "tenant_id": "acme",
+                "steps": [{"id": "index", "plugin": "meili_indexer"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .clone()
+            .oneshot(post_pinned("/pipelines", Some("acme")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // A connection that does not exist yet is not refused: it fails at run time,
+        // as a deleted one does (Decision 15).
+        let missing = PINNED_JSON.replace("prod-movies", "later");
+        let resp = app
+            .oneshot(
+                Request::post("/pipelines")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-meili-project-id", "acme")
+                    .body(Body::from(missing))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn an_operator_cannot_pin_a_tenants_pipeline_to_a_global_connection() {
+        let server = MockServer::start().await;
+        mount_connection(&server, "prod-movies", None).await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        // A global caller naming the tenant in the body.
+        let body = PINNED_JSON.replacen('{', r#"{"tenant_id": "acme", "#, 1);
+        let resp = app
+            .oneshot(
+                Request::post("/pipelines")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_global_pipeline_may_name_a_global_connection() {
+        let server = MockServer::start().await;
+        mount_connection(&server, "prod-movies", None).await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "uid": "pinned",
+                "steps": [{"id": "index", "plugin": "meili_indexer"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app.oneshot(post_pinned("/pipelines", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }

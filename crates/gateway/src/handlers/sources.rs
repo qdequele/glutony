@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::auth::Scope;
-use crate::connections::valid_uid;
+use crate::connections::{require_tenant_connections, valid_uid};
 use crate::error::GatewayError;
 use crate::schedules::SourceSchedule;
 use crate::sources::{
@@ -70,7 +70,8 @@ async fn owned(
         .ok_or_else(|| not_found(uid))
 }
 
-/// The pipeline a source will run, checked to supply its own destination.
+/// The pipeline a source will run, checked to supply its own destination through
+/// connections the source's tenant may use.
 async fn schedulable_pipeline(
     state: &AppState,
     pipeline: &str,
@@ -85,7 +86,8 @@ async fn schedulable_pipeline(
         }
         Err(e) => return Err(e),
     };
-    require_pinned(&def)
+    require_pinned(&def)?;
+    require_tenant_connections(&state.control_plane, &def, tenant_id).await
 }
 
 fn schedule_of(r: &SourceRecord) -> SourceSchedule {
@@ -449,7 +451,7 @@ mod tests {
     use crate::error::GatewayError;
     use crate::schedules::{ScheduleClient, ScheduleInfo, SourceSchedule};
     use crate::state::{AppState, GatewayConfig};
-    use crate::test_support::{FakeStarter, sample_pipeline};
+    use crate::test_support::{FakeStarter, mount_connection, sample_pipeline};
 
     /// Records every call; `reject_create` makes `create` fail like a bad cron would.
     #[derive(Default)]
@@ -679,6 +681,73 @@ mod tests {
             "{body}"
         );
         assert!(schedules.calls().is_empty());
+    }
+
+    fn as_tenant(mut req: Request<Body>, tenant: &str) -> Request<Body> {
+        req.headers_mut()
+            .insert("x-meili-project-id", tenant.parse().expect("header"));
+        req
+    }
+
+    #[tokio::test]
+    async fn a_tenant_source_cannot_run_a_pipeline_pinned_to_a_global_connection() {
+        let cp = MockServer::start().await;
+        // A global pipeline pinned to a global connection: fine untagged, not for a
+        // tenant.
+        mount_pipeline(&cp, true).await;
+        mount_connection(&cp, "prod-movies", None).await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sources"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let (status, body) = call(
+            &app(&cp, schedules.clone(), true),
+            as_tenant(req("POST", "/sources", create_body()), "acme"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("prod-movies") && msg.contains("global"),
+            "{body}"
+        );
+        assert!(schedules.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_source_cannot_be_repointed_at_a_global_connection() {
+        let cp = MockServer::start().await;
+        mount_pipeline(&cp, true).await;
+        mount_connection(&cp, "prod-movies", None).await;
+        let mut owned = record(false);
+        owned["tenant_id"] = "acme".into();
+        Mock::given(method("GET"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(owned))
+            .mount(&cp)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let (status, _) = call(
+            &app(&cp, Arc::new(FakeSchedules::default()), true),
+            as_tenant(
+                req(
+                    "PATCH",
+                    "/sources/tmdb",
+                    serde_json::json!({ "pipeline": "movies" }),
+                ),
+                "acme",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
