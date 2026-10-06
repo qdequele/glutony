@@ -485,7 +485,11 @@ routes are excluded by name.
    `docs/concepts/multi-tenancy.mdx`), so ingest from the UI keeps using the
    Meilisearch key.
 
-**Rollback.** `sqlx` refuses to start a binary that does not know an applied
+**Rollout order.** Deploy the control plane, then the workers, then the gateway.
+
+**Rollback.** Let in-flight pipeline workflows finish (or drain) before rolling
+back: workflows started by the new binary carry `tenant_id`, which the previous
+binary does not read, so they would run without a tenant. `sqlx` refuses to start a binary that does not know an applied
 migration, so going back to the previous binary needs
 `scripts/rollback-lab-seams.sql`: it renames the columns and indexes back,
 drops `lab_events`, and deletes the `0003` and `0004` rows from
@@ -540,3 +544,22 @@ Recorded while implementing:
 7. **§5.4, §5.5:** the control plane refreshes the pending gauges on every
    `GET /metrics` scrape, so they are correct even when `LAB_URL` is unset, and the
    sender reads at most 1 MiB of the Lab's acknowledgement body.
+
+Recorded in the final review:
+
+8. **§3, §4 (known gap, tracked):** a Lab deployment must hold no global Meilisearch
+   connections and no global pipelines pinned to a connection. A tenant's pipeline that
+   names a global connection uid resolves to the global row and writes with its key.
+   Until glutony restricts tenant jobs to tenant-owned connections, keep connections
+   tenant-scoped (documented in `docs/deployment/meilisearch-lab.mdx`; no code change in
+   this branch).
+9. **§4.2:** the gateway refuses to start with `LAB_SERVICE_TOKEN` and no
+   `ENVOY_TRUSTED_HEADER` (`GatewayConfig::validate`). `ADMIN_API_KEY` alone only warns.
+10. **§5.1:** a `PROVIDER_COSTS_FILE` that cannot be read or parsed stops the worker at
+    boot; if it fails later, the process-wide table is empty (every call unpriced),
+    never the bundled placeholder rates. `UsageUnits::merge` saturates.
+11. **§5.2, §5.7:** only the canonical lower-case hyphenated UUID is a Lab account;
+    `cost_micro_usd` is capped at `i64::MAX` (the vendored `glutonyUsageData` schema
+    also sets `"maximum": 9223372036854775807`); non-finite `audio_seconds` is sent as 0.
+12. **§3.1:** `POST /pipelines` and `/pipelines/validate` validate a body `tenant_id`
+    for callers without a tenant (an Admin, or open mode); `400 invalid_tenant`.

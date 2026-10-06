@@ -29,6 +29,10 @@ arrives on a Meilisearch hostname, so the Lab's edge injects it:
 | unset | unset | nothing | open: tenant from the trusted edge |
 
 Management routes are every route except ingest, `GET /jobs/{id}` and `/health`.
+`LAB_SERVICE_TOKEN` requires `ENVOY_TRUSTED_HEADER`: the gateway refuses to start with
+the token and no edge secret, because Lab account ids are not secrets and any client
+could otherwise claim a tenant with a bare `X-Meili-Tenant-Id` header. `ADMIN_API_KEY`
+alone keeps working without an edge (operator mode; the gateway only warns).
 Once either secret is set, `X-Meili-*` headers no longer grant management access.
 The Lab console calls these routes **server side only**: the token never reaches a
 browser.
@@ -72,7 +76,9 @@ Each job run for a Lab account produces one `usage.recorded` event:
 - `cost_micro_usd` is what glutony paid providers, from the provider cost table
   (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). A call it cannot price
   costs 0 and sets `cost_complete: false`. The bundled prices are placeholders: set
-  yours before billing.
+  yours before billing. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
+  worker at boot; if it ever fails to load later, every call is flagged unpriced
+  (never priced at the bundled rates).
 - The Lab converts units and cost to credits; glutony never computes credits.
 
 Enable it with `LAB_EVENTS_ENABLED=true` on the workers and `LAB_URL` +
@@ -113,6 +119,13 @@ Scrapix answer `402`). Because glutony pays the LLM and transcription providers
 itself, an account at zero credits can still run up real cost. Do not sell glutony
 through the Lab to paying accounts until a suspend switch or a lease exists.
 
+## Before connecting a Lab
+
+- A Lab deployment must hold no global Meilisearch connections and no global
+  pipelines pinned to a connection: a tenant's pipeline that names a global
+  connection uid resolves to the global row and writes with its key. Until glutony
+  restricts tenant jobs to tenant-owned connections, keep connections tenant-scoped.
+
 ## What the Lab has to do
 
 1. Accept `product: "glutony"` and `glutonyUsageData` (schema:
@@ -124,7 +137,16 @@ through the Lab to paying accounts until a suspend switch or a lease exists.
 6. Call the management routes from the console's server with
    `LAB_SERVICE_TOKEN` and `X-Glutony-Tenant-Id`.
 
+## Rollout order
+
+Deploy the control plane, then the workers, then the gateway. The aliases make any
+order work, but this one never sends a new field to an old reader.
+
 ## Rollback
+
+Let in-flight pipeline workflows finish (or drain them) before rolling back:
+workflows started by the new binary carry `tenant_id`, which the previous binary does
+not read, so they would run without a tenant.
 
 `scripts/rollback-lab-seams.sql` undoes the tenant rename and drops the outbox so the
 previous binary starts. Stop every glutony service first, then run it once:
