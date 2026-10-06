@@ -86,8 +86,8 @@ pub struct ResolveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     /// Tenant scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Explicit pipeline uid (`POST /ingest/pipeline/{name}`); bypasses routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
@@ -103,13 +103,13 @@ pub struct ResolveResponse {
     pub index_pattern: Option<String>,
 }
 
-/// Keep only the pipelines visible to `project_id`: global ones plus that tenant's.
+/// Keep only the pipelines visible to `tenant_id`: global ones plus that tenant's.
 pub fn scope_pipelines(
     all: Vec<PipelineDefinition>,
-    project_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> Vec<PipelineDefinition> {
     all.into_iter()
-        .filter(|p| match (&p.project_id, project_id) {
+        .filter(|p| match (&p.tenant_id, tenant_id) {
             (None, _) => true,
             (Some(pid), Some(req)) => pid == req,
             (Some(_), None) => false,
@@ -124,11 +124,11 @@ pub fn resolve_with(
     req: &ResolveRequest,
 ) -> Result<ResolveResponse, CpError> {
     let router = PipelineRouter::new(candidates);
-    let project_id = req.project_id.as_deref();
+    let tenant_id = req.tenant_id.as_deref();
     let pipeline = match &req.pipeline {
-        Some(uid) => router.by_uid(uid, project_id).ok_or_else(|| {
+        Some(uid) => router.by_uid(uid, tenant_id).ok_or_else(|| {
             CpError::NotFound(format!(
-                "pipeline {uid:?} not found (project_id={project_id:?})"
+                "pipeline {uid:?} not found (tenant_id={tenant_id:?})"
             ))
         })?,
         None => {
@@ -136,7 +136,7 @@ pub fn resolve_with(
                 .resolve(RouteRequest {
                     mime: &req.mime,
                     filename: req.filename.as_deref(),
-                    project_id,
+                    tenant_id,
                 })
                 .ok_or_else(|| {
                     CpError::NoPipeline(format!(
@@ -175,12 +175,12 @@ pub async fn resolve(
         return resolve_with(builtin_pipelines(), &req).map(Json);
     }
     let user = state.cache.get_or_load(&state.pipelines()).await?;
-    let mut candidates = scope_pipelines(user, req.project_id.as_deref());
+    let mut candidates = scope_pipelines(user, req.tenant_id.as_deref());
     candidates.extend(builtin_pipelines());
     let res = resolve_with(candidates, &req)?;
     tracing::debug!(
         mime = %req.mime,
-        project_id = ?req.project_id,
+        tenant_id = ?req.tenant_id,
         pipeline = %res.pipeline.uid,
         "resolved pipeline"
     );
@@ -192,7 +192,7 @@ mod tests {
     use super::*;
     use meili_ingest_plugin_sdk::{PipelineTrigger, StepDefinition};
 
-    fn user_pdf(uid: &str, project_id: Option<&str>, index: Option<&str>) -> PipelineDefinition {
+    fn user_pdf(uid: &str, tenant_id: Option<&str>, index: Option<&str>) -> PipelineDefinition {
         PipelineDefinition {
             uid: uid.into(),
             name: uid.into(),
@@ -208,7 +208,7 @@ mod tests {
                 StepDefinition::new("index", "meili_indexer").depends_on(["extract"]),
             ],
             builtin: false,
-            project_id: project_id.map(str::to_owned),
+            tenant_id: tenant_id.map(str::to_owned),
         }
     }
 
@@ -216,7 +216,7 @@ mod tests {
         ResolveRequest {
             mime: mime.into(),
             filename: None,
-            project_id: None,
+            tenant_id: None,
             pipeline: None,
         }
     }
@@ -226,11 +226,11 @@ mod tests {
         let r: ResolveRequest = serde_json::from_str(r#"{"mime":"application/pdf"}"#).unwrap();
         assert_eq!(r, req("application/pdf"));
         let r: ResolveRequest = serde_json::from_str(
-            r#"{"mime":"text/csv","filename":"a.csv","project_id":"t1","pipeline":"x"}"#,
+            r#"{"mime":"text/csv","filename":"a.csv","tenant_id":"t1","pipeline":"x"}"#,
         )
         .unwrap();
         assert_eq!(r.filename.as_deref(), Some("a.csv"));
-        assert_eq!(r.project_id.as_deref(), Some("t1"));
+        assert_eq!(r.tenant_id.as_deref(), Some("t1"));
         assert_eq!(r.pipeline.as_deref(), Some("x"));
         assert!(serde_json::from_str::<ResolveRequest>(r#"{"filename":"a"}"#).is_err());
     }
@@ -255,7 +255,7 @@ mod tests {
         let mut c = scope_pipelines(all.clone(), Some("t1"));
         c.extend(builtin_pipelines());
         let mut r = req("application/pdf");
-        r.project_id = Some("t1".into());
+        r.tenant_id = Some("t1".into());
         let res = resolve_with(c, &r).unwrap();
         assert_eq!(res.pipeline.uid, "tenant-pdf");
         assert_eq!(res.index_pattern.as_deref(), Some("tenant_idx"));
@@ -264,7 +264,7 @@ mod tests {
         let mut c = scope_pipelines(all.clone(), Some("t2"));
         assert_eq!(c.len(), 1);
         c.extend(builtin_pipelines());
-        r.project_id = Some("t2".into());
+        r.tenant_id = Some("t2".into());
         let res = resolve_with(c, &r).unwrap();
         assert_eq!(res.pipeline.uid, "global-pdf");
 
@@ -287,7 +287,7 @@ mod tests {
             "builtin.csv"
         );
         r.pipeline = Some("mine".into());
-        r.project_id = Some("t1".into());
+        r.tenant_id = Some("t1".into());
         assert_eq!(resolve_with(c.clone(), &r).unwrap().pipeline.uid, "mine");
         r.pipeline = Some("nope".into());
         assert_eq!(resolve_with(c, &r).unwrap_err().code(), "not_found");

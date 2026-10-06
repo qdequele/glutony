@@ -27,13 +27,13 @@ async fn repo(prefix: &str) -> Option<SourceRepo> {
     Some(SourceRepo::new(pool))
 }
 
-fn new_source(uid: &str, project_id: Option<&str>, pipeline_uid: &str) -> NewSource {
+fn new_source(uid: &str, tenant_id: Option<&str>, pipeline_uid: &str) -> NewSource {
     NewSource {
         id: Uuid::new_v4(),
         uid: uid.to_string(),
         name: format!("source {uid}"),
         description: None,
-        project_id: project_id.map(str::to_owned),
+        tenant_id: tenant_id.map(str::to_owned),
         pipeline_uid: pipeline_uid.to_string(),
         location: Location::Url {
             url: "https://example.test/feed.json".into(),
@@ -96,7 +96,7 @@ async fn the_same_uid_may_exist_globally_and_per_tenant() {
         .expect("get")
         .expect("exists");
     assert_ne!(global.definition.id, tenant.definition.id);
-    assert_eq!(tenant.definition.project_id.as_deref(), Some("proj-1"));
+    assert_eq!(tenant.definition.tenant_id.as_deref(), Some("proj-1"));
 }
 
 #[tokio::test]
@@ -362,7 +362,7 @@ async fn a_tenant_cannot_modify_or_delete_a_global_source() {
         .expect("get")
         .expect("the global source must survive a tenant delete");
     assert_eq!(global.definition.name, "source tr-scope-1", "not renamed");
-    assert!(global.definition.project_id.is_none());
+    assert!(global.definition.tenant_id.is_none());
 
     // A tenant with no row of its own cannot reach the global one either.
     assert!(

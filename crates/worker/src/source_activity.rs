@@ -282,8 +282,8 @@ impl SourceActivities {
 
         // The pipeline as it is now, so an edit takes effect on the next tick.
         let mut pipeline_url = self.url(&["pipelines", &d.pipeline_uid])?;
-        if let Some(p) = &d.project_id {
-            pipeline_url.query_pairs_mut().append_pair("project_id", p);
+        if let Some(p) = &d.tenant_id {
+            pipeline_url.query_pairs_mut().append_pair("tenant_id", p);
         }
         let pipeline: PipelineDefinition = self
             .get_json(pipeline_url, "load pipeline")
@@ -357,7 +357,7 @@ impl SourceActivities {
                 .await
                 .map_err(|e| PluginError::Retryable(format!("staging a fetched item: {e}")))?;
             let context = MeiliContext {
-                project_id: d.project_id.clone(),
+                tenant_id: d.tenant_id.clone(),
                 index: Some(index),
                 ..Default::default()
             };
@@ -395,7 +395,7 @@ impl SourceActivities {
             "job_id": job_id,
             "workflow_id": PipelineWorkflowInput::workflow_id(job_id),
             "pipeline_uid": pipeline.uid,
-            "project_id": context.project_id,
+            "tenant_id": context.tenant_id,
             "index_name": context.index,
             "status": JobStatus::Queued.as_str(),
             "started_at": now,
@@ -519,7 +519,7 @@ mod tests {
                     .config(config),
             ],
             builtin: false,
-            project_id: Some("tenant-1".into()),
+            tenant_id: Some("tenant-1".into()),
         }
     }
 
@@ -528,7 +528,7 @@ mod tests {
             "id": "11111111-1111-1111-1111-111111111111",
             "uid": "tmdb",
             "name": "tmdb",
-            "project_id": "tenant-1",
+            "tenant_id": "tenant-1",
             "pipeline_uid": "movies",
             "location": { "kind": "url", "url": url },
             "cron": "30 0 * * *",
@@ -640,7 +640,7 @@ mod tests {
             Some("movies"),
             "the source's index"
         );
-        assert_eq!(job.context.project_id.as_deref(), Some("tenant-1"));
+        assert_eq!(job.context.tenant_id.as_deref(), Some("tenant-1"));
         assert!(
             job.context.host.is_none() && job.context.api_key.is_none(),
             "the destination is the pipeline's connection, not the context"

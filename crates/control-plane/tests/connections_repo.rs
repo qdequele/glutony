@@ -30,12 +30,12 @@ async fn pool(prefix: &str) -> Option<PgPool> {
     Some(pool)
 }
 
-fn new_connection(uid: &str, project_id: Option<&str>) -> NewConnection {
+fn new_connection(uid: &str, tenant_id: Option<&str>) -> NewConnection {
     NewConnection {
         id: Uuid::new_v4(),
         uid: uid.to_string(),
         name: format!("connection {uid}"),
-        project_id: project_id.map(str::to_owned),
+        tenant_id: tenant_id.map(str::to_owned),
         host: "https://movies.example".into(),
         api_key: vec![7, 7, 7],
     }
@@ -55,7 +55,7 @@ fn pipeline_using(uid: &str, project: Option<&str>, connection: &str) -> Pipelin
                 .config(serde_json::json!({ "connection": connection })),
         ],
         builtin: false,
-        project_id: project.map(str::to_owned),
+        tenant_id: project.map(str::to_owned),
     }
 }
 

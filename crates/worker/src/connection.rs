@@ -54,7 +54,7 @@ pub async fn resolve_connection(
     settings: &ConnectionSettings,
     plugin: &str,
     mut config: Value,
-    project_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> Result<Value, PluginError> {
     if plugin != INDEXER_PLUGIN {
         return Ok(config);
@@ -72,7 +72,7 @@ pub async fn resolve_connection(
         .base_url
         .ok_or_else(|| fail("no control plane is configured on this worker".into()))?;
 
-    let row = fetch(control_plane.http, base, &name, project_id).await?;
+    let row = fetch(control_plane.http, base, &name, tenant_id).await?;
 
     let api_key = key.open(&row.api_key).map_err(|_| {
         fail(
@@ -102,7 +102,7 @@ async fn fetch(
     http: &reqwest::Client,
     base: &str,
     name: &str,
-    project_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> Result<ConnectionRow, PluginError> {
     let mut url = Url::parse(&format!("{base}/internal/connections/"))
         .map_err(|e| PluginError::NonRetryable(format!("control plane url: {e}")))?;
@@ -111,8 +111,8 @@ async fn fetch(
         .map_err(|()| PluginError::NonRetryable("control plane url cannot be a base".into()))?
         .pop_if_empty()
         .push(name);
-    if let Some(p) = project_id {
-        url.query_pairs_mut().append_pair("project_id", p);
+    if let Some(p) = tenant_id {
+        url.query_pairs_mut().append_pair("tenant_id", p);
     }
 
     let resp = http
@@ -123,7 +123,7 @@ async fn fetch(
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(PluginError::NonRetryable(format!(
-            "connection {name:?} not found (project_id={project_id:?}); it may have been \
+            "connection {name:?} not found (tenant_id={tenant_id:?}); it may have been \
              deleted while this pipeline still names it"
         )));
     }
@@ -160,12 +160,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/internal/connections/prod-movies"))
-            .and(query_param("project_id", "tenant-1"))
+            .and(query_param("tenant_id", "tenant-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "11111111-1111-1111-1111-111111111111",
                 "uid": "prod-movies",
                 "name": "Movies",
-                "project_id": "tenant-1",
+                "tenant_id": "tenant-1",
                 "host": host,
                 "api_key": sealed,
                 "created_at": "2026-09-23T00:00:00Z",

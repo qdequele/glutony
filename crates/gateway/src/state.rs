@@ -94,6 +94,11 @@ pub struct GatewayConfig {
     /// Check the request's Meilisearch key against the target index before queueing a
     /// job (`WRITE_PREFLIGHT`, default off). See [`crate::preflight`].
     pub write_preflight: bool,
+    /// Bearer token the Meilisearch Lab uses on management routes (`LAB_SERVICE_TOKEN`).
+    /// Setting it (or `admin_api_key`) closes open mode. See [`crate::auth`].
+    pub lab_service_token: Option<String>,
+    /// Bearer token an operator uses on management routes (`ADMIN_API_KEY`).
+    pub admin_api_key: Option<String>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -120,6 +125,14 @@ impl std::fmt::Debug for GatewayConfig {
             .field("usage_api", &self.usage_api)
             .field("cors_allow_origins", &self.cors_allow_origins)
             .field("write_preflight", &self.write_preflight)
+            .field(
+                "lab_service_token",
+                &self.lab_service_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -141,6 +154,8 @@ impl Default for GatewayConfig {
             usage_api: None,
             cors_allow_origins: Vec::new(),
             write_preflight: false,
+            lab_service_token: None,
+            admin_api_key: None,
         }
     }
 }
@@ -174,6 +189,8 @@ impl GatewayConfig {
                 .map(|v| split_list(&v))
                 .unwrap_or_default(),
             write_preflight: env_parse("WRITE_PREFLIGHT", d.write_preflight)?,
+            lab_service_token: env_opt("LAB_SERVICE_TOKEN"),
+            admin_api_key: env_opt("ADMIN_API_KEY"),
         })
     }
 
@@ -409,8 +426,8 @@ pub struct JobRecord {
     /// Pipeline that was run.
     pub pipeline_uid: String,
     /// Tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Target index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_name: Option<String>,
@@ -455,8 +472,8 @@ pub struct ResolveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     /// Tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Explicit pipeline uid (skips MIME routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
@@ -504,9 +521,9 @@ impl ControlPlaneClient {
         format!("{}{}", self.base_url, path)
     }
 
-    pub(crate) fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
-        project_id
-            .map(|p| vec![("project_id", p.to_string())])
+    pub(crate) fn tenant_query(tenant_id: Option<&str>) -> Vec<(&'static str, String)> {
+        tenant_id
+            .map(|p| vec![("tenant_id", p.to_string())])
             .unwrap_or_default()
     }
 
@@ -567,13 +584,13 @@ impl ControlPlaneClient {
         &self,
         mime: &str,
         filename: Option<&str>,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         pipeline: Option<&str>,
     ) -> Result<ResolveResponse, GatewayError> {
         let body = ResolveRequest {
             mime: mime.to_string(),
             filename: filename.map(str::to_string),
-            project_id: project_id.map(str::to_string),
+            tenant_id: tenant_id.map(str::to_string),
             pipeline: pipeline.map(str::to_string),
         };
         self.send_json(
@@ -583,30 +600,30 @@ impl ControlPlaneClient {
         .await
     }
 
-    /// `GET /pipelines/{uid}?project_id=`.
+    /// `GET /pipelines/{uid}?tenant_id=`.
     pub async fn get_pipeline(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<PipelineDefinition, GatewayError> {
         self.send_json(
             self.http
                 .get(self.url(&format!("/pipelines/{uid}")))
-                .query(&Self::project_query(project_id)),
+                .query(&Self::tenant_query(tenant_id)),
             "get pipeline",
         )
         .await
     }
 
-    /// `GET /pipelines?project_id=`.
+    /// `GET /pipelines?tenant_id=`.
     pub async fn list_pipelines(
         &self,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<PipelineDefinition>, GatewayError> {
         self.send_json(
             self.http
                 .get(self.url("/pipelines"))
-                .query(&Self::project_query(project_id)),
+                .query(&Self::tenant_query(tenant_id)),
             "list pipelines",
         )
         .await
@@ -645,19 +662,19 @@ impl ControlPlaneClient {
             .await
     }
 
-    /// `DELETE /pipelines/{uid}?project_id=`.
+    /// `DELETE /pipelines/{uid}?tenant_id=`.
     ///
     /// Returns the ids of the sources the delete archived, whose Temporal schedules the
     /// caller must delete. An older control plane answering `204` reports none.
     pub async fn delete_pipeline(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<Uuid>, GatewayError> {
         let resp = self
             .http
             .delete(self.url(&format!("/pipelines/{uid}")))
-            .query(&Self::project_query(project_id))
+            .query(&Self::tenant_query(tenant_id))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -825,7 +842,7 @@ mod tests {
                 "meili_indexer",
             )],
             builtin: true,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -898,11 +915,15 @@ mod tests {
         let cfg = GatewayConfig {
             meili_api_key: Some("SUPERSECRET".into()),
             envoy_trusted_header: Some("ENVOYSECRET".into()),
+            lab_service_token: Some("lab-secret-value".into()),
+            admin_api_key: Some("admin-secret-value".into()),
             ..Default::default()
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SUPERSECRET"));
         assert!(!dbg.contains("ENVOYSECRET"));
+        assert!(!dbg.contains("lab-secret-value"));
+        assert!(!dbg.contains("admin-secret-value"));
         assert_eq!(cfg.max_upload_bytes(), 500 * 1024 * 1024);
     }
 
@@ -951,7 +972,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/pipelines/builtin.pdf"))
-            .and(query_param("project_id", "tenant-a"))
+            .and(query_param("tenant_id", "tenant-a"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&def))
             .mount(&server)
             .await;
@@ -1011,7 +1032,7 @@ mod tests {
             job_id,
             workflow_id: format!("ingest-{job_id}"),
             pipeline_uid: "builtin.pdf".into(),
-            project_id: None,
+            tenant_id: None,
             index_name: Some("documents".into()),
             status: JobStatus::Queued,
             current_step: None,

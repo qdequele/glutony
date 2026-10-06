@@ -8,14 +8,14 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
 
+use crate::auth::Scope;
 use crate::connections::{
     ConnectionView, CreateConnection, UpdateConnection, normalize_host, valid_uid,
     validate_destination,
 };
-use crate::context::resolve_project_id;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -45,13 +45,13 @@ fn not_found(uid: &str) -> GatewayError {
 /// `GET /connections` — the tenant's connections plus global ones, keys masked.
 pub async fn list_connections(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
 ) -> Result<Json<Vec<ConnectionView>>, GatewayError> {
     state.connections.key()?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
     let rows = state
         .control_plane
-        .list_connections(project_id.as_deref())
+        .list_connections(tenant_id.as_deref())
         .await?;
     Ok(Json(
         rows.into_iter()
@@ -63,7 +63,7 @@ pub async fn list_connections(
 /// `POST /connections` — validate, seal and store a connection.
 pub async fn create_connection(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ConnectionView>), GatewayError> {
     let key = state.connections.key()?;
@@ -81,12 +81,12 @@ pub async fn create_connection(
         .seal(api_key.as_bytes())
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
     let name = non_blank(req.name).unwrap_or_else(|| uid.clone());
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
-        .create_connection(&uid, &name, project_id.as_deref(), &host, &sealed)
+        .create_connection(&uid, &name, tenant_id.as_deref(), &host, &sealed)
         .await?;
-    tracing::info!(uid = %uid, host = %host, project_id = ?project_id, "connection created");
+    tracing::info!(uid = %uid, host = %host, tenant_id = ?tenant_id, "connection created");
     Ok((
         StatusCode::CREATED,
         Json(ConnectionView::from_record(record, Some(Vec::new()))),
@@ -96,20 +96,20 @@ pub async fn create_connection(
 /// `GET /connections/{uid}` — one connection, key masked, with the pipelines using it.
 pub async fn get_connection(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<ConnectionView>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
-        .get_connection(&uid, project_id.as_deref())
+        .get_connection(&uid, tenant_id.as_deref())
         .await?
         .ok_or_else(|| not_found(&uid))?;
     let used_by = state
         .control_plane
-        .connection_used_by(&uid, project_id.as_deref())
+        .connection_used_by(&uid, tenant_id.as_deref())
         .await?;
     Ok(Json(ConnectionView::from_record(record, Some(used_by))))
 }
@@ -118,22 +118,22 @@ pub async fn get_connection(
 /// `api_key` is re-validated against Meilisearch; omitting `api_key` keeps it.
 pub async fn patch_connection(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ConnectionView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateConnection = parse_body(&body)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
 
     // Reads fall back to the global row, writes never do: a tenant must not reach a
     // global connection, so anything outside the caller's exact scope is "not found".
     let stored = state
         .control_plane
-        .get_connection(&uid, project_id.as_deref())
+        .get_connection(&uid, tenant_id.as_deref())
         .await?
-        .filter(|r| r.project_id == project_id)
+        .filter(|r| r.tenant_id == tenant_id)
         .ok_or_else(|| not_found(&uid))?;
 
     let new_host = req.host.as_deref().map(normalize_host).transpose()?;
@@ -173,7 +173,7 @@ pub async fn patch_connection(
         .control_plane
         .update_connection(
             &uid,
-            project_id.as_deref(),
+            tenant_id.as_deref(),
             name.as_deref(),
             new_host.as_ref().map(|(h, _)| h.as_str()),
             sealed.as_deref(),
@@ -182,7 +182,7 @@ pub async fn patch_connection(
         .ok_or_else(|| not_found(&uid))?;
     let used_by = state
         .control_plane
-        .connection_used_by(&uid, project_id.as_deref())
+        .connection_used_by(&uid, tenant_id.as_deref())
         .await?;
     Ok(Json(ConnectionView::from_record(record, Some(used_by))))
 }
@@ -191,15 +191,22 @@ pub async fn patch_connection(
 /// Decision 15); they fail at run time naming the missing connection.
 pub async fn delete_connection(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
+    // Writes never reach a row outside the caller's exact scope (spec §4.3).
     state
         .control_plane
-        .delete_connection(&uid, project_id.as_deref())
+        .get_connection(&uid, tenant_id.as_deref())
+        .await?
+        .filter(|r| r.tenant_id == tenant_id)
+        .ok_or_else(|| not_found(&uid))?;
+    state
+        .control_plane
+        .delete_connection(&uid, tenant_id.as_deref())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -502,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_cannot_patch_a_global_connection() {
         let cp = MockServer::start().await;
-        // The read falls back to the global row (no project_id)…
+        // The read falls back to the global row (no tenant_id)…
         Mock::given(method("GET"))
             .and(path("/internal/connections/prod"))
             .respond_with(ResponseTemplate::new(200).set_body_json(record(
@@ -542,5 +549,53 @@ mod tests {
             StatusCode::NOT_FOUND,
             "…but the write must not reach it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_delete_a_global_connection() {
+        let cp = MockServer::start().await;
+        let global = record("prod", "https://m.example", b"sealed"); // no tenant_id
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(global))
+            .mount(&cp)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/internal/connections/prod"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let app = app(&cp, Some(secret()));
+        let req = Request::delete("/connections/prod")
+            .header("x-meili-project-id", "tenant-1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rows_say_whose_they_are() {
+        let cp = MockServer::start().await;
+        let mut own = record("mine", "https://m.example", b"sealed");
+        own["tenant_id"] = "tenant-1".into();
+        let global = record("prod", "https://m.example", b"sealed");
+        Mock::given(method("GET"))
+            .and(path("/internal/connections"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([own, global])),
+            )
+            .mount(&cp)
+            .await;
+        let app = app(&cp, Some(secret()));
+        let req = Request::get("/connections")
+            .header("x-meili-project-id", "tenant-1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["scope"], "tenant");
+        assert_eq!(body[1]["scope"], "global");
     }
 }

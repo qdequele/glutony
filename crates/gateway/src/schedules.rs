@@ -34,7 +34,7 @@ pub struct SourceSchedule {
     /// The source the schedule runs.
     pub source_id: Uuid,
     /// Its tenant scope.
-    pub project_id: Option<String>,
+    pub tenant_id: Option<String>,
     /// Cron expression; Temporal validates it (Decision 10).
     pub cron: String,
     /// IANA timezone the cron is evaluated in.
@@ -87,7 +87,7 @@ pub fn spec_for(s: &SourceSchedule) -> ScheduleSpec {
 pub fn action_for(s: &SourceSchedule) -> ScheduleAction {
     let input = SourceRunInput {
         source_id: s.source_id,
-        project_id: s.project_id.clone(),
+        tenant_id: s.tenant_id.clone(),
     };
     ScheduleAction::start_workflow(
         UntypedWorkflow::new(SOURCE_RUN_WORKFLOW),
@@ -268,7 +268,7 @@ mod tests {
         SourceSchedule {
             schedule_id: SourceRunInput::schedule_id(id),
             source_id: id,
-            project_id: Some("tenant-1".into()),
+            tenant_id: Some("tenant-1".into()),
             cron: "30 0 * * *".into(),
             timezone: "Europe/Paris".into(),
             paused,

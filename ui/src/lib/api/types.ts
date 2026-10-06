@@ -125,7 +125,7 @@ export interface PipelineDefinition {
   /** Read-only: true for pipelines compiled into the control plane. */
   builtin?: boolean;
   /** Read-only: tenant scope. Absent = global. */
-  project_id?: string;
+  tenant_id?: string;
 }
 
 // ---------------------------------------------------------------------------

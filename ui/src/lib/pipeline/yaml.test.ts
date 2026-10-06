@@ -204,7 +204,7 @@ describe("draft ⇄ PipelineDefinition", () => {
       steps: [{ id: "a", plugin: "pdf_extractor" }],
       builtin: true,
       version: 7,
-      project_id: "tenant-1",
+      tenant_id: "tenant-1",
     });
     expect(Object.keys(draft).sort()).toEqual([
       "description",

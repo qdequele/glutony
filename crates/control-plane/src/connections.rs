@@ -24,8 +24,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::CpError;
-use crate::pipelines::ProjectQuery;
-use crate::{AppState, JsonBody, project_scope};
+use crate::pipelines::TenantQuery;
+use crate::{AppState, JsonBody, tenant_scope};
 
 /// Postgres `unique_violation`.
 const UNIQUE_VIOLATION: &str = "23505";
@@ -40,8 +40,8 @@ pub struct NewConnection {
     /// Display name.
     pub name: String,
     /// Tenant scope; `None` = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Meilisearch URL. Not secret.
     pub host: String,
     /// Sealed API key.
@@ -74,8 +74,8 @@ pub struct ConnectionRecord {
     /// Display name.
     pub name: String,
     /// Tenant scope; `None` = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Meilisearch URL.
     pub host: String,
     /// Sealed API key.
@@ -98,20 +98,20 @@ impl ConnectionRepo {
         Self { pool }
     }
 
-    /// Global connections plus the ones scoped to `project_id`; tenant rows first.
-    pub async fn list(&self, project_id: Option<&str>) -> Result<Vec<ConnectionRecord>, CpError> {
+    /// Global connections plus the ones scoped to `tenant_id`; tenant rows first.
+    pub async fn list(&self, tenant_id: Option<&str>) -> Result<Vec<ConnectionRecord>, CpError> {
         Ok(sqlx::query_as(
-            "SELECT id, uid, name, project_id, host, api_key, created_at, updated_at \
+            "SELECT id, uid, name, tenant_id, host, api_key, created_at, updated_at \
              FROM meili_connections \
-             WHERE project_id IS NULL OR project_id = $1 \
-             ORDER BY (project_id IS NULL), uid",
+             WHERE tenant_id IS NULL OR tenant_id = $1 \
+             ORDER BY (tenant_id IS NULL), uid",
         )
-        .bind(project_id)
+        .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?)
     }
 
-    /// Fetch one connection by uid: the tenant's row when `project_id` is given and it
+    /// Fetch one connection by uid: the tenant's row when `tenant_id` is given and it
     /// exists, otherwise the global row.
     ///
     /// This is the lookup the worker uses to resolve an indexer step's `connection`, so
@@ -119,17 +119,17 @@ impl ConnectionRepo {
     pub async fn get(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Option<ConnectionRecord>, CpError> {
         Ok(sqlx::query_as(
-            "SELECT id, uid, name, project_id, host, api_key, created_at, updated_at \
+            "SELECT id, uid, name, tenant_id, host, api_key, created_at, updated_at \
              FROM meili_connections \
-             WHERE uid = $1 AND (project_id IS NULL OR project_id = $2) \
-             ORDER BY (project_id IS NULL) \
+             WHERE uid = $1 AND (tenant_id IS NULL OR tenant_id = $2) \
+             ORDER BY (tenant_id IS NULL) \
              LIMIT 1",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?)
     }
@@ -138,14 +138,14 @@ impl ConnectionRepo {
     /// [`CpError::Validation`] naming it, not a raw database error.
     pub async fn insert(&self, new: &NewConnection) -> Result<ConnectionRecord, CpError> {
         sqlx::query_as(
-            "INSERT INTO meili_connections (id, uid, name, project_id, host, api_key) \
+            "INSERT INTO meili_connections (id, uid, name, tenant_id, host, api_key) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             RETURNING id, uid, name, project_id, host, api_key, created_at, updated_at",
+             RETURNING id, uid, name, tenant_id, host, api_key, created_at, updated_at",
         )
         .bind(new.id)
         .bind(&new.uid)
         .bind(&new.name)
-        .bind(new.project_id.as_deref())
+        .bind(new.tenant_id.as_deref())
         .bind(&new.host)
         .bind(&new.api_key)
         .fetch_one(&self.pool)
@@ -157,7 +157,7 @@ impl ConnectionRepo {
             );
             if duplicate {
                 CpError::Validation(format!(
-                    "a connection named {:?} already exists in this project",
+                    "a connection named {:?} already exists for this tenant",
                     new.uid
                 ))
             } else {
@@ -166,12 +166,12 @@ impl ConnectionRepo {
         })
     }
 
-    /// Apply a partial update to the row in exactly `project_id`'s scope. `None` when no
+    /// Apply a partial update to the row in exactly `tenant_id`'s scope. `None` when no
     /// such row exists.
     pub async fn update(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         patch: &ConnectionPatch,
     ) -> Result<Option<ConnectionRecord>, CpError> {
         Ok(sqlx::query_as(
@@ -180,11 +180,11 @@ impl ConnectionRepo {
                 host = COALESCE($4, host), \
                 api_key = COALESCE($5, api_key), \
                 updated_at = now() \
-             WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '') \
-             RETURNING id, uid, name, project_id, host, api_key, created_at, updated_at",
+             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '') \
+             RETURNING id, uid, name, tenant_id, host, api_key, created_at, updated_at",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .bind(patch.name.as_deref())
         .bind(patch.host.as_deref())
         .bind(patch.api_key.as_deref())
@@ -192,18 +192,18 @@ impl ConnectionRepo {
         .await?)
     }
 
-    /// Delete the connection in exactly `project_id`'s scope.
+    /// Delete the connection in exactly `tenant_id`'s scope.
     ///
     /// Never blocked by pipelines that reference it (spec Decision 15): those fail at run
     /// time naming the missing connection. [`ConnectionRepo::used_by`] lets a caller
     /// show what a delete will break before doing it.
-    pub async fn delete(&self, uid: &str, project_id: Option<&str>) -> Result<bool, CpError> {
+    pub async fn delete(&self, uid: &str, tenant_id: Option<&str>) -> Result<bool, CpError> {
         let done = sqlx::query(
             "DELETE FROM meili_connections \
-             WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '')",
+             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() > 0)
@@ -220,7 +220,7 @@ impl ConnectionRepo {
     pub async fn used_by(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<String>, CpError> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT p.uid FROM pipelines p \
@@ -229,11 +229,11 @@ impl ConnectionRepo {
                      AS s(step) \
                  WHERE s.step ->> 'plugin' = $3 \
                    AND s.step -> 'config' ->> 'connection' = $1) \
-               AND ($2::text IS NULL OR p.project_id IS NULL OR p.project_id = $2) \
+               AND ($2::text IS NULL OR p.tenant_id IS NULL OR p.tenant_id = $2) \
              ORDER BY p.uid",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .bind(INDEXER_PLUGIN)
         .fetch_all(&self.pool)
         .await?;
@@ -246,14 +246,14 @@ impl ConnectionRepo {
 // and redaction, and the worker resolves an indexer step's connection through `get`.
 // ---------------------------------------------------------------------------
 
-/// `GET /internal/connections?project_id=` → the tenant's plus global connections.
+/// `GET /internal/connections?tenant_id=` → the tenant's plus global connections.
 pub async fn list_connections(
     State(state): State<AppState>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionRecord>>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
-    Ok(Json(state.connections().list(project_id.as_deref()).await?))
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    Ok(Json(state.connections().list(tenant_id.as_deref()).await?))
 }
 
 /// `POST /internal/connections` body [`NewConnection`] → 201 [`ConnectionRecord`].
@@ -262,86 +262,86 @@ pub async fn create_connection(
     JsonBody(new): JsonBody<NewConnection>,
 ) -> Result<Response, CpError> {
     let stored = state.connections().insert(&new).await?;
-    tracing::info!(uid = %stored.uid, project_id = ?stored.project_id, "connection created");
+    tracing::info!(uid = %stored.uid, tenant_id = ?stored.tenant_id, "connection created");
     Ok((StatusCode::CREATED, Json(stored)).into_response())
 }
 
-/// `GET /internal/connections/{uid}?project_id=` → tenant row, else global, else 404.
+/// `GET /internal/connections/{uid}?tenant_id=` → tenant row, else global, else 404.
 pub async fn get_connection(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ConnectionRecord>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     state
         .connections()
-        .get(&uid, project_id.as_deref())
+        .get(&uid, tenant_id.as_deref())
         .await?
         .map(Json)
-        .ok_or_else(|| not_found(&uid, project_id.as_deref()))
+        .ok_or_else(|| not_found(&uid, tenant_id.as_deref()))
 }
 
-/// `PATCH /internal/connections/{uid}?project_id=` body [`ConnectionPatch`].
+/// `PATCH /internal/connections/{uid}?tenant_id=` body [`ConnectionPatch`].
 pub async fn patch_connection(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
     JsonBody(patch): JsonBody<ConnectionPatch>,
 ) -> Result<Json<ConnectionRecord>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     state
         .connections()
-        .update(&uid, project_id.as_deref(), &patch)
+        .update(&uid, tenant_id.as_deref(), &patch)
         .await?
         .map(Json)
-        .ok_or_else(|| not_found(&uid, project_id.as_deref()))
+        .ok_or_else(|| not_found(&uid, tenant_id.as_deref()))
 }
 
-/// `DELETE /internal/connections/{uid}?project_id=` → 204, or 404 when missing.
+/// `DELETE /internal/connections/{uid}?tenant_id=` → 204, or 404 when missing.
 /// Never blocked by pipelines referencing it (spec Decision 15).
 pub async fn delete_connection(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<StatusCode, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     let repo = state.connections();
     // Read before deleting only so the log names what the delete just broke.
-    let used_by = repo.used_by(&uid, project_id.as_deref()).await?;
-    if repo.delete(&uid, project_id.as_deref()).await? {
+    let used_by = repo.used_by(&uid, tenant_id.as_deref()).await?;
+    if repo.delete(&uid, tenant_id.as_deref()).await? {
         tracing::info!(
             uid = %uid,
-            project_id = ?project_id,
+            tenant_id = ?tenant_id,
             used_by = ?used_by,
             "connection deleted"
         );
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(not_found(&uid, project_id.as_deref()))
+        Err(not_found(&uid, tenant_id.as_deref()))
     }
 }
 
-/// `GET /internal/connections/{uid}/used_by?project_id=` → pipeline uids.
+/// `GET /internal/connections/{uid}/used_by?tenant_id=` → pipeline uids.
 pub async fn connection_used_by(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<String>>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     Ok(Json(
         state
             .connections()
-            .used_by(&uid, project_id.as_deref())
+            .used_by(&uid, tenant_id.as_deref())
             .await?,
     ))
 }
 
-fn not_found(uid: &str, project_id: Option<&str>) -> CpError {
+fn not_found(uid: &str, tenant_id: Option<&str>) -> CpError {
     CpError::NotFound(format!(
-        "connection {uid:?} not found (project_id={project_id:?})"
+        "connection {uid:?} not found (tenant_id={tenant_id:?})"
     ))
 }

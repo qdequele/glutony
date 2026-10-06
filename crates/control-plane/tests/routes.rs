@@ -63,7 +63,7 @@ fn pipeline(uid: &str, plugins: &[&str]) -> PipelineDefinition {
             .map(|(i, p)| StepDefinition::new(format!("s{i}"), *p))
             .collect(),
         builtin: false,
-        project_id: None,
+        tenant_id: None,
     }
 }
 
@@ -229,7 +229,7 @@ async fn resolve_explicit_builtin_without_db() {
 async fn resolve_uses_cached_user_pipelines_with_precedence() {
     let st = state();
     let mut tenant = pipeline("tenant-pdf", &["pdf_extractor", "meili_indexer"]);
-    tenant.project_id = Some("t1".into());
+    tenant.tenant_id = Some("t1".into());
     tenant.trigger = Some(PipelineTrigger {
         content_types: vec!["application/pdf".into()],
         filename_pattern: None,
@@ -248,7 +248,7 @@ async fn resolve_uses_cached_user_pipelines_with_precedence() {
         app(st.clone()),
         post_json(
             "/internal/resolve",
-            r#"{"mime":"application/pdf","filename":"a.pdf","project_id":"t1"}"#,
+            r#"{"mime":"application/pdf","filename":"a.pdf","tenant_id":"t1"}"#,
         ),
     )
     .await;
@@ -262,7 +262,7 @@ async fn resolve_uses_cached_user_pipelines_with_precedence() {
         app(st.clone()),
         post_json(
             "/internal/resolve",
-            r#"{"mime":"application/pdf","project_id":"t2"}"#,
+            r#"{"mime":"application/pdf","tenant_id":"t2"}"#,
         ),
     )
     .await;

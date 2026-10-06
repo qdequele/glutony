@@ -58,7 +58,7 @@ fn pipeline(connection: Option<&str>) -> PipelineDefinition {
                 .config(config),
         ],
         builtin: false,
-        project_id: Some("tenant-1".into()),
+        tenant_id: Some("tenant-1".into()),
     }
 }
 
@@ -67,7 +67,7 @@ fn source_row(url: &str, etag: Option<&str>) -> serde_json::Value {
         "id": SOURCE_ID,
         "uid": "tmdb",
         "name": "tmdb",
-        "project_id": "tenant-1",
+        "tenant_id": "tenant-1",
         "pipeline_uid": "movies",
         "location": { "kind": "url", "url": url },
         "cron": "30 0 * * *",
@@ -163,7 +163,7 @@ async fn run_source(
 
     let input = SourceRunInput {
         source_id: Uuid::parse_str(SOURCE_ID).expect("uuid"),
-        project_id: Some("tenant-1".into()),
+        tenant_id: Some("tenant-1".into()),
     };
     let workflow_id = format!(
         "{}-{}",

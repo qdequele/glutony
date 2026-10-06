@@ -67,7 +67,7 @@ function EditPipeline() {
       stored={{
         version: pipeline.data.version,
         builtin: pipeline.data.builtin,
-        project_id: pipeline.data.project_id,
+        tenant_id: pipeline.data.tenant_id,
       }}
     />
   );

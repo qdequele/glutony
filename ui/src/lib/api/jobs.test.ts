@@ -113,9 +113,9 @@ describe("the GET /jobs query string", () => {
     );
   });
 
-  it("never sends project_id: the gateway scopes the tenant itself", () => {
+  it("never sends tenant_id: the gateway scopes the tenant itself", () => {
     const search = jobListSearch({ status: "running", pipeline_uid: "p", limit: 25, offset: 25 });
-    expect(search).not.toContain("project_id");
+    expect(search).not.toContain("tenant_id");
   });
 });
 

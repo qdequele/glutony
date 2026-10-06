@@ -6,7 +6,7 @@
 //! Meilisearch connection its pipeline's `meili_indexer` step names (spec Decision 6).
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::PipelineDefinition;
+use meili_ingest_plugin_sdk::{PipelineDefinition, RowScope};
 use meili_ingest_source::{
     FetchAuth, HostPolicy, IncrementalState, Location, RunOutcome, SecretKey, SourceDefinition,
     SourceError, open_json, redact, render,
@@ -84,7 +84,7 @@ pub struct NewSource {
     pub description: Option<String>,
     /// Tenant scope.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    pub tenant_id: Option<String>,
     /// Pipeline fed.
     pub pipeline_uid: String,
     /// Where to fetch.
@@ -223,8 +223,11 @@ pub struct SourceView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Tenant scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
+    /// Whose row this is (spec §4.3).
+    #[serde(default)]
+    pub scope: RowScope,
     /// Pipeline fed.
     pub pipeline: String,
     /// Where it fetches from.
@@ -277,7 +280,8 @@ impl SourceView {
             uid: d.uid,
             name: d.name,
             description: d.description,
-            project_id: d.project_id,
+            scope: RowScope::of(false, d.tenant_id.as_deref()),
+            tenant_id: d.tenant_id,
             pipeline: d.pipeline_uid,
             location: d.location,
             cron: d.cron,
@@ -371,10 +375,10 @@ impl ControlPlaneClient {
     /// `GET /internal/sources`.
     pub async fn list_sources(
         &self,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         include_archived: bool,
     ) -> Result<Vec<SourceRecord>, GatewayError> {
-        let mut query = Self::project_query(project_id);
+        let mut query = Self::tenant_query(tenant_id);
         if include_archived {
             query.push(("include_archived", "true".into()));
         }
@@ -386,12 +390,12 @@ impl ControlPlaneClient {
     pub async fn get_source(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Option<SourceRecord>, GatewayError> {
         let req = self
             .http
             .get(self.source_url("sources", uid, "")?)
-            .query(&Self::project_query(project_id));
+            .query(&Self::tenant_query(tenant_id));
         not_found_to_none(self.send_json(req, "get source").await)
     }
 
@@ -405,13 +409,13 @@ impl ControlPlaneClient {
     pub async fn update_source(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         patch: &SourcePatch,
     ) -> Result<Option<SourceRecord>, GatewayError> {
         let req = self
             .http
             .patch(self.source_url("sources", uid, "")?)
-            .query(&Self::project_query(project_id))
+            .query(&Self::tenant_query(tenant_id))
             .json(patch);
         not_found_to_none(self.send_json(req, "update source").await).map_err(reword)
     }
@@ -420,12 +424,12 @@ impl ControlPlaneClient {
     pub async fn delete_source(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<(), GatewayError> {
         let req = self
             .http
             .delete(self.source_url("sources", uid, "")?)
-            .query(&Self::project_query(project_id));
+            .query(&Self::tenant_query(tenant_id));
         self.send_empty(req, "delete source").await
     }
 
@@ -521,7 +525,7 @@ mod tests {
                 "meili_indexer",
             )],
             builtin: false,
-            project_id: None,
+            tenant_id: None,
         };
         let err = require_pinned(&p).expect_err("unpinned");
         assert!(err.to_string().contains("connection"), "{err}");
@@ -545,7 +549,7 @@ mod tests {
                 uid: "tmdb".into(),
                 name: "TMDB".into(),
                 description: None,
-                project_id: None,
+                tenant_id: None,
                 pipeline_uid: "movies".into(),
                 location: url("https://x.example/a"),
                 cron: "0 3 * * *".into(),

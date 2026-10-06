@@ -11,14 +11,14 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use meili_ingest_source::{SecretKey, SourceRunInput, seal_json};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::auth::Scope;
 use crate::connections::valid_uid;
-use crate::context::resolve_project_id;
 use crate::error::GatewayError;
 use crate::schedules::SourceSchedule;
 use crate::sources::{
@@ -60,13 +60,13 @@ fn seal(key: &SecretKey, auth: &meili_ingest_source::FetchAuth) -> Result<Vec<u8
 async fn owned(
     state: &AppState,
     uid: &str,
-    project_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> Result<SourceRecord, GatewayError> {
     state
         .control_plane
-        .get_source(uid, project_id)
+        .get_source(uid, tenant_id)
         .await?
-        .filter(|r| r.definition.project_id.as_deref() == project_id)
+        .filter(|r| r.definition.tenant_id.as_deref() == tenant_id)
         .ok_or_else(|| not_found(uid))
 }
 
@@ -74,9 +74,9 @@ async fn owned(
 async fn schedulable_pipeline(
     state: &AppState,
     pipeline: &str,
-    project_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> Result<(), GatewayError> {
-    let def = match state.control_plane.get_pipeline(pipeline, project_id).await {
+    let def = match state.control_plane.get_pipeline(pipeline, tenant_id).await {
         Ok(def) => def,
         Err(GatewayError::NotFound(_)) => {
             return Err(GatewayError::Unprocessable(format!(
@@ -93,7 +93,7 @@ fn schedule_of(r: &SourceRecord) -> SourceSchedule {
     SourceSchedule {
         schedule_id: d.schedule_id.clone(),
         source_id: d.id,
-        project_id: d.project_id.clone(),
+        tenant_id: d.tenant_id.clone(),
         cron: d.cron.clone(),
         timezone: d.timezone.clone(),
         paused: d.paused,
@@ -111,14 +111,14 @@ pub struct ListQuery {
 /// `GET /sources`.
 pub async fn list_sources(
     State(state): State<AppState>,
+    scope: Scope,
     Query(q): Query<ListQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Vec<SourceView>>, GatewayError> {
     let key = state.connections.key()?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
     let rows = state
         .control_plane
-        .list_sources(project_id.as_deref(), q.include_archived)
+        .list_sources(tenant_id.as_deref(), q.include_archived)
         .await?;
     Ok(Json(
         rows.into_iter()
@@ -130,17 +130,17 @@ pub async fn list_sources(
 /// `POST /sources`.
 pub async fn create_source(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     body: Bytes,
 ) -> Result<(StatusCode, Json<SourceView>), GatewayError> {
     let key = state.connections.key()?;
     let req: CreateSource = parse_body(&body)?;
     let uid = req.uid.trim().to_owned();
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
 
     validate_location(&req.location, &req.timezone, &state.fetch_policy).await?;
-    schedulable_pipeline(&state, &req.pipeline, project_id.as_deref()).await?;
+    schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
     let fetch_auth = req.auth.as_ref().map(|a| seal(key, a)).transpose()?;
 
     let id = Uuid::new_v4();
@@ -149,7 +149,7 @@ pub async fn create_source(
         uid: uid.clone(),
         name: non_blank(req.name).unwrap_or_else(|| uid.clone()),
         description: non_blank(req.description),
-        project_id: project_id.clone(),
+        tenant_id: tenant_id.clone(),
         pipeline_uid: req.pipeline,
         location: req.location,
         cron: req.cron,
@@ -178,7 +178,7 @@ pub async fn create_source(
     };
     let record = match state
         .control_plane
-        .update_source(&uid, project_id.as_deref(), &patch)
+        .update_source(&uid, tenant_id.as_deref(), &patch)
         .await
     {
         Ok(Some(r)) => r,
@@ -201,7 +201,7 @@ pub async fn create_source(
         .ok()
         .flatten()
         .and_then(|i| i.next_run_at);
-    tracing::info!(uid = %uid, project_id = ?project_id, "source created");
+    tracing::info!(uid = %uid, tenant_id = ?tenant_id, "source created");
     Ok((
         StatusCode::CREATED,
         Json(SourceView::from_record(record, key, next)),
@@ -217,7 +217,7 @@ async fn undo_create(state: &AppState, record: &SourceRecord, schedule_created: 
     }
     if let Err(e) = state
         .control_plane
-        .delete_source(&d.uid, d.project_id.as_deref())
+        .delete_source(&d.uid, d.tenant_id.as_deref())
         .await
     {
         tracing::error!(uid = %d.uid, "rollback: could not delete source row: {e}");
@@ -227,15 +227,15 @@ async fn undo_create(state: &AppState, record: &SourceRecord, schedule_created: 
 /// `GET /sources/{uid}` — includes the next run from Temporal.
 pub async fn get_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<SourceView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
-        .get_source(&uid, project_id.as_deref())
+        .get_source(&uid, tenant_id.as_deref())
         .await?
         .ok_or_else(|| not_found(&uid))?;
     // Temporal is the truth for whether it fires and when; the row only mirrors it.
@@ -257,15 +257,15 @@ pub async fn get_source(
 /// `PATCH /sources/{uid}`.
 pub async fn patch_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SourceView>, GatewayError> {
     let key = state.connections.key()?;
     check_uid(&uid)?;
     let req: UpdateSource = parse_body(&body)?;
-    let project_id = resolve_project_id(&headers, &state.config);
-    let stored = owned(&state, &uid, project_id.as_deref()).await?;
+    let tenant_id = scope.tenant_id.clone();
+    let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     let d = &stored.definition;
 
     let timezone = req.timezone.clone().unwrap_or_else(|| d.timezone.clone());
@@ -274,7 +274,7 @@ pub async fn patch_source(
         validate_location(location, &timezone, &state.fetch_policy).await?;
     }
     if let Some(pipeline) = &req.pipeline {
-        schedulable_pipeline(&state, pipeline, project_id.as_deref()).await?;
+        schedulable_pipeline(&state, pipeline, tenant_id.as_deref()).await?;
     }
     let fetch_auth = match &req.auth {
         None => None,
@@ -306,7 +306,7 @@ pub async fn patch_source(
     };
     let record = state
         .control_plane
-        .update_source(&uid, project_id.as_deref(), &patch)
+        .update_source(&uid, tenant_id.as_deref(), &patch)
         .await?
         .ok_or_else(|| not_found(&uid))?;
     Ok(Json(SourceView::from_record(record, key, None)))
@@ -315,13 +315,12 @@ pub async fn patch_source(
 async fn set_paused(
     state: &AppState,
     uid: &str,
-    headers: &HeaderMap,
+    tenant_id: Option<&str>,
     paused: bool,
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(uid)?;
-    let project_id = resolve_project_id(headers, &state.config);
-    let stored = owned(state, uid, project_id.as_deref()).await?;
+    let stored = owned(state, uid, tenant_id).await?;
     state
         .schedules
         .set_paused(&stored.definition.schedule_id, paused)
@@ -336,32 +335,32 @@ async fn set_paused(
 /// `POST /sources/{uid}/pause`.
 pub async fn pause_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    set_paused(&state, &uid, &headers, true).await
+    set_paused(&state, &uid, scope.tenant(), true).await
 }
 
 /// `POST /sources/{uid}/unpause`.
 pub async fn unpause_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    set_paused(&state, &uid, &headers, false).await
+    set_paused(&state, &uid, scope.tenant(), false).await
 }
 
 /// `POST /sources/{uid}/run` — run now, off-schedule. Skipped by Temporal if a run is
 /// already in flight.
 pub async fn run_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
-    let stored = owned(&state, &uid, project_id.as_deref()).await?;
+    let tenant_id = scope.tenant_id.clone();
+    let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     if stored.definition.archived_at.is_some() {
         return Err(GatewayError::Unprocessable(format!(
             "source {uid:?} is archived: its pipeline was deleted"
@@ -381,22 +380,22 @@ pub async fn run_source(
 /// is about to disappear.
 pub async fn delete_source(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
-    let stored = owned(&state, &uid, project_id.as_deref()).await?;
+    let tenant_id = scope.tenant_id.clone();
+    let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     state
         .schedules
         .delete(&stored.definition.schedule_id)
         .await?;
     state
         .control_plane
-        .delete_source(&uid, project_id.as_deref())
+        .delete_source(&uid, tenant_id.as_deref())
         .await?;
-    tracing::info!(uid = %uid, project_id = ?project_id, "source deleted");
+    tracing::info!(uid = %uid, tenant_id = ?tenant_id, "source deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -411,16 +410,16 @@ pub struct RunsQuery {
 /// `GET /sources/{uid}/runs`.
 pub async fn list_runs(
     State(state): State<AppState>,
+    scope: Scope,
     Path(uid): Path<String>,
     Query(q): Query<RunsQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<Vec<RunRecord>>, GatewayError> {
     state.connections.key()?;
     check_uid(&uid)?;
-    let project_id = resolve_project_id(&headers, &state.config);
+    let tenant_id = scope.tenant_id.clone();
     let record = state
         .control_plane
-        .get_source(&uid, project_id.as_deref())
+        .get_source(&uid, tenant_id.as_deref())
         .await?
         .ok_or_else(|| not_found(&uid))?;
     let limit = q.limit.unwrap_or(20).clamp(1, 200);
@@ -807,7 +806,7 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_cannot_trigger_a_global_source() {
         let cp = MockServer::start().await;
-        mount_source(&cp).await; // the record has no project_id: it is global
+        mount_source(&cp).await; // the record has no tenant_id: it is global
         let schedules = Arc::new(FakeSchedules::default());
         let req = Request::builder()
             .method("POST")

@@ -11,7 +11,7 @@ use sqlx::types::Json as SqlJson;
 
 use crate::builtin_pipelines::{builtin_pipelines, is_builtin_uid, is_known_plugin};
 use crate::error::CpError;
-use crate::{AppState, JsonBody, project_scope};
+use crate::{AppState, JsonBody, tenant_scope};
 
 /// Repository over the `pipelines` table.
 #[derive(Debug, Clone)]
@@ -25,17 +25,17 @@ struct PipelineRow {
     uid: String,
     version: i32,
     definition: SqlJson<PipelineDefinition>,
-    project_id: Option<String>,
+    tenant_id: Option<String>,
 }
 
 impl PipelineRow {
     /// Turn the row into the API shape: the JSONB definition with authoritative
-    /// `version`/`project_id` from the columns and `builtin` forced to `false`.
+    /// `version`/`tenant_id` from the columns and `builtin` forced to `false`.
     fn into_definition(self) -> PipelineDefinition {
         let mut def = self.definition.0;
         def.uid = self.uid;
         def.version = u32::try_from(self.version).unwrap_or(1);
-        def.project_id = self.project_id;
+        def.tenant_id = self.tenant_id;
         def.builtin = false;
         def
     }
@@ -47,15 +47,15 @@ impl PipelineRepo {
         Self { pool }
     }
 
-    /// Global pipelines plus the ones scoped to `project_id` (when given).
+    /// Global pipelines plus the ones scoped to `tenant_id` (when given).
     /// Tenant rows come first, then global rows; each group sorted by uid.
-    pub async fn list(&self, project_id: Option<&str>) -> Result<Vec<PipelineDefinition>, CpError> {
+    pub async fn list(&self, tenant_id: Option<&str>) -> Result<Vec<PipelineDefinition>, CpError> {
         let rows: Vec<PipelineRow> = sqlx::query_as(
-            "SELECT uid, version, definition, project_id FROM pipelines \
-             WHERE project_id IS NULL OR project_id = $1 \
-             ORDER BY (project_id IS NULL), uid",
+            "SELECT uid, version, definition, tenant_id FROM pipelines \
+             WHERE tenant_id IS NULL OR tenant_id = $1 \
+             ORDER BY (tenant_id IS NULL), uid",
         )
-        .bind(project_id)
+        .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(PipelineRow::into_definition).collect())
@@ -64,66 +64,66 @@ impl PipelineRepo {
     /// Every user pipeline across all tenants (used to fill the resolver cache).
     pub async fn list_all(&self) -> Result<Vec<PipelineDefinition>, CpError> {
         let rows: Vec<PipelineRow> = sqlx::query_as(
-            "SELECT uid, version, definition, project_id FROM pipelines \
-             ORDER BY (project_id IS NULL), project_id, uid",
+            "SELECT uid, version, definition, tenant_id FROM pipelines \
+             ORDER BY (tenant_id IS NULL), tenant_id, uid",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(PipelineRow::into_definition).collect())
     }
 
-    /// Fetch one pipeline by uid: the tenant-scoped row when `project_id` is given and
+    /// Fetch one pipeline by uid: the tenant-scoped row when `tenant_id` is given and
     /// exists, otherwise the global row.
     pub async fn get(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Option<PipelineDefinition>, CpError> {
         let row: Option<PipelineRow> = sqlx::query_as(
-            "SELECT uid, version, definition, project_id FROM pipelines \
-             WHERE uid = $1 AND (project_id IS NULL OR project_id = $2) \
-             ORDER BY (project_id IS NULL) LIMIT 1",
+            "SELECT uid, version, definition, tenant_id FROM pipelines \
+             WHERE uid = $1 AND (tenant_id IS NULL OR tenant_id = $2) \
+             ORDER BY (tenant_id IS NULL) LIMIT 1",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(PipelineRow::into_definition))
     }
 
-    /// Insert or update by `(uid, project_id)`. On update the stored `version` is
+    /// Insert or update by `(uid, tenant_id)`. On update the stored `version` is
     /// incremented and `updated_at` set to `now()`. Returns the stored definition.
     pub async fn upsert(&self, def: &PipelineDefinition) -> Result<PipelineDefinition, CpError> {
         let version = i32::try_from(def.version.max(1)).unwrap_or(1);
         let row: PipelineRow = sqlx::query_as(
-            "INSERT INTO pipelines (uid, name, description, version, definition, project_id) \
+            "INSERT INTO pipelines (uid, name, description, version, definition, tenant_id) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (uid, COALESCE(project_id, '')) DO UPDATE SET \
+             ON CONFLICT (uid, COALESCE(tenant_id, '')) DO UPDATE SET \
                 name = EXCLUDED.name, \
                 description = EXCLUDED.description, \
                 version = pipelines.version + 1, \
                 definition = EXCLUDED.definition, \
                 updated_at = now() \
-             RETURNING uid, version, definition, project_id",
+             RETURNING uid, version, definition, tenant_id",
         )
         .bind(&def.uid)
         .bind(&def.name)
         .bind(def.description.as_deref())
         .bind(version)
         .bind(SqlJson(def))
-        .bind(def.project_id.as_deref())
+        .bind(def.tenant_id.as_deref())
         .fetch_one(&self.pool)
         .await?;
         Ok(row.into_definition())
     }
 
-    /// Delete the row identified by `(uid, project_id)`. Returns whether a row existed.
-    pub async fn delete(&self, uid: &str, project_id: Option<&str>) -> Result<bool, CpError> {
+    /// Delete the row identified by `(uid, tenant_id)`. Returns whether a row existed.
+    pub async fn delete(&self, uid: &str, tenant_id: Option<&str>) -> Result<bool, CpError> {
         let res = sqlx::query(
-            "DELETE FROM pipelines WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '')",
+            "DELETE FROM pipelines WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
@@ -140,27 +140,27 @@ impl PipelineRepo {
     pub async fn delete_cascading(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<(bool, Vec<uuid::Uuid>), CpError> {
         let mut tx = self.pool.begin().await?;
 
         let archived: Vec<(uuid::Uuid,)> = sqlx::query_as(
             "UPDATE sources SET archived_at = now(), paused = true, updated_at = now() \
              WHERE pipeline_uid = $1 \
-               AND COALESCE(project_id, '') = COALESCE($2, '') \
+               AND COALESCE(tenant_id, '') = COALESCE($2, '') \
                AND archived_at IS NULL \
              RETURNING id",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
 
         let res = sqlx::query(
-            "DELETE FROM pipelines WHERE uid = $1 AND COALESCE(project_id, '') = COALESCE($2, '')",
+            "DELETE FROM pipelines WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
         )
         .bind(uid)
-        .bind(project_id)
+        .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
 
@@ -183,12 +183,12 @@ impl PipelineRepo {
     }
 }
 
-/// `?project_id=` query parameter shared by the pipeline routes.
+/// `?tenant_id=` query parameter shared by the pipeline routes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectQuery {
+pub struct TenantQuery {
     /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
-    #[serde(default)]
-    pub project_id: Option<String>,
+    #[serde(default, alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Plugin names used by `def` that are neither in [`builtin_plugin_names`] nor in
@@ -237,15 +237,15 @@ fn unknown_plugin_error(names: &[String]) -> CpError {
     ))
 }
 
-/// `GET /pipelines?project_id=` → user pipelines (tenant first, then global) followed
+/// `GET /pipelines?tenant_id=` → user pipelines (tenant first, then global) followed
 /// by the built-ins.
 pub async fn list_pipelines(
     State(state): State<AppState>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PipelineDefinition>>, CpError> {
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
-    let mut out = state.pipelines().list(project_id.as_deref()).await?;
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    let mut out = state.pipelines().list(tenant_id.as_deref()).await?;
     out.extend(builtin_pipelines());
     Ok(Json(out))
 }
@@ -274,7 +274,7 @@ pub async fn validate_pipeline(
     JsonBody(mut def): JsonBody<PipelineDefinition>,
 ) -> Result<Json<ValidationResult>, CpError> {
     prepare_definition(&mut def)?;
-    def.project_id = project_scope(def.project_id.as_deref(), &headers);
+    def.tenant_id = tenant_scope(def.tenant_id.as_deref(), &headers);
 
     let statically_unknown = unknown_plugins(&def, &[]);
     if !statically_unknown.is_empty() {
@@ -299,7 +299,7 @@ pub async fn validate_pipeline(
 ///
 /// Normalizes and validates the body (422 `validation`), rejects the `builtin.`
 /// namespace (403 `builtin`), rejects unknown plugins (422 `unknown_plugin`) and
-/// upserts by `(uid, project_id)`. The scope comes from the body's `project_id` or
+/// upserts by `(uid, tenant_id)`. The scope comes from the body's `tenant_id` or
 /// the `X-Meili-Project-Id` header.
 pub async fn create_pipeline(
     State(state): State<AppState>,
@@ -307,7 +307,7 @@ pub async fn create_pipeline(
     JsonBody(mut def): JsonBody<PipelineDefinition>,
 ) -> Result<Response, CpError> {
     prepare_definition(&mut def)?;
-    def.project_id = project_scope(def.project_id.as_deref(), &headers);
+    def.tenant_id = tenant_scope(def.tenant_id.as_deref(), &headers);
 
     // Only hit the database when the static list does not already cover every step.
     let statically_unknown = unknown_plugins(&def, &[]);
@@ -323,27 +323,27 @@ pub async fn create_pipeline(
     state.cache.invalidate().await;
     tracing::info!(
         uid = %stored.uid,
-        project_id = ?stored.project_id,
+        tenant_id = ?stored.tenant_id,
         version = stored.version,
         "pipeline stored"
     );
     Ok((StatusCode::CREATED, Json(stored)).into_response())
 }
 
-/// `GET /pipelines/{uid}?project_id=` → the pipeline or 404.
+/// `GET /pipelines/{uid}?tenant_id=` → the pipeline or 404.
 ///
 /// Built-in uids are answered from the static table without touching the database.
 pub async fn get_pipeline(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<Json<PipelineDefinition>, CpError> {
     if is_builtin_uid(&uid) {
         return find_builtin(&uid).map(Json);
     }
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
-    if let Some(def) = state.pipelines().get(&uid, project_id.as_deref()).await? {
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    if let Some(def) = state.pipelines().get(&uid, tenant_id.as_deref()).await? {
         return Ok(Json(def));
     }
     find_builtin(&uid).map(Json)
@@ -359,12 +359,12 @@ pub struct DeletedPipeline {
     pub archived_sources: Vec<uuid::Uuid>,
 }
 
-/// `DELETE /pipelines/{uid}?project_id=` → 200 [`DeletedPipeline`], 403 for built-ins,
+/// `DELETE /pipelines/{uid}?tenant_id=` → 200 [`DeletedPipeline`], 403 for built-ins,
 /// 404 when missing.
 pub async fn delete_pipeline(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<ProjectQuery>,
+    Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> Result<Json<DeletedPipeline>, CpError> {
     if is_builtin_uid(&uid) {
@@ -372,10 +372,10 @@ pub async fn delete_pipeline(
             "pipeline {uid:?} is built in and cannot be deleted"
         )));
     }
-    let project_id = project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
     let (deleted, archived) = state
         .pipelines()
-        .delete_cascading(&uid, project_id.as_deref())
+        .delete_cascading(&uid, tenant_id.as_deref())
         .await?;
     if deleted {
         state.cache.invalidate().await;
@@ -388,13 +388,13 @@ pub async fn delete_pipeline(
                 "pipeline deleted; dependent sources archived"
             );
         }
-        tracing::info!(uid = %uid, project_id = ?project_id, "pipeline deleted");
+        tracing::info!(uid = %uid, tenant_id = ?tenant_id, "pipeline deleted");
         Ok(Json(DeletedPipeline {
             archived_sources: archived,
         }))
     } else {
         Err(CpError::NotFound(format!(
-            "pipeline {uid:?} not found (project_id={project_id:?})"
+            "pipeline {uid:?} not found (tenant_id={tenant_id:?})"
         )))
     }
 }
@@ -424,7 +424,7 @@ mod tests {
                 .map(|(i, p)| StepDefinition::new(format!("s{i}"), *p))
                 .collect(),
             builtin: false,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -480,5 +480,16 @@ mod tests {
         let e = unknown_plugin_error(&["foo".into(), "bar".into()]);
         assert_eq!(e.code(), "unknown_plugin");
         assert!(e.to_string().starts_with("unknown plugin \"foo\", \"bar\""));
+    }
+
+    #[test]
+    fn tenant_query_accepts_the_old_key() {
+        use axum::extract::Query;
+        let uri: axum::http::Uri = "http://cp/pipelines?project_id=t1".parse().unwrap();
+        let Query(q) = Query::<TenantQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.tenant_id.as_deref(), Some("t1"));
+        let uri: axum::http::Uri = "http://cp/pipelines?tenant_id=t2".parse().unwrap();
+        let Query(q) = Query::<TenantQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.tenant_id.as_deref(), Some("t2"));
     }
 }

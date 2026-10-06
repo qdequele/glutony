@@ -95,11 +95,11 @@ export function usePipeline(uid: string | undefined): UseQueryResult<PipelineDef
  *
  * The API has no "current context" endpoint, so this is read off the pipelines
  * the gateway returned: behind Envoy, tenant-scoped pipelines carry the
- * `project_id`. Standalone deployments report nothing, which is correct.
+ * `tenant_id`. Standalone deployments report nothing, which is correct.
  */
 export function useProjectId(): string | undefined {
   const { data } = usePipelines();
-  return data?.find((pipeline) => Boolean(pipeline.project_id))?.project_id;
+  return data?.find((pipeline) => Boolean(pipeline.tenant_id))?.tenant_id;
 }
 
 /**

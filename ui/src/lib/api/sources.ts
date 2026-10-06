@@ -72,7 +72,7 @@ export interface SourceView {
   uid: string;
   name: string;
   description?: string;
-  project_id?: string;
+  tenant_id?: string;
   /** Pipeline uid fed on every tick. */
   pipeline: string;
   location: SourceLocation;

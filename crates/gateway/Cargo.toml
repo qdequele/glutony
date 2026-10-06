@@ -52,6 +52,7 @@ temporalio-common.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 url.workspace = true
+subtle.workspace = true
 mime_guess.workspace = true
 # Only pulled in with the `ui` feature: embeds the exported admin UI.
 rust-embed = { workspace = true, optional = true }
@@ -65,3 +66,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 tower = { workspace = true, features = ["util"] }
+regex.workspace = true
+http-body-util = "0.1"

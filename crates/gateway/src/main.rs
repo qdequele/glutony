@@ -82,6 +82,12 @@ async fn main() -> anyhow::Result<()> {
     if config.envoy_trusted_header.is_none() {
         tracing::warn!("ENVOY_TRUSTED_HEADER is unset: trusting X-Meili-* headers from any client");
     }
+    if !meili_ingest_gateway::auth::management_auth_enabled(&config) {
+        tracing::warn!(
+            "LAB_SERVICE_TOKEN and ADMIN_API_KEY are unset: management routes are open \
+             (tenant from trusted X-Meili-* headers); keep them off any public hostname"
+        );
+    }
 
     let blob = BlobStore::from_url(&config.blob_store_url)
         .with_context(|| format!("cannot open blob store {:?}", config.blob_store_url))?;

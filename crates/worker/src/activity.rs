@@ -216,7 +216,7 @@ impl StepActivities {
             &self.connections,
             &input.plugin,
             input.config,
-            input.project_id.as_deref(),
+            input.tenant_id.as_deref(),
         )
         .await?;
         let output = plugin.execute(plugin_ctx, resolved, config).await?;
@@ -520,7 +520,7 @@ mod tests {
             input,
             branch: None,
             branch_total: None,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -574,7 +574,7 @@ mod tests {
 
         let mut input = step_input(meili_ingest_plugin_sdk::INDEXER_PLUGIN, PluginInput::Empty);
         input.config = serde_json::json!({ "connection": "prod-movies", "index": "movies" });
-        input.project_id = Some("tenant-1".into());
+        input.tenant_id = Some("tenant-1".into());
 
         // What Temporal records for this activity.
         let recorded = serde_json::to_string(&input).expect("serialize");

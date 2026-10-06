@@ -2,7 +2,7 @@
  * The editor's working model of a pipeline.
  *
  * A `PipelineDraft` is a `PipelineDefinition` minus the fields the control
- * plane owns (`version`, `builtin`, `project_id`): those are displayed but
+ * plane owns (`version`, `builtin`, `tenant_id`): those are displayed but
  * never authored, so keeping them out of the draft keeps the YAML pane honest
  * — everything you see in it is something you can change.
  */

@@ -17,7 +17,7 @@ info:
     **Tenant context**
 
     Every request is scoped to a `MeiliContext` resolved from, in order:
-    `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Project-Id` / `X-Meili-Index`
+    `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Tenant-Id` / `X-Meili-Project-Id` / `X-Meili-Index`
     headers (injected by Meilisearch Cloud's Envoy and trusted only when
     `X-Meili-Envoy-Secret` matches the gateway's `ENVOY_TRUSTED_HEADER`), the
     `?index=` query parameter, an `Authorization: Bearer <key>` header, and
@@ -26,6 +26,13 @@ info:
     unless the pipeline is **pinned**: every `meili_indexer` step names a
     [Meilisearch connection](/concepts/connections), which then supplies the host
     and key, and no context is needed.
+
+    **Management auth**
+
+    Data routes (ingest, job status, health) use the caller's Meilisearch key. Every
+    other route is a management route: with `LAB_SERVICE_TOKEN` or `ADMIN_API_KEY`
+    set it needs `Authorization: Bearer <token>` (and `X-Glutony-Tenant-Id` for the
+    Lab), otherwise it is open and scoped by the trusted `X-Meili-*` headers.
 
     **Errors** are always `{"error": "<message>", "code": "<snake_case>"}`.
   license:
@@ -45,10 +52,6 @@ servers:
         default: my-project
       region:
         default: us-west
-
-security:
-  - bearerAuth: []
-  - {}
 
 tags:
   - name: Ingest
@@ -74,7 +77,7 @@ paths:
       tags: [System]
       operationId: health
       summary: Health check
-      security: []
+      security: [{}]
       responses:
         "200":
           description: The gateway is up.
@@ -94,6 +97,7 @@ paths:
       tags: [Ingest]
       operationId: ingest
       summary: Ingest content (auto-routed)
+      security: [{ MeiliKey: [] }, {}]
       description: |
         Accepts a multipart upload, a JSON body (URL / S3 / inline documents) or a
         raw binary body. The pipeline is chosen from the detected MIME type and
@@ -101,6 +105,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
         - $ref: "#/components/parameters/XMeiliApiKey"
         - $ref: "#/components/parameters/XMeiliIndex"
@@ -156,9 +161,11 @@ paths:
       tags: [Ingest]
       operationId: ingestBatch
       summary: Ingest several items (one job each)
+      security: [{ MeiliKey: [] }, {}]
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
         - $ref: "#/components/parameters/XMeiliApiKey"
         - $ref: "#/components/parameters/XMeiliIndex"
@@ -195,6 +202,7 @@ paths:
       tags: [Ingest]
       operationId: ingestWithPipeline
       summary: Ingest content with an explicit pipeline
+      security: [{ MeiliKey: [] }, {}]
       description: |
         Same body formats as `POST /ingest`, but the pipeline is chosen by `name`
         (a pipeline `uid`, e.g. `builtin.pdf` or `my-pdf-with-enrichment`).
@@ -210,6 +218,7 @@ paths:
           example: my-pdf-with-enrichment
         - $ref: "#/components/parameters/IndexQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
         - $ref: "#/components/parameters/XMeiliApiKey"
         - $ref: "#/components/parameters/XMeiliIndex"
@@ -251,6 +260,7 @@ paths:
       tags: [Ingest]
       operationId: ingestIntoIndex
       summary: Ingest content into a named index (auto-routed)
+      security: [{ MeiliKey: [] }, {}]
       description: |
         `POST /ingest`, with the target index taken from the path. The path wins over
         every other index source (`?index=`, the `index` field, `X-Meili-Index` and the
@@ -262,6 +272,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/IndexUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
         - $ref: "#/components/parameters/XMeiliApiKey"
         - $ref: "#/components/parameters/XMeiliRegion"
@@ -302,10 +313,12 @@ paths:
       tags: [Ingest]
       operationId: ingestBatchIntoIndex
       summary: Ingest several items into a named index (one job each)
+      security: [{ MeiliKey: [] }, {}]
       description: Like `POST /ingest/batch`; every item goes to the path's index.
       parameters:
         - $ref: "#/components/parameters/IndexUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
         - $ref: "#/components/parameters/XMeiliApiKey"
         - $ref: "#/components/parameters/XMeiliRegion"
@@ -335,6 +348,7 @@ paths:
       tags: [Ingest]
       operationId: ingestIntoIndexWithPipeline
       summary: Ingest content into a named index with an explicit pipeline
+      security: [{ MeiliKey: [] }, {}]
       description: Like `POST /ingest/pipeline/{name}`; the path's index wins over the pipeline trigger's `index_pattern`.
       parameters:
         - name: name
@@ -346,6 +360,7 @@ paths:
             pattern: "^[a-zA-Z0-9._-]+$"
         - $ref: "#/components/parameters/IndexUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
         - $ref: "#/components/parameters/XMeiliApiKey"
         - $ref: "#/components/parameters/XMeiliRegion"
@@ -381,18 +396,61 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
+  /jobs:
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      summary: List jobs, newest first
+      description: Always scoped to the caller's tenant; an admin without a tenant sees every job.
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/JobStatus" } }
+        - { name: pipeline_uid, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: One page of jobs.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobList" }
+        "400": { $ref: "#/components/responses/InvalidTenant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/UpstreamUnavailable" }
+
   /jobs/{job_id}:
     get:
       tags: [Jobs]
       operationId: getJob
       summary: Job status and progress
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Combines Temporal `describe` with the workflow's `progress` query. Falls
         back to the control plane's job cache when the workflow is no longer
         known to Temporal (retention expired).
+
+        Read by ingest clients through the edge and by the Lab, so it accepts
+        either caller. The job is visible only to the tenant it belongs to
+        (`404` otherwise); the tenant comes from:
+
+        - a management token (`LabServiceToken` or `AdminKey`): `X-Glutony-Tenant-Id`.
+          An `AdminKey` without it sees every job. Trusted `X-Meili-*` tenant
+          headers are ignored for this caller.
+        - otherwise, the trusted edge: `X-Meili-Tenant-Id`, else `X-Meili-Project-Id`,
+          honoured only with a matching `X-Meili-Envoy-Secret` when
+          `ENVOY_TRUSTED_HEADER` is set. A bearer that is not a management token
+          (a Meilisearch key) is ignored.
+
+        When management auth is configured (`LAB_SERVICE_TOKEN` or `ADMIN_API_KEY`),
+        a call with neither a management token nor a trusted edge tenant is a
+        `401`. In open mode (neither secret set) the tenant, if any, comes from the
+        trusted edge, and a call without one sees every job.
       parameters:
         - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "200":
@@ -417,6 +475,20 @@ paths:
                   cancel_requested: false
                 pipeline_used: my-pdf-with-enrichment
                 target_index: contracts
+        "400":
+          $ref: "#/components/responses/InvalidTenant"
+        "401":
+          description: |
+            Management auth is configured and the call carries neither a valid
+            management token nor a trusted edge tenant (no `X-Meili-Tenant-Id` /
+            `X-Meili-Project-Id`, or a missing or wrong `X-Meili-Envoy-Secret`).
+          headers:
+            WWW-Authenticate:
+              schema: { type: string, const: Bearer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "missing or invalid management token, and no trusted edge tenant", "code": "unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
         "502":
@@ -427,10 +499,13 @@ paths:
       tags: [Jobs]
       operationId: cancelJob
       summary: Cancel a running job
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Sends the `cancel` signal to the workflow. Steps already running finish; no new step is scheduled.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/JobId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "202":
@@ -439,6 +514,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/JobStatusResponse"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
         "502":
@@ -449,9 +525,12 @@ paths:
       tags: [Pipelines]
       operationId: listPipelines
       summary: List pipelines
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Built-in pipelines, global user pipelines and — when a project id is present — that tenant's pipelines.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "200":
@@ -462,21 +541,25 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/PipelineDefinition"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
     post:
       tags: [Pipelines]
       operationId: upsertPipeline
       summary: Create or update a pipeline
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Accepts YAML (`application/x-yaml`, `text/yaml`) or JSON. The definition
         is normalised (implicit sequential `depends_on`), validated (unknown
-        plugin, cycle, bad `fan_out` → `422`) and upserted by `(uid, project_id)`;
+        plugin, cycle, bad `fan_out` → `422`) and upserted by `(uid, tenant_id)`;
         `version` is bumped on update. `uid`s starting with `builtin.` are
         rejected with `403`. Behind Envoy the pipeline is scoped to the calling
         project.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       requestBody:
         required: true
@@ -520,6 +603,7 @@ paths:
                 $ref: "#/components/schemas/PipelineDefinition"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: Attempt to write a `builtin.*` pipeline.
           content:
@@ -537,14 +621,42 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
+  /pipelines/validate:
+    post:
+      tags: [Pipelines]
+      operationId: validatePipeline
+      summary: Dry-run a pipeline definition
+      description: Runs the same checks as a create and persists nothing.
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PipelineDefinition" }
+          application/x-yaml:
+            schema: { $ref: "#/components/schemas/PipelineDefinition" }
+      responses:
+        "200":
+          description: The pipeline is valid.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
   /pipelines/{uid}:
     get:
       tags: [Pipelines]
       operationId: getPipeline
       summary: Get a pipeline
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/PipelineUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "200":
@@ -553,6 +665,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PipelineDefinition"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/PipelineNotFound"
         "502":
@@ -561,16 +674,20 @@ paths:
       tags: [Pipelines]
       operationId: deletePipeline
       summary: Delete a user pipeline
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Never blocked by sources that use the pipeline: they are archived (their
         schedules removed) and remain readable with `archived_at` set.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/PipelineUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "204":
           description: Deleted.
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: Built-in pipelines cannot be deleted.
           content:
@@ -588,7 +705,10 @@ paths:
       tags: [Plugins]
       operationId: listPlugins
       summary: List registered plugins
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Manifests published by the worker pools at boot (proxied from the control plane).
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
       responses:
         "200":
           description: Plugin manifests.
@@ -598,6 +718,7 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/PluginManifest"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
@@ -605,11 +726,14 @@ paths:
     get:
       tags: [Catalog]
       summary: Curated action and workflow catalog
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: >
         Authored descriptions of every action the system can run and every
         workflow it ships with. Static data compiled into the gateway: identical
         for every caller, and unaffected by which workers have registered.
       operationId: getCatalog
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
       responses:
         "200":
           description: The catalog.
@@ -617,15 +741,38 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Catalog"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /usage:
+    get:
+      tags: [System]
+      operationId: getUsage
+      summary: Daily usage of the caller's tenant
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
+        - { name: date_from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: date_to, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Daily rows, oldest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsageResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "501": { $ref: "#/components/responses/NotEnabled" }
 
   /connections:
     get:
       tags: [Connections]
       operationId: listConnections
       summary: List Meilisearch connections
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: The caller's project's connections, then global ones. Keys are always masked.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "200":
@@ -636,6 +783,7 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Connection"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "501":
           $ref: "#/components/responses/NotEnabled"
         "502":
@@ -644,12 +792,15 @@ paths:
       tags: [Connections]
       operationId: createConnection
       summary: Create a connection
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Checks `host` against `MEILI_CONNECTION_HOSTS`, then calls `GET {host}/health`
         and `GET {host}/indexes?limit=1` with the key. Any failure is `422` and
         nothing is stored. The key is sealed before it leaves the gateway.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       requestBody:
         required: true
@@ -671,6 +822,7 @@ paths:
                 $ref: "#/components/schemas/Connection"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "422":
           $ref: "#/components/responses/Unprocessable"
         "501":
@@ -680,13 +832,16 @@ paths:
 
   /connections/{uid}:
     parameters:
+      - $ref: "#/components/parameters/XGlutonyTenantId"
       - $ref: "#/components/parameters/ConnectionUid"
       - $ref: "#/components/parameters/XMeiliProjectId"
+      - $ref: "#/components/parameters/XMeiliTenantId"
       - $ref: "#/components/parameters/XMeiliEnvoySecret"
     get:
       tags: [Connections]
       operationId: getConnection
       summary: Get a connection
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       responses:
         "200":
           description: The connection, with `used_by`.
@@ -694,6 +849,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Connection"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -702,6 +858,7 @@ paths:
       tags: [Connections]
       operationId: updateConnection
       summary: Update a connection
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Changing `host` or `api_key` re-runs the create-time checks. Omit `api_key` to keep the stored key.
       requestBody:
         required: true
@@ -716,6 +873,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Connection"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -726,10 +884,12 @@ paths:
       tags: [Connections]
       operationId: deleteConnection
       summary: Delete a connection
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Never blocked. Pipelines that still name it fail at run time with `connection "<uid>" not found`.
       responses:
         "204":
           description: Deleted.
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -740,7 +900,9 @@ paths:
       tags: [Sources]
       operationId: listSources
       summary: List sources
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - name: include_archived
           in: query
           required: false
@@ -749,6 +911,7 @@ paths:
             type: boolean
             default: false
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "200":
@@ -759,6 +922,7 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Source"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "501":
           $ref: "#/components/responses/NotEnabled"
         "502":
@@ -767,13 +931,16 @@ paths:
       tags: [Sources]
       operationId: createSource
       summary: Create a scheduled source
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Validates the URL template and its host (`SOURCE_FETCH_HOSTS`), checks that
         the pipeline is pinned (every `meili_indexer` step names a connection), then
         creates a Temporal schedule. A cron Temporal rejects is `422`. The source
         starts active.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       requestBody:
         required: true
@@ -799,6 +966,7 @@ paths:
                 $ref: "#/components/schemas/Source"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/PipelineNotFound"
         "422":
@@ -810,13 +978,16 @@ paths:
 
   /sources/{uid}:
     parameters:
+      - $ref: "#/components/parameters/XGlutonyTenantId"
       - $ref: "#/components/parameters/SourceUid"
       - $ref: "#/components/parameters/XMeiliProjectId"
+      - $ref: "#/components/parameters/XMeiliTenantId"
       - $ref: "#/components/parameters/XMeiliEnvoySecret"
     get:
       tags: [Sources]
       operationId: getSource
       summary: Get a source
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       responses:
         "200":
           description: The source, with `next_run_at`.
@@ -824,6 +995,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Source"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -832,6 +1004,7 @@ paths:
       tags: [Sources]
       operationId: updateSource
       summary: Update a source
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Any subset of the create fields except `uid`. `auth` omitted keeps it, `null` clears it.
       requestBody:
         required: true
@@ -846,6 +1019,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Source"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -856,9 +1030,11 @@ paths:
       tags: [Sources]
       operationId: deleteSource
       summary: Delete a source and its schedule
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       responses:
         "204":
           description: Deleted.
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -869,13 +1045,17 @@ paths:
       tags: [Sources]
       operationId: pauseSource
       summary: Pause a source's schedule
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "204":
           description: Paused.
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -886,13 +1066,17 @@ paths:
       tags: [Sources]
       operationId: unpauseSource
       summary: Resume a source's schedule
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "204":
           description: Resumed.
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -903,10 +1087,13 @@ paths:
       tags: [Sources]
       operationId: runSource
       summary: Run a source now
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "202":
@@ -920,6 +1107,7 @@ paths:
                   status:
                     type: string
                     const: triggered
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -936,7 +1124,9 @@ paths:
       tags: [Sources]
       operationId: listSourceRuns
       summary: A source's runs, newest first
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
         - name: limit
           in: query
@@ -947,6 +1137,7 @@ paths:
             maximum: 200
             default: 20
         - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "200":
@@ -957,6 +1148,7 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/SourceRun"
+        "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
@@ -964,13 +1156,24 @@ paths:
 
 components:
   securitySchemes:
-    bearerAuth:
+    MeiliKey:
       type: http
       scheme: bearer
       description: |
-        Self-hosted fallback: a Meilisearch API key with write access. Used as
-        `api_key` when no `X-Meili-Api-Key` header is present. Combine with
-        `X-Meili-Host` (or the gateway's `MEILI_URL`) to target an instance.
+        Data routes. A Meilisearch API key with write access on the target index,
+        used when no trusted `X-Meili-Api-Key` header is present.
+    LabServiceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Management routes, for the Meilisearch Lab (`LAB_SERVICE_TOKEN`). Requires
+        `X-Glutony-Tenant-Id`. Server-to-server only.
+    AdminKey:
+      type: http
+      scheme: bearer
+      description: |
+        Management routes, for an operator (`ADMIN_API_KEY`). Global scope unless
+        `X-Glutony-Tenant-Id` names a tenant.
 
   parameters:
     IndexUid:
@@ -1022,11 +1225,31 @@ components:
         type: string
         pattern: "^[a-zA-Z0-9._-]+$"
       example: tmdb
+    XGlutonyTenantId:
+      name: X-Glutony-Tenant-Id
+      in: header
+      required: false
+      description: |
+        Tenant a management call (or a job read with a management token) acts for.
+        Required with `LabServiceToken`, optional with `AdminKey`, ignored in open
+        mode. 1-128 characters of `[A-Za-z0-9._:-]`.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._:-]{1,128}$"
+      example: 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61
+    XMeiliTenantId:
+      name: X-Meili-Tenant-Id
+      in: header
+      required: false
+      description: Tenant id injected by a trusted edge. Wins over `X-Meili-Project-Id`.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._:-]{1,128}$"
     XMeiliProjectId:
       name: X-Meili-Project-Id
       in: header
       required: false
-      description: Tenant / project identifier (Envoy-injected).
+      description: Tenant id injected by Meilisearch Cloud's Envoy. Used when X-Meili-Tenant-Id is absent.
       schema:
         type: string
       example: xxx
@@ -1074,6 +1297,21 @@ components:
         type: string
 
   responses:
+    Unauthorized:
+      description: Management auth is configured and the token is missing or wrong.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, const: Bearer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { "error": "missing or invalid management token", "code": "unauthorized" }
+    InvalidTenant:
+      description: The tenant header is missing (Lab token) or malformed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { "error": "invalid tenant id: tenant id contains '/'", "code": "invalid_tenant" }
     IngestAccepted:
       description: Job accepted and queued.
       content:
@@ -1163,6 +1401,55 @@ components:
           example: { "error": "control plane unreachable", "code": "upstream_error" }
 
   schemas:
+    RowScope:
+      type: string
+      enum: [tenant, global, builtin]
+      description: Whose the row is. Tenants can read global and built-in rows but only write their own.
+    JobRecord:
+      type: object
+      required: [job_id, workflow_id, pipeline_uid, status, started_at, updated_at]
+      properties:
+        job_id: { type: string, format: uuid }
+        workflow_id: { type: string }
+        pipeline_uid: { type: string }
+        tenant_id: { type: string, description: "Tenant scope. Absent = global." }
+        index_name: { type: string }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        current_step: { type: string }
+        error: { type: string }
+        started_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        source_id: { type: string, format: uuid }
+    JobList:
+      type: object
+      required: [jobs, limit, offset, total]
+      properties:
+        jobs: { type: array, items: { $ref: "#/components/schemas/JobRecord" } }
+        limit: { type: integer }
+        offset: { type: integer }
+        total: { type: integer, description: "Rows matching the filters, ignoring paging." }
+    ValidationResult:
+      type: object
+      required: [valid, order, normalized]
+      properties:
+        valid: { type: boolean, const: true }
+        order: { type: array, items: { type: string }, description: "Topological step order." }
+        normalized: { $ref: "#/components/schemas/PipelineDefinition" }
+    UsageRow:
+      type: object
+      required: [day, pipeline_uid, plugin]
+      properties:
+        day: { type: string, format: date }
+        pipeline_uid: { type: string }
+        plugin: { type: string, description: "Empty on job-level rows." }
+      additionalProperties:
+        description: Numeric metrics passed through from the analytics store.
+    UsageResponse:
+      type: object
+      required: [tenant_id, data]
+      properties:
+        tenant_id: { type: string, description: "Empty when self-hosted." }
+        data: { type: array, items: { $ref: "#/components/schemas/UsageRow" } }
     Error:
       type: object
       required: [error, code]
@@ -1429,6 +1716,7 @@ components:
           minimum: 1
           default: 1
           description: Bumped by the control plane on every update.
+        scope: { $ref: "#/components/schemas/RowScope", readOnly: true }
         trigger:
           $ref: "#/components/schemas/PipelineTrigger"
         steps:
@@ -1440,7 +1728,7 @@ components:
           type: boolean
           default: false
           readOnly: true
-        project_id:
+        tenant_id:
           type: string
           description: Tenant scope. Absent = global.
           readOnly: true
@@ -1552,9 +1840,10 @@ components:
           description: Name a `meili_indexer` step references in `config.connection`.
         name:
           type: string
-        project_id:
+        tenant_id:
           type: string
           description: Tenant scope. Absent = global.
+        scope: { $ref: "#/components/schemas/RowScope", readOnly: true }
         host:
           type: string
           format: uri
@@ -1697,7 +1986,8 @@ components:
         uid: { type: string }
         name: { type: string }
         description: { type: string }
-        project_id: { type: string }
+        tenant_id: { type: string }
+        scope: { $ref: "#/components/schemas/RowScope", readOnly: true }
         pipeline: { type: string }
         location:
           $ref: "#/components/schemas/SourceLocation"

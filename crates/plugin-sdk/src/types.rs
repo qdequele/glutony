@@ -24,9 +24,9 @@ use crate::error::PluginError;
 /// fields still deserialize the plain strings recorded in older workflow histories.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeiliContext {
-    /// Tenant / project identifier (from `X-Meili-Project-Id`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    /// Tenant id (from `X-Meili-Tenant-Id` or `X-Meili-Project-Id`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Full Meilisearch host URL (e.g. `https://xxx.us-west.meilisearch.io`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -45,8 +45,8 @@ impl MeiliContext {
     /// Redacted view for logs: never prints the API key.
     pub fn redacted(&self) -> String {
         format!(
-            "MeiliContext{{project_id={:?}, host={:?}, index={:?}, region={:?}}}",
-            self.project_id, self.host, self.index, self.region
+            "MeiliContext{{tenant_id={:?}, host={:?}, index={:?}, region={:?}}}",
+            self.tenant_id, self.host, self.index, self.region
         )
     }
 }
@@ -829,8 +829,8 @@ pub struct PipelineDefinition {
     #[serde(default)]
     pub builtin: bool,
     /// Tenant scope. `None` = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 fn one() -> u32 {
@@ -1275,9 +1275,9 @@ pub struct StepActivityInput {
     /// Total branches when fanned out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_total: Option<usize>,
-    /// Tenant project id for logging / scoping.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    /// Tenant id for logging / scoping.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Output of the `execute_step` activity.
@@ -1374,7 +1374,7 @@ pub fn pinned_connection(config: &serde_json::Value) -> Option<&str> {
 /// * Otherwise `host`/`api_key` always come from the context, overwriting whatever the
 ///   step set — exactly the behaviour pipelines relied on before connections existed.
 ///
-/// Every other key (`project_id`, `index`, `region`) only fills what the step left
+/// Every other key (`tenant_id`, `index`, `region`) only fills what the step left
 /// unset, in both cases.
 pub fn inject_meili_context(config: &mut serde_json::Value, ctx: &MeiliContext) {
     if !config.is_object() {
@@ -1443,7 +1443,7 @@ mod tests {
             trigger: None,
             steps,
             builtin: false,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -1632,7 +1632,7 @@ steps:
 
     fn request_ctx() -> MeiliContext {
         MeiliContext {
-            project_id: Some("tenant".into()),
+            tenant_id: Some("tenant".into()),
             host: Some("https://request.example".into()),
             api_key: Some("requestKey".into()),
             index: Some("from-request".into()),
@@ -1649,7 +1649,7 @@ steps:
             trigger: None,
             steps,
             builtin: false,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -1717,7 +1717,7 @@ steps:
         );
         assert_eq!(config["connection"], "prod-movies");
         // Non-secret context still fills in what the step did not set.
-        assert_eq!(config["project_id"], "tenant");
+        assert_eq!(config["tenant_id"], "tenant");
         assert_eq!(config["index"], "from-request");
     }
 
@@ -1748,7 +1748,7 @@ steps:
     fn a_context_without_host_or_key_injects_neither() {
         // A source-driven run carries only project and index (spec: SourceRunWorkflow).
         let ctx = MeiliContext {
-            project_id: Some("tenant".into()),
+            tenant_id: Some("tenant".into()),
             index: Some("movies".into()),
             ..Default::default()
         };
@@ -1770,7 +1770,7 @@ steps:
     #[test]
     fn indexer_config_deserializes_from_flattened_context() {
         let ctx = MeiliContext {
-            project_id: Some("xxx".into()),
+            tenant_id: Some("xxx".into()),
             host: Some("http://localhost:7700".into()),
             api_key: Some("masterKey".into()),
             index: Some("documents".into()),
@@ -1802,7 +1802,7 @@ steps:
     #[test]
     fn redacted_context_hides_key() {
         let ctx = MeiliContext {
-            project_id: None,
+            tenant_id: None,
             host: Some("h".into()),
             api_key: Some("SECRET".into()),
             index: None,
@@ -1842,5 +1842,84 @@ steps:
         let step: StepResult = serde_json::from_str(old).unwrap();
         assert!(step.usage.is_empty());
         assert_eq!(step.duration_ms, 0);
+    }
+
+    /// Rename every `tenant_id` key back to the pre-rename `tenant_id`, recursively,
+    /// to build the payloads Temporal already holds.
+    fn with_old_key(v: serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| {
+                        let k = if k == "tenant_id" {
+                            "project_id".to_string()
+                        } else {
+                            k
+                        };
+                        (k, with_old_key(v))
+                    })
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(with_old_key).collect())
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn pre_rename_payloads_still_deserialize() {
+        let context = MeiliContext {
+            tenant_id: Some("acme".into()),
+            host: Some("http://meili:7700".into()),
+            api_key: Some("k".into()),
+            index: Some("docs".into()),
+            region: None,
+        };
+        let old = with_old_key(serde_json::to_value(&context).unwrap());
+        assert_eq!(
+            old["project_id"], "acme",
+            "the fixture must use the old key"
+        );
+        let back: MeiliContext = serde_json::from_value(old).unwrap();
+        assert_eq!(back, context);
+
+        let pipeline: PipelineDefinition = serde_json::from_value(serde_json::json!({
+            "uid": "p",
+            "name": "p",
+            "steps": [{"id": "index", "plugin": "meili_indexer"}],
+            "project_id": "acme"
+        }))
+        .unwrap();
+        assert_eq!(pipeline.tenant_id.as_deref(), Some("acme"));
+
+        let step = StepActivityInput {
+            job_id: uuid::Uuid::nil(),
+            step_id: "index".into(),
+            plugin: "meili_indexer".into(),
+            config: serde_json::json!({}),
+            input: PluginInput::Documents(vec![]),
+            branch: None,
+            branch_total: None,
+            tenant_id: Some("acme".into()),
+        };
+        let back: StepActivityInput =
+            serde_json::from_value(with_old_key(serde_json::to_value(&step).unwrap())).unwrap();
+        assert_eq!(back, step);
+
+        let wf = PipelineWorkflowInput {
+            job_id: uuid::Uuid::nil(),
+            pipeline: pipeline.clone(),
+            input: PluginInput::Documents(vec![]),
+            context: context.clone(),
+        };
+        let back: PipelineWorkflowInput =
+            serde_json::from_value(with_old_key(serde_json::to_value(&wf).unwrap())).unwrap();
+        assert_eq!(back, wf);
+
+        // The indexer received the context flattened into its config under the old key.
+        let config: IndexerConfig =
+            serde_json::from_value(with_old_key(serde_json::to_value(&context).unwrap())).unwrap();
+        assert_eq!(config.meili.tenant_id.as_deref(), Some("acme"));
     }
 }
