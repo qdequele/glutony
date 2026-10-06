@@ -1,0 +1,164 @@
+---
+title: Meilisearch Lab
+description: Run glutony as a Meilisearch Lab data plane - tenants, management auth and billing events
+---
+
+glutony runs on its own. The Meilisearch Lab plugs into it through three seams,
+each off until you configure it.
+
+## Tenants
+
+Every pipeline, source, connection and job belongs to a **tenant** or to the global
+scope. Behind the Lab the tenant is the Lab account id (a UUID). Ingest traffic
+arrives on a Meilisearch hostname, so the Lab's edge injects it:
+
+| Header | Value |
+|---|---|
+| `X-Meili-Envoy-Secret` | the gateway's `ENVOY_TRUSTED_HEADER` |
+| `X-Meili-Tenant-Id` | the account id that owns the instance |
+
+`X-Meili-Project-Id` still works (Meilisearch Cloud's Envoy sends it);
+`X-Meili-Tenant-Id` wins when both are present.
+
+## Management auth
+
+| `LAB_SERVICE_TOKEN` | `ADMIN_API_KEY` | Caller sends | Acts as |
+|---|---|---|---|
+| set | - | `Authorization: Bearer <token>` + `X-Glutony-Tenant-Id` | that tenant |
+| - | set | `Authorization: Bearer <key>` (+ optional `X-Glutony-Tenant-Id`) | global, or that tenant |
+| unset | unset | nothing | open: tenant from the trusted edge |
+
+Management routes are every route except ingest, `GET /jobs/{id}` and `/health`.
+`LAB_SERVICE_TOKEN` requires `ENVOY_TRUSTED_HEADER`: the gateway refuses to start with
+the token and no edge secret, because Lab account ids are not secrets and any client
+could otherwise claim a tenant with a bare `X-Meili-Tenant-Id` header. `ADMIN_API_KEY`
+alone keeps working without an edge (operator mode; the gateway only warns).
+Once either secret is set, `X-Meili-*` headers no longer grant management access.
+The Lab console calls these routes **server side only**: the token never reaches a
+browser.
+
+`GET /jobs/{id}` is the one data route that follows management rules once auth is
+on. With auth off it is scoped by the trusted edge tenant, as before. With auth on it
+accepts either a valid management token (scoped by its `X-Glutony-Tenant-Id`; an
+admin without one sees every job) or a trusted edge tenant, and anything else gets
+`401`. Ingest callers keep polling their jobs on the public hostname with the edge
+headers.
+
+The frozen admin UI (`ui/`) cannot send a token. Once auth is on, the proxy in front
+of the admin hostname must send `Authorization: Bearer <ADMIN_API_KEY>` for it, and
+the Meilisearch key it used to inject as the bearer token moves to
+`X-Meili-Api-Key` (with `X-Meili-Host` and `X-Meili-Envoy-Secret`).
+
+## Billing events
+
+Each job run for a Lab account produces one `usage.recorded` event:
+
+```json
+{
+  "id": "<UUIDv5 of job:{job_id}:usage>",
+  "type": "usage.recorded",
+  "occurred_at": "2026-10-01T10:00:09.000Z",
+  "account_id": "<tenant id>",
+  "api_key_id": null,
+  "product": "glutony",
+  "data": {
+    "job_id": "…", "pipeline_uid": "builtin.pdf", "status": "succeeded",
+    "duration_ms": 9000, "cost_micro_usd": 210, "cost_complete": true,
+    "units": { "documents_out": 12, "input_bytes": 5000, "pages": 9, "images": 0,
+               "audio_seconds": 0, "llm_input_tokens": 1000, "llm_output_tokens": 100,
+               "llm_requests": 1, "external_requests": 0 }
+  }
+}
+```
+
+- Jobs without a UUID tenant (standalone, Cloud projects) are never sent.
+- Failed and cancelled jobs are sent: provider cost already spent is real.
+- `cost_micro_usd` is what glutony paid providers, from the provider cost table
+  (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). A call it cannot price
+  costs 0 and sets `cost_complete: false`. The bundled prices are placeholders: set
+  yours before billing. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
+  worker at boot; if it ever fails to load later, every call is flagged unpriced
+  (never priced at the bundled rates).
+- The Lab converts units and cost to credits; glutony never computes credits.
+
+Enable it with `LAB_EVENTS_ENABLED=true` on the workers and `LAB_URL` +
+`LAB_EVENTS_SECRET` on the control plane. Workers write each event to the control
+plane's `lab_events` outbox; the control plane sends batches of up to 500 to
+`POST {LAB_URL}/internal/events` with
+`X-Lab-Signature: sha256=<hex HMAC-SHA256(LAB_EVENTS_SECRET, body)>`, marks the ids
+the Lab lists in `accepted`, and retries the rest with backoff. Events are never
+dropped. `LAB_URL` must be `https` unless its host is loopback or private.
+
+### Monitoring
+
+The control plane serves `GET /metrics`:
+
+- `glutony_lab_events_pending`
+- `glutony_lab_events_oldest_pending_seconds`
+- `glutony_lab_events_delivered_total`
+- `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`)
+
+The pending gauges are refreshed on every scrape, so they are correct even when
+`LAB_URL` is unset and events are waiting in the outbox. The sender reads at most
+1 MiB of the Lab's acknowledgement body; a larger one counts as `malformed`.
+
+Alert (same threshold as Lumen):
+
+```yaml
+- alert: GlutonyLabEventsStuck
+  expr: glutony_lab_events_oldest_pending_seconds > 900
+  for: 5m
+  annotations:
+    summary: glutony has billing events the Lab has not accepted for 15 minutes
+```
+
+## Known limit: no spend enforcement
+
+glutony bills after the fact and never refuses work for lack of credits (Lumen and
+Scrapix answer `402`). Because glutony pays the LLM and transcription providers
+itself, an account at zero credits can still run up real cost. Do not sell glutony
+through the Lab to paying accounts until a suspend switch or a lease exists.
+
+## Before connecting a Lab
+
+- A Lab deployment must hold no global Meilisearch connections and no global
+  pipelines pinned to a connection: a tenant's pipeline that names a global
+  connection uid resolves to the global row and writes with its key. Until glutony
+  restricts tenant jobs to tenant-owned connections, keep connections tenant-scoped.
+
+## What the Lab has to do
+
+1. Accept `product: "glutony"` and `glutonyUsageData` (schema:
+   `contracts/vendor/lab/lab-events.schema.json` in this repo).
+2. Accept `X-Lab-Signature`.
+3. Convert `cost_micro_usd` and units to credits.
+4. Give each glutony deployment its own events secret and service token.
+5. Inject `X-Meili-Tenant-Id` and `X-Meili-Envoy-Secret` on glutony's ingest routes.
+6. Call the management routes from the console's server with
+   `LAB_SERVICE_TOKEN` and `X-Glutony-Tenant-Id`.
+
+## Rollout order
+
+Deploy the control plane, then the workers, then the gateway. The aliases make any
+order work, but this one never sends a new field to an old reader.
+
+## Rollback
+
+Let in-flight pipeline workflows finish (or drain them) before rolling back:
+workflows started by the new binary carry `tenant_id`, which the previous binary does
+not read, so they would run without a tenant.
+
+`scripts/rollback-lab-seams.sql` undoes the tenant rename and drops the outbox so the
+previous binary starts. Stop every glutony service first, then run it once:
+
+```bash
+psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql
+```
+
+The script is not idempotent: a second run fails. It refuses while events are
+undelivered unless you force it, which loses them:
+
+```bash
+PGOPTIONS='-c glutony.rollback_force=on' \
+  psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql
+```

@@ -485,13 +485,20 @@ routes are excluded by name.
    `docs/concepts/multi-tenancy.mdx`), so ingest from the UI keeps using the
    Meilisearch key.
 
-**Rollback.** `sqlx` refuses to start a binary that does not know an applied
+**Rollout order.** Deploy the control plane, then the workers, then the gateway.
+
+**Rollback.** Let in-flight pipeline workflows finish (or drain) before rolling
+back: workflows started by the new binary carry `tenant_id`, which the previous
+binary does not read, so they would run without a tenant. `sqlx` refuses to start a binary that does not know an applied
 migration, so going back to the previous binary needs
 `scripts/rollback-lab-seams.sql`: it renames the columns and indexes back,
 drops `lab_events`, and deletes the `0003` and `0004` rows from
 `_sqlx_migrations`. A rollback loses undelivered events, so the script
-refuses to run while `lab_events` has undelivered rows unless it is given
-`-v force=1`.
+refuses to run while `lab_events` has undelivered rows unless the session setting
+`glutony.rollback_force = on` is set (`PGOPTIONS='-c glutony.rollback_force=on'`; see
+the amendments in §12). It is run with
+`psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql`,
+once, with every glutony service stopped: it is not idempotent.
 
 ## 11. Out of scope
 
@@ -510,3 +517,49 @@ refuses to run while `lab_events` has undelivered rows unless it is given
   suspend switch or a Lumen-style lease, decided before the first paying
   Lab account uses glutony. `docs/deployment/meilisearch-lab.mdx` states
   this limit.
+
+## 12. Amendments made while planning (2026-10-01)
+
+1. **§5.2:** `data.source_uid` is dropped. No workflow input carries the source, and
+   billing does not need it.
+2. **§5.1:** `UsageUnits` carries an additive `unpriced_calls: u64` instead of a
+   `cost_complete: bool`, because units merge by addition from an all-zero start. The
+   event's `cost_complete` is `unpriced_calls == 0`.
+3. **§5.3:** the usage activity's retry policy changes in every deployment, not only
+   with lab events on: workflow code cannot read configuration, and a new activity
+   would break replay of in-flight workflows. It retries without an attempt limit,
+   5-minute maximum interval, within a 7-day `schedule_to_close` window.
+4. **§10:** the rollback guard is the session setting `glutony.rollback_force = on`
+   (`PGOPTIONS='-c glutony.rollback_force=on'`), not `-v force=1`, so the script is
+   plain SQL a test can run; it is run with `psql --single-transaction`.
+5. **§5.7:** the Jev enricher is left out of the bundled cost table, so its calls are
+   flagged as unpriced until a price is set, rather than billed at a placeholder 0.
+
+Recorded while implementing:
+
+6. **§4.1:** with management auth on, `GET /jobs/{id}` accepts either a valid
+   management token (scoped by its `X-Glutony-Tenant-Id`; an admin without one sees
+   every job) or a trusted edge tenant, and anything else is `401`. With auth off it
+   is scoped by the trusted edge tenant as described in §4.1.
+7. **§5.4, §5.5:** the control plane refreshes the pending gauges on every
+   `GET /metrics` scrape, so they are correct even when `LAB_URL` is unset, and the
+   sender reads at most 1 MiB of the Lab's acknowledgement body.
+
+Recorded in the final review:
+
+8. **§3, §4 (known gap, tracked):** a Lab deployment must hold no global Meilisearch
+   connections and no global pipelines pinned to a connection. A tenant's pipeline that
+   names a global connection uid resolves to the global row and writes with its key.
+   Until glutony restricts tenant jobs to tenant-owned connections, keep connections
+   tenant-scoped (documented in `docs/deployment/meilisearch-lab.mdx`; no code change in
+   this branch).
+9. **§4.2:** the gateway refuses to start with `LAB_SERVICE_TOKEN` and no
+   `ENVOY_TRUSTED_HEADER` (`GatewayConfig::validate`). `ADMIN_API_KEY` alone only warns.
+10. **§5.1:** a `PROVIDER_COSTS_FILE` that cannot be read or parsed stops the worker at
+    boot; if it fails later, the process-wide table is empty (every call unpriced),
+    never the bundled placeholder rates. `UsageUnits::merge` saturates.
+11. **§5.2, §5.7:** only the canonical lower-case hyphenated UUID is a Lab account;
+    `cost_micro_usd` is capped at `i64::MAX` (the vendored `glutonyUsageData` schema
+    also sets `"maximum": 9223372036854775807`); non-finite `audio_seconds` is sent as 0.
+12. **§3.1:** `POST /pipelines` and `/pipelines/validate` validate a body `tenant_id`
+    for callers without a tenant (an Admin, or open mode); `400 invalid_tenant`.

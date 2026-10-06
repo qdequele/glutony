@@ -78,6 +78,23 @@ pub fn parse_pipeline(
     Ok(def)
 }
 
+/// Stamp the caller's tenant on the definition. A caller with a tenant always wins over
+/// the body; a global caller (an Admin, or open mode without an edge tenant) keeps the
+/// body's `tenant_id` so operators can create a tenant's pipeline, but it is validated
+/// like every tenant id that enters the system (spec §3.1).
+fn apply_scope(scope: &Scope, def: &mut PipelineDefinition) -> Result<(), GatewayError> {
+    match &scope.tenant_id {
+        Some(tenant_id) => def.tenant_id = Some(tenant_id.clone()),
+        None => {
+            if let Some(tenant_id) = &def.tenant_id {
+                meili_ingest_plugin_sdk::validate_tenant_id(tenant_id)
+                    .map_err(GatewayError::InvalidTenant)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `POST /pipelines` — create or update.
 pub async fn create_pipeline(
     State(state): State<AppState>,
@@ -94,9 +111,7 @@ pub async fn create_pipeline(
             "user pipelines cannot be marked builtin".into(),
         ));
     }
-    if let Some(tenant_id) = scope.tenant_id.clone() {
-        def.tenant_id = Some(tenant_id);
-    }
+    apply_scope(&scope, &mut def)?;
     let stored = state.control_plane.upsert_pipeline(&def).await?;
     tracing::info!(pipeline = %stored.uid, tenant_id = ?stored.tenant_id, version = stored.version, "pipeline upserted");
     Ok((StatusCode::CREATED, Json(stored.into())))
@@ -128,9 +143,7 @@ pub async fn validate_pipeline(
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
-    if let Some(tenant_id) = scope.tenant_id.clone() {
-        def.tenant_id = Some(tenant_id);
-    }
+    apply_scope(&scope, &mut def)?;
     Ok(Json(state.control_plane.validate_pipeline(&def).await?))
 }
 
@@ -312,6 +325,91 @@ steps:
         let json = json_body(resp).await;
         assert_eq!(json["version"], 2);
         assert_eq!(json["tenant_id"], "xxx");
+    }
+
+    #[tokio::test]
+    async fn a_global_caller_body_tenant_id_is_validated() {
+        let server = MockServer::start().await;
+        let body = |tenant: &str| {
+            json!({"uid": "t", "tenant_id": tenant,
+                   "steps": [{"id": "a", "plugin": "chunker"}]})
+            .to_string()
+        };
+
+        // Admin with no tenant header: the body's tenant is honored but must be valid.
+        let admin = GatewayConfig {
+            admin_api_key: Some("admin-key".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, admin).await;
+        for uri in ["/pipelines", "/pipelines/validate"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post(uri)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("authorization", "Bearer admin-key")
+                        .body(Body::from(body("a/b")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(json_body(resp).await["code"], "invalid_tenant", "{uri}");
+        }
+
+        // Open mode with no edge tenant behaves the same.
+        let (open, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = open
+            .oneshot(
+                Request::post("/pipelines")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body("a/b")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_may_still_create_a_pipeline_for_a_valid_body_tenant() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines"))
+            .and(body_partial_json(
+                json!({"uid": "t", "tenant_id": "acct-9"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "uid": "t", "name": "t", "version": 1, "tenant_id": "acct-9",
+                "steps": [{"id": "a", "plugin": "chunker"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let admin = GatewayConfig {
+            admin_api_key: Some("admin-key".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, admin).await;
+        let body = json!({"uid": "t", "tenant_id": "acct-9",
+                          "steps": [{"id": "a", "plugin": "chunker"}]})
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::post("/pipelines")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer admin-key")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

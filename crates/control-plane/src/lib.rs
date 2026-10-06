@@ -19,6 +19,9 @@ pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
+pub mod lab_events;
+pub mod lab_sender;
+pub mod metrics;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
@@ -43,6 +46,10 @@ pub struct AppState {
     pub pool: PgPool,
     /// Short-lived cache of user pipelines used by the resolver.
     pub cache: PipelineCache,
+    /// Wakes the Lab events sender right after an insert.
+    pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Prometheus metrics served at `GET /metrics`.
+    pub metrics: metrics::LabMetrics,
 }
 
 impl AppState {
@@ -51,6 +58,8 @@ impl AppState {
         Self {
             pool,
             cache: PipelineCache::default(),
+            lab_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            metrics: metrics::LabMetrics::default(),
         }
     }
 
@@ -101,10 +110,38 @@ pub async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `GET /metrics` in the Prometheus text format.
+///
+/// The outbox gauges are refreshed at scrape time so they are right even when no
+/// sender runs (`LAB_URL` unset), which is exactly when the backlog alert must fire.
+pub async fn serve_metrics(State(state): State<AppState>) -> Response {
+    let repo = lab_events::LabEventRepo::new(state.pool.clone());
+    match tokio::time::timeout(std::time::Duration::from_secs(2), repo.stats()).await {
+        Ok(Ok(stats)) => {
+            state.metrics.pending.set(stats.pending);
+            state
+                .metrics
+                .oldest_pending_seconds
+                .set(stats.oldest_pending_seconds);
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "metrics: cannot read the lab_events stats"),
+        Err(_) => tracing::warn!("metrics: reading the lab_events stats timed out"),
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        metrics::render(&state.metrics),
+    )
+        .into_response()
+}
+
 /// Build the full axum router with request tracing.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(serve_metrics))
         .route(
             "/pipelines",
             get(pipelines::list_pipelines).post(pipelines::create_pipeline),
@@ -166,6 +203,7 @@ pub fn app(state: AppState) -> Router {
             get(sources::list_source_runs),
         )
         .route("/internal/source-runs", post(sources::record_source_run))
+        .route("/internal/lab-events", post(lab_events::ingest_lab_events))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

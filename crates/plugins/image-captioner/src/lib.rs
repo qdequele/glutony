@@ -39,6 +39,7 @@
 use std::time::Duration;
 
 use base64::Engine;
+use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -275,8 +276,9 @@ impl Plugin for ImageCaptionerPlugin {
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(&blob.data)
         );
+        let model = cfg.model.as_deref().unwrap_or(&client.default_model);
         let mut body = serde_json::json!({
-            "model": cfg.model.as_deref().unwrap_or(&client.default_model),
+            "model": model,
             "max_tokens": cfg.max_tokens,
             "messages": [{
                 "role": "user",
@@ -295,6 +297,7 @@ impl Plugin for ImageCaptionerPlugin {
             chat_completion(&client.http, &client.base_url, &client.api_key, &body).await?;
         // One image went to the vision model, and its tokens are billed on top.
         units.images = 1;
+        ProviderCosts::global().apply(NAME, model, &mut units);
         ctx.record_usage(units);
 
         let mut doc = match blob.filename.as_deref() {
@@ -692,6 +695,42 @@ mod tests {
         assert_eq!(usage.llm_output_tokens, 37);
         assert_eq!(usage.llm_requests, 1);
         assert_eq!(usage.images, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_calls_are_priced_from_the_cost_table() {
+        let server = MockServer::start().await;
+        let mut reply = chat_reply(r#"{"caption":"A cat on a sofa"}"#);
+        reply["usage"] = serde_json::json!({
+            "prompt_tokens": 1105, "completion_tokens": 37, "total_tokens": 1142
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, image(), serde_json::json!({"model": "gpt-4o-mini"}))
+            .await
+            .unwrap();
+        let usage = ctx.usage();
+        // 1105 * 0.15 + 37 * 0.6 = 165.75 + 22.2 -> 188 micro-USD
+        assert_eq!(usage.cost_micro_usd, 188);
+        assert_eq!(usage.unpriced_calls, 0);
+
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.usage().unpriced_calls,
+            1,
+            "test-model is not in the table"
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,8 @@ xxx.us-west.meilisearch.com/ingest
 
 | Header | Value |
 |---|---|
-| `X-Meili-Project-Id` | tenant identifier (`xxx`) |
+| `X-Meili-Tenant-Id` | tenant identifier (`xxx`) |
+| `X-Meili-Project-Id` | same value, the older name. Still works; `X-Meili-Tenant-Id` wins when both are present |
 | `X-Meili-Host` | full Meilisearch URL, `https://xxx.us-west.meilisearch.io` |
 | `X-Meili-Api-Key` | a key with documents write permission (master or a dedicated ingest key) |
 | `X-Meili-Index` | optional, when the path or query names an index |
@@ -70,6 +71,7 @@ routes:
       cluster: meili-ingest-gateway
       timeout: 600s                     # large uploads
     request_headers_to_remove:
+      - x-meili-tenant-id
       - x-meili-project-id
       - x-meili-host
       - x-meili-api-key
@@ -78,7 +80,7 @@ routes:
       - x-meili-envoy-secret
     request_headers_to_add:
       - header: { key: x-meili-envoy-secret, value: "%ENVIRONMENT(MEILI_INGEST_SECRET)%" }
-      # x-meili-project-id / host / api-key / index / region are added by the
+      # x-meili-project-id (or x-meili-tenant-id) / host / api-key / index / region are added by the
       # glutony Lua/ext_authz filter after looking the project up.
   - match: { prefix: /jobs }
     route: { cluster: meili-ingest-gateway }
@@ -123,7 +125,7 @@ write with it.
 - **Pipelines** created through `POST /pipelines` are stored with the
   project's id and only visible to that project. They shadow global pipelines
   and built-in triggers for that tenant only.
-- **Jobs** record `project_id`. Status URLs use unguessable UUIDs; Envoy should
+- **Jobs** record `tenant_id`. Status URLs use unguessable UUIDs; Envoy should
   still only route `/jobs/*` for authenticated project traffic.
 - **Credentials** live only in the workflow input for the duration of the job
   and in Temporal's history (encrypt payloads with a Temporal data converter /

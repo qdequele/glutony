@@ -21,6 +21,8 @@ pub struct WorkerConfig {
     pub external_plugins: Option<String>,
     /// Maximum number of concurrent activities on this worker.
     pub max_concurrent_activities: usize,
+    /// Post Lab billing events to the control plane's outbox (`LAB_EVENTS_ENABLED`).
+    pub lab_events_enabled: bool,
 }
 
 impl WorkerConfig {
@@ -56,6 +58,31 @@ impl WorkerConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_concurrent_activities,
+            lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
         })
+    }
+}
+
+/// `true`/`1` (any case) -> on; anything else or unset -> off.
+fn parse_flag(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn lab_events_flag_parsing() {
+        for (raw, expected) in [
+            ("true", true),
+            ("1", true),
+            ("TRUE", true),
+            ("false", false),
+            ("0", false),
+            ("", false),
+        ] {
+            assert_eq!(super::parse_flag(Some(raw)), expected, "{raw:?}");
+        }
+        assert!(!super::parse_flag(None));
     }
 }

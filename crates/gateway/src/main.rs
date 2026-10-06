@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = GatewayConfig::from_env().context("invalid gateway configuration")?;
+    config.validate()?;
     tracing::info!(config = ?config, "starting meili-gateway");
     if config.envoy_trusted_header.is_none() {
         tracing::warn!("ENVOY_TRUSTED_HEADER is unset: trusting X-Meili-* headers from any client");

@@ -81,6 +81,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod lab;
+
 use std::fmt;
 use std::time::Duration;
 

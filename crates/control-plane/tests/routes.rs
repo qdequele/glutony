@@ -317,3 +317,19 @@ async fn health_reports_503_when_db_unreachable() {
     let v: serde_json::Value = json(&body);
     assert_eq!(v["status"], "unavailable");
 }
+
+#[tokio::test]
+async fn metrics_are_served_in_the_prometheus_text_format() {
+    let (status, body) = call(
+        app(state()),
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("glutony_lab_events_pending 0"), "{text}");
+    assert!(
+        text.contains("glutony_lab_events_delivered_total 0"),
+        "{text}"
+    );
+}

@@ -29,6 +29,13 @@ serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 meili-ingest-source.workspace = true
+reqwest.workspace = true
+url.workspace = true
+tokio-util.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+prometheus.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -37,3 +44,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+wiremock.workspace = true

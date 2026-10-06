@@ -85,6 +85,7 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+toml = "0.9"
 base64 = "0.23"
 bytes = "1"
 
@@ -169,10 +170,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # misc
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 subtle = "2.6"
+
+# Lab events: HMAC-signed delivery and Prometheus metrics
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+prometheus = { version = "0.14", default-features = false }
 
 # testing
 tempfile = "3"

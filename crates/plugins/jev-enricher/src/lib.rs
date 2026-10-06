@@ -63,6 +63,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures::StreamExt;
+use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -524,20 +525,23 @@ impl JevClient {
         cfg: &JevEnricherConfig,
         mut doc: Document,
     ) -> Result<Document, PluginError> {
+        let model = cfg.model.as_deref().unwrap_or(&self.default_model);
         let body = serde_json::json!({
-            "model": cfg.model.as_deref().unwrap_or(&self.default_model),
+            "model": model,
             "state": state_for(&doc, cfg.max_input_chars),
             "questions": cfg.questions,
         });
         // A failed call records nothing: `?` returns before `record_usage`.
         let reply = self.systemone(&body).await?;
-        ctx.record_usage(match reply.usage {
+        let mut usage = match reply.usage {
             Some(u) => UsageUnits::llm(u.input_tokens, u.output_tokens),
             None => UsageUnits {
                 llm_requests: 1,
                 ..Default::default()
             },
-        });
+        };
+        ProviderCosts::global().apply(NAME, model, &mut usage);
+        ctx.record_usage(usage);
         apply_answers(&mut doc, cfg, &reply.answers)?;
         Ok(doc)
     }
@@ -1001,6 +1005,8 @@ mod tests {
         assert_eq!(usage.llm_input_tokens, 550);
         assert_eq!(usage.llm_output_tokens, 25);
         assert_eq!(usage.llm_requests, 25);
+        // Jev is left out of the bundled cost table: every call is flagged.
+        assert_eq!(usage.unpriced_calls, 25);
     }
 
     #[tokio::test]

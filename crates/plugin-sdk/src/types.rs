@@ -619,6 +619,12 @@ pub struct UsageUnits {
     /// Any other billable call to a third-party service.
     #[serde(default)]
     pub external_requests: u64,
+    /// What glutony paid providers for these units, in micro-USD (spec §5.1).
+    #[serde(default)]
+    pub cost_micro_usd: u64,
+    /// Provider calls the cost table could not price (billed at 0, flagged).
+    #[serde(default)]
+    pub unpriced_calls: u64,
 }
 
 impl UsageUnits {
@@ -634,13 +640,21 @@ impl UsageUnits {
 
     /// Add another set of units into this one.
     pub fn merge(&mut self, other: UsageUnits) {
-        self.llm_input_tokens += other.llm_input_tokens;
-        self.llm_output_tokens += other.llm_output_tokens;
-        self.llm_requests += other.llm_requests;
+        // Saturating: a wrap would turn an over-count into an under-charge (release) or a
+        // panic (debug). `audio_seconds` is a float and cannot wrap.
+        self.llm_input_tokens = self.llm_input_tokens.saturating_add(other.llm_input_tokens);
+        self.llm_output_tokens = self
+            .llm_output_tokens
+            .saturating_add(other.llm_output_tokens);
+        self.llm_requests = self.llm_requests.saturating_add(other.llm_requests);
         self.audio_seconds += other.audio_seconds;
-        self.pages += other.pages;
-        self.images += other.images;
-        self.external_requests += other.external_requests;
+        self.pages = self.pages.saturating_add(other.pages);
+        self.images = self.images.saturating_add(other.images);
+        self.external_requests = self
+            .external_requests
+            .saturating_add(other.external_requests);
+        self.cost_micro_usd = self.cost_micro_usd.saturating_add(other.cost_micro_usd);
+        self.unpriced_calls = self.unpriced_calls.saturating_add(other.unpriced_calls);
     }
 
     /// One LLM call with its token counts.
@@ -1429,6 +1443,50 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_fields_merge_and_default_for_old_payloads() {
+        let mut a = UsageUnits {
+            cost_micro_usd: 100,
+            unpriced_calls: 1,
+            ..UsageUnits::llm(10, 2)
+        };
+        a.merge(UsageUnits {
+            cost_micro_usd: 50,
+            ..UsageUnits::llm(1, 1)
+        });
+        assert_eq!(a.cost_micro_usd, 150);
+        assert_eq!(a.unpriced_calls, 1);
+        // A payload written before the fields existed.
+        let old: UsageUnits =
+            serde_json::from_value(serde_json::json!({"llm_requests": 1})).unwrap();
+        assert_eq!((old.cost_micro_usd, old.unpriced_calls), (0, 0));
+    }
+
+    #[test]
+    fn merge_saturates_instead_of_wrapping_or_panicking() {
+        let big = UsageUnits {
+            llm_input_tokens: u64::MAX - 1,
+            llm_output_tokens: u64::MAX - 1,
+            llm_requests: u64::MAX - 1,
+            pages: u64::MAX - 1,
+            images: u64::MAX - 1,
+            external_requests: u64::MAX - 1,
+            cost_micro_usd: u64::MAX - 1,
+            unpriced_calls: u64::MAX - 1,
+            ..UsageUnits::default()
+        };
+        let mut a = big;
+        a.merge(big);
+        assert_eq!(a.llm_input_tokens, u64::MAX);
+        assert_eq!(a.llm_output_tokens, u64::MAX);
+        assert_eq!(a.llm_requests, u64::MAX);
+        assert_eq!(a.pages, u64::MAX);
+        assert_eq!(a.images, u64::MAX);
+        assert_eq!(a.external_requests, u64::MAX);
+        assert_eq!(a.cost_micro_usd, u64::MAX);
+        assert_eq!(a.unpriced_calls, u64::MAX);
+    }
 
     fn step(id: &str, deps: &[&str]) -> StepDefinition {
         StepDefinition::new(id, "noop").depends_on(deps.iter().copied())

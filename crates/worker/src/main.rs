@@ -28,6 +28,13 @@ async fn main() -> anyhow::Result<()> {
         "starting meili-ingest worker"
     );
 
+    // The provider cost table loads lazily on the first paid call; load it now so a bad
+    // PROVIDER_COSTS_FILE stops the worker before it takes traffic instead of surfacing
+    // mid-run as unpriced events.
+    meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
+        .map_err(anyhow::Error::msg)
+        .context("invalid PROVIDER_COSTS_FILE")?;
+
     // Plugins
     let mut registry = PluginRegistry::builtin();
     if let Some(spec) = &config.external_plugins {
@@ -101,8 +108,16 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| "documents".to_string()),
         );
 
+    if config.lab_events_enabled && config.control_plane_url.is_none() {
+        anyhow::bail!("LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL: the events go to its outbox");
+    }
+    if config.lab_events_enabled {
+        tracing::info!("Lab billing events enabled");
+    }
+
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
         .with_usage(usage)
+        .with_lab_events(config.lab_events_enabled)
         .with_control_plane(config.control_plane_url.clone())
         .with_connections(meili_ingest_worker::connection::ConnectionSettings {
             key: connection_key,

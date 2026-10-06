@@ -5,7 +5,9 @@ description: "Per-tenant usage data: what is recorded, how it reaches Tinybird, 
 
 Every job records what it consumed, per tenant, so you can bill for it and chart it.
 The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse) and is
-written by the worker, never by the gateway.
+written by the worker, never by the gateway. Tinybird holds the analytics. Behind the
+Meilisearch Lab, the bill is a separate stream of events, described in
+[Analytics and billing](#analytics-and-billing).
 
 ## What is recorded
 
@@ -26,7 +28,10 @@ billed for, the extractors report pages. Plugins report through
 `ActivityContext::record_usage`, and the accumulator is shared across clones so a
 plugin fanning out concurrently is not undercounted.
 
-The Meilisearch API key never appears in an event. Only `project_id` and `region` do.
+The Meilisearch API key never appears in an event. Only the tenant and `region` do.
+The tenant id is stored in the Tinybird column `project_id`: renaming a Tinybird column
+means a new data source and a backfill, so the column and the `tenant_usage` pipe
+parameter keep their names.
 
 ## How it gets there
 
@@ -41,8 +46,12 @@ be killed before it could report anything.
 </Note>
 
 Temporal retries the activity until it succeeds, which makes delivery at-least-once and
-survives a worker crash. If it exhausts its retries the job's own result is unchanged:
-losing a usage row must never turn a successful ingest into a failure.
+survives a worker crash. There is no attempt limit: the activity retries with a
+5-minute maximum interval for up to 7 days, in every deployment. During an outage of
+Tinybird or the control plane a workflow can therefore stay open that long, but the
+job's own status is written first, so a slow usage report never holds back a job's
+status. If the window runs out the job's own result is unchanged: losing a usage row
+must never turn a successful ingest into a failure.
 
 At-least-once is safe here because every row carries a deterministic `event_id`
 (`{job_id}:{step_id}:{attempt}`, or `{job_id}:job`), and the data source is a
@@ -77,6 +86,30 @@ curl "https://api.tinybird.co/v0/pipes/tenant_usage.json?\
 project_id=acme&date_from=2026-09-01&date_to=2026-09-30&token=$READ_TOKEN"
 ```
 
+## Analytics and billing
+
+Two streams leave the worker, and they have different jobs.
+
+- **Tinybird rows are analytics.** They feed the dashboard and `GET /usage`. They
+  are per step, they carry no price, and they are on for any deployment that sets
+  `TINYBIRD_TOKEN`.
+- **Lab events are the bill.** Behind the [Meilisearch Lab](/deployment/meilisearch-lab),
+  each job run for a Lab account also produces one `usage.recorded` event with the
+  same units plus `cost_micro_usd`. The Lab converts it to credits.
+
+`cost_micro_usd` is what glutony paid providers for the job. It comes from the
+provider cost table, `config/provider-costs.toml` (or the file named by
+`PROVIDER_COSTS_FILE`), keyed by plugin and model. A call the table cannot price
+costs 0 and sets `cost_complete: false` on the event, so the Lab sees the gap
+instead of silently under-billing. Calls glutony does not pay for, such as a local
+gRPC plugin, cost 0 and stay complete. The bundled prices are placeholders: set
+yours before billing. A missing or invalid `PROVIDER_COSTS_FILE` stops the worker at
+boot; if it ever fails to load later, calls are flagged unpriced instead of being
+priced at the bundled rates.
+
+The Lab event is written first, then Tinybird. A Tinybird failure cannot keep a bill
+from being recorded, and a retry re-inserts the same event id harmlessly.
+
 ## Configuration
 
 Set these on the workers. Without `TINYBIRD_TOKEN` usage reporting is simply off: the
@@ -95,6 +128,6 @@ Push the schema and pipes with the Tinybird CLI from the `tinybird/` directory; 
 ## Usage data is not monitoring
 
 These two answer different questions and must stay separate. Prometheus answers "is the
-system healthy" and its labels must stay low-cardinality, so `project_id` must never
+system healthy" and its labels must stay low-cardinality, so the tenant id must never
 become one. Per-tenant usage is inherently high-cardinality and belongs in a columnar
 store.

@@ -194,6 +194,20 @@ impl GatewayConfig {
         })
     }
 
+    /// Cross-field checks that must stop the process at boot. A Lab service token without
+    /// the edge secret would let any client claim a tenant with a bare `X-Meili-Tenant-Id`
+    /// header (Lab account ids are not secrets), so that combination is refused.
+    /// `ADMIN_API_KEY` alone stays allowed: operator mode may run without an edge.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.lab_service_token.is_some() && self.envoy_trusted_header.is_none() {
+            anyhow::bail!(
+                "LAB_SERVICE_TOKEN is set but ENVOY_TRUSTED_HEADER is not: without the edge \
+                 secret any client could claim a tenant with X-Meili-Tenant-Id; set both"
+            );
+        }
+        Ok(())
+    }
+
     /// Maximum request body size in bytes.
     pub fn max_upload_bytes(&self) -> usize {
         self.max_upload_mb.saturating_mul(1024 * 1024)
@@ -925,6 +939,32 @@ mod tests {
         assert!(!dbg.contains("lab-secret-value"));
         assert!(!dbg.contains("admin-secret-value"));
         assert_eq!(cfg.max_upload_bytes(), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn validate_requires_the_edge_secret_with_a_lab_token() {
+        let lab_only = GatewayConfig {
+            lab_service_token: Some("lab".into()),
+            ..Default::default()
+        };
+        let err = lab_only.validate().unwrap_err().to_string();
+        assert!(err.contains("LAB_SERVICE_TOKEN"), "{err}");
+        assert!(err.contains("ENVOY_TRUSTED_HEADER"), "{err}");
+
+        let both = GatewayConfig {
+            lab_service_token: Some("lab".into()),
+            envoy_trusted_header: Some("edge".into()),
+            ..Default::default()
+        };
+        assert!(both.validate().is_ok());
+
+        // Operator mode may run without an edge.
+        let admin_only = GatewayConfig {
+            admin_api_key: Some("admin".into()),
+            ..Default::default()
+        };
+        assert!(admin_only.validate().is_ok());
+        assert!(GatewayConfig::default().validate().is_ok());
     }
 
     #[tokio::test]

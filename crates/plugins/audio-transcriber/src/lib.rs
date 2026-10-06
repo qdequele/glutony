@@ -63,6 +63,7 @@
 
 use std::time::Duration;
 
+use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -355,7 +356,9 @@ impl Plugin for WhisperTranscriberPlugin {
             duration,
         } = parsed;
         // The endpoint bills per second of audio, so report what it actually got.
-        ctx.record_usage(transcription_usage(duration, &blob.data));
+        let mut usage = transcription_usage(duration, &blob.data);
+        ProviderCosts::global().apply(NAME, model, &mut usage);
+        ctx.record_usage(usage);
         let language = detected
             .filter(|l| !l.trim().is_empty())
             .or_else(|| cfg.language.clone());
@@ -1158,6 +1161,9 @@ mod tests {
         assert_eq!(usage.audio_seconds, 137.25);
         assert_eq!(usage.external_requests, 1);
         assert_eq!(usage.llm_requests, 0);
+        // 137.25 s at 100 micro-USD per second (whisper-1 is the default model).
+        assert_eq!(usage.cost_micro_usd, 13_725);
+        assert_eq!(usage.unpriced_calls, 0);
     }
 
     #[tokio::test]

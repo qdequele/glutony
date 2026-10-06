@@ -60,6 +60,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
+use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -417,8 +418,9 @@ impl LlmClient {
             .system_prompt
             .as_deref()
             .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+        let model = cfg.model.as_deref().unwrap_or(&self.default_model);
         let mut body = serde_json::json!({
-            "model": cfg.model.as_deref().unwrap_or(&self.default_model),
+            "model": model,
             "temperature": cfg.temperature,
             "response_format": { "type": "json_object" },
             "messages": [
@@ -433,7 +435,9 @@ impl LlmClient {
         // A failed call records nothing: `?` returns before `record_usage`.
         let completion =
             chat_completion_with_usage(&self.http, &self.base_url, &self.api_key, &body).await?;
-        ctx.record_usage(completion.usage);
+        let mut usage = completion.usage;
+        ProviderCosts::global().apply(NAME, model, &mut usage);
+        ctx.record_usage(usage);
         apply_reply(&mut doc, &completion.content, cfg.merge_strategy);
         Ok(doc)
     }
@@ -995,6 +999,43 @@ mod tests {
                 .set_delay(Duration::from_millis((5 - idx) * 4))
                 .set_body_json(reply)
         }
+    }
+
+    #[tokio::test]
+    async fn provider_calls_are_priced_from_the_cost_table() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(UsagePerDocument)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![Document::with_id("a", "doc number 1")]),
+                serde_json::json!({"model": "gpt-4o-mini"}),
+            )
+            .await
+            .unwrap();
+        let usage = ctx.usage();
+        // 11 prompt tokens * 0.15 + 1 completion token * 0.6, each rounded up together.
+        assert_eq!(usage.cost_micro_usd, 3);
+        assert_eq!(usage.unpriced_calls, 0);
+
+        let ctx = ActivityContext::noop();
+        plugin(&server)
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![Document::with_id("b", "doc number 2")]),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let usage = ctx.usage();
+        assert_eq!(usage.unpriced_calls, 1, "test-model is not in the table");
+        assert_eq!(usage.cost_micro_usd, 0);
     }
 
     #[tokio::test]
