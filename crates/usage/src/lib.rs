@@ -390,7 +390,7 @@ pub struct JobUsageInput {
 /// step produced (summing steps would count a document once per stage), and its usage
 /// units are the sum over all steps. Because the units appear both on the step rows and
 /// on the job row, any aggregation must pick one: the rollup in
-/// `tinybird/pipes/usage_daily.pipe` sums units from `kind = 'step'` rows only.
+/// `tinybird/pipes/usage_daily_mv.pipe` sums units from `kind = 'step'` rows only.
 pub fn events_for_job(input: &JobUsageInput) -> Vec<UsageEvent> {
     let job_id = input.job_id.to_string();
     let mut events = Vec::with_capacity(input.steps.len() + 1);

@@ -12,6 +12,11 @@
 # for a real-time view (which can double-count a redelivered event) read the
 # materialized `usage_daily` instead. Add `&format=csv` / `.csv` for a billing export.
 #
+# Every deployment mints `glutony_gateway_read`, a READ token scoped to this endpoint
+# only: it is the gateway's TINYBIRD_READ_TOKEN (see tinybird/README.md §3).
+#
+
+TOKEN "glutony_gateway_read" READ
 
 NODE tenant_usage_daily
 DESCRIPTION >

@@ -1,5 +1,8 @@
 #
-# usage_daily_billing — scheduled COPY: meili_ingest_usage FINAL → usage_daily_billing.
+# usage_daily_billing_hourly — scheduled COPY: meili_ingest_usage FINAL → usage_daily_billing.
+#
+# Named apart from its target data source and from its node: Tinybird resource names
+# share one namespace.
 #
 # The billing path. Unlike the materialized `usage_daily`, this reads the raw table
 # with FINAL, so a redelivered event (usage reporting is an at-least-once Temporal
@@ -27,27 +30,29 @@ SQL >
         toDate(ts) AS day,
         pipeline_uid,
         plugin,
-        sum(kind = 'step') AS steps,
-        sum(kind = 'job') AS jobs,
-        sum(kind = 'job' AND status = 'succeeded') AS jobs_succeeded,
-        sum(kind = 'job' AND status = 'failed') AS jobs_failed,
-        sum(if(kind = 'step', documents_out, toUInt64(0))) AS documents_out,
+        -- Raw columns are qualified with `u.`: the output aliases reuse their names, and
+        -- an unqualified `documents_out` below would resolve to the `sum(...)` alias.
+        sum(u.kind = 'step') AS steps,
+        sum(u.kind = 'job') AS jobs,
+        sum(u.kind = 'job' AND u.status = 'succeeded') AS jobs_succeeded,
+        sum(u.kind = 'job' AND u.status = 'failed') AS jobs_failed,
+        sum(if(u.kind = 'step', u.documents_out, toUInt64(0))) AS documents_out,
         -- What a tenant is actually billed for. `documents_out` on step rows counts a
         -- document once per stage (extract -> chunk -> index), so it measures work
         -- done, not corpus size. The job row carries the FINAL step's output, which is
         -- the number of documents that reached Meilisearch.
-        sum(if(kind = 'job', documents_out, toUInt64(0))) AS documents_indexed,
-        sum(if(kind = 'step', input_bytes, toUInt64(0))) AS input_bytes,
-        sum(if(kind = 'step', duration_ms, toUInt64(0))) AS duration_ms,
-        sum(if(kind = 'step', llm_input_tokens, toUInt64(0))) AS llm_input_tokens,
-        sum(if(kind = 'step', llm_output_tokens, toUInt64(0))) AS llm_output_tokens,
-        sum(if(kind = 'step', llm_requests, toUInt64(0))) AS llm_requests,
-        sum(if(kind = 'step', audio_seconds, toFloat64(0))) AS audio_seconds,
-        sum(if(kind = 'step', pages, toUInt64(0))) AS pages,
-        sum(if(kind = 'step', images, toUInt64(0))) AS images,
-        sum(if(kind = 'step', external_requests, toUInt64(0))) AS external_requests
-    FROM meili_ingest_usage FINAL
-    WHERE toDate(ts) >= toStartOfMonth(subtractDays(today(), 2))
+        sum(if(u.kind = 'job', u.documents_out, toUInt64(0))) AS documents_indexed,
+        sum(if(u.kind = 'step', u.input_bytes, toUInt64(0))) AS input_bytes,
+        sum(if(u.kind = 'step', u.duration_ms, toUInt64(0))) AS duration_ms,
+        sum(if(u.kind = 'step', u.llm_input_tokens, toUInt64(0))) AS llm_input_tokens,
+        sum(if(u.kind = 'step', u.llm_output_tokens, toUInt64(0))) AS llm_output_tokens,
+        sum(if(u.kind = 'step', u.llm_requests, toUInt64(0))) AS llm_requests,
+        sum(if(u.kind = 'step', u.audio_seconds, toFloat64(0))) AS audio_seconds,
+        sum(if(u.kind = 'step', u.pages, toUInt64(0))) AS pages,
+        sum(if(u.kind = 'step', u.images, toUInt64(0))) AS images,
+        sum(if(u.kind = 'step', u.external_requests, toUInt64(0))) AS external_requests
+    FROM meili_ingest_usage AS u FINAL
+    WHERE toDate(u.ts) >= toStartOfMonth(subtractDays(today(), 2))
     GROUP BY project_id, day, pipeline_uid, plugin
 
 TYPE COPY

@@ -118,12 +118,14 @@ deployments need no analytics account.
 
 | Variable | Default | Description |
 |---|---|---|
-| `TINYBIRD_TOKEN` | — | Append token for the usage data source. Absent disables reporting. |
+| `TINYBIRD_TOKEN` | — | Append token for the usage data source (`glutony_worker_append`, minted by every Tinybird deployment). Absent disables reporting. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
 | `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |
 
-Push the schema and pipes with the Tinybird CLI from the `tinybird/` directory; see
-`tinybird/README.md`.
+Deploy the schema and pipes with the Tinybird Forward CLI from the `tinybird/` directory
+(`tb --local deploy` against Tinybird Local, `tb --cloud deploy` against a workspace).
+The deployment also mints the gateway's read token, `glutony_gateway_read`
+(`TINYBIRD_READ_TOKEN`); see `tinybird/README.md`.
 
 ## Usage data is not monitoring
 
