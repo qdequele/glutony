@@ -175,6 +175,12 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 subtle = "2.6"
 
+# Lab events: HMAC-signed delivery and Prometheus metrics
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+prometheus = { version = "0.14", default-features = false }
+
 # testing
 tempfile = "3"
 wiremock = "0.6"

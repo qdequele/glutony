@@ -20,6 +20,8 @@ pub mod db;
 pub mod error;
 pub mod jobs;
 pub mod lab_events;
+pub mod lab_sender;
+pub mod metrics;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
@@ -46,6 +48,8 @@ pub struct AppState {
     pub cache: PipelineCache,
     /// Wakes the Lab events sender right after an insert.
     pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Prometheus metrics served at `GET /metrics`.
+    pub metrics: metrics::LabMetrics,
 }
 
 impl AppState {
@@ -55,6 +59,7 @@ impl AppState {
             pool,
             cache: PipelineCache::default(),
             lab_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            metrics: metrics::LabMetrics::default(),
         }
     }
 
@@ -105,10 +110,23 @@ pub async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `GET /metrics` in the Prometheus text format.
+pub async fn serve_metrics(State(state): State<AppState>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        metrics::render(&state.metrics),
+    )
+        .into_response()
+}
+
 /// Build the full axum router with request tracing.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(serve_metrics))
         .route(
             "/pipelines",
             get(pipelines::list_pipelines).post(pipelines::create_pipeline),

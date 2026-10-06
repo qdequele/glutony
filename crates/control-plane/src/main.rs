@@ -28,15 +28,41 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await.context("applying migrations")?;
     tracing::info!("migrations applied");
 
+    let state = AppState::new(pool.clone());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let sender = match meili_ingest_control_plane::lab_sender::LabConfig::from_env()
+        .context("invalid Lab events configuration")?
+    {
+        Some(config) => {
+            tracing::info!(url = %config.url, "lab events sender enabled");
+            let sender = meili_ingest_control_plane::lab_sender::LabSender::new(
+                meili_ingest_control_plane::lab_events::LabEventRepo::new(pool.clone()),
+                config,
+                state.metrics.clone(),
+                state.lab_notify.clone(),
+            )?;
+            Some(tokio::spawn(sender.run(cancel.clone())))
+        }
+        None => {
+            tracing::info!("LAB_URL is unset: lab events are kept in the outbox, not sent");
+            None
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "control plane listening");
 
-    axum::serve(listener, app(AppState::new(pool.clone())))
+    axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("http server")?;
+
+    cancel.cancel();
+    if let Some(handle) = sender {
+        let _ = handle.await;
+    }
 
     tracing::info!("shutting down");
     pool.close().await;
