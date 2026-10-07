@@ -41,7 +41,10 @@
 # and nothing else.
 #
 # Partitioned by month, and dropped after 180 days: invoices are issued monthly and
-# the daily rollups (usage_daily, usage_daily_billing) keep the long-term aggregate.
+# `usage_daily_billing` keeps the long-term aggregate. `usage_daily` shares this
+# 180-day TTL because a deployment that changes its materialized pipe rebuilds it from
+# this table (see usage_daily.datasource). Changing the TTL here means changing it
+# there too, never to a longer one.
 #
 
 TOKEN "glutony_worker_append" APPEND

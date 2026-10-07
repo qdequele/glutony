@@ -70,16 +70,20 @@ reached Meilisearch, taken from the job row's final-step count — that is the f
 to bill on.
 </Note>
 
-| Table | Freshness | Deduplicated | Use for |
-|---|---|---|---|
-| `meili_ingest_usage` | real time | with `FINAL` | drill-down, audits |
-| `usage_daily` | real time | **no** | dashboards, live estimates |
-| `usage_daily_billing` | hourly | yes | **invoices** |
+| Table | Freshness | Deduplicated | Retention | Use for |
+|---|---|---|---|---|
+| `meili_ingest_usage` | real time | with `FINAL` | 180 days | drill-down, audits |
+| `usage_daily` | real time | **no** | 180 days | dashboards, live estimates |
+| `usage_daily_billing` | hourly | yes | indefinite | **invoices** |
 
 A materialized view is a trigger on `INSERT` and never sees deduplication, so
 `usage_daily` can over-count a redelivered event. `usage_daily_billing` is a scheduled
 copy that re-reads the raw table with `FINAL`, trading an hour of freshness for
 correctness. The `tenant_usage` endpoint reads it.
+
+`usage_daily` keeps 180 days, like the raw table, because a deployment that changes
+its materialized pipe rebuilds it from the raw rows. `usage_daily_billing` keeps every
+day: it is the invoice record and no deployment recomputes it.
 
 ```bash
 curl "https://api.tinybird.co/v0/pipes/tenant_usage.json?\

@@ -15,6 +15,18 @@
 # be counted twice HERE while the raw table stays correct. The raw data source remains
 # the source of truth for an invoice; this rollup is for dashboards and estimates.
 #
+# ── Retention: 180 days, like the raw table ─────────────────────────────────────
+# A deployment that changes `usage_daily_mv`'s query rebuilds this table by re-running
+# the pipe over `meili_ingest_usage`, which only holds 180 days. Tinybird therefore
+# refuses that backfill unless this TTL is no longer than the source's ("it has no
+# TTL, while the table that is going to be used for backfill ... has a TTL"), since a
+# rebuild would silently drop every older day. With matching TTLs the rollup is a pure
+# function of the raw table: any rebuild reproduces it exactly, under the new query.
+# Long-term history lives in `usage_daily_billing`, which deployments never recompute.
+#
+# `day` is a Date, so a day's row expires at the start of day + 180, slightly ahead
+# of the raw rows it summarises (`ts` + 180 days): the rollup never outlives its source.
+#
 
 SCHEMA >
     `project_id` LowCardinality(String),
@@ -41,3 +53,4 @@ SCHEMA >
 ENGINE "AggregatingMergeTree"
 ENGINE_SORTING_KEY "project_id, day, pipeline_uid, plugin"
 ENGINE_PARTITION_KEY "toYYYYMM(day)"
+ENGINE_TTL "day + INTERVAL 180 DAY"
