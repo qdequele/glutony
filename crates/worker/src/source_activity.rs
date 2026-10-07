@@ -738,6 +738,29 @@ mod tests {
         assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
     }
 
+    #[tokio::test]
+    async fn a_permanent_client_error_is_non_retryable() {
+        // A 404 stays a 404: three attempts only delay the failed run by ~40 s.
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&files)
+            .await;
+        let cp = control_plane(
+            source_row(&format!("{}/feed.json", files.uri()), None),
+            pipeline(true),
+        )
+        .await;
+        let err = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect_err("404");
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("404")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn the_index_follows_the_gateways_order() {
         let mut p = pipeline(true);

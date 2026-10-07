@@ -50,6 +50,22 @@ fn non_blank(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
+/// A source's cron must be the standard 5 fields (minute hour day-of-month month
+/// day-of-week). Temporal also takes a leading seconds field and a trailing years field
+/// (6 or 7 fields) and `@`-descriptors; those are refused so a source cannot fire every
+/// second and so the API matches what the docs and the Lab console offer. This only
+/// counts fields: whether each one is valid is still Temporal's call (Decision 10).
+fn check_cron(cron: &str) -> Result<(), GatewayError> {
+    let fields = cron.split_whitespace().count();
+    if fields == 5 {
+        return Ok(());
+    }
+    Err(GatewayError::Unprocessable(format!(
+        "invalid cron {cron:?}: expected 5 fields (minute hour day-of-month month \
+         day-of-week), got {fields}"
+    )))
+}
+
 /// Seal a fetch credential.
 fn seal(key: &SecretKey, auth: &meili_ingest_source::FetchAuth) -> Result<Vec<u8>, GatewayError> {
     seal_json(key, auth).map_err(|e| GatewayError::Internal(e.to_string()))
@@ -139,6 +155,7 @@ pub async fn create_source(
     check_uid(&uid)?;
     let tenant_id = scope.tenant_id.clone();
 
+    check_cron(&req.cron)?;
     validate_location(&req.location, &req.timezone, &state.fetch_policy).await?;
     schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
     let fetch_auth = req.auth.as_ref().map(|a| seal(key, a)).transpose()?;
@@ -265,6 +282,9 @@ pub async fn patch_source(
     check_uid(&uid)?;
     let req: UpdateSource = parse_body(&body)?;
     let tenant_id = scope.tenant_id.clone();
+    if let Some(cron) = &req.cron {
+        check_cron(cron)?;
+    }
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     let d = &stored.definition;
 
@@ -300,7 +320,7 @@ pub async fn patch_source(
         location: req.location,
         cron: req.cron,
         timezone: req.timezone,
-        index_name: req.index,
+        index_name: req.index.map(non_blank),
         fetch_auth,
         paused: None,
     };
@@ -764,6 +784,85 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(schedules.calls().len(), 1, "a rename touches no schedule");
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_null_index_clears_the_override() {
+        let cp = MockServer::start().await;
+        mount_source(&cp).await;
+        Mock::given(method("PATCH"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record(false)))
+            .mount(&cp)
+            .await;
+        let app = app(&cp, Arc::new(FakeSchedules::default()), true);
+
+        for body in [
+            serde_json::json!({ "index": "" }),
+            serde_json::json!({ "index": "   " }),
+            serde_json::json!({ "index": null }),
+            serde_json::json!({ "index": " movies " }),
+            serde_json::json!({ "name": "TMDB" }),
+        ] {
+            let (status, _) = call(&app, req("PATCH", "/sources/tmdb", body.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let sent: Vec<serde_json::Value> = cp
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| serde_json::from_slice(&r.body).expect("json"))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                serde_json::json!({ "index_name": null }),
+                serde_json::json!({ "index_name": null }),
+                serde_json::json!({ "index_name": null }),
+                serde_json::json!({ "index_name": "movies" }),
+                serde_json::json!({ "name": "TMDB" }),
+            ],
+            "blank and null clear the override; absent keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cron_without_exactly_five_fields_is_422() {
+        let cp = MockServer::start().await;
+        mount_pipeline(&cp, true).await;
+        mount_source(&cp).await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sources"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(record(true)))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let app = app(&cp, schedules.clone(), true);
+
+        for cron in ["* * * * * *", "0 0 9 * * * 2026", "0 9 * *", "@daily", ""] {
+            let mut body = create_body();
+            body["cron"] = serde_json::json!(cron);
+            let (status, err) = call(&app, req("POST", "/sources", body)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "create {cron:?}");
+            assert!(
+                err["error"].as_str().unwrap_or("").contains("5 fields"),
+                "{err}"
+            );
+            let (status, _) = call(
+                &app,
+                req(
+                    "PATCH",
+                    "/sources/tmdb",
+                    serde_json::json!({ "cron": cron }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "patch {cron:?}");
+        }
+        assert!(schedules.calls().is_empty(), "{:?}", schedules.calls());
     }
 
     #[tokio::test]

@@ -105,11 +105,19 @@ impl SourceConnector for UrlConnector {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(Resolution::Unchanged);
         }
-        if !response.status().is_success() {
-            return Err(SourceError::Fetch(format!(
-                "GET {parsed}: status {}",
-                response.status()
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let message = format!("GET {parsed}: status {status}");
+            let transient = !status.is_client_error()
+                || matches!(
+                    status,
+                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+                );
+            return Err(if transient {
+                SourceError::Fetch(message)
+            } else {
+                SourceError::Rejected(message)
+            });
         }
 
         let etag = header_string(&response, reqwest::header::ETAG);
@@ -522,6 +530,42 @@ mod tests {
             )
             .await;
         assert!(got.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_permanent_and_a_server_error_is_transient() {
+        for (status, permanent) in [
+            (400, true),
+            (401, true),
+            (403, true),
+            (404, true),
+            (410, true),
+            (408, false),
+            (429, false),
+            (500, false),
+            (503, false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let err = UrlConnector
+                .resolve(
+                    &url_location(format!("{}/feed.json", server.uri())),
+                    None,
+                    &IncrementalState::default(),
+                    &rt_without_guard(now()),
+                )
+                .await
+                .expect_err("non-success");
+            assert_eq!(
+                matches!(err, SourceError::Rejected(_)),
+                permanent,
+                "{status}: {err:?}"
+            );
+            assert!(err.to_string().contains(&status.to_string()), "{err}");
+        }
     }
 
     #[tokio::test]

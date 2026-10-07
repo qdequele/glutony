@@ -77,9 +77,14 @@ pub struct SourcePatch {
     /// New timezone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
-    /// New index override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index_name: Option<String>,
+    /// `Some(Some(name))` replaces the index override, `Some(None)` clears it, `None`
+    /// leaves it alone (same JSON handling as `fetch_auth`).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub index_name: Option<Option<String>>,
     /// `Some(Some(bytes))` replaces the credential, `Some(None)` clears it, `None`
     /// leaves it alone. That three-way distinction is the whole point of the type.
     ///
@@ -379,6 +384,12 @@ impl SourceRepo {
             None => (false, None),
             Some(v) => (true, v.as_deref()),
         };
+        // Same three-way split for the index override: `$13` says "write `$9`, even
+        // when it is NULL".
+        let (set_index, index_value) = match &patch.index_name {
+            None => (false, None),
+            Some(v) => (true, v.as_deref()),
+        };
         let sql = format!(
             "UPDATE sources SET \
                 name = COALESCE($3, name), \
@@ -387,7 +398,7 @@ impl SourceRepo {
                 location = COALESCE($6, location), \
                 cron = COALESCE($7, cron), \
                 timezone = COALESCE($8, timezone), \
-                index_name = COALESCE($9, index_name), \
+                index_name = CASE WHEN $13 THEN $9 ELSE index_name END, \
                 fetch_auth = CASE WHEN $10 THEN $11 ELSE fetch_auth END, \
                 paused = COALESCE($12, paused), \
                 updated_at = now() \
@@ -403,10 +414,11 @@ impl SourceRepo {
             .bind(patch.location.as_ref().map(SqlJson))
             .bind(patch.cron.as_deref())
             .bind(patch.timezone.as_deref())
-            .bind(patch.index_name.as_deref())
+            .bind(index_value)
             .bind(set_auth)
             .bind(auth_value)
             .bind(patch.paused)
+            .bind(set_index)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(SourceRecord::from))

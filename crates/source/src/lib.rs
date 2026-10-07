@@ -53,9 +53,14 @@ pub enum SourceError {
     /// A URL template could not be rendered.
     #[error("url template: {0}")]
     Template(String),
-    /// The upstream fetch failed.
+    /// The upstream fetch failed in a way that may pass on a retry: a transport error,
+    /// a 5xx, `408 Request Timeout` or `429 Too Many Requests`.
     #[error("fetch: {0}")]
     Fetch(String),
+    /// The upstream answered with a client error other than 408/429 (404, 403, 410…).
+    /// Not transient: the same request gets the same answer, so it is not retried.
+    #[error("fetch rejected: {0}")]
+    Rejected(String),
     /// The content is larger than the fetch cap, compressed or once decompressed.
     /// Not transient: fetching the same file again yields the same size.
     #[error("too large: {0}")]

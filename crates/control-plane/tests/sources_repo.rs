@@ -413,3 +413,41 @@ async fn archiving_a_tenant_pipeline_leaves_global_sources_alone() {
         "a tenant deleting its pipeline must not archive a global source"
     );
 }
+
+#[tokio::test]
+async fn the_index_override_can_be_set_kept_and_cleared() {
+    use meili_ingest_control_plane::sources::SourcePatch;
+    let Some(repo) = repo("tr-idx").await else {
+        return;
+    };
+    repo.insert(&new_source("tr-idx-1", Some("proj-8"), "builtin.json"))
+        .await
+        .expect("insert");
+    let index_after = |patch: serde_json::Value| {
+        let repo = repo.clone();
+        async move {
+            // Through JSON, as the gateway sends it: `null` must survive as "clear".
+            let patch: SourcePatch = serde_json::from_value(patch).expect("patch");
+            repo.update("tr-idx-1", Some("proj-8"), &patch)
+                .await
+                .expect("update")
+                .expect("row")
+                .definition
+                .index_name
+        }
+    };
+    assert_eq!(
+        index_after(serde_json::json!({ "index_name": "movies" })).await,
+        Some("movies".to_string())
+    );
+    assert_eq!(
+        index_after(serde_json::json!({ "name": "renamed" })).await,
+        Some("movies".to_string()),
+        "absent keeps it"
+    );
+    assert_eq!(
+        index_after(serde_json::json!({ "index_name": null })).await,
+        None,
+        "null clears it"
+    );
+}

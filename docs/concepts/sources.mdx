@@ -68,9 +68,9 @@ curl -X POST $INGEST/sources \
 | `name`, `description` | no | Display only. `name` defaults to `uid`. |
 | `pipeline` | yes | Pipeline to run. Its `meili_indexer` steps must name a connection. |
 | `location` | yes | Where to fetch from (see below). |
-| `cron` | yes | Standard 5-field cron. Validated by Temporal; a bad expression is `422`. |
+| `cron` | yes | Standard 5-field cron (minute, hour, day of month, month, day of week). Anything else is `422`: Temporal's 6- and 7-field forms (seconds, years) and `@` descriptors are refused so a source cannot fire every second. Field values are validated by Temporal. |
 | `timezone` | no | IANA name, default `UTC`. Applies to the cron **and** to URL templates. |
-| `index` | no | Index override, in the place a request's `?index=` would take. |
+| `index` | no | Index override, in the place a request's `?index=` would take. In `PATCH`, `null` or `""` removes the override. |
 | `auth` | no | Credential for the fetch (see [Security](#security)). Write-only. |
 
 A source starts **active**. Pause and resume it, or run it once off-schedule:
@@ -151,6 +151,10 @@ curl "$INGEST/sources/tmdb/runs?limit=5"
 | `ingested` | Content changed; every job it started succeeded. |
 | `unchanged` | Upstream answered `304`, or the bytes hashed the same as last time. No job, nothing billed. |
 | `failed` | The fetch failed, or a job failed. `error` says why. |
+
+A fetch that fails with a transport error, `408`, `429` or a `5xx` is retried
+(3 attempts) before the run is `failed`. Any other `4xx` (`404`, `403`, `410`…)
+fails the run at once: the next tick tries again.
 
 A source remembers the last `ETag`, `Last-Modified` and content hash, and sends
 `If-None-Match` / `If-Modified-Since` on the next fetch. That state is saved
