@@ -349,6 +349,62 @@ mod builtin_pipeline_compat {
         }
     }
 
+    /// Every pipeline glutony ships: the built-ins, the catalog templates with an
+    /// inline definition and the examples under `config/pipelines/`.
+    fn shipped_pipelines() -> Vec<meili_ingest_plugin_sdk::PipelineDefinition> {
+        let mut out = builtin_pipelines();
+        out.extend(
+            meili_ingest_router::catalog::catalog()
+                .workflows
+                .into_iter()
+                .filter_map(|w| w.definition),
+        );
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/pipelines");
+        for entry in std::fs::read_dir(dir).expect("config/pipelines") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "yaml") {
+                let text = std::fs::read_to_string(&path).expect("read example");
+                out.push(
+                    serde_yaml::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+                );
+            }
+        }
+        out
+    }
+
+    /// The control plane checks every step config against its plugin's schema on save
+    /// (`POST /pipelines`). A shipped pipeline that failed that check could not be
+    /// duplicated and saved, which is how the Lab edits a built-in.
+    #[test]
+    fn every_shipped_pipeline_step_config_satisfies_its_plugin_schema() {
+        let reg = registry_with_all_manifests();
+        let mut failures = Vec::new();
+        for pipeline in shipped_pipelines() {
+            for step in &pipeline.steps {
+                let Some(plugin) = reg.get(&step.plugin) else {
+                    assert!(
+                        EXTERNAL.contains(&step.plugin.as_str()),
+                        "{}: plugin {} not registered",
+                        pipeline.uid,
+                        step.plugin
+                    );
+                    continue;
+                };
+                let schema = plugin.manifest().config_schema;
+                let validator = jsonschema::validator_for(&schema)
+                    .unwrap_or_else(|e| panic!("{}: schema does not compile: {e}", step.plugin));
+                for e in validator.iter_errors(&step.config) {
+                    failures.push(format!(
+                        "{}: step {:?} ({}): {e}",
+                        pipeline.uid, step.id, step.plugin
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     #[test]
     fn every_builtin_pipeline_ends_in_the_indexer() {
         for pipeline in builtin_pipelines() {

@@ -4,7 +4,9 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use meili_ingest_plugin_sdk::PipelineDefinition;
+use meili_ingest_plugin_sdk::{
+    INDEXER_PLUGIN, PipelineDefinition, PluginManifest, pinned_connection,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::types::Json as SqlJson;
@@ -173,14 +175,6 @@ impl PipelineRepo {
         tx.commit().await?;
         Ok((deleted, archived.into_iter().map(|(id,)| id).collect()))
     }
-
-    /// Names present in the `plugins` table (manifests registered by workers).
-    pub async fn registered_plugin_names(&self) -> Result<Vec<String>, CpError> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM plugins")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|(n,)| n).collect())
-    }
 }
 
 /// `?tenant_id=` query parameter shared by the pipeline routes.
@@ -225,6 +219,85 @@ pub fn prepare_definition(def: &mut PipelineDefinition) -> Result<(), CpError> {
     Ok(())
 }
 
+/// Every step whose `config` does not satisfy its plugin's `config_schema`, one message
+/// per violation, prefixed with the step id and plugin.
+///
+/// The schemas are the ones `GET /plugins` serves (JSON Schema draft 2020-12). A step
+/// whose plugin has no manifest in `manifests` is skipped: with no worker registered
+/// yet there is nothing to check against, and the run will still fail loudly. A schema
+/// that does not compile is skipped too (and logged), so one broken external plugin
+/// cannot block every pipeline that uses it. `format` is an annotation only, as the
+/// draft says: the custom formats (`meili-connection`, `jev-questions`) have their own
+/// checks.
+pub fn config_errors(def: &PipelineDefinition, manifests: &[PluginManifest]) -> Vec<String> {
+    let mut out = Vec::new();
+    for step in &def.steps {
+        let Some(manifest) = manifests.iter().find(|m| m.name == step.plugin) else {
+            continue;
+        };
+        let validator = match jsonschema::validator_for(&manifest.config_schema) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(plugin = %manifest.name, "config_schema does not compile: {e}");
+                continue;
+            }
+        };
+        for e in validator.iter_errors(&step.config) {
+            let at = e.instance_path().to_string();
+            let at = if at.is_empty() {
+                String::new()
+            } else {
+                format!(" at {at}")
+            };
+            out.push(format!(
+                "step {:?} ({}): invalid config{at}: {e}",
+                step.id, step.plugin
+            ));
+        }
+    }
+    out
+}
+
+/// The checks that need the database, shared by validate and create so the two can
+/// never disagree: unknown plugins (422 `unknown_plugin`), step configs against their
+/// plugin's schema and indexer connections that do not exist for the tenant (both 422
+/// `validation`).
+///
+/// The connection lookup is the one the worker does at run time (the tenant's row, else
+/// the global one), so a pipeline that passes here does not fail later with
+/// "connection not found" unless the connection is deleted in between.
+async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> Result<(), CpError> {
+    let manifests = crate::plugins::registered_manifests(&state.pool).await?;
+    let registered: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
+    let unknown = unknown_plugins(def, &registered);
+    if !unknown.is_empty() {
+        return Err(unknown_plugin_error(&unknown));
+    }
+
+    let mut errors = config_errors(def, &manifests);
+    let connections = state.connections();
+    for step in def.steps.iter().filter(|s| s.plugin == INDEXER_PLUGIN) {
+        let Some(uid) = pinned_connection(&step.config) else {
+            continue;
+        };
+        if connections
+            .get(uid, def.tenant_id.as_deref())
+            .await?
+            .is_none()
+        {
+            errors.push(format!(
+                "step {:?} ({}): connection {uid:?} does not exist for this tenant",
+                step.id, step.plugin
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CpError::Validation(errors.join("; ")))
+    }
+}
+
 /// Build the `unknown plugin` error for a list of names.
 fn unknown_plugin_error(names: &[String]) -> CpError {
     let list = names
@@ -266,8 +339,9 @@ pub struct ValidationResult {
 /// produce. Persists nothing.
 ///
 /// Exists so an editor can tell the author their pipeline has a cycle, an unknown
-/// plugin or a bad fan-out *before* saving. It runs the identical code path as
-/// [`create_pipeline`] so the two can never disagree.
+/// plugin, a bad step config, a missing connection or a bad fan-out *before* saving.
+/// It runs the identical code path as [`create_pipeline`] so the two can never
+/// disagree.
 pub async fn validate_pipeline(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -275,15 +349,7 @@ pub async fn validate_pipeline(
 ) -> Result<Json<ValidationResult>, CpError> {
     prepare_definition(&mut def)?;
     def.tenant_id = tenant_scope(def.tenant_id.as_deref(), &headers);
-
-    let statically_unknown = unknown_plugins(&def, &[]);
-    if !statically_unknown.is_empty() {
-        let registered = state.pipelines().registered_plugin_names().await?;
-        let unknown = unknown_plugins(&def, &registered);
-        if !unknown.is_empty() {
-            return Err(unknown_plugin_error(&unknown));
-        }
-    }
+    check_against_registry(&state, &def).await?;
 
     let order = def
         .validate()
@@ -298,8 +364,9 @@ pub async fn validate_pipeline(
 /// `POST /pipelines` → 201 with the stored definition.
 ///
 /// Normalizes and validates the body (422 `validation`), rejects the `builtin.`
-/// namespace (403 `builtin`), rejects unknown plugins (422 `unknown_plugin`) and
-/// upserts by `(uid, tenant_id)`. The scope comes from the body's `tenant_id` or
+/// namespace (403 `builtin`), rejects unknown plugins (422 `unknown_plugin`), step
+/// configs that break their plugin's schema and indexer connections the tenant does
+/// not have (422 `validation`), and upserts by `(uid, tenant_id)`. The scope comes from the body's `tenant_id` or
 /// the `X-Meili-Project-Id` header.
 pub async fn create_pipeline(
     State(state): State<AppState>,
@@ -308,16 +375,7 @@ pub async fn create_pipeline(
 ) -> Result<Response, CpError> {
     prepare_definition(&mut def)?;
     def.tenant_id = tenant_scope(def.tenant_id.as_deref(), &headers);
-
-    // Only hit the database when the static list does not already cover every step.
-    let statically_unknown = unknown_plugins(&def, &[]);
-    if !statically_unknown.is_empty() {
-        let registered = state.pipelines().registered_plugin_names().await?;
-        let unknown = unknown_plugins(&def, &registered);
-        if !unknown.is_empty() {
-            return Err(unknown_plugin_error(&unknown));
-        }
-    }
+    check_against_registry(&state, &def).await?;
 
     let stored = state.pipelines().upsert(&def).await?;
     state.cache.invalidate().await;
@@ -473,6 +531,45 @@ mod tests {
         cyclic.steps[1].depends_on = vec!["s0".into()];
         let err = prepare_definition(&mut cyclic).err().map(|e| e.code());
         assert_eq!(err, Some("validation"));
+    }
+
+    #[test]
+    fn config_errors_name_the_step_the_plugin_and_the_field() {
+        let chunker = PluginManifest::new("chunker", "0.1.0").config_schema(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "chunk_size": { "type": "integer", "minimum": 1 } }
+        }));
+        let mut d = def("p", &["chunker", "meili_indexer"]);
+        d.steps[0].config = serde_json::json!({ "chunk_size": "big", "nope": 1 });
+        let errors = config_errors(&d, std::slice::from_ref(&chunker));
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0].starts_with("step \"s0\" (chunker): invalid config"),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("/chunk_size") && e.contains("\"big\"")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().any(|e| e.contains("nope")), "{errors:?}");
+
+        d.steps[0].config = serde_json::json!({ "chunk_size": 64 });
+        assert!(config_errors(&d, &[chunker]).is_empty());
+    }
+
+    #[test]
+    fn config_errors_skip_unregistered_plugins_and_broken_schemas() {
+        let mut d = def("p", &["chunker", "custom"]);
+        d.steps[0].config = serde_json::json!({ "anything": true });
+        assert!(config_errors(&d, &[]).is_empty(), "no manifest, no check");
+
+        let broken = PluginManifest::new("chunker", "0.1.0")
+            .config_schema(serde_json::json!({ "type": "not-a-type" }));
+        assert!(config_errors(&d, &[broken]).is_empty());
     }
 
     #[test]

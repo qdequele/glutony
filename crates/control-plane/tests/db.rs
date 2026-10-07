@@ -655,3 +655,171 @@ async fn a_tenant_delete_never_reaches_the_global_pipeline() {
     assert_eq!(status, StatusCode::OK, "the global pipeline is still there");
     t.drop_schema().await;
 }
+
+/// The chunker's manifest as a worker registers it: a draft 2020-12 schema that
+/// rejects unknown keys.
+fn chunker_manifest() -> PluginManifest {
+    PluginManifest::new("chunker", "0.1.0").config_schema(serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "chunk_size": { "type": "integer", "minimum": 1 },
+            "overlap": { "type": "integer", "minimum": 0 }
+        }
+    }))
+}
+
+fn chunk_pipeline(uid: &str, config: serde_json::Value) -> PipelineDefinition {
+    PipelineDefinition {
+        uid: uid.into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            StepDefinition::new("c", "chunker").config(config),
+            StepDefinition::new("index", "meili_indexer"),
+        ],
+        builtin: false,
+        tenant_id: Some("t1".into()),
+    }
+}
+
+#[tokio::test]
+async fn step_config_is_checked_against_the_plugin_schema() {
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let (status, _) = call(
+        app(state.clone()),
+        req_json("POST", "/internal/plugins", &vec![chunker_manifest()]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A wrong type: the run would fail with "expected usize".
+    let bad_type = chunk_pipeline("cfg-type", serde_json::json!({ "chunk_size": "big" }));
+    for uri in ["/pipelines/validate", "/pipelines"] {
+        let (status, body) = call(app(state.clone()), req_json("POST", uri, &bad_type)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation", "{uri}");
+        assert!(
+            err.error.contains("\"c\"")
+                && err.error.contains("chunker")
+                && err.error.contains("chunk_size"),
+            "{uri}: {}",
+            err.error
+        );
+    }
+    // Nothing was stored by the rejected create.
+    let (status, _) = call(app(state.clone()), get("/pipelines/cfg-type?tenant_id=t1")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // An unknown key, against `additionalProperties: false`.
+    let unknown_key = chunk_pipeline("cfg-key", serde_json::json!({ "nope": 1 }));
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines/validate", &unknown_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let err: ErrorBody = json(&body);
+    assert!(err.error.contains("nope"), "{}", err.error);
+
+    // A valid config passes, and so does a plugin with no registered manifest
+    // (meili_indexer here): there is no schema to check it against.
+    let good = chunk_pipeline("cfg-ok", serde_json::json!({ "chunk_size": 100 }));
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines/validate", &good),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = call(app(state.clone()), req_json("POST", "/pipelines", &good)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn an_indexer_connection_must_exist_for_the_tenant() {
+    use meili_ingest_control_plane::connections::{ConnectionRepo, NewConnection};
+
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let pinned = |uid: &str, tenant: &str, connection: &str| PipelineDefinition {
+        uid: uid.into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            StepDefinition::new("index", "meili_indexer")
+                .config(serde_json::json!({ "connection": connection })),
+        ],
+        builtin: false,
+        tenant_id: Some(tenant.into()),
+    };
+    let connection = |uid: &str, tenant: Option<&str>| NewConnection {
+        id: Uuid::new_v4(),
+        uid: uid.into(),
+        name: uid.into(),
+        tenant_id: tenant.map(str::to_owned),
+        host: "https://movies.example".into(),
+        api_key: vec![1, 2, 3],
+    };
+
+    let missing = pinned("pin-missing", "t1", "does-not-exist");
+    for uri in ["/pipelines/validate", "/pipelines"] {
+        let (status, body) = call(app(state.clone()), req_json("POST", uri, &missing)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation");
+        assert!(
+            err.error.contains("\"does-not-exist\"") && err.error.contains("connection"),
+            "{uri}: {}",
+            err.error
+        );
+    }
+
+    // The tenant's own connection is accepted; another tenant's is not.
+    let repo = ConnectionRepo::new(t.pool.clone());
+    repo.insert(&connection("mine", Some("t1"))).await.unwrap();
+    let (status, body) = call(
+        app(state.clone()),
+        req_json(
+            "POST",
+            "/pipelines/validate",
+            &pinned("pin-own", "t1", "mine"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = call(
+        app(state.clone()),
+        req_json(
+            "POST",
+            "/pipelines/validate",
+            &pinned("pin-other", "t2", "mine"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A global connection is usable by every tenant, as at run time.
+    repo.insert(&connection("shared", None)).await.unwrap();
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines", &pinned("pin-shared", "t2", "shared")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    t.drop_schema().await;
+}

@@ -18,7 +18,6 @@ steps:
     plugin: pdf_extractor
     config:
       per_page: true
-      extract_images: false
     timeout_secs: 120
     retry:
       max_attempts: 3

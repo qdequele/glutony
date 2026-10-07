@@ -223,6 +223,7 @@ pub mod test_support {
         inputs: Mutex<Vec<PipelineWorkflowInput>>,
         cancelled: Mutex<Vec<Uuid>>,
         snapshots: Mutex<HashMap<Uuid, JobSnapshot>>,
+        forgotten: Mutex<Vec<Uuid>>,
         fail_start: Mutex<bool>,
     }
 
@@ -238,6 +239,11 @@ pub mod test_support {
         /// Make `progress(job_id)` return this snapshot.
         pub fn set_snapshot(&self, job_id: Uuid, snapshot: JobSnapshot) {
             self.snapshots.lock().unwrap().insert(job_id, snapshot);
+        }
+        /// Make Temporal not know `job_id` at all, as for an unknown id or a workflow
+        /// past its retention: `cancel` is `NotFound` and `progress` is `None`.
+        pub fn forget(&self, job_id: Uuid) {
+            self.forgotten.lock().unwrap().push(job_id);
         }
         /// Make `start` fail with an upstream error.
         pub fn fail_start(&self) {
@@ -263,7 +269,20 @@ pub mod test_support {
         async fn progress(&self, job_id: Uuid) -> Result<Option<JobSnapshot>, GatewayError> {
             Ok(self.snapshots.lock().unwrap().get(&job_id).cloned())
         }
+        /// Like Temporal: signalling or cancelling a closed workflow is `NotFound`,
+        /// exactly as for a workflow that never existed.
         async fn cancel(&self, job_id: Uuid) -> Result<(), GatewayError> {
+            let forgotten = self.forgotten.lock().unwrap().contains(&job_id);
+            let closed = forgotten
+                || self
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .get(&job_id)
+                    .is_some_and(|s| s.status.is_terminal());
+            if closed {
+                return Err(GatewayError::NotFound(format!("job {job_id} not found")));
+            }
             self.cancelled.lock().unwrap().push(job_id);
             Ok(())
         }
