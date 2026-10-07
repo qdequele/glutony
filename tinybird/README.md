@@ -78,6 +78,60 @@ copied*). The billing copy runs on its schedule (`17 * * * *`); to refresh it no
 tb --local copy run usage_daily_billing_hourly --wait     # or --cloud
 ```
 
+### Changing a materialization: what a redeploy backfills
+
+What a deployment does depends on what changed. Each case was verified on Tinybird
+Local (tb 4.6.22) against a workspace that already held rows:
+
+| change | what the deployment does | rows |
+|---|---|---|
+| comments only (`#` lines, `--` in SQL) | nothing: `No changes`, not deployed | untouched |
+| a pipe's `DESCRIPTION` | redeploys the pipe; *No data will be copied* | untouched |
+| `usage_daily_mv`'s **SQL** | rebuilds `usage_daily` by re-running the pipe over `meili_ingest_usage` (*Backfill type: Using Materialized Pipe usage_daily_mv*) | `usage_daily` recomputed from the last 180 days, **under the new query** |
+| `usage_daily_billing_hourly`'s SQL | redeploys the copy; no backfill, the next scheduled run uses the new query | untouched |
+| `usage_daily_billing`'s schema | `ALTER TABLE` on promotion; no data movement | kept |
+| a data source's `ENGINE_TTL` (e.g. upgrading a workspace deployed before `usage_daily` had one) | `ALTER TABLE` on promotion; no data movement | kept, then expired by the TTL |
+
+The rebuild in the third row is why `usage_daily` carries
+`ENGINE_TTL "day + INTERVAL 180 DAY"`. Tinybird refuses a materialized backfill whose
+target would keep data longer than the source it is rebuilt from, since a rebuild
+would silently drop every older day:
+
+```
+ERROR: Error on datasource 'datasources/usage_daily.datasource': it has no TTL, while the
+table that is going to be used for backfill 'meili_ingest_usage' has a TTL of
+toDateTime(ts) + INTERVAL 180 DAY.
+```
+
+A TTL *longer* than the source's is refused the same way ("it has a longer TTL"). So
+`usage_daily`'s TTL must stay at or below `meili_ingest_usage`'s. If you change one,
+change both. Without it, the first deployment that touched the pipe's SQL failed on
+any workspace holding rows. An empty workspace never showed it, because there was
+nothing to backfill.
+
+The error message lists two other ways out. Both keep `usage_daily`'s old days
+computed by the **old** query, so they are deliberately not used here:
+
+* `FORWARD_QUERY > SELECT *` on `usage_daily` copies the live table instead of
+  recomputing it.
+* `DEPLOYMENT_METHOD alter` on the pipe swaps the query in place with
+  `ALTER TABLE … MODIFY QUERY` and touches no stored row. It also only works once the
+  view exists.
+
+Reach for one only for a change that must not touch history, and expect a dashboard
+that mixes old and new semantics. `--allow-destructive-operations` is never needed with
+the TTL in place.
+
+**What to expect in production (Tinybird Cloud).** `tb --cloud deploy --check` prints
+the same plan without deploying: look for `usage_daily` under *Data that will be
+copied*. A real deployment builds a staging deployment, rebuilds `usage_daily` there
+from up to 180 days of raw rows, and promotes it once the backfill finishes. The live
+deployment keeps serving until then, and the backfill's progress shows on the
+deployment's *Data movements* tab. The cost is one aggregation over the raw table,
+which Tinybird may run on on-demand compute for large tables. Nothing
+invoice-relevant moves: `tenant_usage` reads `usage_daily_billing`, which no
+deployment recomputes. Only the real-time dashboard rollup is rebuilt.
+
 ## 3. Tokens
 
 Every deployment mints two scoped static tokens declared in the datafiles; neither is
@@ -89,7 +143,7 @@ the admin token, and neither can do the other's job:
 | `glutony_gateway_read` | `tenant_usage.pipe` | `READ` on `tenant_usage` | gateway `TINYBIRD_READ_TOKEN` |
 
 ```bash
-tb --local token ls                              # or --cloud; add --show-tokens to print values
+tb --local token ls                              # or --cloud; prints each token's value
 tb --local token copy glutony_worker_append      # copies the value to the clipboard
 tb --local token copy glutony_gateway_read
 ```
@@ -225,14 +279,20 @@ Two consequences worth knowing:
    suffix into `DateTime64(3)`, `{{ String(x, required=True) }}` /
    `{{ Date(x, required=True) }}` parameters, and `AggregateFunction(...)` columns in a
    materialized target all work as written.
+5. **`usage_daily` expires with its source.** `ENGINE_TTL "day + INTERVAL 180 DAY"`
+   matches `meili_ingest_usage`'s 180 days, so a deployment that changes
+   `usage_daily_mv`'s query can rebuild it (§2, *Changing a materialization*). The
+   second deploy that changed the pipe on a workspace holding rows failed without it.
+   `usage_daily_billing` has no TTL: it is the invoice record and deployments never
+   rebuild it.
 
 ## Which table do I read?
 
-| Table | Freshness | Deduplicated | Use it for |
-|---|---|---|---|
-| `meili_ingest_usage` | real time | with `FINAL` | ad-hoc drill-down, audits |
-| `usage_daily` (materialized) | real time | **no** | dashboards, live estimates |
-| `usage_daily_billing` (hourly COPY) | up to 1 h | yes | **invoices** |
+| Table | Freshness | Deduplicated | Retention | Use it for |
+|---|---|---|---|---|
+| `meili_ingest_usage` | real time | with `FINAL` | 180 days | ad-hoc drill-down, audits |
+| `usage_daily` (materialized) | real time | **no** | 180 days | dashboards, live estimates |
+| `usage_daily_billing` (hourly COPY) | up to 1 h | yes | indefinite | **invoices** |
 
 Usage reporting is an at-least-once Temporal activity, so the same event can arrive
 twice. The raw table collapses duplicates because `event_id` is deterministic and the

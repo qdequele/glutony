@@ -14,6 +14,20 @@
 # Columns are plain numbers, not aggregate states: the copy has already merged them,
 # so reads are ordinary sums and need no `-Merge` combinators.
 #
+# ── Retention: none, deliberately ───────────────────────────────────────────────
+# This is the invoice record, and it outlives the 180-day raw table: invoices get
+# disputed, audited and restated long after the rows behind them have expired. The
+# table is tiny (one row per tenant, day, pipeline and plugin), so keeping it
+# indefinitely costs nothing worth a TTL. If one is ever wanted, choose it for
+# accounting retention, not to match `meili_ingest_usage`.
+#
+# Unlike `usage_daily`, no TTL is required here: the copy only ever rewrites the
+# current month (and the previous one just after a boundary), and a deployment never
+# rebuilds a COPY target from the raw table. A changed copy pipe simply takes effect on
+# its next run, and a changed schema here is applied with ALTER or a forward query
+# over this table's own rows. Months older than the raw table's retention are
+# therefore final.
+#
 
 SCHEMA >
     `project_id` LowCardinality(String),

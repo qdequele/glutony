@@ -23,6 +23,11 @@
 #   SELECT sum(llm_input_tokens) FROM meili_ingest_usage FINAL
 #   WHERE project_id = {...} AND kind = 'step' AND ts >= {...} AND ts < {...}
 #
+# DEPLOYING A CHANGE — editing the SQL below (comments aside, which deployments ignore)
+# makes the next deployment rebuild `usage_daily` by re-running this query over every
+# row still in `meili_ingest_usage`, i.e. the last 180 days. That only works because
+# `usage_daily` has the same TTL as its source; see tinybird/README.md §2.
+#
 
 NODE usage_daily_rollup
 DESCRIPTION >
