@@ -500,7 +500,11 @@ paths:
       operationId: cancelJob
       summary: Cancel a running job
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Sends the `cancel` signal to the workflow. Steps already running finish; no new step is scheduled.
+      description: |
+        Sends the `cancel` signal to the workflow. Steps already running finish; no
+        new step is scheduled. A job that already reached a terminal status
+        (`succeeded`, `failed`, `cancelled`) is `409 already_finished`; an unknown id,
+        or another tenant's job, is `404`.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/JobId"
@@ -517,6 +521,13 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
+        "409":
+          description: The job exists but has already finished, so there is nothing to cancel.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { "error": "job 550e8400-e29b-41d4-a716-446655440000 already finished (failed); there is nothing to cancel", "code": "already_finished" }
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
@@ -552,7 +563,10 @@ paths:
       description: |
         Accepts YAML (`application/x-yaml`, `text/yaml`) or JSON. The definition
         is normalised (implicit sequential `depends_on`), validated (unknown
-        plugin, cycle, bad `fan_out` → `422`) and upserted by `(uid, tenant_id)`;
+        plugin, cycle, bad `fan_out`, a step `config` that does not satisfy its
+        plugin's `config_schema` from `GET /plugins`, a `meili_indexer`
+        `config.connection` that is not one of the tenant's or a global connection
+        → `422`) and upserted by `(uid, tenant_id)`;
         `version` is bumped on update. `uid`s starting with `builtin.` are
         rejected with `403`. Behind Envoy the pipeline is scoped to the calling
         project.
@@ -612,12 +626,7 @@ paths:
                 $ref: "#/components/schemas/Error"
               example: { "error": "builtin pipelines are read-only", "code": "forbidden" }
         "422":
-          description: Invalid pipeline (unknown plugin, cycle, duplicate step, unsupported `fan_out`).
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-              example: { "error": "step \"enrich\" references unknown plugin \"llm_enrichr\"", "code": "invalid_pipeline" }
+          $ref: "#/components/responses/InvalidPipeline"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
@@ -626,7 +635,15 @@ paths:
       tags: [Pipelines]
       operationId: validatePipeline
       summary: Dry-run a pipeline definition
-      description: Runs the same checks as a create and persists nothing.
+      description: |
+        Runs the same checks as a create and persists nothing: structure (cycle,
+        duplicate step, bad `fan_out`), unknown plugins, every step's `config`
+        against its plugin's `config_schema` (JSON Schema draft 2020-12, as served by
+        `GET /plugins`; `format` is not asserted) and every `meili_indexer`
+        `config.connection` against the caller's connections (its own, else a global
+        one). A plugin no worker has registered yet has no schema, so its config is
+        not checked. All config and connection problems are reported in one message,
+        `; `-separated.
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
@@ -644,7 +661,12 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ValidationResult" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "422": { $ref: "#/components/responses/Unprocessable" }
+        "403":
+          description: The `uid` is in the reserved `builtin.` namespace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/InvalidPipeline" }
 
   /pipelines/{uid}:
     get:
@@ -935,8 +957,13 @@ paths:
       description: |
         Validates the URL template and its host (`SOURCE_FETCH_HOSTS`), checks that
         the pipeline is pinned (every `meili_indexer` step names a connection), then
-        creates a Temporal schedule. A cron Temporal rejects is `422`. The source
-        starts active.
+        creates a Temporal schedule. `cron` must have exactly 5 fields; a 6- or
+        7-field expression (seconds, years) or an `@` descriptor is `422`, and so is
+        a 5-field cron Temporal rejects. The source starts active.
+
+        A run whose fetch gets a client error other than `408`/`429` (e.g. `404`,
+        `403`) fails at once; transport errors, `408`, `429` and `5xx` are retried
+        (3 attempts) before the run is recorded as `failed`.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -1005,7 +1032,11 @@ paths:
       operationId: updateSource
       summary: Update a source
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Any subset of the create fields except `uid`. `auth` omitted keeps it, `null` clears it.
+      description: |
+        Any subset of the create fields except `uid`. `auth` omitted keeps it, `null`
+        clears it. `index` omitted keeps it; `null` or a blank string clears the
+        override (the pipeline's `index_pattern`, then the MIME default, apply
+        again). `cron` follows the create rules (exactly 5 fields).
       requestBody:
         required: true
         content:
@@ -1380,12 +1411,28 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "source \"tmdb\" not found", "code": "not_found" }
     Unprocessable:
-      description: Validation failed (bad cron or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline).
+      description: Validation failed (bad cron — including one without exactly 5 fields — or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example: { "error": "pipeline \"movies\" cannot run on a schedule: its meili_indexer step names no Meilisearch `connection`", "code": "validation" }
+    InvalidPipeline:
+      description: |
+        The pipeline definition is invalid: unknown plugin, cycle, duplicate step,
+        unsupported `fan_out`, a step `config` that breaks its plugin's
+        `config_schema`, or a `meili_indexer` connection the tenant does not have.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            config:
+              value: { "error": "invalid pipeline: step \"c\" (chunker): invalid config at /chunk_size: \"big\" is not of type \"integer\"", "code": "invalid_pipeline" }
+            connection:
+              value: { "error": "invalid pipeline: step \"index\" (meili_indexer): connection \"does-not-exist\" does not exist for this tenant", "code": "invalid_pipeline" }
+            plugin:
+              value: { "error": "invalid pipeline: unknown plugin \"llm_enrichr\": not built in and not registered by any worker", "code": "invalid_pipeline" }
     NotEnabled:
       description: "`SOURCE_SECRET_KEY` is not set on this deployment, so connections and sources are disabled."
       content:
@@ -1948,7 +1995,12 @@ components:
           $ref: "#/components/schemas/SourceLocation"
         cron:
           type: string
-          description: 5-field cron, validated by Temporal.
+          description: |
+            Standard 5-field cron: minute, hour, day of month, month, day of week.
+            Temporal's 6/7-field forms (leading seconds, trailing years) and `@`
+            descriptors are rejected with `422`; the field values are validated by
+            Temporal.
+          pattern: "^\\s*\\S+(\\s+\\S+){4}\\s*$"
           example: "0 9 * * *"
         timezone:
           type: string
@@ -1956,7 +2008,7 @@ components:
           description: IANA timezone for the cron and URL templates.
         index:
           type: string
-          description: Index override (in the place of a request's `?index=`).
+          description: Index override (in the place of a request's `?index=`). A blank string means no override.
         auth:
           $ref: "#/components/schemas/FetchAuth"
     UpdateSource:
@@ -1968,9 +2020,14 @@ components:
         pipeline: { type: string }
         location:
           $ref: "#/components/schemas/SourceLocation"
-        cron: { type: string }
+        cron:
+          type: string
+          description: Standard 5-field cron, as on create.
+          pattern: "^\\s*\\S+(\\s+\\S+){4}\\s*$"
         timezone: { type: string }
-        index: { type: string }
+        index:
+          type: [string, "null"]
+          description: Omit to keep, `null` or a blank string to clear the override, a name to replace it.
         auth:
           description: Omit to keep, `null` to clear, an object to replace.
           oneOf:
