@@ -78,6 +78,10 @@ observe it through `ctx.check_cancelled()`), no new step is scheduled and the
 job ends as `cancelled`. Documents already written by an earlier indexer step
 remain in the index.
 
+Cancelling a job that has already finished (`succeeded`, `failed` or
+`cancelled`) changes nothing and returns `409` with code `already_finished`. An
+unknown id, or another tenant's job, is `404`.
+
 ## Retries and timeouts
 
 Per step, from the pipeline definition:
