@@ -98,6 +98,12 @@ Retryable errors (network, rate limits, transient upstream failures) go through
 this policy. Non-retryable ones (`InvalidInput`, `InvalidConfig`,
 `NonRetryable`) fail the step at once.
 
+When a step's input is a URL (`POST /ingest {"url": ...}`), the worker fetches it
+before the plugin runs. A transport error, `408`, `429` or `5xx` goes through the
+step's retry policy; any other `4xx` (`404`, `403`, `410`…), including one returned
+after a redirect, fails the step at once, since the same request gets the same
+answer. A URL refused by `SOURCE_FETCH_HOSTS` is non-retryable too.
+
 ## Observability
 
 - **Temporal UI** shows every job (`ingest-<job_id>`), its activities, retries

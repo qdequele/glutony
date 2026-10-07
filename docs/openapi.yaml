@@ -1539,7 +1539,11 @@ components:
           description: |
             HTTP(S) URL fetched by the worker. Must satisfy `SOURCE_FETCH_HOSTS` (default
             `public`: `https`, public addresses only), checked here — a forbidden URL is a
-            `422` — and again at fetch time on every redirect hop.
+            `422` — and again at fetch time on every redirect hop. The fetch happens in
+            the job, not in this request: a `4xx` other than `408`/`429` (e.g. `404`,
+            `403`, `410`, also after a redirect) fails the job's first step at once,
+            while transport errors, `408`, `429` and `5xx` are retried per the step's
+            retry policy.
         s3:
           type: string
           description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. Streamed by the worker with its ambient cloud credentials: not subject to `SOURCE_FETCH_HOSTS`, so scope those credentials to what callers may read."
