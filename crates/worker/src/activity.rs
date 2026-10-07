@@ -279,6 +279,10 @@ impl StepActivities {
                 BlobError::Blocked(_) => {
                     PluginError::NonRetryable(format!("refusing to fetch the step input: {e}"))
                 }
+                // A 404 / 403 / 410 ... answers the same way on every attempt.
+                BlobError::Rejected(_) => {
+                    PluginError::NonRetryable(format!("failed to resolve step input: {e}"))
+                }
                 other => PluginError::Retryable(format!("failed to resolve step input: {other}")),
             })?;
         if !manifest.accepts.is_empty() && !manifest.accepts_kind(resolved.kind()) {
@@ -902,6 +906,44 @@ mod tests {
         match out.output {
             PluginOutput::Bytes(b) => assert_eq!(b.data, b"hello"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_permanent_client_error_on_the_input_url_is_non_retryable() {
+        // A 404 stays a 404: retrying only delays the failed job.
+        for (status, permanent) in [
+            (404, true),
+            (403, true),
+            (410, true),
+            (408, false),
+            (429, false),
+            (503, false),
+        ] {
+            let files = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .mount(&files)
+                .await;
+            let err = guarded_acts(files.uri().trim_start_matches("http://"))
+                .run_step(
+                    &PluginContext::noop(),
+                    step_input("echo", url_input(format!("{}/doc.txt", files.uri()))),
+                )
+                .await
+                .unwrap_err();
+            if permanent {
+                assert!(
+                    matches!(err, PluginError::NonRetryable(_)),
+                    "{status}: {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, PluginError::Retryable(_)),
+                    "{status}: {err:?}"
+                );
+            }
+            assert!(err.to_string().contains(&status.to_string()), "{err}");
         }
     }
 

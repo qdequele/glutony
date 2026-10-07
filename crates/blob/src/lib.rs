@@ -58,7 +58,7 @@ pub enum BlobError {
     /// Any other object store failure.
     #[error("object store error: {0}")]
     Store(#[from] object_store::Error),
-    /// HTTP fetch failure (network error or non-2xx status).
+    /// HTTP fetch failure that may clear up: network error, 408, 429 or 5xx status.
     #[error("http error: {0}")]
     Http(String),
     /// The URL / URI could not be parsed or has an unsupported scheme.
@@ -74,6 +74,10 @@ pub enum BlobError {
     /// request was sent to it. Permanent: retrying fetches the same forbidden address.
     #[error("blocked url: {0}")]
     Blocked(String),
+    /// A URL fetch got a client error other than 408 / 429 (404, 403, 410, ...), on the
+    /// URL itself or on a redirect target. Permanent: the same request gets the same answer.
+    #[error("rejected url: {0}")]
+    Rejected(String),
 }
 
 /// Schemes a [`ContentRef::S3`] ref may use: cloud object stores, each with a bucket or
@@ -325,7 +329,8 @@ impl BlobStore {
     ///
     /// * [`ContentRef::Url`] → HTTP GET with `http`; MIME from the hint or the
     ///   `Content-Type` header (parameters stripped); filename from the hint or the
-    ///   last URL path segment.
+    ///   last URL path segment. A final 4xx status other than 408 / 429 is
+    ///   [`BlobError::Rejected`]; other failures are [`BlobError::Http`].
     /// * [`ContentRef::S3`] → a cloud object-store URI ([`OBJECT_REF_SCHEMES`]:
     ///   `s3://`, `gs://`, `az://`, ...), a fresh store per call, credentials from
     ///   the environment; MIME from the hint or guessed from the key's extension.
@@ -360,7 +365,19 @@ impl BlobStore {
                 };
                 let status = response.status();
                 if !status.is_success() {
-                    return Err(BlobError::Http(format!("GET {url}: status {status}")));
+                    let message = format!("GET {url}: status {status}");
+                    // 408 and 429 are the client errors that mean "try again later".
+                    let transient = !status.is_client_error()
+                        || matches!(
+                            status,
+                            reqwest::StatusCode::REQUEST_TIMEOUT
+                                | reqwest::StatusCode::TOO_MANY_REQUESTS
+                        );
+                    return Err(if transient {
+                        BlobError::Http(message)
+                    } else {
+                        BlobError::Rejected(message)
+                    });
                 }
                 let header_mime = response
                     .headers()
@@ -1081,23 +1098,82 @@ mod tests {
         assert!(matches!(resolved, PluginInput::Bytes(b) if b.mime == "application/pdf"));
     }
 
+    /// Non-success statuses and whether retrying the fetch could ever change them.
+    const STATUS_TABLE: [(u16, bool); 9] = [
+        (400, true),
+        (401, true),
+        (403, true),
+        (404, true),
+        (410, true),
+        (408, false),
+        (429, false),
+        (500, false),
+        (503, false),
+    ];
+
+    fn assert_classified(err: &BlobError, status: u16, permanent: bool) {
+        if permanent {
+            assert!(matches!(err, BlobError::Rejected(_)), "{status}: {err:?}");
+        } else {
+            assert!(matches!(err, BlobError::Http(_)), "{status}: {err:?}");
+        }
+        assert!(err.to_string().contains(&status.to_string()), "{err}");
+    }
+
     #[tokio::test]
-    async fn fetch_ref_url_non_success_status_is_http_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/missing"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        let store = BlobStore::memory();
-        let http = reqwest::Client::new();
-        let r = ContentRef::Url {
-            url: format!("{}/missing", server.uri()),
-            mime: None,
-            filename: None,
-        };
-        let err = store.fetch_ref(&r, &http).await.unwrap_err();
-        assert!(matches!(err, BlobError::Http(msg) if msg.contains("404")));
+    async fn a_client_error_is_permanent_and_a_server_error_is_transient() {
+        for (status, permanent) in STATUS_TABLE {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let url = url_ref(format!("{}/doc.pdf", server.uri()));
+            let unguarded = BlobStore::memory()
+                .fetch_ref(&url, &reqwest::Client::new())
+                .await
+                .expect_err("non-success");
+            assert_classified(&unguarded, status, permanent);
+            let guarded = BlobStore::memory()
+                .with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![authority(
+                    &server,
+                )]))))
+                .fetch_ref(&url, &reqwest::Client::new())
+                .await
+                .expect_err("non-success");
+            assert_classified(&guarded, status, permanent);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_error_after_a_redirect_is_permanent() {
+        for (status, permanent) in [(404, true), (410, true), (429, false), (502, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/old"))
+                .respond_with(ResponseTemplate::new(301).insert_header("location", "/gone"))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/gone"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let url = url_ref(format!("{}/old", server.uri()));
+            let unguarded = BlobStore::memory()
+                .fetch_ref(&url, &reqwest::Client::new())
+                .await
+                .expect_err("non-success");
+            assert_classified(&unguarded, status, permanent);
+            let guarded = BlobStore::memory()
+                .with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![authority(
+                    &server,
+                )]))))
+                .fetch_ref(&url, &reqwest::Client::new())
+                .await
+                .expect_err("non-success");
+            assert_classified(&guarded, status, permanent);
+        }
     }
 
     #[tokio::test]
