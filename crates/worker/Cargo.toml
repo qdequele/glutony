@@ -62,3 +62,5 @@ dotenvy.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
+jsonschema = { version = "0.45", default-features = false }
+serde_yaml.workspace = true

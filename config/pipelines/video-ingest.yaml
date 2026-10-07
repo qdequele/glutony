@@ -1,8 +1,8 @@
 # Video ingestion with transcription and LLM enrichment.
 #
-# video_audio_extractor and whisper_transcriber are GPU plugins that run as
-# gRPC containers on the `workers-gpu` pool (they are not compiled into the
-# worker binary). llm_enricher runs on `workers-llm`, everything else on
+# video_audio_extractor (pure Rust decoding) and whisper_transcriber (an HTTP
+# client for an OpenAI-compatible transcription endpoint) are compiled into the
+# worker. llm_enricher runs on `workers-llm`, everything else on
 # `workers-general`. The workflow routes each step to the right queue.
 #
 # Auto-selected for any video/* upload (overrides builtin.video). The
@@ -18,11 +18,10 @@ trigger:
   index_pattern: videos
 
 steps:
-  # 1. Demux the audio track (ffmpeg). Bytes → Bytes (audio/wav).
+  # 1. Decode the audio track. Bytes → Bytes (16-bit PCM WAV).
   - id: extract_audio
     plugin: video_audio_extractor
     config:
-      format: wav
       sample_rate: 16000
       mono: true
     timeout_secs: 900
@@ -36,10 +35,7 @@ steps:
     plugin: whisper_transcriber
     depends_on: [extract_audio]
     config:
-      model: large-v3
-      language: auto
-      segment_seconds: 60
-      word_timestamps: false
+      segment_documents: true
     timeout_secs: 3600
     retry:
       max_attempts: 3

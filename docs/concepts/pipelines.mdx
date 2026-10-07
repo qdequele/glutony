@@ -59,7 +59,7 @@ steps:
 | `steps[].plugin` | yes | A registered plugin name; unknown → `422`. |
 | `steps[].depends_on` | no | Steps to wait for. |
 | `steps[].fan_out` | no | `$.documents`, `$.many` or `$`. Requires exactly one dependency. |
-| `steps[].config` | no | Plugin config block (object). |
+| `steps[].config` | no | Plugin config block (object), checked against the plugin's `config_schema`; a mismatch → `422`. |
 | `steps[].timeout_secs` | no | Activity start-to-close timeout. |
 | `steps[].retry` | no | Retry policy. |
 
@@ -88,8 +88,13 @@ steps:
   earlier indexer step stay indexed).
 - **Cancellation.** `POST /jobs/:id/cancel` sets `cancel_requested`; running
   activities are cancelled, no new step starts, status becomes `cancelled`.
-- **Validation** at creation time: unique ids, known dependencies, no cycles
-  (Kahn's algorithm), `fan_out` arity/path, known plugins.
+- **Validation** at creation time (and by `POST /pipelines/validate`, which
+  saves nothing): unique ids, known dependencies, no cycles (Kahn's algorithm),
+  `fan_out` arity/path, known plugins, each step's `config` against its plugin's
+  `config_schema` from `GET /plugins` (unknown keys and wrong types are `422`),
+  and each `meili_indexer` `connection` against the tenant's connections (its
+  own, else a global one). A plugin that no worker has registered yet has no
+  schema to check against, so its config is accepted as is.
 
 ## Payload sizes
 
