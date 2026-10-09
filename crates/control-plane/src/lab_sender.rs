@@ -2,14 +2,16 @@
 //!
 //! Every 2 s, or right after an insert, lease up to 500 due rows, send them in one
 //! signed batch, mark the ids the Lab lists in `accepted` as delivered and back the
-//! rest off. Rows are never dropped. A Lab `401` is logged and retried: the Lab can
-//! never stop glutony from starting or serving.
+//! rest off. Rows are retried for 24 h; after that they are dropped with an error log
+//! (spec v2 §3.4). A Lab `401` is logged and retried: the Lab can never stop glutony
+//! from serving.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
+use meili_ingest_lab::{LabCredentials, validate_lab_url};
 use sha2::Sha256;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -28,65 +30,120 @@ pub const LEASE: Duration = Duration::from_secs(30);
 pub const MAX_ACK_BYTES: usize = 1024 * 1024;
 /// Delivered rows are kept this long.
 pub const RETENTION: Duration = Duration::from_secs(7 * 86_400);
+/// Undelivered rows older than this were never acknowledged and are dropped (spec §3.4).
+pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3_600);
 
-/// `LAB_URL` + `LAB_EVENTS_SECRET`.
+/// How the sender authenticates to the Lab.
+#[derive(Clone)]
+pub enum LabAuth {
+    /// `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET` (spec v2 §3.3).
+    Instance(LabCredentials),
+    /// `LAB_EVENTS_SECRET`: the pre-v2 global secret, accepted for one more release.
+    Legacy {
+        /// HMAC key over the bare body.
+        secret: String,
+    },
+}
+
+/// `LAB_URL` plus either the instance credentials or the legacy secret.
 #[derive(Clone)]
 pub struct LabConfig {
     /// Lab base URL, without trailing slash.
     pub url: String,
-    secret: String,
+    auth: LabAuth,
 }
 
 impl std::fmt::Debug for LabConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LabConfig")
             .field("url", &self.url)
-            .field("secret", &"<redacted>")
+            .field(
+                "auth",
+                &match &self.auth {
+                    LabAuth::Instance(c) => format!("instance {}", c.instance_id()),
+                    LabAuth::Legacy { .. } => "legacy <redacted>".to_string(),
+                },
+            )
             .finish()
     }
 }
 
 impl LabConfig {
-    /// Both or neither; `https` unless the host is loopback or private.
+    /// `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`, or with the legacy
+    /// `LAB_EVENTS_SECRET` (warned, removed next release); nothing at all is `None`.
     pub fn from_values(
         url: Option<String>,
-        secret: Option<String>,
+        instance_id: Option<String>,
+        instance_secret: Option<String>,
+        legacy_secret: Option<String>,
     ) -> anyhow::Result<Option<Self>> {
-        let (url, secret) = match (url, secret) {
-            (None, None) => return Ok(None),
-            (Some(u), Some(s)) => (u, s),
-            (Some(_), None) => anyhow::bail!("LAB_URL is set but LAB_EVENTS_SECRET is not"),
-            (None, Some(_)) => anyhow::bail!("LAB_EVENTS_SECRET is set but LAB_URL is not"),
+        let Some(url) = url else {
+            if instance_id.is_some() || instance_secret.is_some() || legacy_secret.is_some() {
+                anyhow::bail!(
+                    "LAB_INSTANCE_ID / LAB_INSTANCE_SECRET / LAB_EVENTS_SECRET need LAB_URL"
+                );
+            }
+            return Ok(None);
         };
-        let parsed =
-            url::Url::parse(&url).map_err(|e| anyhow::anyhow!("LAB_URL is not a URL: {e}"))?;
-        let private = match parsed.host() {
-            Some(url::Host::Domain(d)) => d == "localhost",
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unique_local(),
-            None => false,
-        };
-        match parsed.scheme() {
-            "https" => {}
-            "http" if private => {}
-            "http" => anyhow::bail!("LAB_URL must be https unless its host is loopback or private"),
-            other => anyhow::bail!("LAB_URL has unsupported scheme {other:?}"),
+        match (instance_id, instance_secret) {
+            (Some(id), Some(secret)) => {
+                if legacy_secret.is_some() {
+                    tracing::warn!(
+                        "LAB_EVENTS_SECRET is ignored because LAB_INSTANCE_ID and LAB_INSTANCE_SECRET are set; remove it"
+                    );
+                }
+                let creds = LabCredentials::new(&url, &id, &secret)?;
+                Ok(Some(Self {
+                    url: creds.url().to_string(),
+                    auth: LabAuth::Instance(creds),
+                }))
+            }
+            (None, None) => match legacy_secret {
+                Some(secret) => {
+                    tracing::warn!(
+                        "LAB_EVENTS_SECRET is deprecated: set LAB_INSTANCE_ID and LAB_INSTANCE_SECRET \
+                         (the global secret is removed in the next release)"
+                    );
+                    Ok(Some(Self {
+                        url: validate_lab_url(&url)?,
+                        auth: LabAuth::Legacy { secret },
+                    }))
+                }
+                None => anyhow::bail!(
+                    "LAB_URL is set but LAB_INSTANCE_ID and LAB_INSTANCE_SECRET are not"
+                ),
+            },
+            _ => anyhow::bail!("LAB_INSTANCE_ID and LAB_INSTANCE_SECRET go together"),
         }
-        Ok(Some(Self {
-            url: url.trim_end_matches('/').to_string(),
-            secret,
-        }))
     }
 
-    /// Read `LAB_URL` and `LAB_EVENTS_SECRET`.
+    /// Read `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and the legacy `LAB_EVENTS_SECRET`.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         let get = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
-        Self::from_values(get("LAB_URL"), get("LAB_EVENTS_SECRET"))
+        Self::from_values(
+            get("LAB_URL"),
+            get("LAB_INSTANCE_ID"),
+            get("LAB_INSTANCE_SECRET"),
+            get("LAB_EVENTS_SECRET"),
+        )
     }
 
     /// `{url}/internal/events`.
     pub fn events_url(&self) -> String {
         format!("{}/internal/events", self.url)
+    }
+
+    /// The instance credentials, when not running on the legacy secret.
+    pub fn credentials(&self) -> Option<&LabCredentials> {
+        match &self.auth {
+            LabAuth::Instance(c) => Some(c),
+            LabAuth::Legacy { .. } => None,
+        }
+    }
+
+    /// Whether the deprecated global secret is in use.
+    pub fn is_legacy(&self) -> bool {
+        matches!(self.auth, LabAuth::Legacy { .. })
     }
 }
 
@@ -190,17 +247,18 @@ impl LabSender {
                 return self.fail(&ids, "malformed").await;
             }
         };
-        let resp = self
+        let req = self
             .http
             .post(self.config.events_url())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(
-                "x-lab-signature",
-                sign(self.config.secret.as_bytes(), &body),
-            )
-            .body(body)
-            .send()
-            .await;
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let req = match &self.config.auth {
+            LabAuth::Instance(creds) => creds.sign_batch(req, meili_ingest_lab::unix_now(), &body),
+            LabAuth::Legacy { secret } => req.header(
+                meili_ingest_lab::H_SIGNATURE,
+                sign(secret.as_bytes(), &body),
+            ),
+        };
+        let resp = req.body(body).send().await;
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
@@ -211,7 +269,9 @@ impl LabSender {
         };
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            tracing::error!("the Lab rejected LAB_EVENTS_SECRET (401); lab events stay pending");
+            tracing::error!(
+                "the Lab rejected the instance credentials (401); lab events stay pending"
+            );
             return self.fail(&ids, "auth").await;
         }
         if status != reqwest::StatusCode::OK {
@@ -265,6 +325,29 @@ impl LabSender {
         }
     }
 
+    /// Hourly housekeeping: purge delivered rows past retention, and drop undelivered
+    /// rows the Lab never acknowledged within [`STALE_AFTER`] (spec §3.4: a skipped
+    /// event is never acknowledged, so after 24 h it is permanently rejected).
+    pub async fn maintain(&self) {
+        match self.repo.purge_delivered(RETENTION).await {
+            Ok(n) if n > 0 => tracing::info!(purged = n, "old delivered lab events purged"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot purge delivered lab events"),
+        }
+        match self.repo.drop_stale(STALE_AFTER).await {
+            Ok(ids) if !ids.is_empty() => {
+                self.metrics.dropped_total.inc_by(ids.len() as u64);
+                tracing::error!(
+                    count = ids.len(),
+                    ids = ?ids,
+                    "lab events never acknowledged for 24 h were dropped; the Lab skipped them (check its logs for the reason)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot drop stale lab events"),
+        }
+    }
+
     /// Loop until `cancel`: deliver while batches come back full, then wait for the
     /// tick or an insert; refresh the gauges; purge hourly.
     pub async fn run(self, cancel: CancellationToken) {
@@ -281,11 +364,7 @@ impl LabSender {
                     .set(stats.oldest_pending_seconds);
             }
             if last_purge.elapsed() >= Duration::from_secs(3_600) {
-                match self.repo.purge_delivered(RETENTION).await {
-                    Ok(n) if n > 0 => tracing::info!(purged = n, "old delivered lab events purged"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "cannot purge delivered lab events"),
-                }
+                self.maintain().await;
                 last_purge = Instant::now();
             }
             tokio::select! {
@@ -303,15 +382,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_or_neither() {
-        assert!(LabConfig::from_values(None, None).unwrap().is_none());
-        assert!(LabConfig::from_values(Some("https://lab.example".into()), None).is_err());
-        assert!(LabConfig::from_values(None, Some("s".into())).is_err());
-        let c = LabConfig::from_values(Some("https://lab.example/".into()), Some("s".into()))
+    fn instance_credentials_legacy_secret_or_nothing() {
+        let fv = |u: Option<&str>, i: Option<&str>, s: Option<&str>, l: Option<&str>| {
+            LabConfig::from_values(
+                u.map(String::from),
+                i.map(String::from),
+                s.map(String::from),
+                l.map(String::from),
+            )
+        };
+        assert!(fv(None, None, None, None).unwrap().is_none());
+        let c = fv(Some("https://lab.example/"), Some("id"), Some("s"), None)
             .unwrap()
             .unwrap();
         assert_eq!(c.events_url(), "https://lab.example/internal/events");
+        assert!(!c.is_legacy());
+        assert!(c.credentials().is_some());
         assert!(!format!("{c:?}").contains("\"s\""));
+        let legacy = fv(Some("https://lab.example"), None, None, Some("old"))
+            .unwrap()
+            .unwrap();
+        assert!(legacy.is_legacy());
+        assert!(legacy.credentials().is_none());
+        assert!(!format!("{legacy:?}").contains("old"));
+        // Instance credentials win over a leftover legacy secret.
+        let both = fv(
+            Some("https://lab.example"),
+            Some("id"),
+            Some("s"),
+            Some("old"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!both.is_legacy());
+        for bad in [
+            fv(Some("https://lab.example"), None, None, None),
+            fv(Some("https://lab.example"), Some("id"), None, None),
+            fv(Some("https://lab.example"), None, Some("s"), None),
+            fv(None, Some("id"), Some("s"), None),
+            fv(None, None, None, Some("old")),
+        ] {
+            assert!(bad.is_err());
+        }
     }
 
     #[test]
@@ -326,7 +438,8 @@ mod tests {
             "https://lab.meilisearch.com",
         ] {
             assert!(
-                LabConfig::from_values(Some(ok.into()), Some("s".into())).is_ok(),
+                LabConfig::from_values(Some(ok.into()), Some("id".into()), Some("s".into()), None)
+                    .is_ok(),
                 "{ok}"
             );
         }
@@ -337,7 +450,8 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                LabConfig::from_values(Some(bad.into()), Some("s".into())).is_err(),
+                LabConfig::from_values(Some(bad.into()), Some("id".into()), Some("s".into()), None)
+                    .is_err(),
                 "{bad}"
             );
         }

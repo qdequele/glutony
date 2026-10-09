@@ -278,3 +278,31 @@ async fn metrics_reflect_the_outbox_without_a_sender() {
     assert!(text.contains("glutony_lab_events_pending 2"), "{text}");
     t.drop_schema().await;
 }
+
+#[tokio::test]
+async fn drop_stale_only_removes_old_undelivered_rows() {
+    let Some(t) = setup().await else { return };
+    let repo = LabEventRepo::new(t.pool.clone());
+    let (old_pending, old_delivered, recent) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    repo.insert_many(&[event(old_pending), event(old_delivered), event(recent)])
+        .await
+        .unwrap();
+    repo.mark_delivered(&[old_delivered]).await.unwrap();
+    sqlx::query("UPDATE lab_events SET created_at = now() - interval '2 days' WHERE id = ANY($1)")
+        .bind(vec![old_pending, old_delivered])
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    let dropped = repo
+        .drop_stale(Duration::from_secs(24 * 3_600))
+        .await
+        .unwrap();
+    assert_eq!(dropped, vec![old_pending]);
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM lab_events ORDER BY created_at")
+        .fetch_all(&t.pool)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 2);
+    assert!(left.contains(&old_delivered) && left.contains(&recent));
+    t.drop_schema().await;
+}

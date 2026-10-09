@@ -34,7 +34,30 @@ async fn main() -> anyhow::Result<()> {
         .context("invalid Lab events configuration")?
     {
         Some(config) => {
-            tracing::info!(url = %config.url, "lab events sender enabled");
+            tracing::info!(url = %config.url, legacy = config.is_legacy(), "lab events sender enabled");
+            if let Some(creds) = config.credentials() {
+                // Bounded like the sender's own client: a hung Lab must not block boot.
+                let http = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()?;
+                match meili_ingest_lab::fetch_instance_info(&http, creds).await {
+                    Ok(info) => tracing::info!(
+                        kind = ?info.kind,
+                        product = %info.product,
+                        region = ?info.region,
+                        "Lab instance identity confirmed"
+                    ),
+                    // Spec §3.6: a 401 aborts boot; the credentials are wrong or revoked.
+                    Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
+                        "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "could not confirm this deployment's Lab identity; events are sent anyway and retried"
+                    ),
+                }
+            }
             let sender = meili_ingest_control_plane::lab_sender::LabSender::new(
                 meili_ingest_control_plane::lab_events::LabEventRepo::new(pool.clone()),
                 config,

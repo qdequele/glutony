@@ -3307,6 +3307,7 @@ dependencies = [
  "hmac 0.12.1",
  "http-body-util",
  "jsonschema",
+ "meili-ingest-lab",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
  "meili-ingest-source",

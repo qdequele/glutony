@@ -138,6 +138,19 @@ impl LabEventRepo {
         .rows_affected())
     }
 
+    /// Delete undelivered rows older than `older_than` and return their ids. Delivered
+    /// rows are never touched here (see `purge_delivered`).
+    pub async fn drop_stale(&self, older_than: Duration) -> Result<Vec<Uuid>, CpError> {
+        Ok(sqlx::query_scalar(
+            "DELETE FROM lab_events \
+             WHERE delivered_at IS NULL AND created_at < now() - make_interval(secs => $1) \
+             RETURNING id",
+        )
+        .bind(older_than.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Pending count and oldest pending age.
     pub async fn stats(&self) -> Result<LabEventStats, CpError> {
         let (pending, oldest): (i64, Option<f64>) = sqlx::query_as(
