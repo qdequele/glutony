@@ -23,7 +23,7 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::connection::{ConnectionSettings, ControlPlane, resolve_connection};
+use crate::connection::{ConnectionSettings, ControlPlane, authed, resolve_connection};
 use crate::registry::PluginRegistry;
 
 /// Interval at which the activity heartbeats on its own, independent of the plugin.
@@ -101,6 +101,8 @@ pub struct StepActivities {
     /// Control plane base URL, used to keep the job row's status honest and to resolve
     /// Meilisearch connections.
     pub control_plane_url: Option<String>,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Key and host policy for resolving an indexer step's Meilisearch connection.
     pub connections: ConnectionSettings,
     /// Post Lab billing events to the control plane (spec §5.3).
@@ -117,6 +119,7 @@ impl StepActivities {
             spill_threshold,
             usage: None,
             control_plane_url: None,
+            control_plane_token: None,
             connections: ConnectionSettings::default(),
             lab_events: false,
         }
@@ -138,6 +141,12 @@ impl StepActivities {
     /// Attach the control plane, so the workflow can write the job's status back.
     pub fn with_control_plane(mut self, url: Option<String>) -> Self {
         self.control_plane_url = url.map(|u| u.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Present `CONTROL_PLANE_TOKEN` on every control plane request.
+    pub fn with_control_plane_token(mut self, token: Option<String>) -> Self {
+        self.control_plane_token = token;
         self
     }
 
@@ -198,13 +207,14 @@ impl StepActivities {
                 "LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL".into(),
             ));
         };
-        let resp = self
-            .http
-            .post(format!("{base}/internal/lab-events"))
-            .json(&serde_json::json!({ "events": events }))
-            .send()
-            .await
-            .map_err(|e| UsageReportError::Retryable(format!("control plane unreachable: {e}")))?;
+        let resp = authed(
+            self.http.post(format!("{base}/internal/lab-events")),
+            self.control_plane_token.as_deref(),
+        )
+        .json(&serde_json::json!({ "events": events }))
+        .send()
+        .await
+        .map_err(|e| UsageReportError::Retryable(format!("control plane unreachable: {e}")))?;
         if !resp.status().is_success() {
             return Err(UsageReportError::Retryable(format!(
                 "control plane refused the lab events: {}",
@@ -238,9 +248,7 @@ impl StepActivities {
             let truncated: String = err.chars().take(1000).collect();
             body.insert("error".into(), serde_json::json!(truncated));
         }
-        let resp = self
-            .http
-            .patch(&url)
+        let resp = authed(self.http.patch(&url), self.control_plane_token.as_deref())
             .json(&serde_json::Value::Object(body))
             .send()
             .await
@@ -317,6 +325,7 @@ impl StepActivities {
             &ControlPlane {
                 http: &self.http,
                 base_url: self.control_plane_url.as_deref(),
+                token: self.control_plane_token.as_deref(),
             },
             &self.connections,
             &input.plugin,

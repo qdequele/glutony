@@ -333,3 +333,81 @@ async fn metrics_are_served_in_the_prometheus_text_format() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn internal_routes_need_the_control_plane_token() {
+    let app = app(state().with_internal_token(Some("cp-token".into())));
+    for req in [
+        post_json("/internal/lab-events", r#"{"events":[]}"#),
+        Request::post("/internal/lab-events")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer nope")
+            .body(Body::from(r#"{"events":[]}"#))
+            .unwrap(),
+        Request::post("/internal/lab-events")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Basic cp-token")
+            .body(Body::from(r#"{"events":[]}"#))
+            .unwrap(),
+        Request::get("/internal/connections/x")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let (status, body) = call(app.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "unauthorized");
+    }
+    // The right token reaches the handler. With the lazy pool that handler fails on
+    // the database (500 `db`), which is exactly "past the auth gate".
+    let (status, _) = call(
+        app.clone(),
+        Request::get("/internal/connections/x")
+            .header(header::AUTHORIZATION, "Bearer cp-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    // Non-internal routes are untouched: /metrics never needs the token.
+    let (status, _) = call(app, Request::get("/metrics").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn without_a_configured_token_internal_routes_stay_open() {
+    let (status, _) = call(
+        app(state()),
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        app(state()),
+        Request::get("/internal/connections/x")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn control_plane_token_policy() {
+    use meili_ingest_control_plane::control_plane_token_policy as policy;
+    assert_eq!(
+        policy(Some("t".into()), false).unwrap().as_deref(),
+        Some("t")
+    );
+    assert_eq!(
+        policy(Some("t".into()), true).unwrap().as_deref(),
+        Some("t")
+    );
+    assert_eq!(policy(None, true).unwrap(), None);
+    let err = policy(None, false).unwrap_err().to_string();
+    assert!(
+        err.contains("CONTROL_PLANE_TOKEN") && err.contains("CONTROL_PLANE_TOKEN_DISABLED=true"),
+        "{err}"
+    );
+    assert!(policy(Some("  ".into()), false).is_err(), "blank is unset");
+}

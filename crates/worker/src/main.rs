@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Publish manifests to the control plane (best effort).
     if let Some(cp) = &config.control_plane_url {
-        publish_manifests(cp, &registry).await;
+        publish_manifests(cp, config.control_plane_token.as_deref(), &registry).await;
     }
 
     // Temporal
@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
 
     let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
+        .with_control_plane_token(config.control_plane_token.clone())
         .with_security(connection_key.clone(), fetch_policy)
         .with_default_index(
             std::env::var("DEFAULT_INDEX")
@@ -119,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         .with_usage(usage)
         .with_lab_events(config.lab_events_enabled)
         .with_control_plane(config.control_plane_url.clone())
+        .with_control_plane_token(config.control_plane_token.clone())
         .with_connections(meili_ingest_worker::connection::ConnectionSettings {
             key: connection_key,
             policy: host_policy,
@@ -190,14 +192,17 @@ async fn wait_for_signal() {
     }
 }
 
-async fn publish_manifests(control_plane_url: &str, registry: &PluginRegistry) {
+async fn publish_manifests(
+    control_plane_url: &str,
+    token: Option<&str>,
+    registry: &PluginRegistry,
+) {
     let url = format!(
         "{}/internal/plugins",
         control_plane_url.trim_end_matches('/')
     );
     let manifests = registry.manifests();
-    match reqwest::Client::new()
-        .post(&url)
+    match meili_ingest_worker::connection::authed(reqwest::Client::new().post(&url), token)
         .json(&manifests)
         .send()
         .await

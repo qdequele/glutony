@@ -3,7 +3,7 @@
 use anyhow::Context;
 
 /// Runtime configuration of a worker process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     /// Temporal frontend URL, e.g. `http://temporal-frontend:7233`.
     pub temporal_url: String,
@@ -13,6 +13,8 @@ pub struct WorkerConfig {
     pub task_queue: String,
     /// Control plane base URL, used to publish plugin manifests at boot.
     pub control_plane_url: Option<String>,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Blob store URL (`BLOB_STORE_URL`).
     pub blob_store_url: Option<String>,
     /// Outputs larger than this many bytes are spilled to the blob store.
@@ -50,6 +52,10 @@ impl WorkerConfig {
             control_plane_url: std::env::var("CONTROL_PLANE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            control_plane_token: std::env::var("CONTROL_PLANE_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             blob_store_url: std::env::var("BLOB_STORE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -60,6 +66,27 @@ impl WorkerConfig {
             max_concurrent_activities,
             lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
         })
+    }
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    /// Redacts `control_plane_token`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("temporal_url", &self.temporal_url)
+            .field("temporal_namespace", &self.temporal_namespace)
+            .field("task_queue", &self.task_queue)
+            .field("control_plane_url", &self.control_plane_url)
+            .field(
+                "control_plane_token",
+                &self.control_plane_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("blob_store_url", &self.blob_store_url)
+            .field("payload_spill_bytes", &self.payload_spill_bytes)
+            .field("external_plugins", &self.external_plugins)
+            .field("max_concurrent_activities", &self.max_concurrent_activities)
+            .field("lab_events_enabled", &self.lab_events_enabled)
+            .finish()
     }
 }
 

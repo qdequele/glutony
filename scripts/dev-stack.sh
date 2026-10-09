@@ -50,6 +50,8 @@ export DATABASE_URL="postgres://postgres:dev@localhost:${PG_PORT}/postgres"
 export TEMPORAL_URL="http://localhost:${TEMPORAL_PORT}"
 export TEMPORAL_NAMESPACE=default
 export CONTROL_PLANE_URL="http://localhost:${CP_PORT}"
+# Shared by the control plane, gateway and workers this script starts (dev-only value).
+export CONTROL_PLANE_TOKEN="${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}"
 export MEILI_URL="http://localhost:${MEILI_PORT}"
 export MEILI_API_KEY=masterKey
 export BLOB_STORE_URL="file://${WORK}/blobs"

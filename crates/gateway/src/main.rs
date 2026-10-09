@@ -89,6 +89,12 @@ async fn main() -> anyhow::Result<()> {
              (tenant from trusted X-Meili-* headers); keep them off any public hostname"
         );
     }
+    if config.control_plane_token.is_none() {
+        tracing::warn!(
+            "CONTROL_PLANE_TOKEN is unset: the control plane refuses this gateway unless it runs \
+             with CONTROL_PLANE_TOKEN_DISABLED=true"
+        );
+    }
 
     let blob = BlobStore::from_url(&config.blob_store_url)
         .with_context(|| format!("cannot open blob store {:?}", config.blob_store_url))?;

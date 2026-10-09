@@ -66,6 +66,8 @@ pub struct GatewayConfig {
     pub temporal_namespace: String,
     /// Internal control plane base URL (`CONTROL_PLANE_URL`).
     pub control_plane_url: String,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Standalone fallback Meilisearch host (`MEILI_URL`).
     pub meili_url: Option<String>,
     /// Standalone fallback Meilisearch API key (`MEILI_API_KEY`).
@@ -109,6 +111,10 @@ impl std::fmt::Debug for GatewayConfig {
             .field("temporal_url", &self.temporal_url)
             .field("temporal_namespace", &self.temporal_namespace)
             .field("control_plane_url", &self.control_plane_url)
+            .field(
+                "control_plane_token",
+                &self.control_plane_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("meili_url", &self.meili_url)
             .field(
                 "meili_api_key",
@@ -144,6 +150,7 @@ impl Default for GatewayConfig {
             temporal_url: "http://temporal-frontend:7233".into(),
             temporal_namespace: "default".into(),
             control_plane_url: "http://meili-control-plane:9000".into(),
+            control_plane_token: None,
             meili_url: None,
             meili_api_key: None,
             default_index: "documents".into(),
@@ -169,6 +176,7 @@ impl GatewayConfig {
             temporal_url: env_or("TEMPORAL_URL", &d.temporal_url),
             temporal_namespace: env_or("TEMPORAL_NAMESPACE", &d.temporal_namespace),
             control_plane_url: env_or("CONTROL_PLANE_URL", &d.control_plane_url),
+            control_plane_token: env_opt("CONTROL_PLANE_TOKEN"),
             meili_url: env_opt("MEILI_URL"),
             meili_api_key: env_opt("MEILI_API_KEY"),
             default_index: env_or("DEFAULT_INDEX", &d.default_index),
@@ -519,6 +527,8 @@ pub struct ControlPlaneClient {
     pub base_url: String,
     /// Shared HTTP client.
     pub http: reqwest::Client,
+    /// `CONTROL_PLANE_TOKEN`, presented as a bearer on every request.
+    token: Option<String>,
 }
 
 impl ControlPlaneClient {
@@ -528,6 +538,20 @@ impl ControlPlaneClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            token: None,
+        }
+    }
+
+    /// Present `CONTROL_PLANE_TOKEN` on every request.
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
+    }
+
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
         }
     }
 
@@ -571,7 +595,7 @@ impl ControlPlaneClient {
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<T, GatewayError> {
-        let resp = req.send().await?;
+        let resp = self.authed(req).send().await?;
         if !resp.status().is_success() {
             return Err(Self::error_from(resp, what).await);
         }
@@ -585,7 +609,7 @@ impl ControlPlaneClient {
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<(), GatewayError> {
-        let resp = req.send().await?;
+        let resp = self.authed(req).send().await?;
         if !resp.status().is_success() {
             return Err(Self::error_from(resp, what).await);
         }
@@ -686,9 +710,11 @@ impl ControlPlaneClient {
         tenant_id: Option<&str>,
     ) -> Result<Vec<Uuid>, GatewayError> {
         let resp = self
-            .http
-            .delete(self.url(&format!("/pipelines/{uid}")))
-            .query(&Self::tenant_query(tenant_id))
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/pipelines/{uid}")))
+                    .query(&Self::tenant_query(tenant_id)),
+            )
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -797,7 +823,8 @@ impl AppState {
         blob: BlobStore,
         http: reqwest::Client,
     ) -> Self {
-        let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone());
+        let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone())
+            .with_token(config.control_plane_token.clone());
         Self {
             config: Arc::new(config),
             temporal,
@@ -1125,5 +1152,42 @@ mod tests {
             cp.get_job(job_id).await,
             Err(GatewayError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_token_is_sent_as_a_bearer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/jobs"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer cp-token",
+            ))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new())
+            .with_token(Some("cp-token".into()));
+        let job_id = Uuid::new_v4();
+        cp.create_job(&JobRecord {
+            job_id,
+            workflow_id: format!("ingest-{job_id}"),
+            pipeline_uid: "builtin.pdf".into(),
+            tenant_id: None,
+            index_name: None,
+            status: JobStatus::Queued,
+            current_step: None,
+            error: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+        let cfg = GatewayConfig {
+            control_plane_token: Some("cp-token-value".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{cfg:?}").contains("cp-token-value"));
     }
 }

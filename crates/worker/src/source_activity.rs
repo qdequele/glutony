@@ -33,6 +33,8 @@ pub struct SourceActivities {
     pub http: reqwest::Client,
     /// Control plane base URL, trailing slash trimmed.
     pub control_plane_url: Option<String>,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Where fetched items are staged.
     pub blob: BlobStore,
     /// Opens sealed fetch credentials. `None` when `SOURCE_SECRET_KEY` is unset.
@@ -50,11 +52,18 @@ impl SourceActivities {
         Self {
             http: reqwest::Client::new(),
             control_plane_url: control_plane_url.map(|u| u.trim_end_matches('/').to_string()),
+            control_plane_token: None,
             blob,
             key: None,
             fetch_policy: HostPolicy::default(),
             default_index: "documents".into(),
         }
+    }
+
+    /// Present `CONTROL_PLANE_TOKEN` on every control plane request.
+    pub fn with_control_plane_token(mut self, token: Option<String>) -> Self {
+        self.control_plane_token = token;
+        self
     }
 
     /// Set the key that opens fetch credentials and the fetch host policy.
@@ -206,12 +215,11 @@ impl SourceActivities {
         url: Url,
         what: &str,
     ) -> Result<Option<T>, PluginError> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+        let resp =
+            crate::connection::authed(self.http.get(url), self.control_plane_token.as_deref())
+                .send()
+                .await
+                .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -244,6 +252,8 @@ impl SourceActivities {
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<bool, PluginError> {
+        // `send_json` delegates here, so this is the one place the token is attached.
+        let req = crate::connection::authed(req, self.control_plane_token.as_deref());
         let resp = req
             .send()
             .await

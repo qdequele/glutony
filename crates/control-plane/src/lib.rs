@@ -29,11 +29,14 @@ pub mod sources;
 
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 pub use error::CpError;
@@ -50,6 +53,8 @@ pub struct AppState {
     pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
     /// Prometheus metrics served at `GET /metrics`.
     pub metrics: metrics::LabMetrics,
+    /// Bearer token internal callers (gateway, workers) present on `/internal/*`; `None` leaves them open (dev only).
+    pub internal_token: Option<String>,
 }
 
 impl AppState {
@@ -60,7 +65,16 @@ impl AppState {
             cache: PipelineCache::default(),
             lab_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             metrics: metrics::LabMetrics::default(),
+            internal_token: None,
         }
+    }
+
+    /// Require `Authorization: Bearer <token>` on every `/internal/*` route.
+    pub fn with_internal_token(mut self, token: Option<String>) -> Self {
+        self.internal_token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        self
     }
 
     /// Pipeline repository bound to this state's pool.
@@ -71,6 +85,57 @@ impl AppState {
     /// Meilisearch connection repository bound to this state's pool.
     pub fn connections(&self) -> connections::ConnectionRepo {
         connections::ConnectionRepo::new(self.pool.clone())
+    }
+}
+
+/// Decide what the control plane runs with: the token, or none only when the operator
+/// said so explicitly (`CONTROL_PLANE_TOKEN_DISABLED=true`, dev).
+pub fn control_plane_token_policy(
+    token: Option<String>,
+    disabled: bool,
+) -> anyhow::Result<Option<String>> {
+    match token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        Some(t) => Ok(Some(t)),
+        None if disabled => {
+            tracing::warn!(
+                "CONTROL_PLANE_TOKEN_DISABLED=true: /internal/* routes are open; never expose this port"
+            );
+            Ok(None)
+        }
+        None => anyhow::bail!(
+            "CONTROL_PLANE_TOKEN is not set: the gateway and workers authenticate to /internal/* with it. \
+             Set it (openssl rand -hex 32) on all three services, or set CONTROL_PLANE_TOKEN_DISABLED=true in dev"
+        ),
+    }
+}
+
+/// Middleware: `/internal/*` needs the configured bearer token; everything else passes.
+pub async fn require_internal_token(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = &state.internal_token else {
+        return next.run(req).await;
+    };
+    if !req.uri().path().starts_with("/internal/") {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::trim);
+    match presented {
+        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => next.run(req).await,
+        _ => CpError::Unauthorized.into_response(),
     }
 }
 
@@ -204,6 +269,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/internal/source-runs", post(sources::record_source_run))
         .route("/internal/lab-events", post(lab_events::ingest_lab_events))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_internal_token,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

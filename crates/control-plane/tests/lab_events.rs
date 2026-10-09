@@ -236,11 +236,12 @@ async fn purge_only_touches_old_delivered_rows() {
 #[tokio::test]
 async fn the_internal_route_inserts_and_is_idempotent() {
     let Some(t) = setup().await else { return };
-    let app = app(AppState::new(t.pool.clone()));
+    let app = app(AppState::new(t.pool.clone()).with_internal_token(Some("cp-token".into())));
     let id = Uuid::new_v4();
     let body = serde_json::json!({"events": [event(id)]});
     for expected in [1, 0] {
         let req = Request::post("/internal/lab-events")
+            .header(header::AUTHORIZATION, "Bearer cp-token")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
@@ -251,6 +252,7 @@ async fn the_internal_route_inserts_and_is_idempotent() {
         assert_eq!(v["inserted"], expected);
     }
     let bad = Request::post("/internal/lab-events")
+        .header(header::AUTHORIZATION, "Bearer cp-token")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"events":[{"id":"x"}]}"#))
         .unwrap();

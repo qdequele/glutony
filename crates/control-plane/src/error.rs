@@ -26,6 +26,9 @@ pub enum CpError {
     /// Pipeline references a plugin nobody knows about (422, `unknown_plugin`).
     #[error("{0}")]
     UnknownPlugin(String),
+    /// Missing or wrong `CONTROL_PLANE_TOKEN` on an internal route (401, `unauthorized`).
+    #[error("missing or invalid control plane token")]
+    Unauthorized,
     /// Database failure (500, `db`).
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -48,6 +51,7 @@ impl CpError {
     pub fn status(&self) -> StatusCode {
         match self {
             CpError::BadJson(_) => StatusCode::BAD_REQUEST,
+            CpError::Unauthorized => StatusCode::UNAUTHORIZED,
             CpError::Builtin(_) => StatusCode::FORBIDDEN,
             CpError::NotFound(_) | CpError::NoPipeline(_) => StatusCode::NOT_FOUND,
             CpError::Validation(_) | CpError::UnknownPlugin(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -59,6 +63,7 @@ impl CpError {
     pub fn code(&self) -> &'static str {
         match self {
             CpError::BadJson(_) => "bad_json",
+            CpError::Unauthorized => "unauthorized",
             CpError::Builtin(_) => "builtin",
             CpError::NotFound(_) => "not_found",
             CpError::NoPipeline(_) => "no_pipeline",
@@ -106,6 +111,11 @@ mod tests {
                 CpError::BadJson("x".into()),
                 StatusCode::BAD_REQUEST,
                 "bad_json",
+            ),
+            (
+                CpError::Unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
             ),
             (
                 CpError::Builtin("x".into()),

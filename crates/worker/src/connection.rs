@@ -43,6 +43,16 @@ pub struct ControlPlane<'a> {
     pub http: &'a reqwest::Client,
     /// Base URL, trailing slash trimmed. `None` when not configured.
     pub base_url: Option<&'a str>,
+    /// `CONTROL_PLANE_TOKEN`, presented as a bearer.
+    pub token: Option<&'a str>,
+}
+
+/// Present the control plane token, when there is one.
+pub fn authed(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
 }
 
 /// Return `config` with `host`/`api_key` resolved from the step's connection.
@@ -72,7 +82,14 @@ pub async fn resolve_connection(
         .base_url
         .ok_or_else(|| fail("no control plane is configured on this worker".into()))?;
 
-    let row = fetch(control_plane.http, base, &name, tenant_id).await?;
+    let row = fetch(
+        control_plane.http,
+        base,
+        control_plane.token,
+        &name,
+        tenant_id,
+    )
+    .await?;
 
     let api_key = key.open(&row.api_key).map_err(|_| {
         fail(
@@ -101,6 +118,7 @@ pub async fn resolve_connection(
 async fn fetch(
     http: &reqwest::Client,
     base: &str,
+    token: Option<&str>,
     name: &str,
     tenant_id: Option<&str>,
 ) -> Result<ConnectionRow, PluginError> {
@@ -115,8 +133,7 @@ async fn fetch(
         url.query_pairs_mut().append_pair("tenant_id", p);
     }
 
-    let resp = http
-        .get(url)
+    let resp = authed(http.get(url), token)
         .send()
         .await
         .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
@@ -161,6 +178,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/internal/connections/prod-movies"))
             .and(query_param("tenant_id", "tenant-1"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer cp-token",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "11111111-1111-1111-1111-111111111111",
                 "uid": "prod-movies",
@@ -186,6 +207,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some("http://unused.invalid"),
+            token: Some("cp-token"),
         };
         let s = settings(HostPolicy::Any);
         let cfg = serde_json::json!({ "connection": "prod-movies" });
@@ -210,6 +232,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let out = resolve_connection(
             &cp,
@@ -233,6 +256,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -258,6 +282,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some("http://unused.invalid"),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -284,6 +309,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -313,6 +339,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -344,6 +371,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let _ = resolve_connection(
             &cp,

@@ -17,6 +17,12 @@ async fn main() -> anyhow::Result<()> {
     let database_url =
         std::env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
     let bind = std::env::var("BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let internal_token = meili_ingest_control_plane::control_plane_token_policy(
+        std::env::var("CONTROL_PLANE_TOKEN").ok(),
+        std::env::var("CONTROL_PLANE_TOKEN_DISABLED")
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(false),
+    )?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("BIND {bind:?} is not a valid socket address"))?;
@@ -28,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await.context("applying migrations")?;
     tracing::info!("migrations applied");
 
-    let state = AppState::new(pool.clone());
+    let state = AppState::new(pool.clone()).with_internal_token(internal_token);
     let cancel = tokio_util::sync::CancellationToken::new();
     let sender = match meili_ingest_control_plane::lab_sender::LabConfig::from_env()
         .context("invalid Lab events configuration")?
