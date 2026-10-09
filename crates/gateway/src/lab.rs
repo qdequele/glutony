@@ -278,6 +278,9 @@ mod tests {
         c.check_credits(ACCOUNT).await.unwrap();
         tokio::time::advance(Duration::from_secs(29)).await;
         c.check_credits(ACCOUNT).await.unwrap(); // cached: expect(1) holds
+        // Exactly one fetch so far: the 29 s-old entry was served from the cache.
+        // (`reset` below drops mocks without checking their `expect`.)
+        lab.verify().await;
         // The Lab goes down; the 29 s-old entry is stale but usable for 300 s.
         lab.reset().await;
         Mock::given(method("GET"))
