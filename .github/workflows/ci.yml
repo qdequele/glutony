@@ -95,16 +95,20 @@ jobs:
 
   lab-contract-drift:
     name: Lab contract drift
-    # Disabled until the Lab publishes a lab-events schema that includes glutony
-    # (docs/superpowers/specs/2026-10-01-lab-ready-seams-design.md §5.7). Then set
-    # LAB_SCHEMA_URL to its raw URL on meilisearch/lab main and remove this `if`.
-    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Compare the vendored schema with the Lab's
+        # meilisearch/lab is private: LAB_REPO_TOKEN is a fine-grained PAT with
+        # read access to its contents. Without it (forks, missing secret) the check
+        # is skipped loudly rather than failing every PR.
         env:
+          LAB_REPO_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
           LAB_SCHEMA_URL: https://raw.githubusercontent.com/meilisearch/lab/main/contracts/lab-events.schema.json
         run: |
-          curl -fsSL "$LAB_SCHEMA_URL" -o /tmp/lab-events.schema.json
+          if [ -z "$LAB_REPO_TOKEN" ]; then
+            echo "::notice title=Lab contract drift::LAB_REPO_TOKEN is not set; skipping the drift check"
+            exit 0
+          fi
+          curl -fsSL -H "Authorization: Bearer $LAB_REPO_TOKEN" "$LAB_SCHEMA_URL" -o /tmp/lab-events.schema.json
           diff -u /tmp/lab-events.schema.json contracts/vendor/lab/lab-events.schema.json
