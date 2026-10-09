@@ -8,6 +8,7 @@ members = [
     "crates/blob",
     "crates/plugin-sdk",
     "crates/usage",
+    "crates/lab",
     "crates/plugin-runtime",
     "crates/source",
     "crates/plugins/pdf",
@@ -44,6 +45,7 @@ meili-ingest-plugin-sdk = { path = "crates/plugin-sdk", version = "0.1.0" }
 meili-ingest-router = { path = "crates/router" }
 meili-ingest-blob = { path = "crates/blob" }
 meili-ingest-usage = { path = "crates/usage" }
+meili-ingest-lab = { path = "crates/lab" }
 meili-ingest-plugin-runtime = { path = "crates/plugin-runtime" }
 meili-ingest-plugin-pdf = { path = "crates/plugins/pdf" }
 meili-ingest-plugin-docx = { path = "crates/plugins/docx" }

@@ -3364,6 +3364,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "meili-ingest-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "hmac 0.12.1",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "meili-ingest-plugin-audio-transcriber"
 version = "0.1.0"
 dependencies = [
