@@ -141,13 +141,13 @@ impl StepActivities {
         self
     }
 
-    /// Post each finished Lab job's billing event to the control plane's outbox.
+    /// Post each finished Lab job's usage and lifecycle events to the control plane's outbox.
     pub fn with_lab_events(mut self, enabled: bool) -> Self {
         self.lab_events = enabled;
         self
     }
 
-    /// Record a finished job: status write-back, then the Lab billing event, then
+    /// Record a finished job: status write-back, then the Lab events, then
     /// analytics. The bill goes first so an analytics outage cannot hold it back;
     /// every step is idempotent, so a retry repeats them harmlessly.
     pub async fn report_usage(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
@@ -161,7 +161,7 @@ impl StepActivities {
             .map_err(|e| UsageReportError::Retryable(e.to_string()))?;
 
         if self.lab_events {
-            self.post_lab_event(input).await?;
+            self.post_lab_events(input).await?;
         }
 
         let Some(client) = &self.usage else {
@@ -181,14 +181,14 @@ impl StepActivities {
         }
     }
 
-    async fn post_lab_event(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
-        let event = match meili_ingest_usage::lab::lab_event_for_job(input) {
+    async fn post_lab_events(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
+        let events = match meili_ingest_usage::lab::lab_events_for_job(input) {
             Ok(e) => e,
             Err(reason) => {
                 tracing::debug!(
                     job_id = %input.job_id,
                     reason = reason.as_str(),
-                    "no Lab event for this job"
+                    "no Lab events for this job"
                 );
                 return Ok(());
             }
@@ -201,17 +201,17 @@ impl StepActivities {
         let resp = self
             .http
             .post(format!("{base}/internal/lab-events"))
-            .json(&serde_json::json!({ "events": [event] }))
+            .json(&serde_json::json!({ "events": events }))
             .send()
             .await
             .map_err(|e| UsageReportError::Retryable(format!("control plane unreachable: {e}")))?;
         if !resp.status().is_success() {
             return Err(UsageReportError::Retryable(format!(
-                "control plane refused the lab event: {}",
+                "control plane refused the lab events: {}",
                 resp.status()
             )));
         }
-        tracing::info!(job_id = %input.job_id, "lab event recorded");
+        tracing::info!(job_id = %input.job_id, events = events.len(), "lab events recorded");
         Ok(())
     }
 
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lab_job_posts_its_event_to_the_outbox() {
+    async fn a_lab_job_posts_its_usage_and_lifecycle_events_to_the_outbox() {
         let cp = control_plane_with_lab_events(202, 1).await;
         let input = lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61");
         acts_with(&cp, true).report_usage(&input).await.unwrap();
@@ -1027,10 +1027,18 @@ mod tests {
             .find(|r| r.url.path() == "/internal/lab-events")
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&posted.body).unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2, "one batch carries both events of the job");
         assert_eq!(
-            body["events"][0]["id"],
+            events[0]["id"],
             meili_ingest_usage::lab::lab_event_id(input.job_id).to_string()
         );
+        assert_eq!(events[0]["type"], "usage.recorded");
+        assert_eq!(
+            events[1]["id"],
+            meili_ingest_usage::lab::lab_job_event_id(input.job_id).to_string()
+        );
+        assert_eq!(events[1]["type"], "job.completed");
     }
 
     #[tokio::test]

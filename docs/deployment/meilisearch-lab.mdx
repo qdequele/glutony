@@ -51,7 +51,8 @@ the Meilisearch key it used to inject as the bearer token moves to
 
 ## Billing events
 
-Each job run for a Lab account produces one `usage.recorded` event:
+Each job run for a Lab account produces two events, posted together. First a
+`usage.recorded` event with the job's raw units and provider cost:
 
 ```json
 {
@@ -62,20 +63,29 @@ Each job run for a Lab account produces one `usage.recorded` event:
   "api_key_id": null,
   "product": "glutony",
   "data": {
-    "job_id": "…", "pipeline_uid": "builtin.pdf", "status": "succeeded",
-    "duration_ms": 9000, "cost_micro_usd": 210, "cost_complete": true,
-    "units": { "documents_out": 12, "input_bytes": 5000, "pages": 9, "images": 0,
-               "audio_seconds": 0, "llm_input_tokens": 1000, "llm_output_tokens": 100,
-               "llm_requests": 1, "external_requests": 0 }
+    "operation": "ingest",
+    "units": { "documents": 12, "bytes_in": 5000, "step_seconds": 4,
+               "llm_tokens_in": 1000, "llm_tokens_out": 100, "audio_seconds": 0,
+               "ocr_pages": 0, "pages": 9, "images": 0, "llm_requests": 1,
+               "external_requests": 0 },
+    "provider_cost_micro_usd": 210,
+    "description": "Job … (builtin.pdf, succeeded, 12 documents)",
+    "job_id": "…"
   }
 }
 ```
 
+Then a lifecycle event with id `<UUIDv5 of job:{job_id}:lifecycle>`: `job.completed`
+(`job_id`, `index_uid` = the pipeline uid, `documents_indexed`, `duration_secs`,
+`pages_crawled: 0`) for a succeeded job, `job.failed` (`job_id`, `error_message`,
+`pages_crawled: 0`) for a failed or cancelled one.
+
 - Jobs without a UUID tenant (standalone, Cloud projects) are never sent.
 - Failed and cancelled jobs are sent: provider cost already spent is real.
-- `cost_micro_usd` is what glutony paid providers, from the provider cost table
-  (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). A call it cannot price
-  costs 0 and sets `cost_complete: false`. The bundled prices are placeholders: set
+- `provider_cost_micro_usd` is what glutony paid providers, from the provider cost
+  table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). If any call of the
+  job cannot be priced, the job's cost is sent as 0 and the description says
+  "provider cost incomplete". The bundled prices are placeholders: set
   yours before billing. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
   worker at boot; if it ever fails to load later, every call is flagged unpriced
   (never priced at the bundled rates).

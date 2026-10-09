@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use chrono::SecondsFormat;
-use meili_ingest_plugin_sdk::UsageUnits;
+use meili_ingest_plugin_sdk::{JobStatus, UsageUnits};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -239,10 +239,59 @@ pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> 
     )
 }
 
+/// The deterministic id of a job's lifecycle event (`job.completed` / `job.failed`).
+pub fn lab_job_event_id(job_id: Uuid) -> Uuid {
+    Uuid::new_v5(
+        &GLUTONY_LAB_NAMESPACE,
+        format!("job:{job_id}:lifecycle").as_bytes(),
+    )
+}
+
+/// Build the job's lifecycle event (spec §4.4): `job.completed` for a succeeded job,
+/// `job.failed` otherwise (failed and cancelled; the usage activity only runs on
+/// terminal statuses).
+pub fn lab_job_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> {
+    let duration_secs = (input.finished_at - input.started_at).num_seconds().max(0) as u64;
+    let job_id = input.job_id.to_string();
+    let (kind, data) = match input.status {
+        JobStatus::Succeeded => (
+            "job.completed",
+            LabEventData::JobCompleted(JobCompletedData {
+                job_id,
+                index_uid: input.pipeline_uid.clone(),
+                pages_crawled: 0,
+                documents_indexed: documents_out(input),
+                duration_secs,
+            }),
+        ),
+        status => (
+            "job.failed",
+            LabEventData::JobFailed(JobFailedData {
+                job_id,
+                error_message: input
+                    .error
+                    .clone()
+                    .filter(|e| !e.trim().is_empty())
+                    .unwrap_or_else(|| status.as_str().to_string()),
+                pages_crawled: 0,
+            }),
+        ),
+    };
+    envelope(input, lab_job_event_id(input.job_id), kind, data)
+}
+
+/// Every Lab event of a finished job: the usage event, then the lifecycle event.
+pub fn lab_events_for_job(input: &JobUsageInput) -> Result<Vec<LabEvent>, SkipReason> {
+    Ok(vec![
+        lab_event_for_job(input)?,
+        lab_job_event_for_job(input)?,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use meili_ingest_plugin_sdk::{JobStatus, StepResult};
+    use meili_ingest_plugin_sdk::StepResult;
 
     use super::*;
 
@@ -485,5 +534,76 @@ mod tests {
         let mut v = serde_json::to_value(lab_event_for_job(&input()).unwrap()).unwrap();
         v["data"]["operation"] = "crawl".into();
         assert!(!validator().is_valid(&v), "glutony only sends ingest");
+    }
+
+    #[test]
+    fn a_succeeded_job_also_emits_job_completed() {
+        let events = lab_events_for_job(&input()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "usage.recorded");
+        let done = &events[1];
+        assert_eq!(done.kind, "job.completed");
+        assert_eq!(done.id, lab_job_event_id(input().job_id));
+        assert_ne!(done.id, events[0].id);
+        assert_eq!(done.id.get_version_num(), 5);
+        let v = serde_json::to_value(done).unwrap();
+        assert!(errors_of(&v).is_empty(), "{:?}\n{v:#}", errors_of(&v));
+        assert_eq!(v["data"]["index_uid"], "builtin.pdf");
+        assert_eq!(v["data"]["documents_indexed"], 12);
+        assert_eq!(v["data"]["pages_crawled"], 0);
+        assert_eq!(v["data"]["duration_secs"], 9);
+        assert_eq!(v["data"]["job_id"], "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn failed_and_cancelled_jobs_emit_job_failed() {
+        let mut failed = input();
+        failed.status = JobStatus::Failed;
+        failed.error = Some("pdf extractor exploded".into());
+        let v = serde_json::to_value(lab_job_event_for_job(&failed).unwrap()).unwrap();
+        assert!(errors_of(&v).is_empty(), "{:?}\n{v:#}", errors_of(&v));
+        assert_eq!(v["type"], "job.failed");
+        assert_eq!(v["data"]["error_message"], "pdf extractor exploded");
+        assert_eq!(v["data"]["pages_crawled"], 0);
+
+        let mut cancelled = input();
+        cancelled.status = JobStatus::Cancelled;
+        let v = serde_json::to_value(lab_job_event_for_job(&cancelled).unwrap()).unwrap();
+        assert!(validator().is_valid(&v));
+        assert_eq!(v["type"], "job.failed");
+        assert_eq!(v["data"]["error_message"], "cancelled");
+    }
+
+    #[test]
+    fn job_events_follow_the_same_skip_rules() {
+        let mut cloud = input();
+        cloud.tenant_id = "hackersearch".into();
+        assert_eq!(lab_events_for_job(&cloud), Err(SkipReason::NotAUuid));
+        let mut standalone = input();
+        standalone.tenant_id = String::new();
+        assert_eq!(
+            lab_job_event_for_job(&standalone),
+            Err(SkipReason::NoTenant)
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_id_golden_value() {
+        // Python: uuid.uuid5(GLUTONY_LAB_NAMESPACE, "job:11111111-2222-3333-4444-555555555555:lifecycle")
+        let id = lab_job_event_id("11111111-2222-3333-4444-555555555555".parse().unwrap());
+        assert_eq!(id.get_version_num(), 5);
+        assert_eq!(
+            id,
+            Uuid::new_v5(
+                &GLUTONY_LAB_NAMESPACE,
+                b"job:11111111-2222-3333-4444-555555555555:lifecycle"
+            )
+        );
+        assert_eq!(
+            id,
+            "b1b2c9fd-369e-5f6b-afcf-df40c0b32539"
+                .parse::<Uuid>()
+                .unwrap()
+        );
     }
 }
