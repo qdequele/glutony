@@ -1,5 +1,11 @@
-//! Lab billing events (spec §5.2): one `usage.recorded` per finished job, in the
-//! Meilisearch Lab envelope. Pure: same input, byte-identical event, same id.
+//! Lab events (platform contract v2, spec §4): one `usage.recorded` and one job
+//! lifecycle event per finished job, in the Meilisearch Lab envelope. Pure: same
+//! input, byte-identical events, same ids.
+//!
+//! Credits are the Lab's business (decision B): this module reports raw units and
+//! the provider cost glutony paid, nothing priced.
+
+use std::collections::BTreeMap;
 
 use chrono::SecondsFormat;
 use meili_ingest_plugin_sdk::UsageUnits;
@@ -11,59 +17,82 @@ use crate::JobUsageInput;
 /// Namespace of glutony's deterministic Lab event ids. Never change it: a new value
 /// would give redelivered events new ids and bill them twice.
 pub const GLUTONY_LAB_NAMESPACE: Uuid = Uuid::from_u128(0x6c8f_4a1e_2b7d_4c3a_9e51_7f0d_2a6b_8c14);
+/// The one operation glutony reports (spec §4.3).
+pub const OPERATION: &str = "ingest";
+/// The `product` of every glutony event.
+pub const PRODUCT: &str = "glutony";
 
 /// One Lab event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabEvent {
-    /// Idempotency key: [`lab_event_id`] of the job.
+    /// Idempotency key: [`lab_event_id`] or [`lab_job_event_id`] of the job.
     pub id: Uuid,
-    /// Always `usage.recorded`.
+    /// `usage.recorded`, `job.completed` or `job.failed`.
     #[serde(rename = "type")]
     pub kind: String,
     /// The job's finish time, RFC 3339 with milliseconds.
     pub occurred_at: String,
-    /// The Lab account: the job's tenant id, a UUID.
+    /// The Lab account: the job's tenant id, a canonical UUID.
     pub account_id: String,
     /// Glutony has no Lab key ids.
     pub api_key_id: Option<String>,
     /// Always `glutony`.
     pub product: String,
-    /// The job's usage.
-    pub data: GlutonyUsageData,
+    /// Per-type payload.
+    pub data: LabEventData,
 }
 
-/// `data` of a glutony `usage.recorded` event.
+/// `data` of a Lab event, by type.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GlutonyUsageData {
-    /// Job id.
-    pub job_id: Uuid,
-    /// Pipeline that ran.
-    pub pipeline_uid: String,
-    /// `succeeded`, `failed` or `cancelled`.
-    pub status: String,
-    /// Wall time of the job.
-    pub duration_ms: u64,
-    /// What glutony paid providers, summed over the steps.
-    pub cost_micro_usd: u64,
-    /// `false` when a provider call could not be priced.
-    pub cost_complete: bool,
-    /// Units, summed over the steps.
-    pub units: LabUnits,
+#[serde(untagged)]
+pub enum LabEventData {
+    /// `usage.recorded`.
+    Usage(UsageData),
+    /// `job.completed`.
+    JobCompleted(JobCompletedData),
+    /// `job.failed`.
+    JobFailed(JobFailedData),
 }
 
-/// Billable units of a job.
+/// `data` of a `usage.recorded` event (spec §4.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(missing_docs)]
-pub struct LabUnits {
-    pub documents_out: u64,
-    pub input_bytes: u64,
-    pub pages: u64,
-    pub images: u64,
-    pub audio_seconds: f64,
-    pub llm_input_tokens: u64,
-    pub llm_output_tokens: u64,
-    pub llm_requests: u64,
-    pub external_requests: u64,
+pub struct UsageData {
+    /// Always [`OPERATION`].
+    pub operation: String,
+    /// Raw units by name, sorted so the serialized event is byte-stable.
+    pub units: BTreeMap<String, u64>,
+    /// What glutony paid providers, or 0 when a call could not be priced.
+    pub provider_cost_micro_usd: u64,
+    /// Human label for the ledger: pipeline, status, documents, cost completeness.
+    pub description: String,
+    /// The job id.
+    pub job_id: String,
+}
+
+/// `data` of a `job.completed` event (spec §4.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobCompletedData {
+    /// The job id.
+    pub job_id: String,
+    /// The pipeline uid (glutony has no crawl index).
+    pub index_uid: String,
+    /// Always 0 for glutony.
+    pub pages_crawled: u64,
+    /// The final step's documents.
+    pub documents_indexed: u64,
+    /// Wall time of the job, whole seconds.
+    pub duration_secs: u64,
+}
+
+/// `data` of a `job.failed` event (spec §4.4). Cancelled jobs are reported here too.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobFailedData {
+    /// The job id.
+    pub job_id: String,
+    /// The job's error, or its status when it carries none.
+    pub error_message: String,
+    /// Always 0 for glutony.
+    pub pages_crawled: u64,
 }
 
 /// Why a job produced no Lab event.
@@ -93,63 +122,121 @@ pub fn lab_event_id(job_id: Uuid) -> Uuid {
     )
 }
 
-/// Build the job's Lab event, or say why there is none.
-pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> {
-    if input.tenant_id.is_empty() {
+/// The Lab account a tenant id names, or why it names none. Only the canonical
+/// lower-case hyphenated form counts: other spellings of the same UUID (upper-case,
+/// simple, braced, URN) would bill a different string.
+fn lab_account(tenant_id: &str) -> Result<Uuid, SkipReason> {
+    if tenant_id.is_empty() {
         return Err(SkipReason::NoTenant);
     }
-    // Only the canonical lower-case hyphenated form is a Lab account id: other spellings
-    // of the same UUID (upper-case, simple, braced, URN) would bill a different string.
-    let account = Uuid::parse_str(&input.tenant_id)
+    Uuid::parse_str(tenant_id)
         .ok()
-        .filter(|a| a.hyphenated().to_string() == input.tenant_id)
-        .ok_or(SkipReason::NotAUuid)?;
+        .filter(|a| a.hyphenated().to_string() == tenant_id)
+        .ok_or(SkipReason::NotAUuid)
+}
+
+fn totals(input: &JobUsageInput) -> UsageUnits {
     let mut totals = UsageUnits::none();
     for step in &input.steps {
         totals.merge(step.usage);
     }
-    let duration_ms = (input.finished_at - input.started_at)
-        .num_milliseconds()
-        .max(0) as u64;
+    totals
+}
+
+fn documents_out(input: &JobUsageInput) -> u64 {
+    input
+        .steps
+        .last()
+        .map(|s| s.document_count as u64)
+        .unwrap_or(0)
+}
+
+/// The v2 units of a job (spec §4.3), from the step totals. Every value is a
+/// non-negative integer; fractional seconds round up so a started second is billed.
+/// `ocr_pages` stays 0 until a plugin reports OCR'd pages: the PDF extractor's `pages`
+/// are not OCR work and are sent as an extra, unpriced unit instead.
+pub fn lab_units(input: &JobUsageInput, totals: &UsageUnits) -> BTreeMap<String, u64> {
+    let step_ms = input
+        .steps
+        .iter()
+        .fold(0u64, |acc, s| acc.saturating_add(s.duration_ms));
+    let audio_seconds = if totals.audio_seconds.is_finite() && totals.audio_seconds > 0.0 {
+        totals.audio_seconds.ceil() as u64
+    } else {
+        0
+    };
+    BTreeMap::from([
+        ("documents".to_string(), documents_out(input)),
+        ("bytes_in".to_string(), input.input_bytes),
+        ("step_seconds".to_string(), step_ms.div_ceil(1000)),
+        ("llm_tokens_in".to_string(), totals.llm_input_tokens),
+        ("llm_tokens_out".to_string(), totals.llm_output_tokens),
+        ("audio_seconds".to_string(), audio_seconds),
+        ("ocr_pages".to_string(), 0),
+        // Extra units the Lab stores but does not price (spec §4.3).
+        ("pages".to_string(), totals.pages),
+        ("images".to_string(), totals.images),
+        ("llm_requests".to_string(), totals.llm_requests),
+        ("external_requests".to_string(), totals.external_requests),
+    ])
+}
+
+fn envelope(
+    input: &JobUsageInput,
+    id: Uuid,
+    kind: &str,
+    data: LabEventData,
+) -> Result<LabEvent, SkipReason> {
+    let account = lab_account(&input.tenant_id)?;
     Ok(LabEvent {
-        id: lab_event_id(input.job_id),
-        kind: "usage.recorded".into(),
+        id,
+        kind: kind.to_string(),
         occurred_at: input
             .finished_at
             .to_rfc3339_opts(SecondsFormat::Millis, true),
         account_id: account.hyphenated().to_string(),
         api_key_id: None,
-        product: "glutony".into(),
-        data: GlutonyUsageData {
-            job_id: input.job_id,
-            pipeline_uid: input.pipeline_uid.clone(),
-            status: input.status.as_str().to_string(),
-            duration_ms,
-            // The Lab's ledger is a signed bigint; the schema caps the value too.
-            cost_micro_usd: totals.cost_micro_usd.min(i64::MAX as u64),
-            cost_complete: totals.unpriced_calls == 0,
-            units: LabUnits {
-                documents_out: input
-                    .steps
-                    .last()
-                    .map(|s| s.document_count as u64)
-                    .unwrap_or(0),
-                input_bytes: input.input_bytes,
-                pages: totals.pages,
-                images: totals.images,
-                // NaN and infinity serialize to null, which the Lab would never accept.
-                audio_seconds: if totals.audio_seconds.is_finite() {
-                    totals.audio_seconds
-                } else {
-                    0.0
-                },
-                llm_input_tokens: totals.llm_input_tokens,
-                llm_output_tokens: totals.llm_output_tokens,
-                llm_requests: totals.llm_requests,
-                external_requests: totals.external_requests,
-            },
-        },
+        product: PRODUCT.to_string(),
+        data,
     })
+}
+
+/// Build the job's `usage.recorded` event, or say why there is none.
+pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> {
+    let totals = totals(input);
+    let complete = totals.unpriced_calls == 0;
+    // The Lab's ledger is a signed bigint; the schema caps the value too. An
+    // incomplete cost is reported as 0 rather than as a number that is too small.
+    let provider_cost_micro_usd = if complete {
+        totals.cost_micro_usd.min(i64::MAX as u64)
+    } else {
+        0
+    };
+    let units = lab_units(input, &totals);
+    let description = format!(
+        "Job {} ({}, {}, {} documents{})",
+        input.job_id,
+        input.pipeline_uid,
+        input.status.as_str(),
+        documents_out(input),
+        if complete {
+            ""
+        } else {
+            ", provider cost incomplete"
+        }
+    );
+    envelope(
+        input,
+        lab_event_id(input.job_id),
+        "usage.recorded",
+        LabEventData::Usage(UsageData {
+            operation: OPERATION.to_string(),
+            units,
+            provider_cost_micro_usd,
+            description,
+            job_id: input.job_id.to_string(),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -161,7 +248,7 @@ mod tests {
 
     const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
 
-    fn step(id: &str, docs: usize, usage: UsageUnits) -> StepResult {
+    fn step(id: &str, docs: usize, duration_ms: u64, usage: UsageUnits) -> StepResult {
         StepResult {
             step_id: id.into(),
             plugin: "p".into(),
@@ -169,7 +256,7 @@ mod tests {
             document_count: docs,
             branches: 1,
             error: None,
-            duration_ms: 10,
+            duration_ms,
             input_bytes: 100,
             usage,
         }
@@ -191,13 +278,15 @@ mod tests {
             input_bytes: 5_000,
             input_mime: "application/pdf".into(),
             steps: vec![
-                step("extract", 3, UsageUnits::pages(9)),
+                step("extract", 3, 1_200, UsageUnits::pages(9)),
                 step(
                     "enrich",
                     12,
+                    2_100,
                     UsageUnits {
                         cost_micro_usd: 210,
                         unpriced_calls: 1,
+                        audio_seconds: 2.4,
                         ..UsageUnits::llm(1_000, 100)
                     },
                 ),
@@ -217,30 +306,71 @@ mod tests {
             .unwrap()
     }
 
+    fn errors_of(v: &serde_json::Value) -> Vec<String> {
+        validator().iter_errors(v).map(|e| e.to_string()).collect()
+    }
+
     #[test]
-    fn a_lab_job_becomes_one_valid_event() {
+    fn a_lab_job_becomes_one_valid_v2_usage_event() {
         let event = lab_event_for_job(&input()).unwrap();
         let v = serde_json::to_value(&event).unwrap();
-        let errors: Vec<String> = validator().iter_errors(&v).map(|e| e.to_string()).collect();
-        assert!(errors.is_empty(), "{errors:?}\n{v:#}");
+        assert!(errors_of(&v).is_empty(), "{:?}\n{v:#}", errors_of(&v));
         assert_eq!(v["type"], "usage.recorded");
         assert_eq!(v["product"], "glutony");
         assert_eq!(v["account_id"], ACCOUNT);
         assert!(v["api_key_id"].is_null());
         assert_eq!(v["occurred_at"], "2026-10-01T10:00:09.000Z");
-        assert_eq!(v["data"]["duration_ms"], 9_000);
-        assert_eq!(v["data"]["cost_micro_usd"], 210);
-        assert_eq!(v["data"]["cost_complete"], false);
-        assert_eq!(v["data"]["units"]["pages"], 9);
-        assert_eq!(v["data"]["units"]["llm_input_tokens"], 1_000);
-        assert_eq!(
-            v["data"]["units"]["documents_out"], 12,
-            "the final step's documents"
+        assert_eq!(v["data"]["operation"], "ingest");
+        assert_eq!(v["data"]["job_id"], "11111111-2222-3333-4444-555555555555");
+        // One unpriced call: the pass-through cost is unknown, so it is reported as 0.
+        assert_eq!(v["data"]["provider_cost_micro_usd"], 0);
+        assert!(
+            v["data"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("provider cost incomplete")
         );
+        let units = &v["data"]["units"];
+        assert_eq!(units["documents"], 12, "the final step's documents");
+        assert_eq!(units["bytes_in"], 5_000, "the job's payload size");
+        assert_eq!(units["step_seconds"], 4, "3.3 s of steps, rounded up");
+        assert_eq!(units["llm_tokens_in"], 1_000);
+        assert_eq!(units["llm_tokens_out"], 100);
+        assert_eq!(units["audio_seconds"], 3, "2.4 s, rounded up");
+        assert_eq!(units["ocr_pages"], 0, "no plugin reports OCR pages yet");
+        // Extra units: stored by the Lab, ignored by pricing (spec §4.3).
+        assert_eq!(units["pages"], 9);
+        assert_eq!(units["llm_requests"], 1);
+        for (name, value) in units.as_object().unwrap() {
+            assert!(
+                value.is_u64(),
+                "{name} must be a non-negative integer, got {value}"
+            );
+        }
+        // No field the schema does not know (status and cost_complete live in description).
+        let keys: Vec<&String> = v["data"].as_object().unwrap().keys().collect();
         assert_eq!(
-            v["data"]["units"]["input_bytes"], 5_000,
-            "the job's payload size"
+            keys,
+            [
+                "description",
+                "job_id",
+                "operation",
+                "provider_cost_micro_usd",
+                "units"
+            ]
         );
+    }
+
+    #[test]
+    fn complete_cost_is_passed_through() {
+        let mut i = input();
+        i.steps[1].usage.unpriced_calls = 0;
+        let event = lab_event_for_job(&i).unwrap();
+        let LabEventData::Usage(data) = &event.data else {
+            panic!("usage event expected");
+        };
+        assert_eq!(data.provider_cost_micro_usd, 210);
+        assert!(!data.description.contains("incomplete"));
     }
 
     #[test]
@@ -250,9 +380,8 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.id, lab_event_id(input().job_id));
         assert_eq!(a.id.get_version_num(), 5);
-        // Golden value, computed independently (Python uuid5 over GLUTONY_LAB_NAMESPACE and
-        // "job:<id>:usage"). Changing GLUTONY_LAB_NAMESPACE or the name format re-ids every
-        // redelivered event, so the Lab would count them again and double-bill.
+        // Golden value: changing GLUTONY_LAB_NAMESPACE or the name re-ids every
+        // redelivered event and the Lab would count them again.
         assert_eq!(
             lab_event_id("11111111-2222-3333-4444-555555555555".parse().unwrap()),
             "eb3df490-5f14-59b7-9cad-c97f959127ae"
@@ -289,7 +418,6 @@ mod tests {
                 "{form} must be skipped"
             );
         }
-        // The canonical form still passes.
         assert_eq!(lab_event_for_job(&input()).unwrap().account_id, ACCOUNT);
     }
 
@@ -299,52 +427,51 @@ mod tests {
         i.steps = vec![step(
             "enrich",
             1,
+            1,
             UsageUnits {
                 cost_micro_usd: u64::MAX,
                 ..UsageUnits::default()
             },
         )];
-        let event = lab_event_for_job(&i).unwrap();
-        assert_eq!(event.data.cost_micro_usd, i64::MAX as u64);
-        let v = serde_json::to_value(&event).unwrap();
-        assert_eq!(v["data"]["cost_micro_usd"], i64::MAX);
-        let errors: Vec<String> = validator().iter_errors(&v).map(|e| e.to_string()).collect();
-        assert!(errors.is_empty(), "{errors:?}");
-        // The schema itself refuses what a signed ledger cannot hold.
+        let v = serde_json::to_value(lab_event_for_job(&i).unwrap()).unwrap();
+        assert_eq!(v["data"]["provider_cost_micro_usd"], i64::MAX);
+        assert!(errors_of(&v).is_empty(), "{:?}", errors_of(&v));
         let mut over = v.clone();
-        over["data"]["cost_micro_usd"] = serde_json::json!(u64::MAX);
+        over["data"]["provider_cost_micro_usd"] = serde_json::json!(u64::MAX);
         assert!(!validator().is_valid(&over));
     }
 
     #[test]
     fn non_finite_audio_seconds_still_make_a_valid_event() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -3.0] {
             let mut i = input();
             i.steps = vec![step(
                 "transcribe",
+                1,
                 1,
                 UsageUnits {
                     audio_seconds: bad,
                     ..UsageUnits::default()
                 },
             )];
-            let event = lab_event_for_job(&i).unwrap();
-            assert_eq!(event.data.units.audio_seconds, 0.0, "{bad}");
-            let v = serde_json::to_value(&event).unwrap();
-            let errors: Vec<String> = validator().iter_errors(&v).map(|e| e.to_string()).collect();
-            assert!(errors.is_empty(), "{errors:?}\n{v:#}");
+            let v = serde_json::to_value(lab_event_for_job(&i).unwrap()).unwrap();
+            assert_eq!(v["data"]["units"]["audio_seconds"], 0, "{bad}");
+            assert!(errors_of(&v).is_empty(), "{:?}\n{v:#}", errors_of(&v));
         }
     }
 
     #[test]
-    fn failed_jobs_are_billed_too_and_complete_cost_says_so() {
+    fn failed_jobs_are_reported_too() {
         let mut failed = input();
         failed.status = JobStatus::Failed;
-        failed.steps[1].usage.unpriced_calls = 0;
         let v = serde_json::to_value(lab_event_for_job(&failed).unwrap()).unwrap();
         assert!(validator().is_valid(&v));
-        assert_eq!(v["data"]["status"], "failed");
-        assert_eq!(v["data"]["cost_complete"], true);
+        assert!(
+            v["data"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("failed")
+        );
     }
 
     #[test]
@@ -352,5 +479,11 @@ mod tests {
         let mut v = serde_json::to_value(lab_event_for_job(&input()).unwrap()).unwrap();
         v["data"]["surprise"] = 1.into();
         assert!(!validator().is_valid(&v));
+        let mut v = serde_json::to_value(lab_event_for_job(&input()).unwrap()).unwrap();
+        v["data"]["units"]["documents"] = (-1).into();
+        assert!(!validator().is_valid(&v));
+        let mut v = serde_json::to_value(lab_event_for_job(&input()).unwrap()).unwrap();
+        v["data"]["operation"] = "crawl".into();
+        assert!(!validator().is_valid(&v), "glutony only sends ingest");
     }
 }
