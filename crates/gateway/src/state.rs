@@ -773,6 +773,8 @@ pub struct AppState {
     pub schedules: Arc<dyn crate::schedules::ScheduleClient>,
     /// Which hosts a source may fetch from (`SOURCE_FETCH_HOSTS`), checked on save.
     pub fetch_policy: meili_ingest_source::HostPolicy,
+    /// The Lab, when this deployment reports to one (`LAB_URL` + `LAB_INSTANCE_*`).
+    pub lab: Option<Arc<crate::lab::LabClient>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -782,6 +784,7 @@ impl std::fmt::Debug for AppState {
             .field("control_plane", &self.control_plane)
             .field("blob", &self.blob)
             .field("connections", &self.connections)
+            .field("lab", &self.lab)
             .finish_non_exhaustive()
     }
 }
@@ -804,6 +807,7 @@ impl AppState {
             connections: crate::connections::ConnectionConfig::default(),
             schedules: Arc::new(crate::schedules::DisabledSchedules),
             fetch_policy: meili_ingest_source::HostPolicy::default(),
+            lab: None,
         }
     }
 
@@ -823,6 +827,12 @@ impl AppState {
     /// they answer 501, so a key is never stored unsealed by accident.
     pub fn with_connections(mut self, connections: crate::connections::ConnectionConfig) -> Self {
         self.connections = connections;
+        self
+    }
+
+    /// Attach the Lab client: hosted deployments then pre-check credits before each job.
+    pub fn with_lab(mut self, lab: Arc<crate::lab::LabClient>) -> Self {
+        self.lab = Some(lab);
         self
     }
 }

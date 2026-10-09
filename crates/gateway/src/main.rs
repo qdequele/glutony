@@ -116,15 +116,64 @@ async fn main() -> anyhow::Result<()> {
             .context("invalid SOURCE_FETCH_HOSTS")?;
     tracing::info!(policy = ?fetch_policy, "scheduled-source fetch host policy");
 
+    // Lab identity and credit pre-check (spec v2 §3.6, §8.1). Optional: without
+    // LAB_INSTANCE_* this gateway never talks to the Lab. One synchronous attempt
+    // first: a 401 aborts boot (wrong or revoked credentials); any other failure is
+    // retried in the background, and Lab-account jobs are refused until it succeeds.
+    let lab = match meili_ingest_lab::LabCredentials::from_env()
+        .context("invalid LAB_* configuration")?
+    {
+        Some(creds) => {
+            tracing::info!(
+                url = creds.url(),
+                instance_id = creds.instance_id(),
+                "Lab client enabled"
+            );
+            // The credit check runs on the request path: its own client with short
+            // timeouts (the shared one waits 30 s), and no redirects so the bearer
+            // secret is never replayed to another host.
+            let lab_http = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("cannot build the Lab HTTP client")?;
+            let client = Arc::new(meili_ingest_gateway::lab::LabClient::new(creds, lab_http));
+            match client.refresh_identity().await {
+                Ok(info) => tracing::info!(
+                    kind = ?info.kind,
+                    product = %info.product,
+                    region = ?info.region,
+                    "Lab instance identity confirmed"
+                ),
+                Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
+                    "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not confirm the Lab identity; retrying in the background");
+                    let resolver = client.clone();
+                    tokio::spawn(async move {
+                        resolver.resolve_identity(Duration::from_secs(30)).await
+                    });
+                }
+            }
+            Some(client)
+        }
+        None => None,
+    };
+
     let schedules = Arc::new(meili_ingest_gateway::schedules::TemporalSchedules(
         temporal.clone(),
     ));
-    let state = AppState::new(config, Arc::new(TemporalStarter(temporal)), blob, http)
+    let mut state = AppState::new(config, Arc::new(TemporalStarter(temporal)), blob, http)
         .with_connections(meili_ingest_gateway::connections::ConnectionConfig::new(
             connection_key,
             host_policy,
         ))
         .with_sources(schedules, fetch_policy);
+    if let Some(lab) = lab {
+        state = state.with_lab(lab);
+    }
     let app = meili_ingest_gateway::router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)

@@ -3340,6 +3340,7 @@ dependencies = [
  "chrono",
  "http-body-util",
  "meili-ingest-blob",
+ "meili-ingest-lab",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
  "meili-ingest-source",

@@ -215,6 +215,13 @@ pub async fn submit_one(
         crate::preflight::check_write(&state.http, host, key, &target_index).await?;
     }
 
+    // A Lab engine refuses work for an account out of credits (spec v2 §8.1), and
+    // refuses rather than runs unbilled work when the Lab cannot answer (decision A:
+    // every Lab-account job is billed).
+    if let (Some(lab), Some(account)) = (&state.lab, ctx.tenant_id.as_deref()) {
+        lab.check_credits(account).await?;
+    }
+
     let job_id = Uuid::new_v4();
 
     let input = match payload {
@@ -1154,5 +1161,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_hosted_engine_refuses_a_lab_account_without_credits() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{ACCOUNT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "account_id": ACCOUNT, "tier": "free",
+                "credits": {"balance": 0}, "cache_ttl": 30
+            })))
+            .mount(&lab)
+            .await;
+        let client = std::sync::Arc::new(crate::lab::LabClient::new(
+            meili_ingest_lab::LabCredentials::new(
+                &lab.uri(),
+                "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d",
+                "s",
+            )
+            .unwrap(),
+            reqwest::Client::new(),
+        ));
+        client.set_identity(meili_ingest_lab::InstanceInfo {
+            instance_id: "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d".into(),
+            kind: meili_ingest_lab::InstanceKind::Hosted,
+            product: "glutony".into(),
+            region: None,
+            lab_url: None,
+        });
+        let (app, starter) = test_app_with_lab(&server, GatewayConfig::default(), client).await;
+        let (ct, body) = multipart_body("file", "a.pdf", "application/pdf", PDF_MAGIC);
+        let mut req = standalone_request("/ingest", ct, body);
+        req.headers_mut()
+            .insert("x-meili-tenant-id", ACCOUNT.parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(json_body(resp).await["code"], "insufficient_credits");
+        assert!(starter.inputs().is_empty(), "nothing was queued");
     }
 }

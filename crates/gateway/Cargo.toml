@@ -27,6 +27,7 @@ meili-ingest-plugin-sdk.workspace = true
 meili-ingest-router.workspace = true
 meili-ingest-blob.workspace = true
 meili-ingest-source.workspace = true
+meili-ingest-lab.workspace = true
 
 # http
 axum.workspace = true
@@ -64,6 +65,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# `test-util` for `start_paused` (the Lab lookup cache is time-based).
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 tower = { workspace = true, features = ["util"] }
 regex.workspace = true

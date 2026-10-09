@@ -12,6 +12,7 @@ pub mod context;
 pub mod error;
 pub mod extract;
 pub mod handlers;
+pub mod lab;
 pub mod preflight;
 pub mod routes;
 pub mod schedules;
@@ -310,6 +311,24 @@ pub mod test_support {
         config: GatewayConfig,
     ) -> (Router, Arc<FakeStarter>) {
         test_app_with_url(config, &server.uri()).await
+    }
+
+    /// Router + starter wired to a `wiremock` control plane and a Lab client.
+    pub async fn test_app_with_lab(
+        server: &MockServer,
+        mut config: GatewayConfig,
+        lab: Arc<crate::lab::LabClient>,
+    ) -> (Router, Arc<FakeStarter>) {
+        config.control_plane_url = server.uri();
+        let starter = Arc::new(FakeStarter::default());
+        let state = AppState::new(
+            config,
+            starter.clone(),
+            BlobStore::memory(),
+            reqwest::Client::new(),
+        )
+        .with_lab(lab);
+        (crate::router(state), starter)
     }
 
     /// A one-step pipeline definition.

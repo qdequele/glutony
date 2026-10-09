@@ -145,6 +145,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "422":
@@ -155,6 +157,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /ingest/batch:
     post:
@@ -183,7 +187,7 @@ paths:
                 - { "s3": "s3://my-bucket/b.mp4", "index": "videos" }
       responses:
         "202":
-          description: One job per item, in input order.
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
           content:
             application/json:
               schema:
@@ -244,6 +248,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -254,6 +260,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /indexes/{index_uid}/ingest:
     post:
@@ -297,6 +305,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "422":
@@ -307,6 +317,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /indexes/{index_uid}/ingest/batch:
     post:
@@ -331,7 +343,7 @@ paths:
               $ref: "#/components/schemas/BatchIngestRequest"
       responses:
         "202":
-          description: One job per item, in input order.
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
           content:
             application/json:
               schema:
@@ -385,6 +397,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -395,6 +409,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /jobs:
     get:
@@ -1439,6 +1455,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    InsufficientCredits:
+      description: "Hosted Lab engine only. The Lab account has no credits left (`code: insufficient_credits`); nothing was queued."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61 has no credits left; top up in the Lab console", "code": "insufficient_credits" }
+    LabUnavailable:
+      description: "Hosted Lab engine only. The account's credits could not be checked (`code: lab_unavailable`): the Lab has not yet confirmed this deployment's credentials, or has been unreachable for more than 300 s. Nothing was queued; retry later."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the Lab has been unreachable for more than 300s; cannot check account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61's credits", "code": "lab_unavailable" }
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
@@ -1507,7 +1537,7 @@ components:
         code:
           type: string
           description: Stable snake_case error code.
-          examples: [missing_context, bad_request, forbidden, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, internal_error]
+          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, internal_error]
 
     JobStatus:
       type: string
