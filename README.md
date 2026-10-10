@@ -58,7 +58,7 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         └──────────────────────────────────────────────┘
 ```
 
-Three binaries, one image (`ghcr.io/meilisearch/meili-ingest`):
+Three binaries, one image (`ghcr.io/qdequele/glutony`):
 
 | Binary | Role |
 |---|---|

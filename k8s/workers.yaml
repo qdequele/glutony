@@ -56,7 +56,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: worker
-          image: ghcr.io/meilisearch/meili-ingest:latest
+          image: ghcr.io/qdequele/glutony:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/meili-ingest-worker"]
           env:
@@ -157,7 +157,7 @@ spec:
       terminationGracePeriodSeconds: 300
       containers:
         - name: worker
-          image: ghcr.io/meilisearch/meili-ingest:latest
+          image: ghcr.io/qdequele/glutony:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/meili-ingest-worker"]
           env:
@@ -238,7 +238,8 @@ spec:
 # GPU pool. The worker binary itself needs no GPU: it forwards
 # whisper_transcriber / video_audio_extractor / ocr to gRPC plugin servers
 # (see EXTERNAL_PLUGINS). Co-locating those servers as sidecars in this pod is
-# the simplest layout; the GPU request below is for the sidecar.
+# the simplest layout; the GPU request goes on the sidecar (see the commented
+# example below).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -272,7 +273,7 @@ spec:
       terminationGracePeriodSeconds: 600
       containers:
         - name: worker
-          image: ghcr.io/meilisearch/meili-ingest:latest
+          image: ghcr.io/qdequele/glutony:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/meili-ingest-worker"]
           env:
@@ -318,33 +319,14 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-        # Example gRPC plugin sidecar (replace with your Whisper / ffmpeg image).
-        - name: whisper-plugin
-          image: ghcr.io/meilisearch/meili-ingest-plugin-whisper:latest
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: grpc
-              containerPort: 50051
-          resources:
-            limits:
-              nvidia.com/gpu: 1
-              memory: 16Gi
-            requests:
-              cpu: "2"
-              memory: 8Gi
-        - name: ffmpeg-plugin
-          image: ghcr.io/meilisearch/meili-ingest-plugin-ffmpeg:latest
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: grpc
-              containerPort: 50052
-          resources:
-            requests:
-              cpu: "1"
-              memory: 1Gi
-            limits:
-              cpu: "4"
-              memory: 4Gi
+        # gRPC plugin sidecars go here (Whisper, ffmpeg, OCR). Nothing in this repo
+        # builds such images: bring your own, implementing proto/plugin.proto, and
+        # list them in EXTERNAL_PLUGINS above. Example:
+        # - name: whisper-plugin
+        #   image: <your registry>/whisper-plugin:latest
+        #   ports: [{ name: grpc, containerPort: 50051 }]
+        #   resources:
+        #     limits: { nvidia.com/gpu: 1, memory: 16Gi }
       volumes:
         - name: tmp
           emptyDir: {}

@@ -118,7 +118,7 @@ Run the server next to the worker of the right pool and declare it:
 ```yaml
 containers:
   - name: worker
-    image: ghcr.io/meilisearch/meili-ingest:latest
+    image: ghcr.io/qdequele/glutony:latest
     command: ["/usr/local/bin/meili-ingest-worker"]
     env:
       - name: TASK_QUEUE

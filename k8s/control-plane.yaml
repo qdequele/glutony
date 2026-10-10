@@ -89,7 +89,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: control-plane
-          image: ghcr.io/meilisearch/meili-ingest:latest
+          image: ghcr.io/qdequele/glutony:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/meili-ingest-control-plane"]
           ports:

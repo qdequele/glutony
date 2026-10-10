@@ -1,8 +1,8 @@
 # kubectl apply -k k8s/
 #
 # Everything is deployed into the `meili-ingest` namespace from the single
-# image ghcr.io/meilisearch/meili-ingest. Override the tag with:
-#   kustomize edit set image ghcr.io/meilisearch/meili-ingest=ghcr.io/meilisearch/meili-ingest:v0.1.0
+# image ghcr.io/qdequele/glutony. Override the tag with:
+#   kustomize edit set image ghcr.io/qdequele/glutony=ghcr.io/qdequele/glutony:v0.1.0
 #
 # temporal.yaml is a non-production reference (single-pod auto-setup). Remove
 # it and point TEMPORAL_URL at Temporal Cloud / your own cluster in production.
@@ -19,7 +19,7 @@ resources:
   - temporal.yaml
 
 images:
-  - name: ghcr.io/meilisearch/meili-ingest
+  - name: ghcr.io/qdequele/glutony
     newTag: latest
 
 commonLabels:

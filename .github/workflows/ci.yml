@@ -84,13 +84,13 @@ jobs:
           file: Dockerfile
           push: false
           load: true
-          tags: ghcr.io/meilisearch/meili-ingest:ci
+          tags: ghcr.io/qdequele/glutony:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke test binaries
         run: |
           for bin in meili-ingest-gateway meili-ingest-control-plane meili-ingest-worker; do
-            docker run --rm --entrypoint /usr/bin/test ghcr.io/meilisearch/meili-ingest:ci -x /usr/local/bin/$bin
+            docker run --rm --entrypoint /usr/bin/test ghcr.io/qdequele/glutony:ci -x /usr/local/bin/$bin
           done
 
   lab-contract-drift:
