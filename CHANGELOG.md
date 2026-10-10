@@ -45,13 +45,14 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 - `LAB_URL` must be a bare base URL (no path, query or fragment); surrounding
   whitespace is ignored.
 - Tinybird is documented as analytics only; the Lab bills.
-
-### Deprecated
-- `LAB_EVENTS_SECRET` (control plane): still read, but a v2 Lab does not accept events
-  signed with it (they are dropped after 24 h); boot logs an error. Set
-  `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET`. Removed in the next release.
+- Lab events still undelivered from a pre-v2 release are converted to the v2
+  `usage.recorded` shape on upgrade (migration 0005) and get a fresh 24 h delivery
+  window; they carry no job lifecycle event.
 
 ### Removed
+- `LAB_EVENTS_SECRET` (control plane): glutony has no working legacy Lab route (a v2
+  Lab attributes legacy batches to Scrapix), so the control plane refuses to boot
+  while it is set. Remove it and set `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET`.
 - References to `meili-ingest-plugin-whisper` / `-ffmpeg` sidecar images that nothing
   built.
 

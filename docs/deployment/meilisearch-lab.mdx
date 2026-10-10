@@ -75,15 +75,10 @@ The task prints:
 On the gateway the three `LAB_*` variables go together: all three or none, and they
 require `ENVOY_TRUSTED_HEADER` (without the edge secret any client could bill any Lab
 account with `X-Meili-Tenant-Id`, so the gateway refuses to boot). The control plane
-needs `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`.
-
-`LAB_EVENTS_SECRET`, the pre-v2 global secret, is still read by the control plane but
-**a v2 Lab does not accept events signed with it**: its legacy path checks them as
-Scrapix's, so glutony's batches are never acknowledged and are dropped after 24 h.
-The control plane logs an error at boot when it runs on that secret alone; set
-`LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` instead. It is ignored with a warning when
-the instance credentials are also set, and removed next release. The gateway never
-reads it.
+takes the same three values, all three or none. The Lab accepts glutony's event
+batches only when they are signed with these instance credentials, so the pre-v2
+global events secret is gone: the control plane refuses to boot while it is still set
+and says what to set instead.
 
 At boot the gateway and the control plane call `GET {LAB_URL}/internal/instances/me`
 to confirm the credentials and log the product and region. A 401 aborts boot, and so
@@ -278,6 +273,12 @@ the token set answers them `401`. Upgrade in this order:
 On Kubernetes, [Upgrading to Lab contract v2](/deployment/kubernetes#upgrading-to-lab-contract-v2)
 gives the commands.
 
+Lab events still waiting in the outbox from a pre-v2 release (written by the old
+workers, in a shape a v2 Lab rejects) are converted to the v2 `usage.recorded` shape
+when the new control plane first boots, and get a fresh 24 h delivery window. Their
+`step_seconds` is the job's wall time, and they carry no job lifecycle event
+(`job.completed` / `job.failed`).
+
 ## Rollback
 
 Let in-flight pipeline workflows finish (or drain them) before rolling back:
@@ -298,3 +299,8 @@ undelivered unless you force it, which loses them:
 PGOPTIONS='-c glutony.rollback_force=on' \
   psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql
 ```
+
+To go back only to a build that already has the outbox (migration 0004, not 0005),
+skip the script: stop every glutony service and forget the event conversion, which
+that build does not know, with `DELETE FROM _sqlx_migrations WHERE version = 5;`.
+Converted events stay in the v2 shape.
