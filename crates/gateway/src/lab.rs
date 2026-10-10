@@ -14,8 +14,8 @@ use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use meili_ingest_lab::{
-    AccountLookup, InstanceInfo, LabCredentials, LabError, fetch_account, fetch_instance_info,
-    is_lab_account,
+    AccountLookup, InstanceInfo, LabCredentials, LabError, check_product, fetch_account,
+    fetch_instance_info, is_lab_account,
 };
 use tokio::time::Instant;
 
@@ -104,9 +104,11 @@ impl LabClient {
         *self.identity.write().unwrap_or_else(|p| p.into_inner()) = Some(info);
     }
 
-    /// Ask the Lab once and remember the answer.
+    /// Ask the Lab once and remember the answer. Credentials minted for another
+    /// product's engine are refused ([`LabError::WrongProduct`]) and never remembered.
     pub async fn refresh_identity(&self) -> Result<InstanceInfo, LabError> {
         let info = fetch_instance_info(&self.http, &self.creds).await?;
+        check_product(&info)?;
         self.set_identity(info.clone());
         Ok(info)
     }
@@ -114,12 +116,17 @@ impl LabClient {
     /// Ask until the Lab answers, waiting `every` between attempts. Spawned at boot
     /// (after one synchronous attempt in `main`, where a 401 aborts boot) so a Lab
     /// outage never blocks startup; until it returns, every Lab-account job is
-    /// refused with 503.
+    /// refused with 503. Credentials of another product stop the retries: the identity
+    /// stays unknown, so every Lab-account job keeps being refused.
     pub async fn resolve_identity(&self, every: Duration) {
         loop {
             match self.refresh_identity().await {
                 Ok(info) => {
                     tracing::info!(kind = ?info.kind, product = %info.product, region = ?info.region, "Lab instance identity confirmed");
+                    return;
+                }
+                Err(e @ LabError::WrongProduct(_)) => {
+                    tracing::error!(error = %e, "Lab-account jobs are refused until the credentials are fixed");
                     return;
                 }
                 Err(e) => {
@@ -413,6 +420,33 @@ mod tests {
         c.advance(Duration::from_secs(5));
         c.check_credits(ACCOUNT).await.unwrap();
         lab.verify().await;
+    }
+
+    #[tokio::test]
+    async fn credentials_of_another_product_are_refused_and_never_confirmed() {
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/instances/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "instance_id": ID, "kind": "hosted", "product": "scrapix"
+            })))
+            .expect(2)
+            .mount(&lab)
+            .await;
+        let c = client(&lab);
+        assert_eq!(
+            c.refresh_identity().await,
+            Err(LabError::WrongProduct("scrapix".into()))
+        );
+        assert!(c.identity().is_none(), "Lab-account jobs stay refused");
+        // The background resolver gives up instead of retrying forever.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            c.resolve_identity(Duration::from_millis(10)),
+        )
+        .await
+        .expect("resolve_identity returns on a wrong product");
+        assert!(c.identity().is_none());
     }
 
     #[tokio::test]

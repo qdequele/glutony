@@ -24,10 +24,22 @@ pub const H_TIMESTAMP: &str = "x-lab-timestamp";
 /// Header carrying `sha256=<hex HMAC>` of an event batch.
 pub const H_SIGNATURE: &str = "x-lab-signature";
 
-/// Accept a Lab base URL: `https`, or `http` when the host is loopback or private.
-/// Returns it without a trailing slash.
+/// Accept a Lab base URL: `https`, or `http` when the host is loopback or private; no
+/// path, query, fragment or credentials. Surrounding whitespace is ignored. Returns the
+/// normalized URL without a trailing slash (`https://lab.example`), which every
+/// endpoint is appended to.
 pub fn validate_lab_url(url: &str) -> anyhow::Result<String> {
-    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("LAB_URL is not a URL: {e}"))?;
+    let parsed =
+        url::Url::parse(url.trim()).map_err(|e| anyhow::anyhow!("LAB_URL is not a URL: {e}"))?;
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!(
+            "LAB_URL must be the Lab's base URL (scheme, host and port only), without a path, \
+             query or fragment"
+        );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("LAB_URL must not carry credentials");
+    }
     let private = match parsed.host() {
         Some(url::Host::Domain(d)) => d == "localhost",
         Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
@@ -40,7 +52,7 @@ pub fn validate_lab_url(url: &str) -> anyhow::Result<String> {
         "http" => anyhow::bail!("LAB_URL must be https unless its host is loopback or private"),
         other => anyhow::bail!("LAB_URL has unsupported scheme {other:?}"),
     }
-    Ok(url.trim_end_matches('/').to_string())
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 /// `LAB_URL` + `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`.
@@ -252,6 +264,26 @@ pub enum LabError {
     /// A 2xx whose body is not what the contract says, or an id that cannot be a path segment.
     #[error("the Lab answered with an unreadable body: {0}")]
     Malformed(String),
+    /// The credentials belong to another product's engine (`GET /internal/instances/me`
+    /// answered a `product` other than [`PRODUCT`]).
+    #[error(
+        "LAB_INSTANCE_ID / LAB_INSTANCE_SECRET belong to a {0:?} engine, not {PRODUCT:?}; \
+         mint glutony credentials with `bin/rails lab:hosted_engine:create PRODUCT=glutony`"
+    )]
+    WrongProduct(String),
+}
+
+/// The product this engine is in the Lab.
+pub const PRODUCT: &str = "glutony";
+
+/// Refuse an identity minted for another product's engine: its events and credit
+/// checks would be attributed to that product.
+pub fn check_product(info: &InstanceInfo) -> Result<(), LabError> {
+    if info.product == PRODUCT {
+        Ok(())
+    } else {
+        Err(LabError::WrongProduct(info.product.clone()))
+    }
 }
 
 async fn get_json<T: DeserializeOwned>(
@@ -357,6 +389,65 @@ mod tests {
     }
 
     #[test]
+    fn lab_urls_are_trimmed_and_normalized() {
+        assert_eq!(
+            validate_lab_url(" https://lab.example/ \n").unwrap(),
+            "https://lab.example"
+        );
+        assert_eq!(
+            validate_lab_url("https://lab.example").unwrap(),
+            "https://lab.example"
+        );
+        assert_eq!(
+            validate_lab_url("https://lab.example:8443/").unwrap(),
+            "https://lab.example:8443"
+        );
+        // The credentials and the endpoints use the normalized form.
+        let c = LabCredentials::new("https://lab.example/\n", ID, "s").unwrap();
+        assert_eq!(
+            c.endpoint("/internal/events"),
+            "https://lab.example/internal/events"
+        );
+    }
+
+    #[test]
+    fn lab_urls_with_a_path_query_or_fragment_are_refused() {
+        for url in [
+            "https://lab.example/path",
+            "https://lab.example/path/",
+            "https://lab.example?x",
+            "https://lab.example/?x=1",
+            "https://lab.example#frag",
+            "https://user:pw@lab.example",
+        ] {
+            assert!(validate_lab_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn http_is_only_accepted_for_loopback_and_private_hosts() {
+        for url in [
+            "http://localhost:3000",
+            "http://127.0.0.1:8091",
+            "http://10.0.0.5",
+            "http://172.16.1.1",
+            "http://192.168.1.10/",
+            "http://[::1]:3000",
+            "http://[fd00::1]",
+        ] {
+            assert!(validate_lab_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://lab.example",
+            "http://8.8.8.8",
+            "http://[2001:db8::1]",
+            "ftp://lab.example",
+        ] {
+            assert!(validate_lab_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
     fn only_canonical_lowercase_uuids_are_lab_accounts() {
         assert!(is_lab_account(ID));
         assert!(!is_lab_account(&ID.to_uppercase()));
@@ -438,6 +529,23 @@ mod tests {
             fetch_account(&http, &dead, ID).await,
             Err(LabError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn only_glutony_credentials_are_accepted() {
+        let mut info = InstanceInfo {
+            instance_id: ID.into(),
+            kind: InstanceKind::Hosted,
+            product: "glutony".into(),
+            region: None,
+            lab_url: None,
+        };
+        assert_eq!(check_product(&info), Ok(()));
+        info.product = "scrapix".into();
+        let err = check_product(&info).unwrap_err();
+        assert_eq!(err, LabError::WrongProduct("scrapix".into()));
+        assert!(err.to_string().contains("scrapix"), "{err}");
+        assert!(err.to_string().contains("glutony"), "{err}");
     }
 
     #[test]

@@ -48,12 +48,17 @@ async fn main() -> anyhow::Result<()> {
                     .timeout(std::time::Duration::from_secs(10))
                     .build()?;
                 match meili_ingest_lab::fetch_instance_info(&http, creds).await {
-                    Ok(info) => tracing::info!(
-                        kind = ?info.kind,
-                        product = %info.product,
-                        region = ?info.region,
-                        "Lab instance identity confirmed"
-                    ),
+                    Ok(info) => {
+                        // Credentials of another product's engine abort boot: its
+                        // events would be attributed to that product.
+                        meili_ingest_lab::check_product(&info)?;
+                        tracing::info!(
+                            kind = ?info.kind,
+                            product = %info.product,
+                            region = ?info.region,
+                            "Lab instance identity confirmed"
+                        )
+                    }
                     // Spec §3.6: a 401 aborts boot; the credentials are wrong or revoked.
                     Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
                         "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"

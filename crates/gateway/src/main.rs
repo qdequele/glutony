@@ -155,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
                 Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
                     "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"
                 ),
+                // The credentials belong to another product's engine (spec v2 §3.6).
+                Err(e @ meili_ingest_lab::LabError::WrongProduct(_)) => anyhow::bail!(e),
                 Err(e) => {
                     tracing::warn!(error = %e, "could not confirm the Lab identity; retrying in the background");
                     let resolver = client.clone();
