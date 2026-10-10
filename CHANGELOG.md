@@ -54,3 +54,5 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 - A Lab `usage.recorded` event whose job had an unpriced provider call now bills the
   priced calls' `provider_cost_micro_usd` (it was sent as 0) and counts the missing
   calls in a new `unpriced_provider_calls` unit; the worker logs a warning.
+- `ocr_pages` in Lab `usage.recorded` events counts the job's `ocr` plugin steps (their
+  reported pages, else their output documents); it was always 0.

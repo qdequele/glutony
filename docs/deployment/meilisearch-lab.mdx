@@ -128,6 +128,9 @@ error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
 
 - The Lab prices `documents`, `ocr_pages` and `provider_cost_micro_usd` (its
   `pricing.yml`); other units are stored and shown. glutony never computes credits.
+- `ocr_pages` counts the job's `ocr` plugin steps: the pages a step reports, or else
+  its output documents (the OCR plugin emits one document per page). The PDF
+  extractor's pages are not OCR and stay in the unpriced `pages` unit.
 - `provider_cost_micro_usd` is what glutony paid providers, from the provider cost
   table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). When some calls of
   the job could not be priced it is the sum of the calls that could: the description

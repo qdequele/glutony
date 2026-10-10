@@ -21,6 +21,9 @@ pub const GLUTONY_LAB_NAMESPACE: Uuid = Uuid::from_u128(0x6c8f_4a1e_2b7d_4c3a_9e
 pub const OPERATION: &str = "ingest";
 /// The `product` of every glutony event.
 pub const PRODUCT: &str = "glutony";
+/// The plugin that does OCR: the external gRPC plugin of that name (the control
+/// plane's `EXTERNAL_PLUGINS`). Its steps are the job's `ocr_pages`.
+pub const OCR_PLUGIN: &str = "ocr";
 
 /// One Lab event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,10 +161,28 @@ fn documents_out(input: &JobUsageInput) -> u64 {
         .unwrap_or(0)
 }
 
+/// Pages OCR'd by the job: for each [`OCR_PLUGIN`] step, the `pages` it reported, or
+/// else its output documents. The gRPC plugin contract carries no usage, so today the
+/// plugin reports nothing and emits one document per page it read.
+fn ocr_pages(input: &JobUsageInput) -> u64 {
+    input
+        .steps
+        .iter()
+        .filter(|s| s.plugin == OCR_PLUGIN)
+        .map(|s| {
+            if s.usage.pages > 0 {
+                s.usage.pages
+            } else {
+                s.document_count as u64
+            }
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
 /// The v2 units of a job (spec §4.3), from the step totals. Every value is a
 /// non-negative integer; fractional seconds round up so a started second is billed.
-/// `ocr_pages` stays 0 until a plugin reports OCR'd pages: the PDF extractor's `pages`
-/// are not OCR work and are sent as an extra, unpriced unit instead.
+/// `ocr_pages` counts only the [`OCR_PLUGIN`] steps (see [`ocr_pages`]): the PDF
+/// extractor's `pages` are not OCR work and are sent as an extra, unpriced unit.
 pub fn lab_units(input: &JobUsageInput, totals: &UsageUnits) -> BTreeMap<String, u64> {
     let step_ms = input
         .steps
@@ -179,7 +200,7 @@ pub fn lab_units(input: &JobUsageInput, totals: &UsageUnits) -> BTreeMap<String,
         ("llm_tokens_in".to_string(), totals.llm_input_tokens),
         ("llm_tokens_out".to_string(), totals.llm_output_tokens),
         ("audio_seconds".to_string(), audio_seconds),
-        ("ocr_pages".to_string(), 0),
+        ("ocr_pages".to_string(), ocr_pages(input)),
         // Extra units the Lab stores but does not price (spec §4.3).
         ("pages".to_string(), totals.pages),
         ("images".to_string(), totals.images),
@@ -393,7 +414,7 @@ mod tests {
         assert_eq!(units["llm_tokens_in"], 1_000);
         assert_eq!(units["llm_tokens_out"], 100);
         assert_eq!(units["audio_seconds"], 3, "2.4 s, rounded up");
-        assert_eq!(units["ocr_pages"], 0, "no plugin reports OCR pages yet");
+        assert_eq!(units["ocr_pages"], 0, "no ocr step");
         // Extra units: stored by the Lab, ignored by pricing (spec §4.3).
         assert_eq!(units["pages"], 9);
         assert_eq!(units["llm_requests"], 1);
@@ -433,6 +454,46 @@ mod tests {
             Some(&0),
             "always present, 0 when the cost is complete"
         );
+    }
+
+    fn ocr_units(steps: Vec<StepResult>) -> serde_json::Value {
+        let mut i = input();
+        i.steps = steps;
+        let v = serde_json::to_value(lab_event_for_job(&i).unwrap()).unwrap();
+        assert!(errors_of(&v).is_empty(), "{:?}\n{v:#}", errors_of(&v));
+        v["data"]["units"].clone()
+    }
+
+    fn plugin_step(plugin: &str, docs: usize, usage: UsageUnits) -> StepResult {
+        StepResult {
+            plugin: plugin.into(),
+            ..step(plugin, docs, 1, usage)
+        }
+    }
+
+    #[test]
+    fn an_ocr_step_reports_one_page_per_output_document() {
+        let units = ocr_units(vec![
+            plugin_step("pdf_extractor", 1, UsageUnits::pages(4)),
+            plugin_step("ocr", 4, UsageUnits::none()),
+        ]);
+        assert_eq!(units["ocr_pages"], 4);
+    }
+
+    #[test]
+    fn an_ocr_step_that_reports_pages_is_trusted() {
+        let units = ocr_units(vec![plugin_step("ocr", 2, UsageUnits::pages(7))]);
+        assert_eq!(units["ocr_pages"], 7);
+    }
+
+    #[test]
+    fn pdf_extractor_pages_are_not_ocr_pages() {
+        let units = ocr_units(vec![
+            plugin_step("pdf_extractor", 3, UsageUnits::pages(9)),
+            plugin_step("chunker", 12, UsageUnits::none()),
+        ]);
+        assert_eq!(units["ocr_pages"], 0, "no ocr step");
+        assert_eq!(units["pages"], 9, "extracted pages stay an extra unit");
     }
 
     #[test]
