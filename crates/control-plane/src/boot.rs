@@ -190,6 +190,27 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn the_identity_call_never_follows_a_redirect() {
+        // A redirect would replay the bearer secret to another host.
+        let elsewhere = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"instance_id": "id", "kind": "hosted", "product": "lumen"}),
+            ))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let redirect = wiremock::ResponseTemplate::new(307).insert_header(
+            "location",
+            format!("{}/internal/instances/me", elsewhere.uri()).as_str(),
+        );
+        // Boot only warns (the 307 is "some other failure"), and `elsewhere` is never
+        // asked: had it been, its "lumen" answer would have aborted boot too.
+        identity(redirect).await.unwrap();
+        elsewhere.verify().await;
+    }
+
     #[test]
     fn debug_redacts_the_secrets() {
         let c = boot(&[
