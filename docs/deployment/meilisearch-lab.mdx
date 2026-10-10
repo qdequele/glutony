@@ -136,10 +136,12 @@ error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
   the job could not be priced it is the sum of the calls that could: the description
   says `provider cost incomplete` and the `unpriced_provider_calls` unit counts the
   missing calls (it is always present, 0 when the cost is complete), and the worker
-  logs a warning. The bundled prices are placeholders: set yours before
-  reporting to a Lab. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
-  worker at boot; if it ever fails to load later, every call is flagged unpriced
-  (never priced at the bundled rates).
+  logs a warning. The bundled prices are placeholders: set yours before reporting to
+  a Lab (`jev_enricher` has no bundled price at all). At boot the worker logs an
+  error naming every registered provider plugin the table has no entry for. A
+  `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at boot; if it
+  ever fails to load later, every call is flagged unpriced (never priced at the
+  bundled rates).
 - Jobs without a canonical-UUID tenant (standalone, Cloud projects) are never sent.
   Failed and cancelled jobs are: provider cost already spent is real.
 

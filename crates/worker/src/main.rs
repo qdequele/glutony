@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     // The provider cost table loads lazily on the first paid call; load it now so a bad
     // PROVIDER_COSTS_FILE stops the worker before it takes traffic instead of surfacing
     // mid-run as unpriced events.
-    meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
+    let costs = meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
         .map_err(anyhow::Error::msg)
         .context("invalid PROVIDER_COSTS_FILE")?;
 
@@ -41,6 +41,17 @@ async fn main() -> anyhow::Result<()> {
         registry.load_external(spec).await;
     }
     tracing::info!(plugins = ?registry.names(), unavailable = ?registry.unavailable(), "plugins registered");
+    // A provider plugin with no price entry bills every call at 0: say so now, once,
+    // rather than only when its first call is warned about.
+    let names = registry.names();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let unpriced = costs.unpriced_plugins(&names);
+    if !unpriced.is_empty() {
+        tracing::error!(
+            plugins = ?unpriced,
+            "provider plugins with no entry in the provider cost table: their calls are billed at 0 provider cost and flagged unpriced; add them to PROVIDER_COSTS_FILE"
+        );
+    }
     let registry = Arc::new(registry);
 
     // URL fetches on a tenant's behalf — scheduled sources AND `{"url": …}` refs in

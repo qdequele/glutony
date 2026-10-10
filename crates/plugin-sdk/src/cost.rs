@@ -17,6 +17,17 @@ use crate::types::UsageUnits;
 /// The bundled table.
 const BUNDLED: &str = include_str!("../../../config/provider-costs.toml");
 
+/// Every plugin that pays a provider (calls [`ProviderCosts::apply`]), by plugin name.
+/// The worker checks at boot that each registered one has a price entry. A plugin that
+/// starts calling `apply` must be added here (the worker tests this against the
+/// plugins' `NAME`s).
+pub const PRICED_PLUGINS: &[&str] = &[
+    "llm_enricher",
+    "jev_enricher",
+    "image_captioner",
+    "whisper_transcriber",
+];
+
 /// Price of one model, in micro-USD. Absent dimensions cost nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +115,18 @@ impl ProviderCosts {
     pub fn price(&self, plugin: &str, model: &str) -> Option<Price> {
         let models = self.entries.get(plugin)?;
         models.get(model).or_else(|| models.get("default")).copied()
+    }
+
+    /// The `registered` plugins that pay a provider ([`PRICED_PLUGINS`]) but have no
+    /// entry at all in this table (neither a model nor `default`): every call they make
+    /// is billed at 0 and flagged unpriced. In `registered` order.
+    pub fn unpriced_plugins<'a>(&self, registered: &[&'a str]) -> Vec<&'a str> {
+        registered
+            .iter()
+            .copied()
+            .filter(|p| PRICED_PLUGINS.contains(p))
+            .filter(|p| self.entries.get(*p).is_none_or(HashMap::is_empty))
+            .collect()
     }
 
     /// Price one provider call in place: add its cost to `units.cost_micro_usd`, or
@@ -334,6 +357,67 @@ mod tests {
         assert_eq!((u.cost_micro_usd, u.unpriced_calls), (0, 1));
         // A successful load is passed through untouched.
         assert_eq!(ProviderCosts::or_unpriced(Ok(costs())), costs());
+    }
+
+    #[test]
+    fn plugins_without_any_price_entry_are_listed() {
+        let table = ProviderCosts::from_toml(
+            r#"
+            [llm_enricher."gpt-4o-mini"]
+            input_per_mtok = 1
+            [jev_enricher.default]
+            per_request = 1
+            "#,
+        )
+        .unwrap();
+        let registered = [
+            "pdf_extractor",
+            "llm_enricher",
+            "image_captioner",
+            "jev_enricher",
+            "whisper_transcriber",
+        ];
+        assert_eq!(
+            table.unpriced_plugins(&registered),
+            ["image_captioner", "whisper_transcriber"],
+            "provider plugins only: pdf_extractor pays no provider"
+        );
+        // A plugin that is not registered is not reported.
+        assert_eq!(
+            table.unpriced_plugins(&["llm_enricher"]),
+            Vec::<&str>::new()
+        );
+        // An empty table prices none of them.
+        assert_eq!(
+            ProviderCosts::default().unpriced_plugins(PRICED_PLUGINS),
+            PRICED_PLUGINS
+        );
+    }
+
+    #[test]
+    fn the_bundled_table_leaves_only_jev_enricher_unpriced() {
+        assert_eq!(
+            ProviderCosts::bundled().unpriced_plugins(PRICED_PLUGINS),
+            ["jev_enricher"]
+        );
+    }
+
+    #[test]
+    fn the_k8s_table_is_the_bundled_one_and_the_jev_template_parses() {
+        let k8s = include_str!("../../../k8s/provider-costs.toml");
+        let (_note, body) = k8s.split_once('\n').unwrap();
+        assert_eq!(
+            body, BUNDLED,
+            "k8s/provider-costs.toml drifted from config/"
+        );
+        assert!(BUNDLED.contains("# NOT PRODUCTION PRICES"));
+        let template: String = BUNDLED
+            .lines()
+            .skip_while(|l| *l != "# [jev_enricher.default]")
+            .map(|l| format!("{}\n", l.trim_start_matches("# ")))
+            .collect();
+        let table = ProviderCosts::from_toml(&template).unwrap();
+        assert!(table.price("jev_enricher", "jev-latest").is_some());
     }
 
     #[test]

@@ -56,3 +56,7 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   calls in a new `unpriced_provider_calls` unit; the worker logs a warning.
 - `ocr_pages` in Lab `usage.recorded` events counts the job's `ocr` plugin steps (their
   reported pages, else their output documents); it was always 0.
+- The worker logs an error at boot listing every registered provider plugin
+  (`llm_enricher`, `jev_enricher`, `image_captioner`, `whisper_transcriber`) with no
+  entry in the provider cost table; the bundled tables now say loudly that their
+  prices are placeholders and carry a commented `[jev_enricher.default]` template.

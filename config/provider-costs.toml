@@ -1,11 +1,21 @@
+# =====================================================================================
+# NOT PRODUCTION PRICES: every value below is a list-price PLACEHOLDER (public OpenAI
+# list prices at the time of writing), not what this deployment pays. Replace them
+# with your negotiated prices BEFORE reporting usage to a Meilisearch Lab: the Lab
+# bills provider_cost_micro_usd with its markup, so a wrong price here is a wrong bill.
+# jev_enricher has no entry at all: its calls are billed at 0 and flagged unpriced
+# until you fill in the [jev_enricher.default] template at the end of this file. The
+# worker logs an error at boot for every registered provider plugin with no entry.
+# =====================================================================================
+#
 # What glutony pays a provider per call, in micro-USD (1 USD = 1_000_000).
 # Keys: [<plugin name>.<model>] or [<plugin name>.default]. Dimensions:
 # input_per_mtok, output_per_mtok (per million tokens), per_audio_second, per_request.
 #
-# PLACEHOLDERS: these are public list prices at the time of writing, for the
-# providers the plugins default to (OpenAI). Set real prices before billing, and ship
-# your own file (PROVIDER_COSTS_FILE) if a plugin's *_BASE_URL points elsewhere.
-# A model missing here is billed at 0 and flagged (cost_complete: false).
+# The prices assume the providers the plugins default to (OpenAI, TypeSafe). Ship your
+# own file (PROVIDER_COSTS_FILE) if a plugin's *_BASE_URL points elsewhere.
+# A model missing here is billed at 0 and flagged (unpriced_provider_calls in the
+# Lab event, "provider cost incomplete" in its description).
 
 [llm_enricher."gpt-4o-mini"]
 input_per_mtok = 150000
@@ -28,3 +38,10 @@ per_audio_second = 100
 
 # jev_enricher (TypeSafe Jev) has no public price: left out on purpose, so its calls
 # are flagged as unpriced until you add [jev_enricher.default] or a model entry.
+# Template (uncomment and set real values). Jev reports token counts when TypeSafe
+# returns them; a call without them is flagged unpriced if a per-token price is set,
+# so set per_request too if you are billed per call.
+# [jev_enricher.default]
+# input_per_mtok = 0
+# output_per_mtok = 0
+# per_request = 0
