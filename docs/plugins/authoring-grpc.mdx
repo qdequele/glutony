@@ -54,6 +54,10 @@ The exact `.proto` shipped in the repository is authoritative:
 [`proto/plugin.proto`](https://github.com/meilisearch/meili-ingest/blob/main/proto/plugin.proto).
 </Note>
 
+Billing: a plugin named `ocr` is billed to the Lab as `ocr_pages` (5 credits each),
+one per output document (emit one document per page you OCR), or per `pages` if it
+ever reports usage. See [Meilisearch Lab](/deployment/meilisearch-lab).
+
 ## Python example (Whisper)
 
 ```python

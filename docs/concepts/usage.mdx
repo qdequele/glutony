@@ -103,11 +103,11 @@ the provider cost table, `config/provider-costs.toml` (or the file named by
 costs 0 and marks the job's cost incomplete: the Lab event still carries the cost of
 the calls that could be priced, its description says `provider cost incomplete` and
 its `unpriced_provider_calls` unit counts the missing calls, so the Lab sees the gap
-instead of a silently low cost. Calls glutony does not pay for,
-such as a local gRPC plugin, cost 0 and stay complete. The bundled prices are
-placeholders: set yours before reporting to a Lab. A missing or invalid
-`PROVIDER_COSTS_FILE` stops the worker at boot; if it ever fails to load later, calls
-are flagged unpriced instead of being priced at the bundled rates.
+instead of a silently low cost. Calls glutony does not pay for, such as a local gRPC
+plugin, cost 0 and stay complete. The bundled prices are placeholders: set yours
+before reporting to a Lab. A missing or invalid `PROVIDER_COSTS_FILE` stops the worker
+at boot; if it ever fails to load later, calls are flagged unpriced instead of being
+priced at the bundled rates.
 
 The Lab events are written first, then Tinybird. A Tinybird failure cannot keep a Lab
 event from being recorded, and a retry re-inserts the same event id harmlessly.

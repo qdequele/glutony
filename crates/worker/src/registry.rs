@@ -273,22 +273,6 @@ mod builtin_pipeline_compat {
         reg
     }
 
-    #[test]
-    fn priced_plugins_are_the_plugins_that_call_providers() {
-        // Every plugin that calls `ProviderCosts::apply`, by its own NAME: a rename
-        // must not silently drop it from the boot check for missing prices.
-        let mut callers = vec![
-            meili_ingest_plugin_llm_enricher::NAME,
-            meili_ingest_plugin_jev_enricher::NAME,
-            meili_ingest_plugin_image_captioner::NAME,
-            meili_ingest_plugin_audio_transcriber::NAME,
-        ];
-        callers.sort_unstable();
-        let mut priced = meili_ingest_plugin_sdk::cost::PRICED_PLUGINS.to_vec();
-        priced.sort_unstable();
-        assert_eq!(priced, callers);
-    }
-
     /// Plugins provided by external gRPC containers, not by this binary.
     const EXTERNAL: &[&str] = &["ocr", "s3_downloader"];
 
@@ -432,5 +416,24 @@ mod builtin_pipeline_compat {
                 pipeline.uid
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod priced_plugins {
+    #[test]
+    fn priced_plugins_are_the_plugins_that_call_providers() {
+        // Every plugin that calls `ProviderCosts::apply`, by its own NAME: a rename
+        // must not silently drop it from the boot check for missing prices.
+        let mut callers = vec![
+            meili_ingest_plugin_llm_enricher::NAME,
+            meili_ingest_plugin_jev_enricher::NAME,
+            meili_ingest_plugin_image_captioner::NAME,
+            meili_ingest_plugin_audio_transcriber::NAME,
+        ];
+        callers.sort_unstable();
+        let mut priced = meili_ingest_plugin_sdk::cost::PRICED_PLUGINS.to_vec();
+        priced.sort_unstable();
+        assert_eq!(priced, callers);
     }
 }

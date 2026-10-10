@@ -487,6 +487,29 @@ mod tests {
     }
 
     #[test]
+    fn ocr_steps_are_matched_by_plugin_not_step_id() {
+        let scan = StepResult {
+            step_id: "scan".into(),
+            ..plugin_step("ocr", 5, UsageUnits::none())
+        };
+        let named_ocr = StepResult {
+            step_id: "ocr".into(),
+            ..plugin_step("chunker", 30, UsageUnits::none())
+        };
+        let units = ocr_units(vec![scan, named_ocr]);
+        assert_eq!(units["ocr_pages"], 5, "only the step whose plugin is ocr");
+    }
+
+    #[test]
+    fn several_ocr_steps_are_summed() {
+        let units = ocr_units(vec![
+            plugin_step("ocr", 3, UsageUnits::none()),
+            plugin_step("ocr", 1, UsageUnits::pages(6)),
+        ]);
+        assert_eq!(units["ocr_pages"], 9, "3 documents + 6 reported pages");
+    }
+
+    #[test]
     fn pdf_extractor_pages_are_not_ocr_pages() {
         let units = ocr_units(vec![
             plugin_step("pdf_extractor", 3, UsageUnits::pages(9)),
