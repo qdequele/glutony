@@ -20,6 +20,19 @@ use crate::{AppState, CpError, JsonBody};
 /// Also run after every insert, so a released migration file must never change.
 const CONVERT_PRE_V2: &str = include_str!("../../../migrations/0005_lab_events_v2.sql");
 
+/// Whether `events` may hold a pre-v2 `usage.recorded` event: one with a `data` object
+/// and no `data.operation`. A superset of what [`CONVERT_PRE_V2`] matches, so skipping
+/// the conversion when this is false never leaves a pre-v2 row unconverted, and v2
+/// batches never pay for a scan of the outbox.
+pub fn needs_pre_v2_conversion(events: &[serde_json::Value]) -> bool {
+    events.iter().any(|e| {
+        e.get("type").and_then(|t| t.as_str()) == Some("usage.recorded")
+            && e.get("data")
+                .and_then(|d| d.as_object())
+                .is_some_and(|d| !d.contains_key("operation"))
+    })
+}
+
 /// A leased row, ready to send.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct PendingEvent {
@@ -77,10 +90,11 @@ impl LabEventRepo {
             .await?
             .rows_affected();
         }
-        if inserted > 0 {
+        if inserted > 0 && needs_pre_v2_conversion(events) {
             // Workers not upgraded yet still post pre-v2 `usage.recorded` events, which a
             // v2 Lab accepts in the batch and then rejects: convert them like the
             // upgrade did (the migration is idempotent and only touches pre-v2 rows).
+            // It scans the undelivered outbox, so v2 batches skip it.
             sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -200,4 +214,44 @@ pub async fn ingest_lab_events(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "inserted": inserted })),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::needs_pre_v2_conversion;
+
+    #[test]
+    fn only_a_usage_event_without_an_operation_needs_the_conversion() {
+        let v2_usage =
+            json!({"type": "usage.recorded", "data": {"operation": "ingest", "units": {}}});
+        let lifecycle = json!({"type": "job.completed", "data": {"job_id": "j"}});
+        let pre_v2 = json!({"type": "usage.recorded", "data": {"cost_complete": true}});
+        assert!(!needs_pre_v2_conversion(&[]));
+        assert!(!needs_pre_v2_conversion(&[
+            v2_usage.clone(),
+            lifecycle.clone()
+        ]));
+        assert!(needs_pre_v2_conversion(&[
+            v2_usage,
+            pre_v2.clone(),
+            lifecycle
+        ]));
+        // Anything the SQL cannot convert does not trigger it either.
+        assert!(!needs_pre_v2_conversion(&[
+            json!({"type": "usage.recorded", "data": 1})
+        ]));
+        assert!(!needs_pre_v2_conversion(&[
+            json!({"type": "usage.recorded"})
+        ]));
+        assert!(!needs_pre_v2_conversion(&[
+            json!({"data": {"cost_complete": true}})
+        ]));
+        // A usage event without operation but also without cost_complete still counts:
+        // the guard is a superset of the SQL predicate.
+        assert!(needs_pre_v2_conversion(&[
+            json!({"type": "usage.recorded", "data": {}})
+        ]));
+    }
 }

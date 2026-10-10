@@ -446,3 +446,42 @@ async fn an_old_worker_inserting_a_pre_v2_event_gets_it_converted() {
     assert_eq!(row(&t.pool, v2_id).await.1, v2);
     t.drop_schema().await;
 }
+
+#[tokio::test]
+async fn a_v2_only_batch_does_not_run_the_conversion() {
+    // The conversion scans the whole undelivered outbox, so it only runs when the batch
+    // may hold a pre-v2 event. Observable: a pre-v2 row written straight to the table
+    // (as before the upgrade) stays as it is when a v2-only batch is inserted.
+    let Some(t) = setup().await else { return };
+    let stray = insert(
+        &t.pool,
+        &old_event(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            json!({"pipeline_uid": "p", "status": "succeeded", "duration_ms": 1,
+                   "cost_micro_usd": 0, "cost_complete": true, "units": {}}),
+        ),
+        false,
+    )
+    .await;
+    let before = row(&t.pool, stray).await;
+    let v2 = json!({
+        "id": Uuid::new_v4(), "type": "usage.recorded",
+        "occurred_at": "2026-10-01T10:00:09.000Z", "account_id": ACCOUNT,
+        "api_key_id": null, "product": "glutony",
+        "data": {"operation": "ingest", "units": {"documents": 1}}
+    });
+    let repo = LabEventRepo::new(t.pool.clone());
+    assert_eq!(
+        repo.insert_many(std::slice::from_ref(&v2)).await.unwrap(),
+        1
+    );
+    let v2_id: Uuid = v2["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        row(&t.pool, v2_id).await.1,
+        v2,
+        "v2 rows are stored unchanged"
+    );
+    assert_eq!(row(&t.pool, stray).await, before, "no conversion ran");
+    t.drop_schema().await;
+}
