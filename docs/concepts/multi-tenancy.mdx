@@ -80,8 +80,8 @@ development, never for an exposed deployment.
 4. X-Meili-Index                     → index (starting point)
 5. ?index= query param               → index (overrides header)
 6. Authorization: Bearer <key>       → api_key (self-hosted fallback)
-7. MEILI_URL / MEILI_API_KEY env     → host / api_key (self-hosted fallback,
-                                       only without a tenant)
+7. MEILI_URL / MEILI_API_KEY env     → host / api_key (standalone only:
+                                       never with a tenant)
 ```
 
 Nothing found → `400 {"error": "...", "code": "missing_context"}`, unless the

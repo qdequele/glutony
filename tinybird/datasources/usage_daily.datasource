@@ -6,14 +6,14 @@
 # (`sumMerge`, `countMerge`) — see `pipes/tenant_usage.pipe`.
 #
 # Sorting key `project_id, day, pipeline_uid, plugin` matches the rollup's GROUP BY and,
-# like the raw table, leads with the tenant: billing reads one project at a time.
+# like the raw table, leads with the tenant: usage reads one project at a time.
 # Job-level rows (kind = 'job') carry no plugin, so their counters land in the
 # `plugin = ''` bucket.
 #
 # CAVEAT (see pipes/usage_daily_mv.pipe): a materialized view fires per INSERT and does not
 # see the ReplacingMergeTree deduplication of the source, so a redelivered event would
 # be counted twice HERE while the raw table stays correct. The raw data source remains
-# the source of truth for an invoice; this rollup is for dashboards and estimates.
+# the source of truth for reconciliation; this rollup is for dashboards and estimates.
 #
 # ── Retention: 180 days, like the raw table ─────────────────────────────────────
 # A deployment that changes `usage_daily_mv`'s query rebuilds this table by re-running

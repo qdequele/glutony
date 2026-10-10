@@ -1,5 +1,5 @@
 #
-# meili_ingest_usage — raw per-job / per-step usage rows (billing + dashboards).
+# meili_ingest_usage — raw per-job / per-step usage rows (reconciliation + dashboards).
 #
 # Written by `meili-ingest-usage` (crates/usage) through the Events API:
 #   POST {base_url}/v0/events?name=meili_ingest_usage&wait=true
@@ -28,7 +28,7 @@
 # merge keeps (the last inserted, without a version) is the same row.
 #
 # ── Sorting key ─────────────────────────────────────────────────────────────────
-# `project_id, ts, event_id` leads with the tenant because every billing and dashboard
+# `project_id, ts, event_id` leads with the tenant because every report and dashboard
 # query filters by tenant first ("what did project X consume between two dates"), so
 # ClickHouse can skip whole granules for other tenants before it looks at the time
 # range. `ts` second serves the date range, `event_id` last makes the key unique. The
@@ -40,7 +40,7 @@
 # use as TINYBIRD_TOKEN (see tinybird/README.md §3). It can write this data source
 # and nothing else.
 #
-# Partitioned by month, and dropped after 180 days: invoices are issued monthly and
+# Partitioned by month, and dropped after 180 days: usage is reconciled monthly and
 # `usage_daily_billing` keeps the long-term aggregate. `usage_daily` shares this
 # 180-day TTL because a deployment that changes its materialized pipe rebuilds it from
 # this table (see usage_daily.datasource). Changing the TTL here means changing it

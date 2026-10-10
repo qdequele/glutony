@@ -1,5 +1,5 @@
 #
-# tenant_usage — ENDPOINT: the billing API over the daily rollup.
+# tenant_usage — ENDPOINT: the per-tenant usage API over the daily rollup.
 #
 #   GET {base_url}/v0/pipes/tenant_usage.json
 #       ?project_id=acme&date_from=2026-04-01&date_to=2026-04-30&token=<READ token>
@@ -8,9 +8,9 @@
 # job-level counters.
 #
 # Reads `usage_daily_billing`, the hourly COPY that reads the raw table with FINAL, so
-# these totals are deduplicated and safe to invoice from. They lag by up to an hour;
+# these totals are deduplicated and safe to reconcile from. They lag by up to an hour;
 # for a real-time view (which can double-count a redelivered event) read the
-# materialized `usage_daily` instead. Add `&format=csv` / `.csv` for a billing export.
+# materialized `usage_daily` instead. Add `&format=csv` / `.csv` for a usage export.
 #
 # Every deployment mints `glutony_gateway_read`, a READ token scoped to this endpoint
 # only: it is the gateway's TINYBIRD_READ_TOKEN (see tinybird/README.md §3).

@@ -1,6 +1,6 @@
 ---
 title: Meilisearch Lab
-description: Run glutony as a Meilisearch Lab data plane - tenants, management auth and billing events
+description: Run glutony as a Meilisearch Lab data plane - tenants, management auth, usage events, credit pre-check
 ---
 
 glutony runs on its own. The Meilisearch Lab plugs into it through three seams,
@@ -49,10 +49,40 @@ of the admin hostname must send `Authorization: Bearer <ADMIN_API_KEY>` for it, 
 the Meilisearch key it used to inject as the bearer token moves to
 `X-Meili-Api-Key` (with `X-Meili-Host` and `X-Meili-Envoy-Secret`).
 
-## Billing events
+## Reporting to the Lab
 
-Each job run for a Lab account produces two events, posted together. First a
-`usage.recorded` event with the job's raw units and provider cost:
+Engines are run by Meilisearch. The operator mints each deployment's credentials in
+the Lab with
+`bin/rails lab:hosted_engine:create PRODUCT=glutony REGION=... URL=... CREDENTIAL=...`,
+which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once (rotate them
+with `lab:hosted_engine:rotate`, revoke them with `lab:hosted_engine:revoke`):
+
+| Variable | Service | Notes |
+|---|---|---|
+| `LAB_URL` | control plane, gateway | `https` unless the host is loopback or private |
+| `LAB_INSTANCE_ID` | control plane, gateway | this deployment's id in the Lab |
+| `LAB_INSTANCE_SECRET` | control plane, gateway | 64 hex chars; rotate or revoke in the Lab |
+| `LAB_EVENTS_ENABLED` | workers | `true` writes events to the control plane's outbox |
+
+On the gateway the three `LAB_*` variables go together: all three or none. The
+control plane needs `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`, or with
+`LAB_EVENTS_SECRET`, the pre-v2 global secret. That one still works with a boot
+warning (it signs the bare body and skips the identity check), is ignored with a
+warning when the instance credentials are also set, and is removed next release. The
+gateway never reads it.
+
+At boot the gateway and the control plane call `GET {LAB_URL}/internal/instances/me`
+to confirm the credentials and log the product and region. A 401 aborts boot. Any
+other failure is logged and boot goes on: the control plane sends events anyway, and
+the gateway retries every 30 s and, until the Lab answers, refuses jobs for Lab
+accounts with `503 {"code": "lab_unavailable"}` (every job is billed, so none runs
+unchecked).
+
+### Events
+
+Each finished Lab job produces two events, built once and delivered at least once
+with deterministic ids. First `usage.recorded`, with the job's raw units and provider
+cost:
 
 ```json
 {
@@ -75,29 +105,50 @@ Each job run for a Lab account produces two events, posted together. First a
 }
 ```
 
-Then a lifecycle event with id `<UUIDv5 of job:{job_id}:lifecycle>`: `job.completed`
-(`job_id`, `index_uid` = the pipeline uid, `documents_indexed`, `duration_secs`,
-`pages_crawled: 0`) for a succeeded job, `job.failed` (`job_id`, `error_message`,
-`pages_crawled: 0`) for a failed or cancelled one.
+Then `job.completed` (`{job_id, index_uid: <pipeline uid>, pages_crawled: 0,
+documents_indexed, duration_secs}`) for a succeeded job, or `job.failed` (`{job_id,
+error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
+`<UUIDv5 of job:{job_id}:lifecycle>`.
 
-- Jobs without a UUID tenant (standalone, Cloud projects) are never sent.
-- Failed and cancelled jobs are sent: provider cost already spent is real.
+- The Lab prices `documents`, `ocr_pages` and `provider_cost_micro_usd` (its
+  `pricing.yml`); other units are stored and shown. glutony never computes credits.
 - `provider_cost_micro_usd` is what glutony paid providers, from the provider cost
-  table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). If any call of the
-  job cannot be priced, the job's cost is sent as 0 and the description says
-  "provider cost incomplete". The bundled prices are placeholders: set
-  yours before billing. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
+  table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). When any call of
+  the job could not be priced it is sent as 0 and the description says
+  `provider cost incomplete`. The bundled prices are placeholders: set yours before
+  reporting to a Lab. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
   worker at boot; if it ever fails to load later, every call is flagged unpriced
   (never priced at the bundled rates).
-- The Lab converts units and cost to credits; glutony never computes credits.
+- Jobs without a canonical-UUID tenant (standalone, Cloud projects) are never sent.
+  Failed and cancelled jobs are: provider cost already spent is real.
 
-Enable it with `LAB_EVENTS_ENABLED=true` on the workers and `LAB_URL` +
-`LAB_EVENTS_SECRET` on the control plane. Workers write each event to the control
-plane's `lab_events` outbox; the control plane sends batches of up to 500 to
-`POST {LAB_URL}/internal/events` with
-`X-Lab-Signature: sha256=<hex HMAC-SHA256(LAB_EVENTS_SECRET, body)>`, marks the ids
-the Lab lists in `accepted`, and retries the rest with backoff. Events are never
-dropped. `LAB_URL` must be `https` unless its host is loopback or private.
+### Delivery
+
+Workers post events to `POST /internal/lab-events` on the control plane (with
+`CONTROL_PLANE_TOKEN`), which stores them in its `lab_events` outbox. The control
+plane sends batches of up to 500 to `POST {LAB_URL}/internal/events` with
+`X-Lab-Instance-Id`, `X-Lab-Timestamp` and
+`X-Lab-Signature: sha256=<hex HMAC-SHA256(LAB_INSTANCE_SECRET, "<timestamp>.<body>")>`,
+marks the ids the Lab lists in `accepted`, and retries the rest with backoff (max
+5 min). A Lab `401` is logged and retried like any other failure.
+
+An event the Lab has not accepted **24 h** after it was written to the outbox (its
+`created_at`) was skipped on purpose (for example `product mismatch`): it is dropped
+with an error log and counted in `glutony_lab_events_dropped_total`. The check runs
+hourly. Set `LAB_URL` before enabling `LAB_EVENTS_ENABLED`: events already older than
+24 h when the sender first starts get a single delivery attempt before they are
+dropped.
+
+### Credit pre-check
+
+Before queueing an ingest job for a Lab account, the gateway calls
+`GET {LAB_URL}/internal/accounts/{account}` (cached 30 s; when the Lab cannot answer,
+a cached answer up to 300 s old is used) and answers
+`402 {"code": "insufficient_credits"}` when the balance is 0 or the account is
+inactive. When the Lab cannot answer and no cached answer is that recent, or before
+the Lab has confirmed the credentials at boot, it answers
+`503 {"code": "lab_unavailable"}` and queues nothing. Tenants that are not Lab
+account ids (Cloud projects) are never checked.
 
 ### Monitoring
 
@@ -106,50 +157,59 @@ The control plane serves `GET /metrics`:
 - `glutony_lab_events_pending`
 - `glutony_lab_events_oldest_pending_seconds`
 - `glutony_lab_events_delivered_total`
+- `glutony_lab_events_dropped_total`
 - `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`)
 
 The pending gauges are refreshed on every scrape, so they are correct even when
 `LAB_URL` is unset and events are waiting in the outbox. The sender reads at most
 1 MiB of the Lab's acknowledgement body; a larger one counts as `malformed`.
 
-Alert (same threshold as Lumen):
+Alert on `glutony_lab_events_oldest_pending_seconds > 900` for 5 minutes (same
+threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
 
 ```yaml
 - alert: GlutonyLabEventsStuck
   expr: glutony_lab_events_oldest_pending_seconds > 900
   for: 5m
   annotations:
-    summary: glutony has billing events the Lab has not accepted for 15 minutes
+    summary: glutony has usage events the Lab has not accepted for 15 minutes
+- alert: GlutonyLabEventsDropped
+  expr: increase(glutony_lab_events_dropped_total[1h]) > 0
+  annotations:
+    summary: glutony dropped usage events the Lab never accepted within 24 h
 ```
 
-## Known limit: no spend enforcement
+## Spend enforcement
 
-glutony bills after the fact and never refuses work for lack of credits (Lumen and
-Scrapix answer `402`). Because glutony pays the LLM and transcription providers
-itself, an account at zero credits can still run up real cost. Do not sell glutony
-through the Lab to paying accounts until a suspend switch or a lease exists.
+The gateway refuses work for an account out of credits (`402`) and refuses rather
+than runs unbilled work when it cannot check (`503`): before the Lab has confirmed
+the credentials, and during a Lab outage longer than 5 minutes. The pre-check is a
+snapshot: work already running keeps running. It guards ingest requests; scheduled
+source runs start from Temporal, not through the gateway, and are not pre-checked.
 
-## Before connecting a Lab
+## Isolation
 
-- Tenant jobs only use their own Meilisearch connections, and this is enforced: a
-  tenant pipeline that names a global connection is refused at validation (`422
-  validation`), and the worker looks up only the tenant's own row at run time. Global
-  connections are templates an operator may copy into a tenant, never a key a tenant
-  writes with.
-- A request that carries a tenant never falls back to the deployment's `MEILI_URL` /
-  `MEILI_API_KEY`: its destination is its own headers or its pipeline's connection.
-  Those env vars only serve standalone requests without a tenant.
+- A tenant job may only write with a connection its tenant owns. Global connections
+  are templates: a tenant pipeline that names one fails validation on save and, if
+  it was saved before this rule, fails the indexer step with "a tenant job may only
+  use its own connections".
+- A request that carries a tenant never falls back to `MEILI_URL` / `MEILI_API_KEY`:
+  it brings its own `X-Meili-Host` / key, or its pipeline is pinned to a connection.
+- The control plane's `/internal/*` routes require `CONTROL_PLANE_TOKEN`.
 
-## What the Lab has to do
+Before upgrading, copy any global connection a tenant pipeline relies on into that
+tenant. Deploy the control plane before the workers: a new worker against an old
+control plane silently falls back to the global row.
 
-1. Accept `product: "glutony"` and `glutonyUsageData` (schema:
-   `contracts/vendor/lab/lab-events.schema.json` in this repo).
-2. Accept `X-Lab-Signature`.
-3. Convert `cost_micro_usd` and units to credits.
-4. Give each glutony deployment its own events secret and service token.
-5. Inject `X-Meili-Tenant-Id` and `X-Meili-Envoy-Secret` on glutony's ingest routes.
-6. Call the management routes from the console's server with
-   `LAB_SERVICE_TOKEN` and `X-Glutony-Tenant-Id`.
+## What the Lab provides
+
+1. The events schema this repo vendors (`contracts/vendor/lab/lab-events.schema.json`).
+2. Per-deployment credentials (`LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET`) and
+   `GET /internal/instances/me`.
+3. `GET /internal/accounts/{id}` for the hosted pre-check.
+4. `X-Meili-Tenant-Id` and `X-Meili-Envoy-Secret` injected on glutony's ingest routes.
+5. The console calls the management routes server side with `LAB_SERVICE_TOKEN` and
+   `X-Glutony-Tenant-Id`.
 
 ## Rollout order
 

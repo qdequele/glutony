@@ -1,13 +1,13 @@
 ---
 title: "Usage & metering"
-description: "Per-tenant usage data: what is recorded, how it reaches Tinybird, and which table to bill from."
+description: "Per-tenant usage data: what is recorded, how it reaches Tinybird, and which table to read."
 ---
 
-Every job records what it consumed, per tenant, so you can bill for it and chart it.
+Every job records what it consumed, per tenant, so you can chart it and reconcile it.
 The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse) and is
 written by the worker, never by the gateway. Tinybird holds the analytics. Behind the
-Meilisearch Lab, the bill is a separate stream of events, described in
-[Analytics and billing](#analytics-and-billing).
+Meilisearch Lab, billing is the Lab's, from a separate stream of events described in
+[Analytics and the Lab](#analytics-and-the-lab).
 
 ## What is recorded
 
@@ -37,7 +37,7 @@ parameter keep their names.
 
 Reporting is a Temporal activity, not a fire-and-forget HTTP call. The workflow invokes
 it on every terminal path, so a failed or cancelled job is metered too. It consumed
-tokens and CPU, and that has to be billed.
+tokens and CPU, and that has to be reported.
 
 <Note>
 The reporting activity is deliberately detached from the workflow's cancellation
@@ -60,21 +60,21 @@ it. Timestamps are deterministic too: every row of a job is stamped with the job
 finish time rather than "now", because `ReplacingMergeTree` deduplicates on the whole
 sorting key.
 
-## Which table to bill from
+## Which table to read
 
 <Note>
 `documents_out` on a step row counts a document once per stage, so a pipeline that
 extracts then chunks then indexes reports it three times. That measures work done,
 not corpus size. The rollups expose `documents_indexed` for the number that actually
 reached Meilisearch, taken from the job row's final-step count — that is the figure
-to bill on.
+to report.
 </Note>
 
 | Table | Freshness | Deduplicated | Retention | Use for |
 |---|---|---|---|---|
 | `meili_ingest_usage` | real time | with `FINAL` | 180 days | drill-down, audits |
 | `usage_daily` | real time | **no** | 180 days | dashboards, live estimates |
-| `usage_daily_billing` | hourly | yes | indefinite | **invoices** |
+| `usage_daily_billing` | hourly | yes | indefinite | **reports, reconciliation** |
 
 A materialized view is a trigger on `INSERT` and never sees deduplication, so
 `usage_daily` can over-count a redelivered event. `usage_daily_billing` is a scheduled
@@ -83,36 +83,33 @@ correctness. The `tenant_usage` endpoint reads it.
 
 `usage_daily` keeps 180 days, like the raw table, because a deployment that changes
 its materialized pipe rebuilds it from the raw rows. `usage_daily_billing` keeps every
-day: it is the invoice record and no deployment recomputes it.
+day: it is the reconciliation record and no deployment recomputes it.
 
 ```bash
 curl "https://api.tinybird.co/v0/pipes/tenant_usage.json?\
 project_id=acme&date_from=2026-09-01&date_to=2026-09-30&token=$READ_TOKEN"
 ```
 
-## Analytics and billing
+## Analytics and the Lab
 
-Two streams leave the worker, and they have different jobs.
+Tinybird rows are analytics: the dashboard, `GET /usage`, and a way to reconcile what
+the Lab billed. They carry no price. Lab events are what the Lab bills from; glutony
+reports raw units and `provider_cost_micro_usd` and never computes credits. See
+[Meilisearch Lab](/deployment/meilisearch-lab).
 
-- **Tinybird rows are analytics.** They feed the dashboard and `GET /usage`. They
-  are per step, they carry no price, and they are on for any deployment that sets
-  `TINYBIRD_TOKEN`.
-- **Lab events are the bill.** Behind the [Meilisearch Lab](/deployment/meilisearch-lab),
-  each job run for a Lab account also produces one `usage.recorded` event with the
-  same units plus `cost_micro_usd`. The Lab converts it to credits.
-
-`cost_micro_usd` is what glutony paid providers for the job. It comes from the
-provider cost table, `config/provider-costs.toml` (or the file named by
+`provider_cost_micro_usd` is what glutony paid providers for the job. It comes from
+the provider cost table, `config/provider-costs.toml` (or the file named by
 `PROVIDER_COSTS_FILE`), keyed by plugin and model. A call the table cannot price
-costs 0 and sets `cost_complete: false` on the event, so the Lab sees the gap
-instead of silently under-billing. Calls glutony does not pay for, such as a local
-gRPC plugin, cost 0 and stay complete. The bundled prices are placeholders: set
-yours before billing. A missing or invalid `PROVIDER_COSTS_FILE` stops the worker at
-boot; if it ever fails to load later, calls are flagged unpriced instead of being
-priced at the bundled rates.
+costs 0 and marks the job's cost incomplete: the Lab event then carries
+`provider_cost_micro_usd: 0` and its description says `provider cost incomplete`, so
+the Lab sees the gap instead of a silently low cost. Calls glutony does not pay for,
+such as a local gRPC plugin, cost 0 and stay complete. The bundled prices are
+placeholders: set yours before reporting to a Lab. A missing or invalid
+`PROVIDER_COSTS_FILE` stops the worker at boot; if it ever fails to load later, calls
+are flagged unpriced instead of being priced at the bundled rates.
 
-The Lab event is written first, then Tinybird. A Tinybird failure cannot keep a bill
-from being recorded, and a retry re-inserts the same event id harmlessly.
+The Lab events are written first, then Tinybird. A Tinybird failure cannot keep a Lab
+event from being recorded, and a retry re-inserts the same event id harmlessly.
 
 ## Configuration
 
