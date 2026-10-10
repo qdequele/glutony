@@ -34,7 +34,7 @@ LAB_URL = f"http://127.0.0.1:{PORT}"
 MAX_SKEW = 300
 EVENTS: dict[str, dict] = {}
 ACCOUNT = re.compile(r"^/internal/accounts/([0-9a-f-]{36})$")
-ENVELOPE_KEYS = ("id", "type", "occurred_at", "account_id", "product", "data")
+ENVELOPE_KEYS = ("id", "type", "occurred_at", "account_id", "api_key_id", "product", "data")
 
 
 def v2_error(event) -> str | None:
