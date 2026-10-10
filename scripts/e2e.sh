@@ -36,6 +36,9 @@ WORK="$(mktemp -d)"
 export DATABASE_URL="postgres://postgres:dev@localhost:${PG_PORT}/postgres"
 export TEMPORAL_URL="http://localhost:${TEMPORAL_PORT}"
 export TEMPORAL_NAMESPACE=default
+# Address for the `temporal` CLI: 127.0.0.1, not localhost. With localhost the CLI
+# (seen with 1.7.0 on macOS) times out against the dev server while 127.0.0.1 works.
+TEMPORAL_CLI_ADDRESS="127.0.0.1:${TEMPORAL_PORT}"
 export CONTROL_PLANE_URL="http://localhost:${CP_PORT}"
 # Shared by the control plane, gateway and workers this script starts (dev-only value).
 export CONTROL_PLANE_TOKEN="${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}"
@@ -91,7 +94,7 @@ temporal server start-dev --headless --port "${TEMPORAL_PORT}" --db-filename "${
 PIDS+=($!)
 wait_for "${MEILI_URL}/health" meilisearch
 for _ in $(seq 1 60); do docker exec mi-e2e-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
-for _ in $(seq 1 60); do temporal operator cluster health --address "localhost:${TEMPORAL_PORT}" >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 60); do temporal operator cluster health --address "${TEMPORAL_CLI_ADDRESS}" >/dev/null 2>&1 && break; sleep 1; done
 echo "temporal ready"
 
 echo "--- services"
@@ -542,10 +545,10 @@ echo "$SECOND" | jq -c .
 [ "$(curl -fsS "${GW}/sources/e2e-movies" | jq -r .last_status)" = "unchanged" ] || { echo "last_status not updated" >&2; exit 1; }
 
 echo "--- no secret reached Temporal history for source runs"
-for WF in $(temporal workflow list --address "localhost:${TEMPORAL_PORT}" \
+for WF in $(temporal workflow list --address "${TEMPORAL_CLI_ADDRESS}" \
     --query 'WorkflowType="SourceRunWorkflow"' -o json | jq -r '.[].execution.workflowId') \
     "ingest-${SJOB}" "ingest-${JOB_P}"; do
-  HIST=$(temporal workflow show --address "localhost:${TEMPORAL_PORT}" -w "$WF" -o json)
+  HIST=$(temporal workflow show --address "${TEMPORAL_CLI_ADDRESS}" -w "$WF" -o json)
   for secret in "${FETCH_TOKEN}" masterKey; do
     echo "$HIST" | grep -q "$secret" && { echo "secret ${secret} is in the history of ${WF}" >&2; exit 1; }
   done
