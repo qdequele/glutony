@@ -1,31 +1,24 @@
 //! Control-plane binary: reads its configuration from the environment, connects to
 //! Postgres, applies migrations and serves the internal HTTP API.
 
-use std::net::SocketAddr;
-
 use anyhow::Context;
+use meili_ingest_control_plane::boot::BootConfig;
 use meili_ingest_control_plane::{AppState, app, db};
 use tracing_subscriber::EnvFilter;
-
-/// Default listen address (SPEC §13).
-const DEFAULT_BIND: &str = "0.0.0.0:9000";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
-    let bind = std::env::var("BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    let internal_token = meili_ingest_control_plane::control_plane_token_policy(
-        std::env::var("CONTROL_PLANE_TOKEN").ok(),
-        std::env::var("CONTROL_PLANE_TOKEN_DISABLED")
-            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
-            .unwrap_or(false),
-    )?;
-    let addr: SocketAddr = bind
-        .parse()
-        .with_context(|| format!("BIND {bind:?} is not a valid socket address"))?;
+    // Validate the whole configuration BEFORE touching Postgres: a binary that
+    // migrates and then refuses its configuration leaves the database ahead of the
+    // image still running (sqlx refuses a migration it does not know).
+    let BootConfig {
+        database_url,
+        addr,
+        internal_token,
+        lab: lab_config,
+    } = BootConfig::from_env()?;
 
     tracing::info!("connecting to Postgres");
     let pool = db::connect(&database_url)
@@ -34,8 +27,6 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await.context("applying migrations")?;
     tracing::info!("migrations applied");
 
-    let lab_config = meili_ingest_control_plane::lab_sender::LabConfig::from_env()
-        .context("invalid Lab events configuration")?;
     let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
     if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
         // Workers ask `GET /internal/lab/credits/{account}` before a source run; this

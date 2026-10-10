@@ -64,18 +64,6 @@ impl LabConfig {
         )
     }
 
-    /// Read `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET`, and refuse a leftover
-    /// `LAB_EVENTS_SECRET` (blank counts as unset).
-    pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let get = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
-        Self::from_values(
-            get("LAB_URL"),
-            get("LAB_INSTANCE_ID"),
-            get("LAB_INSTANCE_SECRET"),
-            get("LAB_EVENTS_SECRET"),
-        )
-    }
-
     /// Lab base URL, without trailing slash.
     pub fn url(&self) -> &str {
         self.creds.url()
@@ -377,7 +365,7 @@ mod tests {
                 "the secret is never echoed: {err}"
             );
         }
-        // Blank counts as unset, as in from_env.
+        // Blank counts as unset, as in the environment (crate::boot).
         assert!(
             LabConfig::from_values(
                 url.map(String::from),

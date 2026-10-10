@@ -16,6 +16,7 @@
 //! The binary lives in `main.rs`; everything else is exposed as a library so the
 //! router can be exercised in tests without opening a socket.
 
+pub mod boot;
 pub mod builtin_pipelines;
 pub mod connections;
 pub mod db;
