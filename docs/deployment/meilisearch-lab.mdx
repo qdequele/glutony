@@ -175,6 +175,20 @@ does not ask the Lab again for 10 s (for any account): requests in that window u
 cached answer or get the `503` straight away, so a hung Lab costs one timeout, not one
 per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
 
+Scheduled source runs start from Temporal, not through the gateway, so they are
+checked at the start of each run instead: before fetching anything, the worker asks
+the control plane (`GET /internal/lab/credits/{account}`, with `CONTROL_PLANE_TOKEN`),
+which asks the Lab with the control plane's `LAB_INSTANCE_*` credentials and the same
+cache rules (30 s fresh, 300 s stale, 10 s backoff after a failure). Workers never
+hold Lab credentials. An account without credits fails the run at once: it is recorded
+as failed with the reason ("account … has no Lab credits left; source run skipped"),
+nothing is fetched, staged or billed, its incremental state is not saved, and the next
+tick tries again. When the Lab cannot be asked (`503`, or a control plane that does not
+answer the check), the run is retried with the activity's retry policy and, if the Lab
+is still unreachable, recorded as failed: the check fails closed. A control plane
+without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs are checked twice
+(by the gateway, then by the worker); the second answer usually comes from the cache.
+
 ### Monitoring
 
 The control plane serves `GET /metrics`:
@@ -210,8 +224,10 @@ The gateway refuses work for an account out of credits (`402`) and refuses rathe
 than runs unbilled work when it cannot check (`503`): before the Lab has confirmed
 the credentials, and when the Lab cannot answer and the account has no lookup from
 the last 5 minutes. The pre-check is a snapshot: work already running keeps running.
-It guards ingest requests and manual `POST /sources/{uid}/run`; scheduled source
-runs start from Temporal, not through the gateway, and are not pre-checked.
+It guards ingest requests and manual `POST /sources/{uid}/run` in the gateway, and
+every source run, scheduled or manual, at its start in the worker (through the control
+plane). A scheduled run refused for credits is recorded as failed with the reason and
+retried on the next tick.
 
 ## Isolation
 
@@ -249,7 +265,9 @@ the token set answers them `401`. Upgrade in this order:
 1. Copy any global connection a tenant pipeline relies on into that tenant.
 2. Deploy the control plane with `CONTROL_PLANE_TOKEN_DISABLED=true` and without
    `CONTROL_PLANE_TOKEN` (when the token is set it is enforced, whatever the flag).
-3. Deploy the gateway and the workers with `CONTROL_PLANE_TOKEN`.
+3. Deploy the gateway and the workers with `CONTROL_PLANE_TOKEN`. The workers ask the
+   control plane for the credit check of every source run, and fail the run when it
+   does not answer it: upgrade the control plane first.
 4. Set `CONTROL_PLANE_TOKEN` on the control plane, remove
    `CONTROL_PLANE_TOKEN_DISABLED`, and restart it.
 
