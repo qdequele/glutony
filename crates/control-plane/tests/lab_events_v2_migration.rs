@@ -1,11 +1,12 @@
 //! Migration 0005: pre-v2 `usage.recorded` rows still in the outbox are rewritten to
-//! the v2 shape. Needs DATABASE_URL (skips otherwise), e.g.
+//! the v2 shape, at upgrade and again whenever an old worker inserts one. Needs DATABASE_URL (skips otherwise), e.g.
 //! `DATABASE_URL=postgres://postgres:dev@localhost:55433/postgres cargo test -p meili-ingest-control-plane --test lab_events_v2_migration`.
 
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use meili_ingest_control_plane::db;
+use meili_ingest_control_plane::lab_events::LabEventRepo;
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -308,5 +309,140 @@ async fn pending_pre_v2_usage_events_are_rewritten_to_v2() {
         .await
         .unwrap();
     assert_eq!(rows(&t.pool).await, after_first);
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn odd_pre_v2_values_convert_without_error_and_validate() {
+    let Some(t) = setup().await else { return };
+    let job = Uuid::new_v4();
+    // No units at all, a null duration, a non-boolean cost_complete, a string cost.
+    let bare = insert(
+        &t.pool,
+        &old_event(
+            Uuid::new_v4(),
+            job,
+            json!({
+                "pipeline_uid": null,
+                "duration_ms": null,
+                "cost_micro_usd": "12",
+                "cost_complete": "yes"
+            }),
+        ),
+        false,
+    )
+    .await;
+    // Strings, nulls, negatives, fractions and numbers past every cap.
+    let odd = insert(
+        &t.pool,
+        &old_event(
+            Uuid::new_v4(),
+            job,
+            json!({
+                "pipeline_uid": "p",
+                "status": "failed",
+                "duration_ms": -5000,
+                "cost_micro_usd": 1e30,
+                "cost_complete": true,
+                "units": {
+                    "documents_out": "12", "input_bytes": 1e30, "pages": 2.5,
+                    "images": null, "audio_seconds": -3.5, "llm_input_tokens": 1.25,
+                    "llm_output_tokens": [1], "llm_requests": {"n": 1},
+                    "external_requests": 7
+                }
+            }),
+        ),
+        false,
+    )
+    .await;
+
+    sqlx::raw_sql(AssertSqlSafe(MIGRATION))
+        .execute(&t.pool)
+        .await
+        .unwrap();
+
+    let (_, body, ..) = row(&t.pool, bare).await;
+    assert_valid(&body);
+    assert_eq!(
+        body["data"],
+        json!({
+            "operation": "ingest",
+            "units": {
+                "documents": 0, "bytes_in": 0, "step_seconds": 0,
+                "llm_tokens_in": 0, "llm_tokens_out": 0, "audio_seconds": 0,
+                "ocr_pages": 0, "pages": 0, "images": 0, "llm_requests": 0,
+                "external_requests": 0, "unpriced_provider_calls": 1
+            },
+            "provider_cost_micro_usd": 0,
+            "description": format!("Job {job} (, , 0 documents, provider cost incomplete)"),
+            "job_id": job.to_string(),
+        })
+    );
+
+    let (_, body, ..) = row(&t.pool, odd).await;
+    assert_valid(&body);
+    assert_eq!(
+        body["data"],
+        json!({
+            "operation": "ingest",
+            "units": {
+                "documents": 0, "bytes_in": 18446744073709551615u64, "step_seconds": 0,
+                "llm_tokens_in": 2, "llm_tokens_out": 0, "audio_seconds": 0,
+                "ocr_pages": 0, "pages": 3, "images": 0, "llm_requests": 0,
+                "external_requests": 7, "unpriced_provider_calls": 0
+            },
+            "provider_cost_micro_usd": 9223372036854775807i64,
+            "description": format!("Job {job} (p, failed, 0 documents)"),
+            "job_id": job.to_string(),
+        })
+    );
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn an_old_worker_inserting_a_pre_v2_event_gets_it_converted() {
+    // During the rollout the control plane is upgraded before the workers, so old
+    // workers keep posting pre-v2 events after the migration ran.
+    let Some(t) = setup().await else { return };
+    let repo = LabEventRepo::new(t.pool.clone());
+    let (id, job) = (Uuid::new_v4(), Uuid::new_v4());
+    let old = old_event(
+        id,
+        job,
+        json!({
+            "pipeline_uid": "builtin.json",
+            "status": "succeeded",
+            "duration_ms": 1500,
+            "cost_micro_usd": 0,
+            "cost_complete": true,
+            "units": {
+                "documents_out": 3, "input_bytes": 99, "pages": 0, "images": 0,
+                "audio_seconds": 0.0, "llm_input_tokens": 0,
+                "llm_output_tokens": 0, "llm_requests": 0, "external_requests": 0
+            }
+        }),
+    );
+    // A v2 event in the same batch is stored as is.
+    let v2 = json!({
+        "id": Uuid::new_v4(), "type": "job.completed",
+        "occurred_at": "2026-10-01T10:00:09.000Z", "account_id": ACCOUNT,
+        "api_key_id": null, "product": "glutony",
+        "data": {"job_id": "j", "index_uid": "p", "pages_crawled": 0,
+                 "documents_indexed": 1, "duration_secs": 1}
+    });
+    assert_eq!(repo.insert_many(&[old, v2.clone()]).await.unwrap(), 2);
+
+    let (_, body, attempts, ..) = row(&t.pool, id).await;
+    assert_valid(&body);
+    assert_eq!(body["data"]["operation"], "ingest");
+    assert_eq!(body["data"]["units"]["documents"], 3);
+    assert_eq!(body["data"]["units"]["step_seconds"], 2);
+    assert_eq!(
+        body["data"]["description"],
+        format!("Job {job} (builtin.json, succeeded, 3 documents)")
+    );
+    assert_eq!(attempts, 0);
+    let v2_id: Uuid = v2["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(row(&t.pool, v2_id).await.1, v2);
     t.drop_schema().await;
 }

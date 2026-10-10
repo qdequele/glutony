@@ -16,6 +16,10 @@ use uuid::Uuid;
 
 use crate::{AppState, CpError, JsonBody};
 
+/// Migration 0005: rewrites undelivered pre-v2 `usage.recorded` rows to the v2 shape.
+/// Also run after every insert, so a released migration file must never change.
+const CONVERT_PRE_V2: &str = include_str!("../../../migrations/0005_lab_events_v2.sql");
+
 /// A leased row, ready to send.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct PendingEvent {
@@ -48,8 +52,9 @@ impl LabEventRepo {
         Self { pool }
     }
 
-    /// Insert events, ignoring ids already present. Every event needs a UUID `id`;
-    /// otherwise nothing is inserted and the call fails.
+    /// Insert events, ignoring ids already present, and convert pre-v2 usage events to
+    /// the v2 shape. Every event needs a UUID `id`; otherwise nothing is inserted and
+    /// the call fails.
     pub async fn insert_many(&self, events: &[serde_json::Value]) -> Result<u64, CpError> {
         let mut ids = Vec::with_capacity(events.len());
         for e in events {
@@ -71,6 +76,12 @@ impl LabEventRepo {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        }
+        if inserted > 0 {
+            // Workers not upgraded yet still post pre-v2 `usage.recorded` events, which a
+            // v2 Lab accepts in the batch and then rejects: convert them like the
+            // upgrade did (the migration is idempotent and only touches pre-v2 rows).
+            sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(inserted)
