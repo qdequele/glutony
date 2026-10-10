@@ -131,10 +131,14 @@ through the Lab to paying accounts until a suspend switch or a lease exists.
 
 ## Before connecting a Lab
 
-- A Lab deployment must hold no global Meilisearch connections and no global
-  pipelines pinned to a connection: a tenant's pipeline that names a global
-  connection uid resolves to the global row and writes with its key. Until glutony
-  restricts tenant jobs to tenant-owned connections, keep connections tenant-scoped.
+- Tenant jobs only use their own Meilisearch connections, and this is enforced: a
+  tenant pipeline that names a global connection is refused at validation (`422
+  validation`), and the worker looks up only the tenant's own row at run time. Global
+  connections are templates an operator may copy into a tenant, never a key a tenant
+  writes with.
+- A request that carries a tenant never falls back to the deployment's `MEILI_URL` /
+  `MEILI_API_KEY`: its destination is its own headers or its pipeline's connection.
+  Those env vars only serve standalone requests without a tenant.
 
 ## What the Lab has to do
 

@@ -15,8 +15,8 @@ inside plugins or workflow code.
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
 | `CONTROL_PLANE_URL` | `http://meili-control-plane:9000` | Internal control plane. |
-| `MEILI_URL` | — | Standalone fallback Meilisearch host (used when no `X-Meili-Host`). |
-| `MEILI_API_KEY` | — | Standalone fallback API key (used when no `X-Meili-Api-Key` / bearer). |
+| `MEILI_URL` | — | Standalone fallback Meilisearch host (used when no `X-Meili-Host` and the request carries no tenant). |
+| `MEILI_API_KEY` | — | Standalone fallback API key (used when no `X-Meili-Api-Key` / bearer and the request carries no tenant). |
 | `DEFAULT_INDEX` | `documents` | Last resort of the index resolution chain. |
 | `MAX_UPLOAD_MB` | `500` | Maximum request body; larger → `413`. |
 | `ENVOY_TRUSTED_HEADER` | — | Shared secret. When set, `X-Meili-*` headers are honoured only if `X-Meili-Envoy-Secret` matches. Unset = trust headers (dev mode, warned at startup). |

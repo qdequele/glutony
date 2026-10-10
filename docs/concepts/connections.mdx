@@ -91,6 +91,9 @@ the document, rather than looping on `413`.
   tightening the policy takes effect immediately.
 - Connections are tenant-scoped like pipelines: a project sees its own
   connections first, then global ones, and can only modify its own.
+- A tenant pipeline may only name its **own** connections. Global connections are
+  templates: a tenant pipeline that names one is refused (`422`) and its jobs never
+  resolve to it.
 
 `MEILI_CONNECTION_HOSTS` controls where connections may point:
 

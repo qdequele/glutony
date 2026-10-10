@@ -8,7 +8,8 @@
 //! 4. `X-Meili-Index` → index (starting point)
 //! 5. `?index=` query param → index (overrides the header)
 //! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback)
-//! 7. `MEILI_URL` / `MEILI_API_KEY` env vars → host / api_key (self-hosted fallback)
+//! 7. `MEILI_URL` / `MEILI_API_KEY` env vars → host / api_key (self-hosted fallback, only
+//!    without a tenant)
 //!
 //! Steps 1–4 (and `X-Meili-Region`) are only applied when the `X-Meili-*` headers are
 //! trusted: either `ENVOY_TRUSTED_HEADER` is unset (dev mode), or the request carries
@@ -165,12 +166,16 @@ pub fn resolve_request_context(
         api_key = bearer_token(headers);
     }
 
-    // 7: env fallbacks.
-    if host.is_none() {
-        host = config.meili_url.clone();
-    }
-    if api_key.is_none() {
-        api_key = config.meili_api_key.clone();
+    // 7: env fallbacks, standalone only. A request that carries a tenant never falls
+    // back to the deployment's own Meilisearch (spec v2 isolation): its destination is
+    // its own headers or its pipeline's connection, nothing else.
+    if tenant_id.is_none() {
+        if host.is_none() {
+            host = config.meili_url.clone();
+        }
+        if api_key.is_none() {
+            api_key = config.meili_api_key.clone();
+        }
     }
 
     Ok(MeiliContext {
@@ -665,5 +670,25 @@ mod tests {
         assert_eq!(resolve_index(&mut ctx, None, "video/mp4", "glob"), "videos");
         let mut ctx = ctx_with_index(None);
         assert_eq!(resolve_index(&mut ctx, None, "text/plain", "glob"), "glob");
+    }
+
+    #[test]
+    fn a_tenant_request_never_falls_back_to_the_env_destination() {
+        let h = headers(&[("x-meili-tenant-id", "acct-1")]);
+        let err = resolve_context(&h, None, &cfg_env()).unwrap_err();
+        assert!(matches!(err, GatewayError::MissingContext(_)), "{err:?}");
+        let ctx = resolve_request_context(&h, None, &cfg_env()).unwrap();
+        assert_eq!(ctx.tenant_id.as_deref(), Some("acct-1"));
+        assert_eq!(ctx.host, None);
+        assert_eq!(ctx.api_key, None);
+        // A tenant that brings its own destination keeps it.
+        let h = headers(&[
+            ("x-meili-tenant-id", "acct-1"),
+            ("x-meili-host", "http://m:7700"),
+            ("authorization", "Bearer k"),
+        ]);
+        let ctx = resolve_context(&h, None, &cfg_env()).unwrap();
+        assert_eq!(ctx.host.as_deref(), Some("http://m:7700"));
+        assert_eq!(ctx.api_key.as_deref(), Some("k"));
     }
 }

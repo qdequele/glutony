@@ -263,9 +263,10 @@ pub fn config_errors(def: &PipelineDefinition, manifests: &[PluginManifest]) -> 
 /// plugin's schema and indexer connections that do not exist for the tenant (both 422
 /// `validation`).
 ///
-/// The connection lookup is the one the worker does at run time (the tenant's row, else
-/// the global one), so a pipeline that passes here does not fail later with
-/// "connection not found" unless the connection is deleted in between.
+/// The connection lookup is the one the worker does at run time: the tenant's own row for
+/// a tenant pipeline (a global connection is a template, never usable by a tenant), the
+/// global row for a global pipeline. A pipeline that passes here therefore does not fail
+/// later with "connection not found" unless the connection is deleted in between.
 async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> Result<(), CpError> {
     let manifests = crate::plugins::registered_manifests(&state.pool).await?;
     let registered: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
@@ -280,13 +281,14 @@ async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> R
         let Some(uid) = pinned_connection(&step.config) else {
             continue;
         };
-        if connections
-            .get(uid, def.tenant_id.as_deref())
-            .await?
-            .is_none()
-        {
+        let found = match def.tenant_id.as_deref() {
+            Some(t) => connections.get_owned(uid, t).await?,
+            None => connections.get(uid, None).await?,
+        };
+        if found.is_none() {
             errors.push(format!(
-                "step {:?} ({}): connection {uid:?} does not exist for this tenant",
+                "step {:?} ({}): connection {uid:?} does not exist for this tenant \
+                 (a tenant pipeline may only name its own connections; global ones are templates)",
                 step.id, step.plugin
             ));
         }

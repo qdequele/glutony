@@ -314,3 +314,83 @@ async fn used_by_ignores_a_connection_key_on_a_non_indexer_step() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn get_owned_never_returns_the_global_row() {
+    let Some(pool) = pool("cn-owned").await else {
+        return;
+    };
+    let repo = ConnectionRepo::new(pool);
+    repo.insert(&new_connection("cn-owned-1", None))
+        .await
+        .expect("global");
+    repo.insert(&new_connection("cn-owned-1", Some("cp-2")))
+        .await
+        .expect("tenant");
+    assert!(
+        repo.get_owned("cn-owned-1", "cp-2")
+            .await
+            .expect("get")
+            .is_some()
+    );
+    assert!(
+        repo.get_owned("cn-owned-1", "cp-3")
+            .await
+            .expect("get")
+            .is_none(),
+        "a global connection is a template, never a tenant's key"
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_pipeline_cannot_name_a_global_connection() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use meili_ingest_plugin_sdk::PluginManifest;
+    use tower::ServiceExt;
+
+    let Some(pool) = pool("cn-tpl").await else {
+        return;
+    };
+    let connections = ConnectionRepo::new(pool.clone());
+    connections
+        .insert(&new_connection("cn-tpl-global", None))
+        .await
+        .expect("global");
+    connections
+        .insert(&new_connection("cn-tpl-own", Some("cp-9")))
+        .await
+        .expect("own");
+    let app = meili_ingest_control_plane::app(meili_ingest_control_plane::AppState::new(pool));
+
+    // `POST /internal/plugins` takes full manifests (`produces` is required).
+    let manifests = vec![
+        PluginManifest::new("json_parser", "0"),
+        PluginManifest::new("meili_indexer", "0"),
+    ];
+    let reg = Request::post("/internal/plugins")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifests).unwrap()))
+        .unwrap();
+    assert!(
+        app.clone()
+            .oneshot(reg)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    for (connection, expected) in [
+        ("cn-tpl-global", StatusCode::UNPROCESSABLE_ENTITY),
+        ("cn-tpl-own", StatusCode::OK),
+    ] {
+        let def = pipeline_using("cn-tpl-p", Some("cp-9"), connection);
+        let req = Request::post("/pipelines/validate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&def).unwrap()))
+            .unwrap();
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        assert_eq!(status, expected, "{connection}");
+    }
+}

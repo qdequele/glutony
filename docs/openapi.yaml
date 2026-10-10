@@ -21,7 +21,8 @@ info:
     headers (injected by Meilisearch Cloud's Envoy and trusted only when
     `X-Meili-Envoy-Secret` matches the gateway's `ENVOY_TRUSTED_HEADER`), the
     `?index=` query parameter, an `Authorization: Bearer <key>` header, and
-    finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables.
+    finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables
+    (only for a request without a tenant: a tenant request never falls back to them).
     When none of these yields a host and API key the request fails with `400` —
     unless the pipeline is **pinned**: every `meili_indexer` step names a
     [Meilisearch connection](/concepts/connections), which then supplies the host
@@ -581,8 +582,8 @@ paths:
         is normalised (implicit sequential `depends_on`), validated (unknown
         plugin, cycle, bad `fan_out`, a step `config` that does not satisfy its
         plugin's `config_schema` from `GET /plugins`, a `meili_indexer`
-        `config.connection` that is not one of the tenant's or a global connection
-        → `422`) and upserted by `(uid, tenant_id)`;
+        `config.connection` that is not one of the tenant's own connections, or
+        for a global pipeline not a global connection → `422`) and upserted by `(uid, tenant_id)`;
         `version` is bumped on update. `uid`s starting with `builtin.` are
         rejected with `403`. Behind Envoy the pipeline is scoped to the calling
         project.
@@ -656,8 +657,8 @@ paths:
         duplicate step, bad `fan_out`), unknown plugins, every step's `config`
         against its plugin's `config_schema` (JSON Schema draft 2020-12, as served by
         `GET /plugins`; `format` is not asserted) and every `meili_indexer`
-        `config.connection` against the caller's connections (its own, else a global
-        one). A plugin no worker has registered yet has no schema, so its config is
+        `config.connection` against the caller's own connections (a tenant pipeline
+        may not name a global connection; global ones are templates). A plugin no worker has registered yet has no schema, so its config is
         not checked. All config and connection problems are reported in one message,
         `; `-separated.
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]

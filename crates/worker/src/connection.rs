@@ -130,7 +130,10 @@ async fn fetch(
         .pop_if_empty()
         .push(name);
     if let Some(p) = tenant_id {
-        url.query_pairs_mut().append_pair("tenant_id", p);
+        // A tenant job may only write with its own connection (spec v2 isolation).
+        url.query_pairs_mut()
+            .append_pair("tenant_id", p)
+            .append_pair("scope", "tenant");
     }
 
     let resp = authed(http.get(url), token)
@@ -140,8 +143,9 @@ async fn fetch(
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(PluginError::NonRetryable(format!(
-            "connection {name:?} not found (tenant_id={tenant_id:?}); it may have been \
-             deleted while this pipeline still names it"
+            "connection {name:?} not found (tenant_id={tenant_id:?}); a tenant job may only \
+             use its own connections (global ones are templates), or it was deleted while \
+             this pipeline still names it"
         )));
     }
     if !status.is_success() {
@@ -178,6 +182,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/internal/connections/prod-movies"))
             .and(query_param("tenant_id", "tenant-1"))
+            .and(query_param("scope", "tenant"))
             .and(wiremock::matchers::header(
                 "authorization",
                 "Bearer cp-token",
@@ -382,5 +387,66 @@ mod tests {
         )
         .await;
         // `expect(1)` is verified when the server drops.
+    }
+
+    #[tokio::test]
+    async fn a_tenant_lookup_asks_for_the_tenants_row_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .and(query_param("tenant_id", "tenant-1"))
+            .and(query_param("scope", "tenant"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: Some("cp-token"),
+        };
+        let err = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            Some("tenant-1"),
+        )
+        .await
+        .expect_err("global rows are not the tenant's");
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("prod-movies") && m.contains("own connections")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_global_lookup_has_no_scope() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: None,
+        };
+        let _ = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            None,
+        )
+        .await;
+        let req = &server.received_requests().await.unwrap()[0];
+        assert!(req.url.query().is_none(), "{:?}", req.url);
     }
 }
