@@ -4,8 +4,9 @@
 //! credentials (`LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`), the headers of
 //! service calls and signed event batches, `GET /internal/instances/me` (are these
 //! credentials good, and which product and region is this?) and
-//! `GET /internal/accounts/{id}` (can this account still spend?). No business logic
-//! lives here; the callers decide what to do.
+//! `GET /internal/accounts/{id}` (can this account still spend?), and the cached credit
+//! check built on it ([`AccountCreditCache`], spec §8.1). The callers decide what a
+//! [`CreditDecision`] means for them (an HTTP status, a failed run).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -16,6 +17,9 @@ use hmac::{Hmac, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+
+pub mod credits;
+pub use credits::{AccountCreditCache, CreditDecision, FAILURE_BACKOFF, FRESH_FOR, STALE_FOR};
 
 /// Header naming the reporting deployment on every engine-to-Lab request.
 pub const H_INSTANCE_ID: &str = "x-lab-instance-id";
