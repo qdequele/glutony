@@ -1136,7 +1136,10 @@ paths:
       operationId: runSource
       summary: Run a source now
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+      description: >-
+        Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+        On a Lab engine the tenant's credits are checked first, as for ingest (scheduled
+        runs are not checked).
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
@@ -1156,6 +1159,8 @@ paths:
                     type: string
                     const: triggered
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -1166,6 +1171,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "501":
           $ref: "#/components/responses/NotEnabled"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /sources/{uid}/runs:
     get:
@@ -1464,7 +1471,7 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61 has no credits left; top up in the Lab console", "code": "insufficient_credits" }
     LabUnavailable:
-      description: "Hosted Lab engine only. The account's credits could not be checked (`code: lab_unavailable`): the Lab has not yet confirmed this deployment's credentials, or has been unreachable for more than 300 s. Nothing was queued; retry later."
+      description: "Hosted Lab engine only. The account's credits could not be checked (`code: lab_unavailable`): the Lab has not yet confirmed this deployment's credentials, or it cannot answer and there is no answer for the account from the last 300 s. Nothing was queued or started; retry later."
       content:
         application/json:
           schema:

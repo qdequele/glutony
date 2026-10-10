@@ -37,3 +37,21 @@ images:
 
 commonLabels:
   app.kubernetes.io/part-of: meili-ingest
+
+# One-time, when upgrading from a release without CONTROL_PLANE_TOKEN (see
+# "Upgrading to Lab contract v2" in docs/deployment/kubernetes.mdx): uncomment
+# to run the control plane with the token not enforced while the gateway and
+# workers roll, then comment it out again and re-apply.
+# patches:
+#   - target:
+#       kind: Deployment
+#       name: meili-control-plane
+#     patch: |-
+#       - op: test
+#         path: /spec/template/spec/containers/0/env/3/name
+#         value: CONTROL_PLANE_TOKEN
+#       - op: replace
+#         path: /spec/template/spec/containers/0/env/3
+#         value:
+#           name: CONTROL_PLANE_TOKEN_DISABLED
+#           value: "true"

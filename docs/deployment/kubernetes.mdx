@@ -8,6 +8,7 @@ The `k8s/` directory is a kustomize base deploying everything into the
 `ghcr.io/qdequele/glutony`.
 
 ```bash
+# once: create the Secret (step 1 below), then
 kubectl apply -k k8s/
 kubectl -n meili-ingest get pods
 ```
@@ -15,11 +16,12 @@ kubectl -n meili-ingest get pods
 | File | Contents |
 |---|---|
 | `namespace.yaml` | `meili-ingest` namespace |
-| `control-plane.yaml` | shared `ConfigMap` + `Secret`, control plane `Deployment` + `Service` (9000) |
+| `control-plane.yaml` | shared `ConfigMap`, control plane `Deployment` + `Service` (9000) |
 | `gateway.yaml` | gateway `Deployment` (2 replicas), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
 | `workers.yaml` | `workers-general`, `workers-llm`, `workers-gpu` `Deployment`s, each with a KEDA `ScaledObject` |
 | `temporal.yaml` | **reference only** single-pod Temporal (`auto-setup`) + Postgres + UI |
 | `kustomization.yaml` | ties it together; pin the image tag here |
+| `secrets.example.yaml` | **example only**, not in the kustomization: every key of the `meili-ingest-secrets` `Secret` |
 
 ## Prerequisites
 
@@ -44,48 +46,95 @@ LLM_BASE_URL: "https://api.openai.com/v1"
 LLM_MODEL: "gpt-4o-mini"
 ```
 
-Create the secret (do not commit real values; the manifest ships `CHANGE_ME`
-placeholders):
+Create the `Secret` **once, before the first `kubectl apply -k k8s/`**. It is not
+part of the kustomization, so re-applying the kustomization never touches it:
 
 ```bash
+kubectl create namespace meili-ingest
 kubectl -n meili-ingest create secret generic meili-ingest-secrets \
   --from-literal=DATABASE_URL='postgres://user:pass@postgres:5432/meili_ingest' \
   --from-literal=LLM_API_KEY='sk-...' \
   --from-literal=ENVOY_TRUSTED_HEADER="$(openssl rand -hex 32)" \
   --from-literal=CONTROL_PLANE_TOKEN="$(openssl rand -hex 32)" \
   --from-literal=SOURCE_SECRET_KEY="$(openssl rand -base64 32)" \
-  --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)" \
-  --dry-run=client -o yaml | kubectl apply -f -
+  --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)"
 ```
 
+`k8s/secrets.example.yaml` lists every key with what it does. It is an example to
+read, or to copy out of the repository and fill: **never apply it as is**. Its
+`CHANGE_ME` values are public, and the gateway, workers and control plane refuse to
+boot on `CHANGE_ME` for `CONTROL_PLANE_TOKEN`, `ADMIN_API_KEY` and
+`ENVOY_TRUSTED_HEADER`.
+
 `SOURCE_SECRET_KEY` (32 bytes, base64) seals stored Meilisearch keys and source
-credentials: set it once and do not rotate it casually. Without it `/connections`
-answers 501 and connection-based steps fail.
+credentials. **Save the generated value somewhere safe** (a password manager or your
+secret store) right away: losing it makes every sealed key unreadable, and rotating
+it does the same. Without it `/connections` answers 501 and connection-based steps
+fail.
+
+Pods read their environment at start. After any change to the `Secret` or the
+`ConfigMap`, restart the control plane, gateway and workers:
+
+```bash
+kubectl -n meili-ingest rollout restart deployment/meili-control-plane \
+  deployment/meili-gateway deployment/workers-general deployment/workers-llm \
+  deployment/workers-gpu
+```
+
+`CONTROL_PLANE_TOKEN` guards the control plane's `/internal/*` routes only:
+`/pipelines`, `/jobs` and `/plugins` on port 9000 stay open. Keep the
+`meili-control-plane` `Service` a `ClusterIP` and never expose port 9000 outside the
+cluster network.
 
 The control plane runs two replicas; its outbox sender leases rows with
 `SKIP LOCKED`, so both deliver without duplicates.
 
 ### Optional: report to a Meilisearch Lab
 
-Skip this step to run without a Lab. To report to one, the operator mints the
-credentials in the Lab with `bin/rails lab:hosted_engine:create PRODUCT=glutony ...`,
-which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once. The
-three values go together: the gateway and the control plane refuse to boot with
-only some of them set.
+Skip this step to run without a Lab. To report to one:
 
-Add the two credentials to the secret:
+1. Generate the bearer the Lab will present on the gateway's management routes:
+   `openssl rand -hex 32`. This is glutony's `LAB_SERVICE_TOKEN`. Never reuse
+   `ADMIN_API_KEY` as the Lab credential.
+2. In the Lab, mint the instance credentials:
 
-```bash
-kubectl -n meili-ingest patch secret meili-ingest-secrets --type merge -p \
-  '{"stringData":{"LAB_INSTANCE_ID":"<from the Lab>","LAB_INSTANCE_SECRET":"<from the Lab>"}}'
-```
+   ```bash
+   bin/rails lab:hosted_engine:create PRODUCT=glutony REGION=... URL=https://<glutony gateway> \
+     CREDENTIAL=<LAB_SERVICE_TOKEN> EDGE_SECRET=<ENVOY_TRUSTED_HEADER>
+   ```
 
-Then set `LAB_URL` and turn the worker events on in the `ConfigMap`:
+   `CREDENTIAL=` is the `LAB_SERVICE_TOKEN` from step 1; `EDGE_SECRET=` is the
+   gateway's `ENVOY_TRUSTED_HEADER`. The task prints `LAB_URL`, `LAB_INSTANCE_ID` and
+   `LAB_INSTANCE_SECRET` once.
+3. Add the three secrets to the `Secret`:
 
-```yaml
-LAB_URL: "https://<your Lab>"
-LAB_EVENTS_ENABLED: "true"
-```
+   ```bash
+   kubectl -n meili-ingest patch secret meili-ingest-secrets --type merge -p \
+     '{"stringData":{"LAB_INSTANCE_ID":"<from the Lab>","LAB_INSTANCE_SECRET":"<from the Lab>","LAB_SERVICE_TOKEN":"<from step 1>"}}'
+   ```
+
+4. Set `LAB_URL` and turn the worker events on in the `ConfigMap` in
+   `k8s/control-plane.yaml`, then re-apply. The `ConfigMap` is part of the
+   kustomization, so edit the file rather than `kubectl patch` the live object (the
+   next `apply -k` would revert a patch); re-applying is safe because the `Secret` is
+   not in the kustomization:
+
+   ```yaml
+   LAB_URL: "https://<your Lab>"
+   LAB_EVENTS_ENABLED: "true"
+   ```
+
+   ```bash
+   kubectl apply -k k8s/
+   ```
+
+5. Restart the control plane, gateway and workers (command above): env is read at
+   pod start.
+
+`LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` go together: the gateway and
+the control plane refuse to boot with only some of them set, and the gateway refuses
+to boot with them but without `ENVOY_TRUSTED_HEADER` (any client could otherwise bill
+any Lab account).
 
 See [Meilisearch Lab](/deployment/meilisearch-lab) for what the Lab receives.
 
@@ -200,8 +249,45 @@ kubectl -n meili-ingest get scaledobjects
 
 ## Upgrades
 
-Pin the image tag in `kustomization.yaml` (`newTag: v0.2.0`) and
-`kubectl apply -k k8s/`. Control-plane migrations run automatically at boot
-(`sqlx::migrate!`); roll the control plane first, then the gateway and workers.
-Workflows in flight keep running: the workflow code is versioned by Temporal
-and activities are retried on the new workers.
+Pin the image tag in `kustomization.yaml` (`newTag: 0.2.0`: release images are
+tagged without the `v`) and `kubectl apply -k k8s/`. The `Secret` is not in the
+kustomization, so this never resets it; add any new key with `kubectl patch secret`
+and restart the pods. Control-plane migrations run automatically at boot
+(`sqlx::migrate!`). Workflows in flight keep running: the workflow code is versioned
+by Temporal and activities are retried on the new workers.
+
+### Upgrading to Lab contract v2
+
+This release makes the control plane require `CONTROL_PLANE_TOKEN` on `/internal/*`.
+A control plane that enforces it before the gateway and workers present it answers
+them `401`, so roll out in this order:
+
+1. Copy any global connection a tenant pipeline relies on into that tenant (see
+   [Isolation](/deployment/meilisearch-lab#isolation)).
+2. Add the new keys to the `Secret` (`CONTROL_PLANE_TOKEN`, and `SOURCE_SECRET_KEY` /
+   `ADMIN_API_KEY` if you do not have them yet):
+
+   ```bash
+   kubectl -n meili-ingest patch secret meili-ingest-secrets --type merge -p \
+     "{\"stringData\":{\"CONTROL_PLANE_TOKEN\":\"$(openssl rand -hex 32)\"}}"
+   ```
+
+3. Deploy the control plane with `CONTROL_PLANE_TOKEN_DISABLED=true`: uncomment the
+   one-time `patches:` block at the end of `k8s/kustomization.yaml`, set `newTag`,
+   and apply the `ConfigMap` and the control plane only:
+
+   ```bash
+   kubectl apply -k k8s/ -l 'app.kubernetes.io/name in (meili-ingest, meili-control-plane)'
+   kubectl -n meili-ingest rollout status deployment/meili-control-plane
+   ```
+
+4. Deploy the gateway and workers, which present `CONTROL_PLANE_TOKEN`:
+
+   ```bash
+   kubectl apply -k k8s/
+   kubectl -n meili-ingest rollout status deployment/meili-gateway
+   ```
+
+5. Enforce the token on the control plane: comment the `patches:` block out again and
+   `kubectl apply -k k8s/`. The control plane restarts with `CONTROL_PLANE_TOKEN` and
+   without `CONTROL_PLANE_TOKEN_DISABLED`.

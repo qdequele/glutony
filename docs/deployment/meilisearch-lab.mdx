@@ -53,30 +53,46 @@ the Meilisearch key it used to inject as the bearer token moves to
 
 Engines are run by Meilisearch. The operator mints each deployment's credentials in
 the Lab with
-`bin/rails lab:hosted_engine:create PRODUCT=glutony REGION=... URL=... CREDENTIAL=...`,
+`bin/rails lab:hosted_engine:create PRODUCT=glutony REGION=... URL=... CREDENTIAL=... EDGE_SECRET=...`,
 which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once (rotate them
-with `lab:hosted_engine:rotate`, revoke them with `lab:hosted_engine:revoke`):
+with `lab:hosted_engine:rotate`, revoke them with `lab:hosted_engine:revoke`). The two
+inputs map to glutony's gateway variables:
+
+| Lab task input | glutony variable | Notes |
+|---|---|---|
+| `CREDENTIAL=` | `LAB_SERVICE_TOKEN` | generate with `openssl rand -hex 32` and set it on the gateway; never reuse `ADMIN_API_KEY` |
+| `EDGE_SECRET=` | `ENVOY_TRUSTED_HEADER` | the edge secret the Lab sends in `X-Meili-Envoy-Secret` |
+
+The task prints:
 
 | Variable | Service | Notes |
 |---|---|---|
-| `LAB_URL` | control plane, gateway | `https` unless the host is loopback or private |
+| `LAB_URL` | control plane, gateway | base URL only (no path or query); `https` unless the host is loopback or private |
 | `LAB_INSTANCE_ID` | control plane, gateway | this deployment's id in the Lab |
 | `LAB_INSTANCE_SECRET` | control plane, gateway | 64 hex chars; rotate or revoke in the Lab |
 | `LAB_EVENTS_ENABLED` | workers | `true` writes events to the control plane's outbox |
 
-On the gateway the three `LAB_*` variables go together: all three or none. The
-control plane needs `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`, or with
-`LAB_EVENTS_SECRET`, the pre-v2 global secret. That one still works with a boot
-warning (it signs the bare body and skips the identity check), is ignored with a
-warning when the instance credentials are also set, and is removed next release. The
-gateway never reads it.
+On the gateway the three `LAB_*` variables go together: all three or none, and they
+require `ENVOY_TRUSTED_HEADER` (without the edge secret any client could bill any Lab
+account with `X-Meili-Tenant-Id`, so the gateway refuses to boot). The control plane
+needs `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`.
+
+`LAB_EVENTS_SECRET`, the pre-v2 global secret, is still read by the control plane but
+**a v2 Lab does not accept events signed with it**: its legacy path checks them as
+Scrapix's, so glutony's batches are never acknowledged and are dropped after 24 h.
+The control plane logs an error at boot when it runs on that secret alone; set
+`LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` instead. It is ignored with a warning when
+the instance credentials are also set, and removed next release. The gateway never
+reads it.
 
 At boot the gateway and the control plane call `GET {LAB_URL}/internal/instances/me`
-to confirm the credentials and log the product and region. A 401 aborts boot. Any
-other failure is logged and boot goes on: the control plane sends events anyway, and
-the gateway retries every 30 s and, until the Lab answers, refuses jobs for Lab
-accounts with `503 {"code": "lab_unavailable"}` (every job is billed, so none runs
-unchecked).
+to confirm the credentials and log the product and region. A 401 aborts boot, and so
+does an answer whose `product` is not `glutony` (the credentials belong to another
+product's engine). Any other failure is logged and boot goes on: the control plane
+sends events anyway, and the gateway retries every 30 s and, until the Lab answers,
+refuses jobs for Lab accounts with `503 {"code": "lab_unavailable"}` (every job is
+billed, so none runs unchecked). If the Lab, once reachable, names another product,
+the gateway stops retrying and keeps refusing those jobs.
 
 ### Events
 
@@ -141,14 +157,16 @@ dropped.
 
 ### Credit pre-check
 
-Before queueing an ingest job for a Lab account, the gateway calls
-`GET {LAB_URL}/internal/accounts/{account}` (cached 30 s; when the Lab cannot answer,
-a cached answer up to 300 s old is used) and answers
+Before queueing an ingest job or a manual source run (`POST /sources/{uid}/run`) for
+a Lab account, the gateway calls `GET {LAB_URL}/internal/accounts/{account}` (cached
+30 s; when the Lab cannot answer, a cached answer up to 300 s old is used) and answers
 `402 {"code": "insufficient_credits"}` when the balance is 0 or the account is
 inactive. When the Lab cannot answer and no cached answer is that recent, or before
 the Lab has confirmed the credentials at boot, it answers
-`503 {"code": "lab_unavailable"}` and queues nothing. Tenants that are not Lab
-account ids (Cloud projects) are never checked.
+`503 {"code": "lab_unavailable"}` and starts nothing. After a failed call the gateway
+does not ask the Lab again for 10 s (for any account): requests in that window use a
+cached answer or get the `503` straight away, so a hung Lab costs one timeout, not one
+per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
 
 ### Monitoring
 
@@ -185,9 +203,8 @@ The gateway refuses work for an account out of credits (`402`) and refuses rathe
 than runs unbilled work when it cannot check (`503`): before the Lab has confirmed
 the credentials, and when the Lab cannot answer and the account has no lookup from
 the last 5 minutes. The pre-check is a snapshot: work already running keeps running.
-It guards ingest requests only: scheduled source runs start from Temporal, not
-through the gateway, and a manual `POST /sources/{uid}/run` is not pre-checked
-either.
+It guards ingest requests and manual `POST /sources/{uid}/run`; scheduled source
+runs start from Temporal, not through the gateway, and are not pre-checked.
 
 ## Isolation
 
@@ -197,11 +214,14 @@ either.
   use its own connections".
 - A request that carries a tenant never falls back to `MEILI_URL` / `MEILI_API_KEY`:
   it brings its own `X-Meili-Host` / key, or its pipeline is pinned to a connection.
-- The control plane's `/internal/*` routes require `CONTROL_PLANE_TOKEN`.
+- The control plane's `/internal/*` routes require `CONTROL_PLANE_TOKEN`. That token
+  guards `/internal/*` only: `/pipelines`, `/jobs` and `/plugins` on port 9000 stay
+  open, so port 9000 must never be reachable from outside the cluster network.
 
 Before upgrading, copy any global connection a tenant pipeline relies on into that
-tenant. Deploy the control plane before the workers: a new worker against an old
-control plane silently falls back to the global row.
+tenant, and deploy the control plane before the workers (a new worker against an old
+control plane silently falls back to the global row). [Rollout order](#rollout-order)
+gives the full sequence.
 
 ## What the Lab provides
 
@@ -215,8 +235,19 @@ control plane silently falls back to the global row.
 
 ## Rollout order
 
-Deploy the control plane, then the workers, then the gateway. The aliases make any
-order work, but this one never sends a new field to an old reader.
+The control plane enforces `CONTROL_PLANE_TOKEN` from this release on, and the
+previous gateway and workers do not send it: a control plane rolled out first with
+the token set answers them `401`. Upgrade in this order:
+
+1. Copy any global connection a tenant pipeline relies on into that tenant.
+2. Deploy the control plane with `CONTROL_PLANE_TOKEN_DISABLED=true` and without
+   `CONTROL_PLANE_TOKEN` (when the token is set it is enforced, whatever the flag).
+3. Deploy the gateway and the workers with `CONTROL_PLANE_TOKEN`.
+4. Set `CONTROL_PLANE_TOKEN` on the control plane, remove
+   `CONTROL_PLANE_TOKEN_DISABLED`, and restart it.
+
+On Kubernetes, [Upgrading to Lab contract v2](/deployment/kubernetes#upgrading-to-lab-contract-v2)
+gives the commands.
 
 ## Rollback
 
