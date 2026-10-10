@@ -34,11 +34,26 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await.context("applying migrations")?;
     tracing::info!("migrations applied");
 
-    let state = AppState::new(pool.clone()).with_internal_token(internal_token);
+    let lab_config = meili_ingest_control_plane::lab_sender::LabConfig::from_env()
+        .context("invalid Lab events configuration")?;
+    let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
+    if let Some(creds) = lab_config.as_ref().and_then(|c| c.credentials()) {
+        // Workers ask `GET /internal/lab/credits/{account}` before a source run; this
+        // client is on that path: short timeouts, and no redirects so the bearer
+        // secret is never replayed to another host.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("cannot build the Lab HTTP client")?;
+        state = state.with_lab_credits(std::sync::Arc::new(
+            meili_ingest_lab::AccountCreditCache::new(creds.clone(), http),
+        ));
+        tracing::info!("credit pre-check for source runs enabled");
+    }
     let cancel = tokio_util::sync::CancellationToken::new();
-    let sender = match meili_ingest_control_plane::lab_sender::LabConfig::from_env()
-        .context("invalid Lab events configuration")?
-    {
+    let sender = match lab_config {
         Some(config) => {
             tracing::info!(url = %config.url, legacy = config.is_legacy(), "lab events sender enabled");
             if let Some(creds) = config.credentials() {

@@ -9,7 +9,9 @@
 //! * denormalized job cache (`/internal/jobs`);
 //! * Meilisearch connections (`/internal/connections`), keys held sealed;
 //! * scheduled sources (`/internal/sources`, `/internal/sources-by-id`,
-//!   `/internal/source-runs`).
+//!   `/internal/source-runs`);
+//! * the Lab credit pre-check workers run before a source run
+//!   (`/internal/lab/credits/{account_id}`).
 //!
 //! The binary lives in `main.rs`; everything else is exposed as a library so the
 //! router can be exercised in tests without opening a socket.
@@ -19,6 +21,7 @@ pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
+pub mod lab_credits;
 pub mod lab_events;
 pub mod lab_sender;
 pub mod metrics;
@@ -55,6 +58,9 @@ pub struct AppState {
     pub metrics: metrics::LabMetrics,
     /// Bearer token internal callers (gateway, workers) present on `/internal/*`; `None` leaves them open (dev only).
     pub internal_token: Option<String>,
+    /// Lab account lookups behind `GET /internal/lab/credits/{account_id}`; `None`
+    /// when the control plane has no Lab instance credentials (nothing is checked).
+    pub lab_credits: Option<std::sync::Arc<meili_ingest_lab::AccountCreditCache>>,
 }
 
 impl AppState {
@@ -66,7 +72,17 @@ impl AppState {
             lab_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             metrics: metrics::LabMetrics::default(),
             internal_token: None,
+            lab_credits: None,
         }
+    }
+
+    /// Answer the workers' credit checks from this cache (spec v2 §8.1).
+    pub fn with_lab_credits(
+        mut self,
+        cache: std::sync::Arc<meili_ingest_lab::AccountCreditCache>,
+    ) -> Self {
+        self.lab_credits = Some(cache);
+        self
     }
 
     /// Require `Authorization: Bearer <token>` on every `/internal/*` route.
@@ -274,6 +290,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/internal/source-runs", post(sources::record_source_run))
         .route("/internal/lab-events", post(lab_events::ingest_lab_events))
+        .route(
+            "/internal/lab/credits/{account_id}",
+            get(lab_credits::check_credits),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_internal_token,
