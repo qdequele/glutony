@@ -18,9 +18,9 @@ use crate::types::UsageUnits;
 const BUNDLED: &str = include_str!("../../../config/provider-costs.toml");
 
 /// Every plugin that pays a provider (calls [`ProviderCosts::apply`]), by plugin name.
-/// The worker checks at boot that each registered one has a price entry. A plugin that
-/// starts calling `apply` must be added here (the worker tests this against the
-/// plugins' `NAME`s).
+/// The worker checks at boot that each registered one has a price entry. A worker test
+/// pins this list to the plugins' `NAME`s, so a rename is caught; a NEW plugin that
+/// starts calling `apply` is not caught and must be added here by hand.
 pub const PRICED_PLUGINS: &[&str] = &[
     "llm_enricher",
     "jev_enricher",
@@ -79,7 +79,8 @@ impl ProviderCosts {
     }
 
     /// The table to use when loading failed: EMPTY, so every call is flagged unpriced
-    /// (`cost_complete: false`) instead of being billed at the bundled placeholder rates.
+    /// (counted in the Lab event's `unpriced_provider_calls`) instead of being billed at
+    /// the bundled placeholder rates.
     pub fn or_unpriced(loaded: Result<Self, String>) -> Self {
         loaded.unwrap_or_default()
     }
@@ -118,14 +119,19 @@ impl ProviderCosts {
     }
 
     /// The `registered` plugins that pay a provider ([`PRICED_PLUGINS`]) but have no
-    /// entry at all in this table (neither a model nor `default`): every call they make
-    /// is billed at 0 and flagged unpriced. In `registered` order.
+    /// usable entry in this table: none at all (neither a model nor `default`), so every
+    /// call is billed at 0 and flagged unpriced, or only all-zero prices, so every call
+    /// is billed at 0 and looks complete. In `registered` order.
     pub fn unpriced_plugins<'a>(&self, registered: &[&'a str]) -> Vec<&'a str> {
         registered
             .iter()
             .copied()
             .filter(|p| PRICED_PLUGINS.contains(p))
-            .filter(|p| self.entries.get(*p).is_none_or(HashMap::is_empty))
+            .filter(|p| {
+                self.entries
+                    .get(*p)
+                    .is_none_or(|models| models.values().all(|price| *price == Price::default()))
+            })
             .collect()
     }
 
@@ -403,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn the_k8s_table_is_the_bundled_one_and_the_jev_template_parses() {
+    fn the_k8s_table_is_the_bundled_one() {
         let k8s = include_str!("../../../k8s/provider-costs.toml");
         let (_note, body) = k8s.split_once('\n').unwrap();
         assert_eq!(
@@ -411,13 +417,64 @@ mod tests {
             "k8s/provider-costs.toml drifted from config/"
         );
         assert!(BUNDLED.contains("# NOT PRODUCTION PRICES"));
+    }
+
+    /// The commented `[jev_enricher.default]` template at the end of the bundled file,
+    /// uncommented as an operator would.
+    fn jev_template() -> String {
         let template: String = BUNDLED
             .lines()
             .skip_while(|l| *l != "# [jev_enricher.default]")
             .map(|l| format!("{}\n", l.trim_start_matches("# ")))
             .collect();
-        let table = ProviderCosts::from_toml(&template).unwrap();
-        assert!(table.price("jev_enricher", "jev-latest").is_some());
+        assert!(template.starts_with("[jev_enricher.default]"), "{template}");
+        template
+    }
+
+    #[test]
+    fn an_unedited_jev_template_does_not_parse() {
+        // Uncommented but not filled in, it must stop the worker at boot rather than
+        // price every Jev call at 0 and call it complete.
+        let err = ProviderCosts::from_toml(&jev_template()).unwrap_err();
+        assert!(err.contains("invalid provider cost table"), "{err}");
+    }
+
+    #[test]
+    fn a_filled_in_jev_template_parses() {
+        let filled: String = jev_template()
+            .lines()
+            .map(|l| match l.split_once('=') {
+                Some((key, value)) if value.contains('<') => format!("{key}= 250\n"),
+                _ => format!("{l}\n"),
+            })
+            .collect();
+        let table = ProviderCosts::from_toml(&filled).unwrap();
+        let price = table.price("jev_enricher", "jev-latest").unwrap();
+        assert_ne!(price, Price::default(), "{filled}");
+        assert!(table.unpriced_plugins(&["jev_enricher"]).is_empty());
+    }
+
+    #[test]
+    fn a_plugin_whose_every_price_is_zero_is_unpriced() {
+        let table = ProviderCosts::from_toml(
+            r#"
+            [jev_enricher.default]
+            input_per_mtok = 0
+            output_per_mtok = 0
+            per_request = 0
+            [llm_enricher."gpt-4o-mini"]
+            input_per_mtok = 0
+            [llm_enricher."gpt-4o"]
+            output_per_mtok = 5
+            [image_captioner.free]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            table.unpriced_plugins(&["jev_enricher", "llm_enricher", "image_captioner"]),
+            ["jev_enricher", "image_captioner"],
+            "one non-zero price is enough to count as priced"
+        );
     }
 
     #[test]
