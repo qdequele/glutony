@@ -131,13 +131,12 @@ error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
   the job could not be priced it is the sum of the calls that could: the description
   says `provider cost incomplete` and the `unpriced_provider_calls` unit counts the
   missing calls (it is always present, 0 when the cost is complete), and the worker
-  logs a warning. The bundled prices are placeholders: set yours before reporting to
-  a Lab (`jev_enricher` has no bundled price at all). At boot the worker logs an
-  error naming every registered provider plugin the table has no entry, or only zero
-  prices, for. A
-  `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at boot; if it
-  ever fails to load later, every call is flagged unpriced (never priced at the
-  bundled rates).
+  logs a warning. The bundled prices are placeholders: set yours before reporting to a
+  Lab (`jev_enricher` has no bundled price at all). At boot the worker logs an error
+  naming every registered provider plugin the table has no entry for, or only zero
+  prices for. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at
+  boot; if it ever fails to load later, every call is flagged unpriced (never priced
+  at the bundled rates).
 - Jobs without a canonical-UUID tenant (standalone, Cloud projects) are never sent.
   Failed and cancelled jobs are: provider cost already spent is real.
 
@@ -172,21 +171,21 @@ cached answer or get the `503` straight away, so a hung Lab costs one timeout, n
 per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
 
 Scheduled source runs start from Temporal, not through the gateway, so they are
-checked at the start of each run instead: when the source's tenant is a Lab account id,
-the worker asks the control plane before fetching anything
+checked at the start of each run instead: when the source's tenant is a Lab account
+id, the worker asks the control plane before fetching anything
 (`GET /internal/lab/credits/{account}`, with `CONTROL_PLANE_TOKEN`), which asks the Lab
 with the control plane's `LAB_INSTANCE_*` credentials and the same cache rules (30 s
 fresh, 300 s stale, 10 s backoff after a failure). Workers never hold Lab credentials,
-and never ask for tenants that are not Lab account ids. An account without credits
-fails the run at once: it is recorded as failed with the reason ("source run refused:"
-and the control plane's message, which names the account and says to top up in the
-Lab console), nothing is fetched, staged or billed, its incremental state is not
-saved, and the next tick tries again. When the Lab cannot be asked (`503`, or a control plane that does not
-answer the check), the run is retried with the activity's retry policy and, if the Lab
-is still unreachable, recorded as failed: the check fails closed. A control plane
-without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs are checked
-twice, by the gateway, then by the worker through the control plane; each keeps its
-own 30 s cache.
+and never ask for tenants that are not Lab account ids. An account without credits fails
+the run at once: it is recorded as failed with the reason ("source run refused:" and
+the control plane's message, which names the account and says to top up in the Lab
+console), nothing is fetched, staged or billed, its incremental state is not saved,
+and the next tick tries again. When the Lab cannot be asked (`503`, or a control plane
+that does not answer the check), the run is retried with the activity's retry policy
+and, if the Lab is still unreachable, recorded as failed: the check fails closed. A
+control plane without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs
+are checked twice, by the gateway, then by the worker through the control plane; each
+keeps its own 30 s cache.
 
 ### Monitoring
 
@@ -219,14 +218,14 @@ threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
 
 ## Spend enforcement
 
-The gateway refuses work for an account out of credits (`402`) and refuses rather
-than runs unbilled work when it cannot check (`503`): before the Lab has confirmed
-the credentials, and when the Lab cannot answer and the account has no lookup from
-the last 5 minutes. The pre-check is a snapshot: work already running keeps running.
-It guards ingest requests and manual `POST /sources/{uid}/run` in the gateway, and
-every source run of a Lab account, scheduled or manual, at its start in the worker
-(through the control plane). A scheduled run refused for credits is recorded as failed with the reason and
-retried on the next tick.
+The gateway refuses work for an account out of credits (`402`) and refuses rather than
+runs unbilled work when it cannot check (`503`): before the Lab has confirmed the
+credentials, and when the Lab cannot answer and the account has no lookup from the
+last 5 minutes. The pre-check is a snapshot: work already running keeps running. It
+guards ingest requests and manual `POST /sources/{uid}/run` in the gateway, and every
+source run of a Lab account, scheduled or manual, at its start in the worker (through
+the control plane). A scheduled run refused for credits is recorded as failed with the
+reason and retried on the next tick.
 
 ## Isolation
 
@@ -275,9 +274,11 @@ gives the commands.
 
 Lab events still waiting in the outbox from a pre-v2 release (written by the old
 workers, in a shape a v2 Lab rejects) are converted to the v2 `usage.recorded` shape
-when the new control plane first boots, and get a fresh 24 h delivery window. Their
-`step_seconds` is the job's wall time, and they carry no job lifecycle event
-(`job.completed` / `job.failed`).
+when the new control plane first boots, and get a fresh 24 h delivery window. Workers
+not upgraded yet keep posting that old shape while the rollout runs (the control plane
+goes first), so the control plane converts such events as it stores them too: nothing
+from the rollout window goes unbilled. Converted events have the job's wall time as
+`step_seconds`, and carry no job lifecycle event (`job.completed` / `job.failed`).
 
 ## Rollback
 

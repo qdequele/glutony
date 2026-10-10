@@ -16,11 +16,12 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 - Hosted deployments refuse jobs and manual source runs (`POST /sources/{uid}/run`)
   for a Lab account without credits (`402 insufficient_credits`). After a failed Lab
   call the gateway does not ask again for 10 s.
-- Scheduled source runs of a Lab account are pre-checked too: before fetching
-  anything the worker asks the control plane (`GET /internal/lab/credits/{account}`),
-  which asks the Lab with its own cache, under the same rules as the gateway. A run for an account without credits is
-  recorded as failed with the reason and retried on the next tick; when the Lab
-  cannot be asked the run fails closed. Upgrade the control plane before the workers.
+- Scheduled source runs of a Lab account are pre-checked too: before fetching anything
+  the worker asks the control plane (`GET /internal/lab/credits/{account}`), which
+  asks the Lab with its own cache, under the same rules as the gateway. A run for an
+  account without credits is recorded as failed with the reason and retried on the
+  next tick; when the Lab cannot be asked the run fails closed. Upgrade the control
+  plane before the workers.
 - The binaries refuse to boot on the example placeholder `CHANGE_ME` for
   `CONTROL_PLANE_TOKEN`, `ADMIN_API_KEY` and `ENVOY_TRUSTED_HEADER`; the gateway
   refuses `LAB_INSTANCE_*` without `ENVOY_TRUSTED_HEADER`, and both Lab clients
@@ -47,7 +48,8 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 - Tinybird is documented as analytics only; the Lab bills.
 - Lab events still undelivered from a pre-v2 release are converted to the v2
   `usage.recorded` shape on upgrade (migration 0005) and get a fresh 24 h delivery
-  window; they carry no job lifecycle event.
+  window; they carry no job lifecycle event. Pre-v2 events that workers not upgraded
+  yet post during the rollout are converted as they are stored.
 
 ### Removed
 - `LAB_EVENTS_SECRET` (control plane): glutony has no working legacy Lab route (a v2
