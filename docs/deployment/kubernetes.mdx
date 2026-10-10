@@ -52,8 +52,38 @@ kubectl -n meili-ingest create secret generic meili-ingest-secrets \
   --from-literal=DATABASE_URL='postgres://user:pass@postgres:5432/meili_ingest' \
   --from-literal=LLM_API_KEY='sk-...' \
   --from-literal=ENVOY_TRUSTED_HEADER="$(openssl rand -hex 32)" \
+  --from-literal=CONTROL_PLANE_TOKEN="$(openssl rand -hex 32)" \
+  --from-literal=SOURCE_SECRET_KEY="$(openssl rand -base64 32)" \
+  --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
+
+The control plane runs two replicas; its outbox sender leases rows with
+`SKIP LOCKED`, so both deliver without duplicates.
+
+### Optional: report to a Meilisearch Lab
+
+Skip this step to run without a Lab. To report to one, the operator mints the
+credentials in the Lab with `bin/rails lab:hosted_engine:create PRODUCT=glutony ...`,
+which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once. The
+three values go together: the gateway and the control plane refuse to boot with
+only some of them set.
+
+Add the two credentials to the secret:
+
+```bash
+kubectl -n meili-ingest patch secret meili-ingest-secrets --type merge -p \
+  '{"stringData":{"LAB_INSTANCE_ID":"<from the Lab>","LAB_INSTANCE_SECRET":"<from the Lab>"}}'
+```
+
+Then set `LAB_URL` and turn the worker events on in the `ConfigMap`:
+
+```yaml
+LAB_URL: "https://<your Lab>"
+LAB_EVENTS_ENABLED: "true"
+```
+
+See [Meilisearch Lab](/deployment/meilisearch-lab) for what the Lab receives.
 
 Object-store credentials follow the provider's conventions
 (`AWS_ACCESS_KEY_ID` / IRSA, `GOOGLE_APPLICATION_CREDENTIALS` / Workload

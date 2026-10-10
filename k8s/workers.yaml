@@ -71,6 +71,18 @@ spec:
                   name: meili-ingest-secrets
                   key: TINYBIRD_TOKEN
                   optional: true
+            # Presented on every control-plane call.
+            - name: CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: CONTROL_PLANE_TOKEN
+            # Opens stored Meilisearch connection keys.
+            - name: SOURCE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: SOURCE_SECRET_KEY
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -89,9 +101,15 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: provider-costs
+              mountPath: /etc/meili-ingest
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: provider-costs
+          configMap:
+            name: meili-ingest-provider-costs
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -186,6 +204,18 @@ spec:
                   name: meili-ingest-secrets
                   key: TINYBIRD_TOKEN
                   optional: true
+            # Presented on every control-plane call.
+            - name: CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: CONTROL_PLANE_TOKEN
+            # Opens stored Meilisearch connection keys.
+            - name: SOURCE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: SOURCE_SECRET_KEY
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -204,9 +234,15 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: provider-costs
+              mountPath: /etc/meili-ingest
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: provider-costs
+          configMap:
+            name: meili-ingest-provider-costs
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -301,6 +337,18 @@ spec:
                   name: meili-ingest-secrets
                   key: TINYBIRD_TOKEN
                   optional: true
+            # Presented on every control-plane call.
+            - name: CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: CONTROL_PLANE_TOKEN
+            # Opens stored Meilisearch connection keys.
+            - name: SOURCE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: SOURCE_SECRET_KEY
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -319,6 +367,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: provider-costs
+              mountPath: /etc/meili-ingest
+              readOnly: true
         # gRPC plugin sidecars go here (Whisper, ffmpeg, OCR). Nothing in this repo
         # builds such images: bring your own, implementing proto/plugin.proto, and
         # list them in EXTERNAL_PLUGINS above. Example:
@@ -330,6 +381,9 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: provider-costs
+          configMap:
+            name: meili-ingest-provider-costs
 ---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject

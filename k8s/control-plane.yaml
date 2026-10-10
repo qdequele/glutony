@@ -8,7 +8,17 @@
 #     --from-literal=LLM_API_KEY='sk-...' \
 #     --from-literal=TINYBIRD_TOKEN='p.ey...' \
 #     --from-literal=ENVOY_TRUSTED_HEADER='<shared secret agreed with the Envoy team>' \
+#     --from-literal=CONTROL_PLANE_TOKEN="$(openssl rand -hex 32)" \
+#     --from-literal=SOURCE_SECRET_KEY="$(openssl rand -base64 32)" \
+#     --from-literal=ADMIN_API_KEY="$(openssl rand -hex 32)" \
 #     --dry-run=client -o yaml | kubectl apply -f -
+#
+# To report to a Meilisearch Lab, also add the two Lab credentials (printed once
+# by `bin/rails lab:hosted_engine:create PRODUCT=glutony ...` in the Lab) and set
+# LAB_URL in the ConfigMap below. The three Lab values go together:
+#
+#     --from-literal=LAB_INSTANCE_ID='<from the Lab>' \
+#     --from-literal=LAB_INSTANCE_SECRET='<from the Lab>' \
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -39,6 +49,12 @@ data:
   # region: api.tinybird.co, api.eu-central-1.aws.tinybird.co, and so on.
   TINYBIRD_BASE_URL: "https://api.tinybird.co"
   TINYBIRD_DATASOURCE: "meili_ingest_usage"
+  # Meilisearch Lab (platform contract v2). Leave LAB_URL empty to run without a Lab.
+  LAB_URL: ""
+  # Workers write one usage and one lifecycle event per Lab job to the outbox.
+  LAB_EVENTS_ENABLED: "false"
+  # Provider cost table mounted from the meili-ingest-provider-costs ConfigMap.
+  PROVIDER_COSTS_FILE: "/etc/meili-ingest/provider-costs.toml"
 ---
 apiVersion: v1
 kind: Secret
@@ -62,6 +78,19 @@ stringData:
   # Shared secret Envoy must send in `X-Meili-Envoy-Secret` for X-Meili-*
   # headers to be honoured. Leave empty to trust headers unconditionally (dev only).
   ENVOY_TRUSTED_HEADER: "CHANGE_ME"
+  # Control plane <-> gateway/workers. Generate with `openssl rand -hex 32`.
+  CONTROL_PLANE_TOKEN: "CHANGE_ME"
+  # Seals stored Meilisearch keys and source credentials: `openssl rand -base64 32`.
+  SOURCE_SECRET_KEY: "CHANGE_ME"
+  # Operator bearer for the management routes.
+  ADMIN_API_KEY: "CHANGE_ME"
+  # Meilisearch Lab credentials. The operator mints them in the Lab with
+  # `bin/rails lab:hosted_engine:create PRODUCT=glutony ...`, which prints LAB_URL,
+  # LAB_INSTANCE_ID and LAB_INSTANCE_SECRET once. Uncomment together with LAB_URL
+  # in the ConfigMap to report to a Meilisearch Lab: the gateway and the control
+  # plane refuse to boot with only some of the three set.
+  # LAB_INSTANCE_ID: "CHANGE_ME"
+  # LAB_INSTANCE_SECRET: "CHANGE_ME"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -72,7 +101,8 @@ metadata:
     app.kubernetes.io/name: meili-control-plane
     app.kubernetes.io/component: control-plane
 spec:
-  replicas: 1
+  # Two replicas: the Lab events sender leases rows with FOR UPDATE SKIP LOCKED, so both can run it.
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: meili-control-plane
@@ -108,6 +138,29 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: DATABASE_URL
+            - name: CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: CONTROL_PLANE_TOKEN
+            - name: LAB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: meili-ingest-config
+                  key: LAB_URL
+                  optional: true
+            - name: LAB_INSTANCE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_INSTANCE_ID
+                  optional: true
+            - name: LAB_INSTANCE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_INSTANCE_SECRET
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

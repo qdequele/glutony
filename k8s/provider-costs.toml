@@ -1,0 +1,31 @@
+# Copy of config/provider-costs.toml for the k8s ConfigMap; set your prices here.
+# What glutony pays a provider per call, in micro-USD (1 USD = 1_000_000).
+# Keys: [<plugin name>.<model>] or [<plugin name>.default]. Dimensions:
+# input_per_mtok, output_per_mtok (per million tokens), per_audio_second, per_request.
+#
+# PLACEHOLDERS: these are public list prices at the time of writing, for the
+# providers the plugins default to (OpenAI). Set real prices before billing, and ship
+# your own file (PROVIDER_COSTS_FILE) if a plugin's *_BASE_URL points elsewhere.
+# A model missing here is billed at 0 and flagged (cost_complete: false).
+
+[llm_enricher."gpt-4o-mini"]
+input_per_mtok = 150000
+output_per_mtok = 600000
+
+[llm_enricher."gpt-4o"]
+input_per_mtok = 2500000
+output_per_mtok = 10000000
+
+[image_captioner."gpt-4o-mini"]
+input_per_mtok = 150000
+output_per_mtok = 600000
+
+[image_captioner."gpt-4o"]
+input_per_mtok = 2500000
+output_per_mtok = 10000000
+
+[whisper_transcriber."whisper-1"]
+per_audio_second = 100
+
+# jev_enricher (TypeSafe Jev) has no public price: left out on purpose, so its calls
+# are flagged as unpriced until you add [jev_enricher.default] or a model entry.

@@ -18,6 +18,15 @@ resources:
   - workers.yaml
   - temporal.yaml
 
+# Provider cost table, mounted into the workers at /etc/meili-ingest
+# (PROVIDER_COSTS_FILE in the ConfigMap). Edit k8s/provider-costs.toml.
+configMapGenerator:
+  - name: meili-ingest-provider-costs
+    files:
+      - provider-costs.toml
+    options:
+      disableNameSuffixHash: true
+
 images:
   - name: ghcr.io/qdequele/glutony
     newTag: latest
