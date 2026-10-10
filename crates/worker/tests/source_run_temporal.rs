@@ -82,7 +82,7 @@ fn source_row(url: &str, etag: Option<&str>) -> serde_json::Value {
 }
 
 /// A control plane serving the source and the pipeline and accepting every write. Its
-/// credit check answers "not checked" (`tenant-1` is not a Lab account).
+/// credit check answers "not checked", as a control plane without Lab credentials does.
 async fn control_plane(row: serde_json::Value, pipeline: PipelineDefinition) -> MockServer {
     control_plane_with_credits(
         row,
@@ -307,11 +307,16 @@ async fn an_account_without_credits_fails_the_run_before_fetching_and_records_wh
         return;
     };
     let files = MockServer::start().await;
+    // Only a Lab account id is checked.
+    let account = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+    let mut row = source_row(&format!("{}/feed.json", files.uri()), None);
+    row["tenant_id"] = serde_json::json!(account);
     let cp = control_plane_with_credits(
-        source_row(&format!("{}/feed.json", files.uri()), None),
+        row,
         pipeline(Some("prod-movies")),
         ResponseTemplate::new(402).set_body_json(serde_json::json!({
-            "error": "account tenant-1 has no credits left", "code": "insufficient_credits"
+            "error": format!("account {account} has no credits left; top up in the Lab console"),
+            "code": "insufficient_credits"
         })),
     )
     .await;

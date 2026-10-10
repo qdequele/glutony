@@ -16,9 +16,9 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 - Hosted deployments refuse jobs and manual source runs (`POST /sources/{uid}/run`)
   for a Lab account without credits (`402 insufficient_credits`). After a failed Lab
   call the gateway does not ask again for 10 s.
-- Scheduled source runs are pre-checked too: before fetching anything the worker asks
-  the control plane (`GET /internal/lab/credits/{account}`), which asks the Lab with
-  the same cache rules as the gateway. A run for an account without credits is
+- Scheduled source runs of a Lab account are pre-checked too: before fetching
+  anything the worker asks the control plane (`GET /internal/lab/credits/{account}`),
+  which asks the Lab with its own cache, under the same rules as the gateway. A run for an account without credits is
   recorded as failed with the reason and retried on the next tick; when the Lab
   cannot be asked the run fails closed. Upgrade the control plane before the workers.
 - The binaries refuse to boot on the example placeholder `CHANGE_ME` for

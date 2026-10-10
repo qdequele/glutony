@@ -176,18 +176,21 @@ cached answer or get the `503` straight away, so a hung Lab costs one timeout, n
 per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
 
 Scheduled source runs start from Temporal, not through the gateway, so they are
-checked at the start of each run instead: before fetching anything, the worker asks
-the control plane (`GET /internal/lab/credits/{account}`, with `CONTROL_PLANE_TOKEN`),
-which asks the Lab with the control plane's `LAB_INSTANCE_*` credentials and the same
-cache rules (30 s fresh, 300 s stale, 10 s backoff after a failure). Workers never
-hold Lab credentials. An account without credits fails the run at once: it is recorded
-as failed with the reason ("account … has no Lab credits left; source run skipped"),
-nothing is fetched, staged or billed, its incremental state is not saved, and the next
-tick tries again. When the Lab cannot be asked (`503`, or a control plane that does not
+checked at the start of each run instead: when the source's tenant is a Lab account id,
+the worker asks the control plane before fetching anything
+(`GET /internal/lab/credits/{account}`, with `CONTROL_PLANE_TOKEN`), which asks the Lab
+with the control plane's `LAB_INSTANCE_*` credentials and the same cache rules (30 s
+fresh, 300 s stale, 10 s backoff after a failure). Workers never hold Lab credentials,
+and never ask for tenants that are not Lab account ids. An account without credits
+fails the run at once: it is recorded as failed with the reason ("account … has no Lab
+credits left; source run refused", followed by the control plane's message, which says
+to top up in the Lab console), nothing is fetched, staged or billed, its incremental state is not saved, and the next tick
+tries again. When the Lab cannot be asked (`503`, or a control plane that does not
 answer the check), the run is retried with the activity's retry policy and, if the Lab
 is still unreachable, recorded as failed: the check fails closed. A control plane
-without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs are checked twice
-(by the gateway, then by the worker); the second answer usually comes from the cache.
+without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs are checked
+twice, by the gateway, then by the worker through the control plane; each keeps its
+own 30 s cache.
 
 ### Monitoring
 
@@ -225,8 +228,8 @@ than runs unbilled work when it cannot check (`503`): before the Lab has confirm
 the credentials, and when the Lab cannot answer and the account has no lookup from
 the last 5 minutes. The pre-check is a snapshot: work already running keeps running.
 It guards ingest requests and manual `POST /sources/{uid}/run` in the gateway, and
-every source run, scheduled or manual, at its start in the worker (through the control
-plane). A scheduled run refused for credits is recorded as failed with the reason and
+every source run of a Lab account, scheduled or manual, at its start in the worker
+(through the control plane). A scheduled run refused for credits is recorded as failed with the reason and
 retried on the next tick.
 
 ## Isolation
@@ -266,8 +269,8 @@ the token set answers them `401`. Upgrade in this order:
 2. Deploy the control plane with `CONTROL_PLANE_TOKEN_DISABLED=true` and without
    `CONTROL_PLANE_TOKEN` (when the token is set it is enforced, whatever the flag).
 3. Deploy the gateway and the workers with `CONTROL_PLANE_TOKEN`. The workers ask the
-   control plane for the credit check of every source run, and fail the run when it
-   does not answer it: upgrade the control plane first.
+   control plane for the credit check of every Lab-account source run, and fail the
+   run when it does not answer it: upgrade the control plane first.
 4. Set `CONTROL_PLANE_TOKEN` on the control plane, remove
    `CONTROL_PLANE_TOKEN_DISABLED`, and restart it.
 

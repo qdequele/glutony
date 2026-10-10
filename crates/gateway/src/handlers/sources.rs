@@ -387,7 +387,8 @@ pub async fn run_source(
         )));
     }
     // A manual run starts billable work for the tenant: the same credit pre-check as
-    // POST /ingest (spec v2 §8.1). Scheduled runs fire from Temporal and are not checked.
+    // POST /ingest (spec v2 §8.1). Every run, scheduled or manual, is checked again at
+    // its start by the worker, through the control plane.
     if let (Some(lab), Some(account)) = (&state.lab, tenant_id.as_deref()) {
         lab.check_credits(account).await?;
     }

@@ -156,7 +156,7 @@ A fetch that fails with a transport error, `408`, `429` or a `5xx` is retried
 (3 attempts) before the run is `failed`. Any other `4xx` (`404`, `403`, `410`…)
 fails the run at once: the next tick tries again.
 
-On a Lab engine every run starts with the account's
+On a Lab engine every run of a Lab account starts with its
 [credit pre-check](/deployment/meilisearch-lab#credit-pre-check): a run for an account
 without credits is `failed` before anything is fetched, and the next tick tries again.
 

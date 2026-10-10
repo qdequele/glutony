@@ -37,6 +37,7 @@ meili-ingest-plugin-pptx.workspace = true
 meili-ingest-plugin-audio-transcriber.workspace = true
 meili-ingest-plugin-video-audio.workspace = true
 meili-ingest-source.workspace = true
+meili-ingest-lab.workspace = true
 
 temporalio-sdk.workspace = true
 temporalio-client.workspace = true

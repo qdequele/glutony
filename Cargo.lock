@@ -3757,6 +3757,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "meili-ingest-blob",
+ "meili-ingest-lab",
  "meili-ingest-plugin-audio-transcriber",
  "meili-ingest-plugin-avro",
  "meili-ingest-plugin-chunker",
