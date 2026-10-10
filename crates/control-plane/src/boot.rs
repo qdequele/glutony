@@ -63,6 +63,41 @@ impl BootConfig {
     }
 }
 
+/// Ask the Lab who this deployment is (spec §3.6), before anything touches Postgres.
+/// A `401` (wrong or revoked credentials) and credentials of another product's engine
+/// abort boot; any other failure is logged and boot goes on: events are sent anyway
+/// and retried.
+pub async fn confirm_lab_identity(config: &LabConfig) -> anyhow::Result<()> {
+    // Bounded like the sender's own client: a hung Lab must not block boot.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("cannot build the Lab HTTP client")?;
+    match meili_ingest_lab::fetch_instance_info(&http, config.credentials()).await {
+        Ok(info) => {
+            // Credentials of another product's engine: its events would be
+            // attributed to that product.
+            meili_ingest_lab::check_product(&info)?;
+            tracing::info!(
+                kind = ?info.kind,
+                product = %info.product,
+                region = ?info.region,
+                "Lab instance identity confirmed"
+            );
+        }
+        Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
+            "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not confirm this deployment's Lab identity; events are sent anyway and retried"
+        ),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -91,6 +126,43 @@ mod tests {
         assert_eq!(c.addr.to_string(), DEFAULT_BIND);
         assert_eq!(c.internal_token.as_deref(), Some("t"));
         assert_eq!(c.lab.unwrap().credentials().instance_id(), "id");
+    }
+
+    async fn identity(resp: wiremock::ResponseTemplate) -> anyhow::Result<()> {
+        let lab = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/internal/instances/me"))
+            .respond_with(resp)
+            .mount(&lab)
+            .await;
+        let config =
+            LabConfig::from_values(Some(lab.uri()), Some("id".into()), Some("s".into()), None)
+                .unwrap()
+                .unwrap();
+        confirm_lab_identity(&config).await
+    }
+
+    #[tokio::test]
+    async fn the_lab_identity_aborts_boot_only_on_401_or_another_product() {
+        let me = |product: &str| {
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "instance_id": "id", "kind": "hosted", "product": product
+            }))
+        };
+        identity(me("glutony")).await.unwrap();
+        let err = identity(me("lumen")).await.unwrap_err().to_string();
+        assert!(err.contains("lumen"), "{err}");
+        let err = identity(wiremock::ResponseTemplate::new(401))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LAB_INSTANCE_SECRET"), "{err}");
+        // Anything else only warns.
+        identity(wiremock::ResponseTemplate::new(503))
+            .await
+            .unwrap();
+        identity(wiremock::ResponseTemplate::new(200).set_body_string("nope"))
+            .await
+            .unwrap();
     }
 
     #[test]
