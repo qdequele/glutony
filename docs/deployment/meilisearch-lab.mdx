@@ -136,7 +136,7 @@ An event the Lab has not accepted **24 h** after it was written to the outbox (i
 `created_at`) was skipped on purpose (for example `product mismatch`): it is dropped
 with an error log and counted in `glutony_lab_events_dropped_total`. The check runs
 hourly. Set `LAB_URL` before enabling `LAB_EVENTS_ENABLED`: events already older than
-24 h when the sender first starts get a single delivery attempt before they are
+24 h when the sender first starts get at most one delivery attempt before they are
 dropped.
 
 ### Credit pre-check
@@ -183,9 +183,11 @@ threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
 
 The gateway refuses work for an account out of credits (`402`) and refuses rather
 than runs unbilled work when it cannot check (`503`): before the Lab has confirmed
-the credentials, and during a Lab outage longer than 5 minutes. The pre-check is a
-snapshot: work already running keeps running. It guards ingest requests; scheduled
-source runs start from Temporal, not through the gateway, and are not pre-checked.
+the credentials, and when the Lab cannot answer and the account has no lookup from
+the last 5 minutes. The pre-check is a snapshot: work already running keeps running.
+It guards ingest requests only: scheduled source runs start from Temporal, not
+through the gateway, and a manual `POST /sources/{uid}/run` is not pre-checked
+either.
 
 ## Isolation
 
