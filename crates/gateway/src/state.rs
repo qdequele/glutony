@@ -1050,7 +1050,8 @@ mod tests {
     #[test]
     fn validate_refuses_the_change_me_placeholder() {
         // The example Secret ships CHANGE_ME; booting on it would make these public.
-        let cases: [(&str, fn(&mut GatewayConfig, String)); 3] = [
+        type Set = fn(&mut GatewayConfig, String);
+        let cases: [(&str, Set); 3] = [
             ("CONTROL_PLANE_TOKEN", |c, v| {
                 c.control_plane_token = Some(v)
             }),
