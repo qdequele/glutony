@@ -81,9 +81,29 @@ fn source_row(url: &str, etag: Option<&str>) -> serde_json::Value {
     row
 }
 
-/// A control plane serving the source and the pipeline and accepting every write.
+/// A control plane serving the source and the pipeline and accepting every write. Its
+/// credit check answers "not checked", as a control plane without Lab credentials does.
 async fn control_plane(row: serde_json::Value, pipeline: PipelineDefinition) -> MockServer {
+    control_plane_with_credits(
+        row,
+        pipeline,
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"checked": false})),
+    )
+    .await
+}
+
+/// [`control_plane`] whose `GET /internal/lab/credits/{tenant}` answers `credits`.
+async fn control_plane_with_credits(
+    row: serde_json::Value,
+    pipeline: PipelineDefinition,
+    credits: ResponseTemplate,
+) -> MockServer {
     let cp = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/internal/lab/credits/[^/]+$"))
+        .respond_with(credits)
+        .mount(&cp)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/internal/sources-by-id/{SOURCE_ID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(row))
@@ -278,6 +298,62 @@ async fn a_pipeline_without_a_connection_fails_the_run_and_records_why() {
             .unwrap_or_default()
             .is_empty(),
         "nothing is fetched for a run that cannot be delivered"
+    );
+}
+
+#[tokio::test]
+async fn an_account_without_credits_fails_the_run_before_fetching_and_records_why() {
+    let Some(client) = client().await else {
+        return;
+    };
+    let files = MockServer::start().await;
+    // Only a Lab account id is checked.
+    let account = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+    let mut row = source_row(&format!("{}/feed.json", files.uri()), None);
+    row["tenant_id"] = serde_json::json!(account);
+    let cp = control_plane_with_credits(
+        row,
+        pipeline(Some("prod-movies")),
+        ResponseTemplate::new(402).set_body_json(serde_json::json!({
+            "error": format!("account {account} has no credits left; top up in the Lab console"),
+            "code": "insufficient_credits"
+        })),
+    )
+    .await;
+
+    let queue = format!("source-run-test-{}", Uuid::new_v4());
+    let key = Arc::new(SecretKey::from_bytes([3; 32]));
+    let err = run_source(client, &queue, &cp, &files, key)
+        .await
+        .expect_err("the run fails");
+    assert!(err.contains("failed"), "{err}");
+
+    let runs = bodies(&cp, "POST", "/internal/source-runs").await;
+    assert_eq!(runs.len(), 1, "the refused run is recorded");
+    assert_eq!(runs[0]["outcome"], "failed");
+    let why = runs[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("source run refused") && why.contains("no credits left"),
+        "the run row says why: {why}"
+    );
+    assert!(
+        files
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "nothing is fetched for an account without credits"
+    );
+    assert!(bodies(&cp, "POST", "/internal/jobs").await.is_empty());
+    assert!(
+        bodies(
+            &cp,
+            "PUT",
+            &format!("/internal/sources-by-id/{SOURCE_ID}/state")
+        )
+        .await
+        .is_empty(),
+        "no state saved: the next tick tries again"
     );
 }
 

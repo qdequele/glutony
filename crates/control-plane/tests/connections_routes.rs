@@ -221,3 +221,69 @@ async fn used_by_and_list_are_exposed() {
         "no pipeline uses it yet"
     );
 }
+
+#[tokio::test]
+async fn scope_tenant_returns_only_the_tenants_own_row() {
+    let Some(app) = setup("cr-scope").await else {
+        return;
+    };
+    let mut global = new_connection("cr-scope-1", "unused");
+    global.tenant_id = None;
+    let (status, _) = call(&app, with_json("POST", "/internal/connections", &global)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &app,
+        with_json(
+            "POST",
+            "/internal/connections",
+            &new_connection("cr-scope-1", "rp-6"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Management reads still fall back to the global template.
+    let (status, body) = call(
+        &app,
+        bare("GET", "/internal/connections/cr-scope-1?tenant_id=rp-7"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json::<ConnectionRecord>(&body).tenant_id, None);
+
+    // A job's lookup never does.
+    let (status, body) = call(
+        &app,
+        bare(
+            "GET",
+            "/internal/connections/cr-scope-1?tenant_id=rp-7&scope=tenant",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json::<ErrorBody>(&body).code, "not_found");
+
+    let (status, body) = call(
+        &app,
+        bare(
+            "GET",
+            "/internal/connections/cr-scope-1?tenant_id=rp-6&scope=tenant",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json::<ConnectionRecord>(&body).tenant_id.as_deref(),
+        Some("rp-6")
+    );
+
+    // `scope=tenant` without a tenant, or an unknown scope, is a validation error.
+    for uri in [
+        "/internal/connections/cr-scope-1?scope=tenant",
+        "/internal/connections/cr-scope-1?tenant_id=rp-6&scope=everything",
+    ] {
+        let (status, body) = call(&app, bare("GET", uri)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        assert_eq!(json::<ErrorBody>(&body).code, "validation", "{uri}");
+    }
+}

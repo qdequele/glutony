@@ -150,11 +150,15 @@ curl "$INGEST/sources/tmdb/runs?limit=5"
 |---|---|
 | `ingested` | Content changed; every job it started succeeded. |
 | `unchanged` | Upstream answered `304`, or the bytes hashed the same as last time. No job, nothing billed. |
-| `failed` | The fetch failed, or a job failed. `error` says why. |
+| `failed` | The credit check refused the run, the fetch failed, or a job failed. `error` says why. |
 
 A fetch that fails with a transport error, `408`, `429` or a `5xx` is retried
 (3 attempts) before the run is `failed`. Any other `4xx` (`404`, `403`, `410`…)
 fails the run at once: the next tick tries again.
+
+On a Lab engine every run of a Lab account starts with its
+[credit pre-check](/deployment/meilisearch-lab#credit-pre-check): a run for an account
+without credits is `failed` before anything is fetched, and the next tick tries again.
 
 A source remembers the last `ETag`, `Last-Modified` and content hash, and sends
 `If-None-Match` / `If-Modified-Since` on the next fetch. That state is saved

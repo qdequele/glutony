@@ -21,7 +21,8 @@ info:
     headers (injected by Meilisearch Cloud's Envoy and trusted only when
     `X-Meili-Envoy-Secret` matches the gateway's `ENVOY_TRUSTED_HEADER`), the
     `?index=` query parameter, an `Authorization: Bearer <key>` header, and
-    finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables.
+    finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables
+    (only for a request without a tenant: a tenant request never falls back to them).
     When none of these yields a host and API key the request fails with `400` —
     unless the pipeline is **pinned**: every `meili_indexer` step names a
     [Meilisearch connection](/concepts/connections), which then supplies the host
@@ -145,6 +146,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "422":
@@ -155,6 +158,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /ingest/batch:
     post:
@@ -183,7 +188,7 @@ paths:
                 - { "s3": "s3://my-bucket/b.mp4", "index": "videos" }
       responses:
         "202":
-          description: One job per item, in input order.
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
           content:
             application/json:
               schema:
@@ -244,6 +249,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -254,6 +261,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /indexes/{index_uid}/ingest:
     post:
@@ -297,6 +306,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "422":
@@ -307,6 +318,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /indexes/{index_uid}/ingest/batch:
     post:
@@ -331,7 +344,7 @@ paths:
               $ref: "#/components/schemas/BatchIngestRequest"
       responses:
         "202":
-          description: One job per item, in input order.
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
           content:
             application/json:
               schema:
@@ -385,6 +398,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -395,6 +410,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /jobs:
     get:
@@ -565,8 +582,8 @@ paths:
         is normalised (implicit sequential `depends_on`), validated (unknown
         plugin, cycle, bad `fan_out`, a step `config` that does not satisfy its
         plugin's `config_schema` from `GET /plugins`, a `meili_indexer`
-        `config.connection` that is not one of the tenant's or a global connection
-        → `422`) and upserted by `(uid, tenant_id)`;
+        `config.connection` that is not one of the tenant's own connections, or
+        for a global pipeline not a global connection → `422`) and upserted by `(uid, tenant_id)`;
         `version` is bumped on update. `uid`s starting with `builtin.` are
         rejected with `403`. Behind Envoy the pipeline is scoped to the calling
         project.
@@ -640,8 +657,8 @@ paths:
         duplicate step, bad `fan_out`), unknown plugins, every step's `config`
         against its plugin's `config_schema` (JSON Schema draft 2020-12, as served by
         `GET /plugins`; `format` is not asserted) and every `meili_indexer`
-        `config.connection` against the caller's connections (its own, else a global
-        one). A plugin no worker has registered yet has no schema, so its config is
+        `config.connection` against the caller's own connections (a tenant pipeline
+        may not name a global connection; global ones are templates). A plugin no worker has registered yet has no schema, so its config is
         not checked. All config and connection problems are reported in one message,
         `; `-separated.
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
@@ -1119,7 +1136,11 @@ paths:
       operationId: runSource
       summary: Run a source now
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+      description: >-
+        Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+        On a Lab engine the tenant's credits are checked first, as for ingest. Every
+        run of a Lab account, scheduled or manual, is checked again by the worker before
+        it fetches anything; a run refused there is recorded as failed with the reason.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
@@ -1139,6 +1160,8 @@ paths:
                     type: string
                     const: triggered
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -1149,6 +1172,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "501":
           $ref: "#/components/responses/NotEnabled"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /sources/{uid}/runs:
     get:
@@ -1439,6 +1464,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    InsufficientCredits:
+      description: "Hosted Lab engine only. The Lab account has no credits left (`code: insufficient_credits`); nothing was queued."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61 has no credits left; top up in the Lab console", "code": "insufficient_credits" }
+    LabUnavailable:
+      description: "Hosted Lab engine only. The account's credits could not be checked (`code: lab_unavailable`): the Lab has not yet confirmed this deployment's credentials, or it cannot answer and there is no answer for the account from the last 300 s. Nothing was queued or started; retry later."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the Lab has been unreachable for more than 300s; cannot check account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61's credits", "code": "lab_unavailable" }
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
@@ -1507,7 +1546,7 @@ components:
         code:
           type: string
           description: Stable snake_case error code.
-          examples: [missing_context, bad_request, forbidden, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, internal_error]
+          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, internal_error]
 
     JobStatus:
       type: string

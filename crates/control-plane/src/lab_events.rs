@@ -16,6 +16,26 @@ use uuid::Uuid;
 
 use crate::{AppState, CpError, JsonBody};
 
+/// Migration 0005: rewrites undelivered pre-v2 `usage.recorded` rows to the v2 shape.
+/// Also run when such rows are inserted or about to be sent, so a released migration
+/// file must never change.
+const CONVERT_PRE_V2: &str = include_str!("../../../migrations/0005_lab_events_v2.sql");
+
+/// Whether `events` may hold a pre-v2 `usage.recorded` event: one with a `data` object
+/// and no `data.operation`. A superset of what [`CONVERT_PRE_V2`] matches, so skipping
+/// the conversion when this is false never leaves a pre-v2 row of this batch
+/// unconverted, and v2 batches never pay for a scan of the outbox.
+pub fn needs_pre_v2_conversion<'a>(
+    events: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> bool {
+    events.into_iter().any(|e| {
+        e.get("type").and_then(|t| t.as_str()) == Some("usage.recorded")
+            && e.get("data")
+                .and_then(|d| d.as_object())
+                .is_some_and(|d| !d.contains_key("operation"))
+    })
+}
+
 /// A leased row, ready to send.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct PendingEvent {
@@ -48,8 +68,9 @@ impl LabEventRepo {
         Self { pool }
     }
 
-    /// Insert events, ignoring ids already present. Every event needs a UUID `id`;
-    /// otherwise nothing is inserted and the call fails.
+    /// Insert events, ignoring ids already present, and convert pre-v2 usage events to
+    /// the v2 shape. Every event needs a UUID `id`; otherwise nothing is inserted and
+    /// the call fails.
     pub async fn insert_many(&self, events: &[serde_json::Value]) -> Result<u64, CpError> {
         let mut ids = Vec::with_capacity(events.len());
         for e in events {
@@ -71,6 +92,13 @@ impl LabEventRepo {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        }
+        if inserted > 0 && needs_pre_v2_conversion(events) {
+            // Workers not upgraded yet still post pre-v2 `usage.recorded` events, which a
+            // v2 Lab accepts in the batch and then rejects: convert them like the
+            // upgrade did (the migration is idempotent and only touches pre-v2 rows).
+            // It scans the undelivered outbox, so v2 batches skip it.
+            sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(inserted)
@@ -97,6 +125,31 @@ impl LabEventRepo {
         .bind(lease.as_secs_f64())
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// Convert the outbox's pre-v2 rows ([`CONVERT_PRE_V2`]) and return the leased
+    /// rows `ids` again, leased anew for `lease`, in one transaction. The conversion
+    /// resets a converted row's `attempts` (0) and `next_attempt` (now): re-leasing
+    /// before commit means no other sender ever sees the claimed rows due. Rows of
+    /// `ids` delivered meanwhile are left out.
+    pub async fn convert_pre_v2_and_reload(
+        &self,
+        ids: &[Uuid],
+        lease: Duration,
+    ) -> Result<Vec<PendingEvent>, CpError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
+        let rows = sqlx::query_as(
+            "UPDATE lab_events SET next_attempt = now() + make_interval(secs => $2) \
+             WHERE id = ANY($1) AND delivered_at IS NULL \
+             RETURNING id, body, attempts",
+        )
+        .bind(ids)
+        .bind(lease.as_secs_f64())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     /// Mark rows delivered.
@@ -138,6 +191,19 @@ impl LabEventRepo {
         .rows_affected())
     }
 
+    /// Delete undelivered rows older than `older_than` and return their ids. Delivered
+    /// rows are never touched here (see `purge_delivered`).
+    pub async fn drop_stale(&self, older_than: Duration) -> Result<Vec<Uuid>, CpError> {
+        Ok(sqlx::query_scalar(
+            "DELETE FROM lab_events \
+             WHERE delivered_at IS NULL AND created_at < now() - make_interval(secs => $1) \
+             RETURNING id",
+        )
+        .bind(older_than.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Pending count and oldest pending age.
     pub async fn stats(&self) -> Result<LabEventStats, CpError> {
         let (pending, oldest): (i64, Option<f64>) = sqlx::query_as(
@@ -176,4 +242,44 @@ pub async fn ingest_lab_events(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "inserted": inserted })),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::needs_pre_v2_conversion;
+
+    #[test]
+    fn only_a_usage_event_without_an_operation_needs_the_conversion() {
+        let v2_usage =
+            json!({"type": "usage.recorded", "data": {"operation": "ingest", "units": {}}});
+        let lifecycle = json!({"type": "job.completed", "data": {"job_id": "j"}});
+        let pre_v2 = json!({"type": "usage.recorded", "data": {"cost_complete": true}});
+        assert!(!needs_pre_v2_conversion(&[]));
+        assert!(!needs_pre_v2_conversion(&[
+            v2_usage.clone(),
+            lifecycle.clone()
+        ]));
+        assert!(needs_pre_v2_conversion(&[
+            v2_usage,
+            pre_v2.clone(),
+            lifecycle
+        ]));
+        // Anything the SQL cannot convert does not trigger it either.
+        assert!(!needs_pre_v2_conversion(&[
+            json!({"type": "usage.recorded", "data": 1})
+        ]));
+        assert!(!needs_pre_v2_conversion(&[
+            json!({"type": "usage.recorded"})
+        ]));
+        assert!(!needs_pre_v2_conversion(&[
+            json!({"data": {"cost_complete": true}})
+        ]));
+        // A usage event without operation but also without cost_complete still counts:
+        // the guard is a superset of the SQL predicate.
+        assert!(needs_pre_v2_conversion(&[
+            json!({"type": "usage.recorded", "data": {}})
+        ]));
+    }
 }

@@ -1,8 +1,12 @@
 # kubectl apply -k k8s/
 #
+# The Secret `meili-ingest-secrets` is not part of this kustomization: create it
+# once before the first apply (see secrets.example.yaml, never apply that file as
+# is), so re-applying never resets it.
+#
 # Everything is deployed into the `meili-ingest` namespace from the single
-# image ghcr.io/meilisearch/meili-ingest. Override the tag with:
-#   kustomize edit set image ghcr.io/meilisearch/meili-ingest=ghcr.io/meilisearch/meili-ingest:v0.1.0
+# image ghcr.io/qdequele/glutony. Override the tag with:
+#   kustomize edit set image ghcr.io/qdequele/glutony=ghcr.io/qdequele/glutony:0.1.0
 #
 # temporal.yaml is a non-production reference (single-pod auto-setup). Remove
 # it and point TEMPORAL_URL at Temporal Cloud / your own cluster in production.
@@ -18,9 +22,36 @@ resources:
   - workers.yaml
   - temporal.yaml
 
+# Provider cost table, mounted into the workers at /etc/meili-ingest
+# (PROVIDER_COSTS_FILE in the ConfigMap). Edit k8s/provider-costs.toml.
+configMapGenerator:
+  - name: meili-ingest-provider-costs
+    files:
+      - provider-costs.toml
+    options:
+      disableNameSuffixHash: true
+
 images:
-  - name: ghcr.io/meilisearch/meili-ingest
+  - name: ghcr.io/qdequele/glutony
     newTag: latest
 
 commonLabels:
   app.kubernetes.io/part-of: meili-ingest
+
+# One-time, when upgrading from a release without CONTROL_PLANE_TOKEN (see
+# "Upgrading to Lab contract v2" in docs/deployment/kubernetes.mdx): uncomment
+# to run the control plane with the token not enforced while the gateway and
+# workers roll, then comment it out again and re-apply.
+# patches:
+#   - target:
+#       kind: Deployment
+#       name: meili-control-plane
+#     patch: |-
+#       - op: test
+#         path: /spec/template/spec/containers/0/env/3/name
+#         value: CONTROL_PLANE_TOKEN
+#       - op: replace
+#         path: /spec/template/spec/containers/0/env/3
+#         value:
+#           name: CONTROL_PLANE_TOKEN_DISABLED
+#           value: "true"

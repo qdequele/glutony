@@ -26,6 +26,16 @@ pub enum CpError {
     /// Pipeline references a plugin nobody knows about (422, `unknown_plugin`).
     #[error("{0}")]
     UnknownPlugin(String),
+    /// Missing or wrong `CONTROL_PLANE_TOKEN` on an internal route (401, `unauthorized`).
+    #[error("missing or invalid control plane token")]
+    Unauthorized,
+    /// A Lab account is out of credits or inactive (402, `insufficient_credits`).
+    #[error("{0}")]
+    InsufficientCredits(String),
+    /// The Lab cannot answer a credit check and no cached lookup is recent enough
+    /// (503, `lab_unavailable`): the caller must not start billable work.
+    #[error("{0}")]
+    LabUnavailable(String),
     /// Database failure (500, `db`).
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -48,7 +58,10 @@ impl CpError {
     pub fn status(&self) -> StatusCode {
         match self {
             CpError::BadJson(_) => StatusCode::BAD_REQUEST,
+            CpError::Unauthorized => StatusCode::UNAUTHORIZED,
             CpError::Builtin(_) => StatusCode::FORBIDDEN,
+            CpError::InsufficientCredits(_) => StatusCode::PAYMENT_REQUIRED,
+            CpError::LabUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             CpError::NotFound(_) | CpError::NoPipeline(_) => StatusCode::NOT_FOUND,
             CpError::Validation(_) | CpError::UnknownPlugin(_) => StatusCode::UNPROCESSABLE_ENTITY,
             CpError::Db(_) | CpError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -59,11 +72,14 @@ impl CpError {
     pub fn code(&self) -> &'static str {
         match self {
             CpError::BadJson(_) => "bad_json",
+            CpError::Unauthorized => "unauthorized",
             CpError::Builtin(_) => "builtin",
             CpError::NotFound(_) => "not_found",
             CpError::NoPipeline(_) => "no_pipeline",
             CpError::Validation(_) => "validation",
             CpError::UnknownPlugin(_) => "unknown_plugin",
+            CpError::InsufficientCredits(_) => "insufficient_credits",
+            CpError::LabUnavailable(_) => "lab_unavailable",
             CpError::Db(_) => "db",
             CpError::Internal(_) => "internal",
         }
@@ -108,6 +124,11 @@ mod tests {
                 "bad_json",
             ),
             (
+                CpError::Unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            ),
+            (
                 CpError::Builtin("x".into()),
                 StatusCode::FORBIDDEN,
                 "builtin",
@@ -133,6 +154,16 @@ mod tests {
                 "unknown_plugin",
             ),
             (
+                CpError::InsufficientCredits("x".into()),
+                StatusCode::PAYMENT_REQUIRED,
+                "insufficient_credits",
+            ),
+            (
+                CpError::LabUnavailable("x".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "lab_unavailable",
+            ),
+            (
                 CpError::Db(sqlx::Error::RowNotFound),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "db",
@@ -143,6 +174,9 @@ mod tests {
                 "internal",
             ),
         ];
+        let codes: std::collections::HashSet<&str> =
+            cases.iter().map(|(e, _, _)| e.code()).collect();
+        assert_eq!(codes.len(), cases.len(), "codes are unique");
         for (err, status, code) in cases {
             assert_eq!(err.status(), status, "{err:?}");
             assert_eq!(err.code(), code, "{err:?}");

@@ -6,9 +6,11 @@
 # PDF and a JSON document through the gateway, and checks that documents land in
 # Meilisearch. Everything is torn down at the end.
 #
-# Pass --lab to also run the Meilisearch Lab leg: a fake Lab event receiver, a second
-# gateway with management auth on (LAB_SERVICE_TOKEN), per-tenant isolation checks and
-# a signed usage event delivered to the fake Lab for one job.
+# Pass --lab to also run the Meilisearch Lab leg: a fake Lab (platform contract v2,
+# scripts/fake_lab.py) the control plane and a second gateway report to with instance
+# credentials, management auth on that gateway (LAB_SERVICE_TOKEN), per-tenant
+# isolation checks, and the signed usage and lifecycle events of one job delivered to
+# the fake Lab.
 #
 # Requirements: docker, temporal CLI, curl, jq, python3, cargo.
 set -euo pipefail
@@ -17,7 +19,9 @@ LAB=0
 [ "${1:-}" = "--lab" ] && LAB=1
 LAB_PORT=${LAB_PORT:-58191}
 GW_LAB_PORT=${GW_LAB_PORT:-58081}
-LAB_EVENTS_SECRET_VALUE=e2e-lab-events-secret
+# Dev-only Lab instance credentials, checked by the fake Lab.
+LAB_INSTANCE_ID_VALUE=7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d
+LAB_INSTANCE_SECRET_VALUE=e2e0000000000000000000000000000000000000000000000000000000000000
 LAB_TOKEN=e2e-lab-service-token
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,7 +36,12 @@ WORK="$(mktemp -d)"
 export DATABASE_URL="postgres://postgres:dev@localhost:${PG_PORT}/postgres"
 export TEMPORAL_URL="http://localhost:${TEMPORAL_PORT}"
 export TEMPORAL_NAMESPACE=default
+# Address for the `temporal` CLI: 127.0.0.1, not localhost. With localhost the CLI
+# (seen with 1.7.0 on macOS) times out against the dev server while 127.0.0.1 works.
+TEMPORAL_CLI_ADDRESS="127.0.0.1:${TEMPORAL_PORT}"
 export CONTROL_PLANE_URL="http://localhost:${CP_PORT}"
+# Shared by the control plane, gateway and workers this script starts (dev-only value).
+export CONTROL_PLANE_TOKEN="${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}"
 export MEILI_URL="http://localhost:${MEILI_PORT}"
 export MEILI_API_KEY=masterKey
 export BLOB_STORE_URL="file://${WORK}/blobs"
@@ -85,16 +94,21 @@ temporal server start-dev --headless --port "${TEMPORAL_PORT}" --db-filename "${
 PIDS+=($!)
 wait_for "${MEILI_URL}/health" meilisearch
 for _ in $(seq 1 60); do docker exec mi-e2e-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
-for _ in $(seq 1 60); do temporal operator cluster health --address "localhost:${TEMPORAL_PORT}" >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 60); do temporal operator cluster health --address "${TEMPORAL_CLI_ADDRESS}" >/dev/null 2>&1 && break; sleep 1; done
 echo "temporal ready"
 
 echo "--- services"
 CP_LAB_ENV=()
 WORKER_LAB_ENV=()
 if [ "$LAB" = 1 ]; then
-  python3 scripts/fake_lab.py "${LAB_PORT}" "${LAB_EVENTS_SECRET_VALUE}" "${WORK}/lab-events.ndjson" >"${WORK}/lab.log" 2>&1 &
+  python3 scripts/fake_lab.py "${LAB_PORT}" "${LAB_INSTANCE_ID_VALUE}" "${LAB_INSTANCE_SECRET_VALUE}" \
+    "${WORK}/lab-events.ndjson" >"${WORK}/lab.log" 2>&1 &
   PIDS+=($!)
-  CP_LAB_ENV=(LAB_URL="http://127.0.0.1:${LAB_PORT}" LAB_EVENTS_SECRET="${LAB_EVENTS_SECRET_VALUE}")
+  wait_for "http://127.0.0.1:${LAB_PORT}/events" fake-lab
+  # The control plane and the Lab gateway confirm these with the Lab at boot.
+  LAB_CREDS_ENV=(LAB_URL="http://127.0.0.1:${LAB_PORT}" LAB_INSTANCE_ID="${LAB_INSTANCE_ID_VALUE}"
+    LAB_INSTANCE_SECRET="${LAB_INSTANCE_SECRET_VALUE}")
+  CP_LAB_ENV=("${LAB_CREDS_ENV[@]}")
   WORKER_LAB_ENV=(LAB_EVENTS_ENABLED=true)
 fi
 env ${CP_LAB_ENV[@]+"${CP_LAB_ENV[@]}"} BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
@@ -104,8 +118,8 @@ BIND="0.0.0.0:${GW_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" ./target/debug/
 PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
 if [ "$LAB" = 1 ]; then
-  BIND="0.0.0.0:${GW_LAB_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" LAB_SERVICE_TOKEN="${LAB_TOKEN}" \
-    ./target/debug/meili-ingest-gateway >"${WORK}/gw-lab.log" 2>&1 &
+  env "${LAB_CREDS_ENV[@]}" BIND="0.0.0.0:${GW_LAB_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" \
+    LAB_SERVICE_TOKEN="${LAB_TOKEN}" ./target/debug/meili-ingest-gateway >"${WORK}/gw-lab.log" 2>&1 &
   PIDS+=($!)
   wait_for "http://localhost:${GW_LAB_PORT}/health" gateway-lab
 fi
@@ -531,10 +545,10 @@ echo "$SECOND" | jq -c .
 [ "$(curl -fsS "${GW}/sources/e2e-movies" | jq -r .last_status)" = "unchanged" ] || { echo "last_status not updated" >&2; exit 1; }
 
 echo "--- no secret reached Temporal history for source runs"
-for WF in $(temporal workflow list --address "localhost:${TEMPORAL_PORT}" \
+for WF in $(temporal workflow list --address "${TEMPORAL_CLI_ADDRESS}" \
     --query 'WorkflowType="SourceRunWorkflow"' -o json | jq -r '.[].execution.workflowId') \
     "ingest-${SJOB}" "ingest-${JOB_P}"; do
-  HIST=$(temporal workflow show --address "localhost:${TEMPORAL_PORT}" -w "$WF" -o json)
+  HIST=$(temporal workflow show --address "${TEMPORAL_CLI_ADDRESS}" -w "$WF" -o json)
   for secret in "${FETCH_TOKEN}" masterKey; do
     echo "$HIST" | grep -q "$secret" && { echo "secret ${secret} is in the history of ${WF}" >&2; exit 1; }
   done
@@ -711,13 +725,17 @@ if [ "$LAB" = 1 ]; then
   code=$(curl -sS -o /dev/null -w '%{http_code}' "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TB}" "${GWL}/jobs/${JOBL}")
   [ "$code" = 404 ] || { echo "tenant B saw tenant A's job (${code})" >&2; exit 1; }
 
+  # One usage.recorded (v2: operation ingest) and one job.completed per job.
   for _ in $(seq 1 30); do
-    N=$(curl -fsS "http://127.0.0.1:${LAB_PORT}/events" \
-      | jq "[.[] | select(.data.job_id == \"${JOBL}\" and .account_id == \"${TA}\" and .product == \"glutony\")] | length")
-    [ "$N" = 1 ] && break
+    EV=$(curl -fsS "http://127.0.0.1:${LAB_PORT}/events" \
+      | jq -c "[.[] | select(.data.job_id == \"${JOBL}\" and .account_id == \"${TA}\" and .product == \"glutony\")]")
+    N=$(echo "$EV" | jq '[.[] | select(.type == "usage.recorded" and .data.operation == "ingest")] | length')
+    NL=$(echo "$EV" | jq '[.[] | select(.type == "job.completed")] | length')
+    [ "$N" = 1 ] && [ "$NL" = 1 ] && break
     sleep 1
   done
-  [ "$N" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBL} (${N})" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
+  [ "$N" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBL} (${N})" >&2; tail -40 "${WORK}/cp.log"; tail -20 "${WORK}/lab.log"; exit 1; }
+  [ "$NL" = 1 ] || { echo "the Lab did not receive exactly one job.completed event for ${JOBL} (${NL})" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
   curl -fsS "http://localhost:${CP_PORT}/metrics" | grep -q '^glutony_lab_events_delivered_total [1-9]' \
     || { echo "delivered_total did not move" >&2; exit 1; }
   echo "Lab leg passed"

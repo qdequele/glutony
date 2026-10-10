@@ -6,6 +6,11 @@
 //! loads the source (credential still sealed), opens the credential, fetches, stages the
 //! bytes into the blob store and returns only references — never the credential, and
 //! never the bytes.
+//!
+//! Before it fetches anything, `resolve_source` runs the Lab credit pre-check (spec v2
+//! §8.1) for a tenant that is a Lab account, through the control plane, which holds the
+//! Lab credentials: a run for an account without credits fails before any item is
+//! fetched, staged or billed.
 
 use std::sync::Arc;
 
@@ -33,6 +38,8 @@ pub struct SourceActivities {
     pub http: reqwest::Client,
     /// Control plane base URL, trailing slash trimmed.
     pub control_plane_url: Option<String>,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Where fetched items are staged.
     pub blob: BlobStore,
     /// Opens sealed fetch credentials. `None` when `SOURCE_SECRET_KEY` is unset.
@@ -50,11 +57,18 @@ impl SourceActivities {
         Self {
             http: reqwest::Client::new(),
             control_plane_url: control_plane_url.map(|u| u.trim_end_matches('/').to_string()),
+            control_plane_token: None,
             blob,
             key: None,
             fetch_policy: HostPolicy::default(),
             default_index: "documents".into(),
         }
+    }
+
+    /// Present `CONTROL_PLANE_TOKEN` on every control plane request.
+    pub fn with_control_plane_token(mut self, token: Option<String>) -> Self {
+        self.control_plane_token = token;
+        self
     }
 
     /// Set the key that opens fetch credentials and the fetch host policy.
@@ -206,12 +220,11 @@ impl SourceActivities {
         url: Url,
         what: &str,
     ) -> Result<Option<T>, PluginError> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+        let resp =
+            crate::connection::authed(self.http.get(url), self.control_plane_token.as_deref())
+                .send()
+                .await
+                .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -244,6 +257,8 @@ impl SourceActivities {
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<bool, PluginError> {
+        // `send_json` delegates here, so this is the one place the token is attached.
+        let req = crate::connection::authed(req, self.control_plane_token.as_deref());
         let resp = req
             .send()
             .await
@@ -259,6 +274,51 @@ impl SourceActivities {
                 resp.status()
             )))
         }
+    }
+
+    /// Ask the control plane whether the Lab `account` may start billable work: workers hold
+    /// no Lab credentials, so it asks the Lab for them (`GET
+    /// /internal/lab/credits/{account}`, same cache rules as the gateway).
+    ///
+    /// A `402` fails the run now, non-retryably: it is recorded as failed and the next
+    /// tick asks again. Anything else that is not a `2xx` (`503 lab_unavailable`, a
+    /// transport error, a `404` from a control plane that predates the route) is
+    /// retryable and, once the retries are spent, fails the run too: the check fails
+    /// closed.
+    async fn check_credits(&self, account: &str) -> Result<(), PluginError> {
+        let url = self.url(&["internal", "lab", "credits", account])?;
+        let resp =
+            crate::connection::authed(self.http.get(url), self.control_plane_token.as_deref())
+                .send()
+                .await
+                .map_err(|e| {
+                    PluginError::Retryable(format!(
+                        "credit check for account {account}: control plane unreachable: {e}"
+                    ))
+                })?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+            // Keep the control plane's message ("… top up in the Lab console").
+            let detail = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|b| b.get("error")?.as_str().map(str::to_owned))
+                .filter(|m| !m.trim().is_empty());
+            // The control plane's message already names the account.
+            let msg = match detail {
+                Some(d) => format!("source run refused: {d}"),
+                None => format!("account {account} has no Lab credits left; source run refused"),
+            };
+            return Err(PluginError::NonRetryable(msg));
+        }
+        Err(PluginError::Retryable(format!(
+            "credit check for account {account}: control plane returned {status}; \
+             the run does not start until the credits can be checked"
+        )))
     }
 
     /// Load, fetch and stage one run. See the module docs for why this is one activity.
@@ -279,6 +339,15 @@ impl SourceActivities {
                 ))
             })?;
         let d = row.definition;
+
+        // Before anything billable is fetched or staged (spec v2 §8.1). Only a Lab
+        // account is billed, so only a Lab account is checked: a worker upgraded ahead
+        // of its control plane cannot fail the runs of other tenants.
+        if let Some(tenant) = d.tenant_id.as_deref()
+            && meili_ingest_lab::is_lab_account(tenant)
+        {
+            self.check_credits(tenant).await?;
+        }
 
         // The pipeline as it is now, so an edit takes effect on the next tick.
         let mut pipeline_url = self.url(&["pipelines", &d.pipeline_uid])?;
@@ -491,10 +560,11 @@ mod tests {
     use super::*;
     use meili_ingest_plugin_sdk::{ContentRef, PipelineTrigger, PluginInput, StepDefinition};
     use meili_ingest_source::seal_json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TOKEN: &str = "sk-fetch-NEVER-IN-HISTORY";
+    const LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
 
     fn key() -> Arc<SecretKey> {
         Arc::new(SecretKey::from_bytes([8; 32]))
@@ -552,9 +622,29 @@ mod tests {
         }
     }
 
-    /// A control plane serving `row` and `pipeline`, and accepting job rows.
+    /// A control plane serving `row` and `pipeline`, and accepting job rows. Its credit
+    /// check answers "not checked", as a control plane without Lab credentials does.
     async fn control_plane(row: serde_json::Value, pipeline: PipelineDefinition) -> MockServer {
+        control_plane_with_credits(
+            row,
+            pipeline,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"checked": false})),
+        )
+        .await
+    }
+
+    /// [`control_plane`] whose `GET /internal/lab/credits/{tenant}` answers `credits`.
+    async fn control_plane_with_credits(
+        row: serde_json::Value,
+        pipeline: PipelineDefinition,
+        credits: ResponseTemplate,
+    ) -> MockServer {
         let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/internal/lab/credits/[^/]+$"))
+            .respond_with(credits)
+            .mount(&cp)
+            .await;
         Mock::given(method("GET"))
             .and(path(
                 "/internal/sources-by-id/11111111-1111-1111-1111-111111111111",
@@ -867,5 +957,204 @@ mod tests {
             .record(&run)
             .await
             .expect("nothing left to record is not an error");
+    }
+
+    // --- Credit pre-check (spec v2 §8.1): before anything is fetched or staged ---
+
+    /// Files that must never be fetched: `expect(0)` is verified when they drop.
+    async fn files_never_fetched() -> MockServer {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "application/json"))
+            .expect(0)
+            .mount(&files)
+            .await;
+        files
+    }
+
+    async fn requests_to(cp: &MockServer, p: &str) -> Vec<wiremock::Request> {
+        cp.received_requests()
+            .await
+            .expect("recorded")
+            .into_iter()
+            .filter(|r| r.url.path() == p)
+            .collect()
+    }
+
+    fn lab_row(files: &MockServer) -> serde_json::Value {
+        let mut row = source_row(&format!("{}/feed.json", files.uri()), None);
+        row["tenant_id"] = serde_json::json!(LAB_ACCOUNT);
+        row
+    }
+
+    #[tokio::test]
+    async fn a_run_for_an_account_without_credits_fails_before_fetching() {
+        let files = files_never_fetched().await;
+        let cp = control_plane_with_credits(
+            lab_row(&files),
+            pipeline(true),
+            ResponseTemplate::new(402).set_body_json(serde_json::json!({
+                "error": format!("account {LAB_ACCOUNT} has no credits left; top up in the Lab console"),
+                "code": "insufficient_credits"
+            })),
+        )
+        .await;
+        let err = activities(&cp, &files)
+            .with_control_plane_token(Some("cp-token".into()))
+            .resolve(&input())
+            .await
+            .expect_err("no credits");
+        // The control plane's message names the account; it is not repeated.
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m)
+            if m == &format!(
+                "source run refused: account {LAB_ACCOUNT} has no credits left; \
+                 top up in the Lab console"
+            )),
+            "the run fails now and the next tick tries again: {err:?}"
+        );
+        let checks = requests_to(&cp, &format!("/internal/lab/credits/{LAB_ACCOUNT}")).await;
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer cp-token"),
+            "the check presents CONTROL_PLANE_TOKEN"
+        );
+        assert!(
+            requests_to(&cp, "/internal/jobs").await.is_empty(),
+            "no job row, nothing staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lab_outage_is_retryable_and_fetches_nothing() {
+        let files = files_never_fetched().await;
+        let cp = control_plane_with_credits(
+            lab_row(&files),
+            pipeline(true),
+            ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "the Lab has been unreachable", "code": "lab_unavailable"
+            })),
+        )
+        .await;
+        let err = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect_err("lab down");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_without_the_credit_route_fails_closed() {
+        // An older control plane answers 404: the run does not go ahead unchecked.
+        let files = files_never_fetched().await;
+        let cp =
+            control_plane_with_credits(lab_row(&files), pipeline(true), ResponseTemplate::new(404))
+                .await;
+        let err = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect_err("no route");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_run_the_control_plane_does_not_check_proceeds() {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{\"id\":1}", "application/json"))
+            .expect(1)
+            .mount(&files)
+            .await;
+        let cp = control_plane(lab_row(&files), pipeline(true)).await;
+        let out = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect("resolves");
+        assert!(matches!(out, ResolveSourceOutput::Ready { .. }), "{out:?}");
+        assert_eq!(
+            requests_to(&cp, &format!("/internal/lab/credits/{LAB_ACCOUNT}"))
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_that_is_not_a_lab_account_is_not_checked() {
+        // A Cloud project id (or any non-canonical id) is never billed: the worker does
+        // not ask, so it cannot fail such runs against a control plane without the route.
+        for tenant in ["tenant-1", "0192F3C1-7C2E-7B1A-9F00-3C9D2E4A5B61"] {
+            let files = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/feed.json"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw("{\"id\":1}", "application/json"),
+                )
+                .mount(&files)
+                .await;
+            let mut row = source_row(&format!("{}/feed.json", files.uri()), None);
+            row["tenant_id"] = serde_json::json!(tenant);
+            let cp =
+                control_plane_with_credits(row, pipeline(true), ResponseTemplate::new(402)).await;
+            activities(&cp, &files)
+                .resolve(&input())
+                .await
+                .unwrap_or_else(|e| panic!("{tenant}: not a Lab account, not checked: {e:?}"));
+            let checks = cp
+                .received_requests()
+                .await
+                .expect("recorded")
+                .iter()
+                .filter(|r| r.url.path().starts_with("/internal/lab/credits/"))
+                .count();
+            assert_eq!(checks, 0, "{tenant}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_402_without_a_message_names_the_account() {
+        let files = files_never_fetched().await;
+        let cp =
+            control_plane_with_credits(lab_row(&files), pipeline(true), ResponseTemplate::new(402))
+                .await;
+        let err = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect_err("no credits");
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m)
+                if m == &format!("account {LAB_ACCOUNT} has no Lab credits left; source run refused")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_without_a_tenant_is_not_checked() {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{\"id\":1}", "application/json"))
+            .mount(&files)
+            .await;
+        let mut row = source_row(&format!("{}/feed.json", files.uri()), None);
+        row.as_object_mut().expect("object").remove("tenant_id");
+        let cp = control_plane_with_credits(row, pipeline(true), ResponseTemplate::new(402)).await;
+        activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect("a global source has no account to check");
+        let checks = cp
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .filter(|r| r.url.path().starts_with("/internal/lab/credits/"))
+            .count();
+        assert_eq!(checks, 0);
     }
 }

@@ -27,6 +27,7 @@ meili-ingest-plugin-sdk.workspace = true
 meili-ingest-router.workspace = true
 meili-ingest-blob.workspace = true
 meili-ingest-source.workspace = true
+meili-ingest-lab.workspace = true
 
 # http
 axum.workspace = true

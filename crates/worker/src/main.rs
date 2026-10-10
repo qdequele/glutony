@@ -31,9 +31,19 @@ async fn main() -> anyhow::Result<()> {
     // The provider cost table loads lazily on the first paid call; load it now so a bad
     // PROVIDER_COSTS_FILE stops the worker before it takes traffic instead of surfacing
     // mid-run as unpriced events.
-    meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
+    let costs = meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
         .map_err(anyhow::Error::msg)
         .context("invalid PROVIDER_COSTS_FILE")?;
+    if meili_ingest_worker::config::lab_events_use_placeholder_prices(
+        config.lab_events_enabled,
+        &costs,
+    ) {
+        tracing::error!(
+            "LAB_EVENTS_ENABLED is on but the provider cost table is the bundled one: Lab \
+             events are priced with placeholder list prices, not what this deployment pays; \
+             set PROVIDER_COSTS_FILE to your own prices"
+        );
+    }
 
     // Plugins
     let mut registry = PluginRegistry::builtin();
@@ -41,6 +51,17 @@ async fn main() -> anyhow::Result<()> {
         registry.load_external(spec).await;
     }
     tracing::info!(plugins = ?registry.names(), unavailable = ?registry.unavailable(), "plugins registered");
+    // A provider plugin with no price entry, or only zero prices, bills every call at
+    // 0: say so now, once, rather than only when its first call is warned about.
+    let names = registry.names();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let unpriced = costs.unpriced_plugins(&names);
+    if !unpriced.is_empty() {
+        tracing::error!(
+            plugins = ?unpriced,
+            "provider plugins with no entry, or only zero prices, in the provider cost table: their calls are billed at 0 provider cost (flagged unpriced when there is no entry); add their prices to PROVIDER_COSTS_FILE"
+        );
+    }
     let registry = Arc::new(registry);
 
     // URL fetches on a tenant's behalf — scheduled sources AND `{"url": …}` refs in
@@ -61,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Publish manifests to the control plane (best effort).
     if let Some(cp) = &config.control_plane_url {
-        publish_manifests(cp, &registry).await;
+        publish_manifests(cp, config.control_plane_token.as_deref(), &registry).await;
     }
 
     // Temporal
@@ -100,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
 
     let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
+        .with_control_plane_token(config.control_plane_token.clone())
         .with_security(connection_key.clone(), fetch_policy)
         .with_default_index(
             std::env::var("DEFAULT_INDEX")
@@ -119,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .with_usage(usage)
         .with_lab_events(config.lab_events_enabled)
         .with_control_plane(config.control_plane_url.clone())
+        .with_control_plane_token(config.control_plane_token.clone())
         .with_connections(meili_ingest_worker::connection::ConnectionSettings {
             key: connection_key,
             policy: host_policy,
@@ -190,14 +213,17 @@ async fn wait_for_signal() {
     }
 }
 
-async fn publish_manifests(control_plane_url: &str, registry: &PluginRegistry) {
+async fn publish_manifests(
+    control_plane_url: &str,
+    token: Option<&str>,
+    registry: &PluginRegistry,
+) {
     let url = format!(
         "{}/internal/plugins",
         control_plane_url.trim_end_matches('/')
     );
     let manifests = registry.manifests();
-    match reqwest::Client::new()
-        .post(&url)
+    match meili_ingest_worker::connection::authed(reqwest::Client::new().post(&url), token)
         .json(&manifests)
         .send()
         .await

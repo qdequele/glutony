@@ -3303,10 +3303,9 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "hex",
- "hmac 0.12.1",
  "http-body-util",
  "jsonschema",
+ "meili-ingest-lab",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
  "meili-ingest-source",
@@ -3314,8 +3313,8 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sqlx",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -3339,6 +3338,7 @@ dependencies = [
  "chrono",
  "http-body-util",
  "meili-ingest-blob",
+ "meili-ingest-lab",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
  "meili-ingest-source",
@@ -3360,6 +3360,24 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "meili-ingest-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "hmac 0.12.1",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
  "wiremock",
 ]
 
@@ -3736,6 +3754,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "meili-ingest-blob",
+ "meili-ingest-lab",
  "meili-ingest-plugin-audio-transcriber",
  "meili-ingest-plugin-avro",
  "meili-ingest-plugin-chunker",

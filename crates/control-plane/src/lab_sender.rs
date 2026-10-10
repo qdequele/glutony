@@ -2,15 +2,15 @@
 //!
 //! Every 2 s, or right after an insert, lease up to 500 due rows, send them in one
 //! signed batch, mark the ids the Lab lists in `accepted` as delivered and back the
-//! rest off. Rows are never dropped. A Lab `401` is logged and retried: the Lab can
-//! never stop glutony from starting or serving.
+//! rest off. Rows are retried for 24 h; after that they are dropped with an error log
+//! (spec v2 §3.4). A Lab `401` is logged and retried: the Lab can never stop glutony
+//! from serving.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use meili_ingest_lab::LabCredentials;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -28,74 +28,56 @@ pub const LEASE: Duration = Duration::from_secs(30);
 pub const MAX_ACK_BYTES: usize = 1024 * 1024;
 /// Delivered rows are kept this long.
 pub const RETENTION: Duration = Duration::from_secs(7 * 86_400);
+/// Undelivered rows older than this were never acknowledged and are dropped (spec §3.4).
+pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3_600);
 
-/// `LAB_URL` + `LAB_EVENTS_SECRET`.
-#[derive(Clone)]
+/// `LAB_URL` + `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`: where the sender delivers and
+/// how it signs (spec v2 §3.3). The control plane's credit check uses the same
+/// credentials.
+#[derive(Clone, Debug)]
 pub struct LabConfig {
-    /// Lab base URL, without trailing slash.
-    pub url: String,
-    secret: String,
-}
-
-impl std::fmt::Debug for LabConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LabConfig")
-            .field("url", &self.url)
-            .field("secret", &"<redacted>")
-            .finish()
-    }
+    creds: LabCredentials,
 }
 
 impl LabConfig {
-    /// Both or neither; `https` unless the host is loopback or private.
+    /// All three instance values, or none (`None`: no Lab). `legacy_secret` is the
+    /// pre-v2 `LAB_EVENTS_SECRET`: when it is set (non-blank) boot is refused, because
+    /// glutony has no working legacy Lab route (a v2 Lab checks legacy batches as
+    /// Scrapix's and never accepts glutony's).
     pub fn from_values(
         url: Option<String>,
-        secret: Option<String>,
+        instance_id: Option<String>,
+        instance_secret: Option<String>,
+        legacy_secret: Option<String>,
     ) -> anyhow::Result<Option<Self>> {
-        let (url, secret) = match (url, secret) {
-            (None, None) => return Ok(None),
-            (Some(u), Some(s)) => (u, s),
-            (Some(_), None) => anyhow::bail!("LAB_URL is set but LAB_EVENTS_SECRET is not"),
-            (None, Some(_)) => anyhow::bail!("LAB_EVENTS_SECRET is set but LAB_URL is not"),
-        };
-        let parsed =
-            url::Url::parse(&url).map_err(|e| anyhow::anyhow!("LAB_URL is not a URL: {e}"))?;
-        let private = match parsed.host() {
-            Some(url::Host::Domain(d)) => d == "localhost",
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unique_local(),
-            None => false,
-        };
-        match parsed.scheme() {
-            "https" => {}
-            "http" if private => {}
-            "http" => anyhow::bail!("LAB_URL must be https unless its host is loopback or private"),
-            other => anyhow::bail!("LAB_URL has unsupported scheme {other:?}"),
+        if legacy_secret.is_some_and(|s| !s.trim().is_empty()) {
+            anyhow::bail!(
+                "LAB_EVENTS_SECRET is set, but glutony has no working legacy Lab route: the Lab \
+                 only accepts glutony events signed with instance credentials. Remove \
+                 LAB_EVENTS_SECRET and set LAB_INSTANCE_ID and LAB_INSTANCE_SECRET (mint them \
+                 with `bin/rails lab:hosted_engine:create PRODUCT=glutony ...`)"
+            );
         }
-        Ok(Some(Self {
-            url: url.trim_end_matches('/').to_string(),
-            secret,
-        }))
+        Ok(
+            LabCredentials::from_values(url, instance_id, instance_secret)?
+                .map(|creds| Self { creds }),
+        )
     }
 
-    /// Read `LAB_URL` and `LAB_EVENTS_SECRET`.
-    pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let get = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
-        Self::from_values(get("LAB_URL"), get("LAB_EVENTS_SECRET"))
+    /// Lab base URL, without trailing slash.
+    pub fn url(&self) -> &str {
+        self.creds.url()
     }
 
     /// `{url}/internal/events`.
     pub fn events_url(&self) -> String {
-        format!("{}/internal/events", self.url)
+        self.creds.endpoint("/internal/events")
     }
-}
 
-/// `sha256=<hex HMAC-SHA256(secret, body)>`.
-pub fn sign(secret: &[u8], body: &[u8]) -> String {
-    // HMAC accepts keys of any length; new_from_slice cannot fail for Hmac<Sha256>.
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC takes any key length");
-    mac.update(body);
-    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    /// The instance credentials.
+    pub fn credentials(&self) -> &LabCredentials {
+        &self.creds
+    }
 }
 
 /// Read a response body, or `None` if it is larger than `cap` bytes or cannot be read.
@@ -181,6 +163,29 @@ impl LabSender {
         if batch.is_empty() {
             return Delivery::Idle;
         }
+        // Pre-v2 rows (stored by a control plane not upgraded yet, during the rollout)
+        // are accepted by a v2 Lab in the batch, then rejected, and their ids are
+        // consumed: convert them before they leave.
+        let batch = if crate::lab_events::needs_pre_v2_conversion(batch.iter().map(|e| &e.body)) {
+            let ids: Vec<Uuid> = batch.iter().map(|e| e.id).collect();
+            match self.repo.convert_pre_v2_and_reload(&ids, LEASE).await {
+                Ok(b) => b,
+                Err(e) => {
+                    // Not sent: a pre-v2 row would be lost. The lease expires and the
+                    // rows come back.
+                    tracing::error!(error = %e, "cannot convert pre-v2 lab events");
+                    return Delivery::Failed {
+                        reason: "db",
+                        pending: ids.len(),
+                    };
+                }
+            }
+        } else {
+            batch
+        };
+        if batch.is_empty() {
+            return Delivery::Idle;
+        }
         let ids: Vec<Uuid> = batch.iter().map(|e| e.id).collect();
         let bodies: Vec<&serde_json::Value> = batch.iter().map(|e| &e.body).collect();
         let body = match serde_json::to_vec(&serde_json::json!({ "events": bodies })) {
@@ -190,17 +195,14 @@ impl LabSender {
                 return self.fail(&ids, "malformed").await;
             }
         };
-        let resp = self
-            .http
-            .post(self.config.events_url())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(
-                "x-lab-signature",
-                sign(self.config.secret.as_bytes(), &body),
-            )
-            .body(body)
-            .send()
-            .await;
+        let req = self.config.credentials().sign_batch(
+            self.http
+                .post(self.config.events_url())
+                .header(reqwest::header::CONTENT_TYPE, "application/json"),
+            meili_ingest_lab::unix_now(),
+            &body,
+        );
+        let resp = req.body(body).send().await;
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
@@ -211,7 +213,9 @@ impl LabSender {
         };
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            tracing::error!("the Lab rejected LAB_EVENTS_SECRET (401); lab events stay pending");
+            tracing::error!(
+                "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); lab events stay pending until the credentials are fixed"
+            );
             return self.fail(&ids, "auth").await;
         }
         if status != reqwest::StatusCode::OK {
@@ -265,6 +269,29 @@ impl LabSender {
         }
     }
 
+    /// Hourly housekeeping: purge delivered rows past retention, and drop undelivered
+    /// rows the Lab never acknowledged within [`STALE_AFTER`] (spec §3.4: a skipped
+    /// event is never acknowledged, so after 24 h it is permanently rejected).
+    pub async fn maintain(&self) {
+        match self.repo.purge_delivered(RETENTION).await {
+            Ok(n) if n > 0 => tracing::info!(purged = n, "old delivered lab events purged"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot purge delivered lab events"),
+        }
+        match self.repo.drop_stale(STALE_AFTER).await {
+            Ok(ids) if !ids.is_empty() => {
+                self.metrics.dropped_total.inc_by(ids.len() as u64);
+                tracing::error!(
+                    count = ids.len(),
+                    ids = ?ids,
+                    "lab events never acknowledged for 24 h were dropped; the Lab skipped them (check its logs for the reason)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot drop stale lab events"),
+        }
+    }
+
     /// Loop until `cancel`: deliver while batches come back full, then wait for the
     /// tick or an insert; refresh the gauges; purge hourly.
     pub async fn run(self, cancel: CancellationToken) {
@@ -281,11 +308,7 @@ impl LabSender {
                     .set(stats.oldest_pending_seconds);
             }
             if last_purge.elapsed() >= Duration::from_secs(3_600) {
-                match self.repo.purge_delivered(RETENTION).await {
-                    Ok(n) if n > 0 => tracing::info!(purged = n, "old delivered lab events purged"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "cannot purge delivered lab events"),
-                }
+                self.maintain().await;
                 last_purge = Instant::now();
             }
             tokio::select! {
@@ -303,15 +326,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_or_neither() {
-        assert!(LabConfig::from_values(None, None).unwrap().is_none());
-        assert!(LabConfig::from_values(Some("https://lab.example".into()), None).is_err());
-        assert!(LabConfig::from_values(None, Some("s".into())).is_err());
-        let c = LabConfig::from_values(Some("https://lab.example/".into()), Some("s".into()))
+    fn all_three_instance_values_or_nothing() {
+        let fv = |u: Option<&str>, i: Option<&str>, s: Option<&str>| {
+            LabConfig::from_values(
+                u.map(String::from),
+                i.map(String::from),
+                s.map(String::from),
+                None,
+            )
+        };
+        assert!(fv(None, None, None).unwrap().is_none());
+        let c = fv(Some("https://lab.example/"), Some("id"), Some("s3cret"))
             .unwrap()
             .unwrap();
+        assert_eq!(c.url(), "https://lab.example");
         assert_eq!(c.events_url(), "https://lab.example/internal/events");
-        assert!(!format!("{c:?}").contains("\"s\""));
+        assert_eq!(c.credentials().instance_id(), "id");
+        assert!(!format!("{c:?}").contains("s3cret"));
+        for bad in [
+            fv(Some("https://lab.example"), None, None),
+            fv(Some("https://lab.example"), Some("id"), None),
+            fv(Some("https://lab.example"), None, Some("s")),
+            fv(None, Some("id"), Some("s")),
+            fv(None, Some("id"), None),
+            fv(None, None, Some("s")),
+        ] {
+            assert!(bad.is_err());
+        }
+    }
+
+    #[test]
+    fn a_legacy_events_secret_refuses_to_boot() {
+        // A v2 Lab checks X-Scrapix-Signature on its legacy path and attributes those
+        // events to Scrapix: glutony has no working legacy route, so the secret is an
+        // error whatever else is set.
+        let url = Some("https://lab.example");
+        for (u, i, s) in [
+            (None, None, None),
+            (url, None, None),
+            (url, Some("id"), Some("s")),
+        ] {
+            let err = LabConfig::from_values(
+                u.map(String::from),
+                i.map(String::from),
+                s.map(String::from),
+                Some("leftover-v1-secret".into()),
+            )
+            .unwrap_err()
+            .to_string();
+            for needle in [
+                "LAB_EVENTS_SECRET",
+                "no working legacy Lab route",
+                "LAB_INSTANCE_ID",
+                "LAB_INSTANCE_SECRET",
+                "bin/rails lab:hosted_engine:create PRODUCT=glutony",
+            ] {
+                assert!(err.contains(needle), "{needle:?} missing from {err}");
+            }
+            assert!(
+                !err.contains("leftover-v1-secret"),
+                "the secret is never echoed: {err}"
+            );
+        }
+        // Blank counts as unset, as in the environment (crate::boot).
+        assert!(
+            LabConfig::from_values(
+                url.map(String::from),
+                Some("id".into()),
+                Some("s".into()),
+                Some("  ".into()),
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
@@ -322,11 +409,14 @@ mod tests {
             "http://10.0.0.5",
             "http://192.168.1.2:3000",
             "http://172.20.0.3",
+            // The Lab's dev stack hands engines this one.
+            "http://172.29.81.10:8081",
             "http://[::1]:8091",
             "https://lab.meilisearch.com",
         ] {
             assert!(
-                LabConfig::from_values(Some(ok.into()), Some("s".into())).is_ok(),
+                LabConfig::from_values(Some(ok.into()), Some("id".into()), Some("s".into()), None)
+                    .is_ok(),
                 "{ok}"
             );
         }
@@ -337,27 +427,10 @@ mod tests {
             "not a url",
         ] {
             assert!(
-                LabConfig::from_values(Some(bad.into()), Some("s".into())).is_err(),
+                LabConfig::from_values(Some(bad.into()), Some("id".into()), Some("s".into()), None)
+                    .is_err(),
                 "{bad}"
             );
         }
-    }
-
-    #[test]
-    fn signature_matches_a_known_vector() {
-        // echo -n '{"events":[]}' | openssl dgst -sha256 -hmac secret
-        assert_eq!(
-            sign(b"secret", br#"{"events":[]}"#),
-            format!(
-                "sha256={}",
-                hex::encode({
-                    let mut m = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-                    m.update(br#"{"events":[]}"#);
-                    m.finalize().into_bytes()
-                })
-            )
-        );
-        assert!(sign(b"k", b"body").starts_with("sha256="));
-        assert_eq!(sign(b"k", b"body").len(), "sha256=".len() + 64);
     }
 }

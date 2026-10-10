@@ -9,16 +9,20 @@
 //! * denormalized job cache (`/internal/jobs`);
 //! * Meilisearch connections (`/internal/connections`), keys held sealed;
 //! * scheduled sources (`/internal/sources`, `/internal/sources-by-id`,
-//!   `/internal/source-runs`).
+//!   `/internal/source-runs`);
+//! * the Lab credit pre-check workers run before a source run
+//!   (`/internal/lab/credits/{account_id}`).
 //!
 //! The binary lives in `main.rs`; everything else is exposed as a library so the
 //! router can be exercised in tests without opening a socket.
 
+pub mod boot;
 pub mod builtin_pipelines;
 pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
+pub mod lab_credits;
 pub mod lab_events;
 pub mod lab_sender;
 pub mod metrics;
@@ -29,11 +33,14 @@ pub mod sources;
 
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 pub use error::CpError;
@@ -50,6 +57,11 @@ pub struct AppState {
     pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
     /// Prometheus metrics served at `GET /metrics`.
     pub metrics: metrics::LabMetrics,
+    /// Bearer token internal callers (gateway, workers) present on `/internal/*`; `None` leaves them open (dev only).
+    pub internal_token: Option<String>,
+    /// Lab account lookups behind `GET /internal/lab/credits/{account_id}`; `None`
+    /// when the control plane has no Lab instance credentials (nothing is checked).
+    pub lab_credits: Option<std::sync::Arc<meili_ingest_lab::AccountCreditCache>>,
 }
 
 impl AppState {
@@ -60,7 +72,26 @@ impl AppState {
             cache: PipelineCache::default(),
             lab_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             metrics: metrics::LabMetrics::default(),
+            internal_token: None,
+            lab_credits: None,
         }
+    }
+
+    /// Answer the workers' credit checks from this cache (spec v2 §8.1).
+    pub fn with_lab_credits(
+        mut self,
+        cache: std::sync::Arc<meili_ingest_lab::AccountCreditCache>,
+    ) -> Self {
+        self.lab_credits = Some(cache);
+        self
+    }
+
+    /// Require `Authorization: Bearer <token>` on every `/internal/*` route.
+    pub fn with_internal_token(mut self, token: Option<String>) -> Self {
+        self.internal_token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        self
     }
 
     /// Pipeline repository bound to this state's pool.
@@ -71,6 +102,62 @@ impl AppState {
     /// Meilisearch connection repository bound to this state's pool.
     pub fn connections(&self) -> connections::ConnectionRepo {
         connections::ConnectionRepo::new(self.pool.clone())
+    }
+}
+
+/// Decide what the control plane runs with: the token, or none only when the operator
+/// said so explicitly (`CONTROL_PLANE_TOKEN_DISABLED=true`, dev). The example Secret's
+/// `CHANGE_ME` placeholder is refused: it is a public value.
+pub fn control_plane_token_policy(
+    token: Option<String>,
+    disabled: bool,
+) -> anyhow::Result<Option<String>> {
+    match token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        Some(t) if t == "CHANGE_ME" => anyhow::bail!(
+            "CONTROL_PLANE_TOKEN is the example placeholder CHANGE_ME; set a real token \
+             (openssl rand -hex 32) on the control plane, the gateway and the workers"
+        ),
+        Some(t) => Ok(Some(t)),
+        None if disabled => {
+            tracing::warn!(
+                "CONTROL_PLANE_TOKEN_DISABLED=true: /internal/* routes are open; never expose this port"
+            );
+            Ok(None)
+        }
+        None => anyhow::bail!(
+            "CONTROL_PLANE_TOKEN is not set: the gateway and workers authenticate to /internal/* with it. \
+             Set it (openssl rand -hex 32) on all three services, or set CONTROL_PLANE_TOKEN_DISABLED=true in dev"
+        ),
+    }
+}
+
+/// Middleware: `/internal/*` needs the configured bearer token; everything else passes.
+pub async fn require_internal_token(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = &state.internal_token else {
+        return next.run(req).await;
+    };
+    if !req.uri().path().starts_with("/internal/") {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::trim);
+    match presented {
+        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => next.run(req).await,
+        _ => CpError::Unauthorized.into_response(),
     }
 }
 
@@ -204,6 +291,14 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/internal/source-runs", post(sources::record_source_run))
         .route("/internal/lab-events", post(lab_events::ingest_lab_events))
+        .route(
+            "/internal/lab/credits/{account_id}",
+            get(lab_credits::check_credits),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_internal_token,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -73,6 +73,8 @@ x-worker-env: &worker-env
   TEMPORAL_URL: http://temporal:7233
   TEMPORAL_NAMESPACE: default
   CONTROL_PLANE_URL: http://control-plane:9000
+  # Shared by the three services. The default is a well-known dev-only value: never deploy it.
+  CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}
   BLOB_STORE_URL: file:///data/blobs
   PAYLOAD_SPILL_BYTES: "1048576"
   MAX_CONCURRENT_ACTIVITIES: "20"
@@ -155,6 +157,7 @@ services:
       RUST_LOG: info,meili_ingest=debug
       BIND: 0.0.0.0:9000
       DATABASE_URL: postgres://postgres:dev-password@postgres:5432/postgres
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,6 +180,7 @@ services:
       TEMPORAL_URL: http://temporal:7233
       TEMPORAL_NAMESPACE: default
       CONTROL_PLANE_URL: http://control-plane:9000
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}
       # Standalone-mode fallback (SPEC §3.3): every request without X-Meili-*
       # headers targets the local Meilisearch.
       MEILI_URL: http://meilisearch:7700

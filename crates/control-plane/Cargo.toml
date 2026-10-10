@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 meili-ingest-plugin-sdk.workspace = true
 meili-ingest-router.workspace = true
+meili-ingest-lab.workspace = true
 
 axum.workspace = true
 tokio.workspace = true
@@ -32,9 +33,7 @@ meili-ingest-source.workspace = true
 reqwest.workspace = true
 url.workspace = true
 tokio-util.workspace = true
-hmac.workspace = true
-sha2.workspace = true
-hex.workspace = true
+subtle.workspace = true
 prometheus.workspace = true
 jsonschema = { version = "0.45", default-features = false }
 anyhow.workspace = true

@@ -14,7 +14,7 @@ tinybird/
 ├── pipes/
 │   ├── usage_daily_mv.pipe                # MATERIALIZED: raw → usage_daily
 │   ├── usage_daily_billing_hourly.pipe    # COPY (hourly): raw FINAL → usage_daily_billing
-│   └── tenant_usage.pipe                  # ENDPOINT: billing API over usage_daily_billing
+│   └── tenant_usage.pipe                  # ENDPOINT: usage API over usage_daily_billing
 └── README.md
 ```
 
@@ -129,7 +129,7 @@ from up to 180 days of raw rows, and promotes it once the backfill finishes. The
 deployment keeps serving until then, and the backfill's progress shows on the
 deployment's *Data movements* tab. The cost is one aggregation over the raw table,
 which Tinybird may run on on-demand compute for large tables. Nothing
-invoice-relevant moves: `tenant_usage` reads `usage_daily_billing`, which no
+reconciliation-relevant moves: `tenant_usage` reads `usage_daily_billing`, which no
 deployment recomputes. Only the real-time dashboard rollup is rebuilt.
 
 ## 3. Tokens
@@ -255,8 +255,8 @@ Two consequences worth knowing:
 * Deduplication happens **on merge**, so an exact count needs
   `SELECT … FROM meili_ingest_usage FINAL` (or `GROUP BY event_id`).
 * A materialized view is a trigger on INSERT and does **not** see that deduplication, so
-  a duplicate is counted twice in `usage_daily`. That rollup is for dashboards; an
-  invoice reads `usage_daily_billing`, which the hourly copy rebuilds from the raw
+  a duplicate is counted twice in `usage_daily`. That rollup is for dashboards; a
+  reconciliation reads `usage_daily_billing`, which the hourly copy rebuilds from the raw
   table with `FINAL`.
 
 ## Datafile decisions the first deploy settled
@@ -283,7 +283,7 @@ Two consequences worth knowing:
    matches `meili_ingest_usage`'s 180 days, so a deployment that changes
    `usage_daily_mv`'s query can rebuild it (§2, *Changing a materialization*). The
    second deploy that changed the pipe on a workspace holding rows failed without it.
-   `usage_daily_billing` has no TTL: it is the invoice record and deployments never
+   `usage_daily_billing` has no TTL: it is the reconciliation record and deployments never
    rebuild it.
 
 ## Which table do I read?
@@ -292,14 +292,14 @@ Two consequences worth knowing:
 |---|---|---|---|---|
 | `meili_ingest_usage` | real time | with `FINAL` | 180 days | ad-hoc drill-down, audits |
 | `usage_daily` (materialized) | real time | **no** | 180 days | dashboards, live estimates |
-| `usage_daily_billing` (hourly COPY) | up to 1 h | yes | indefinite | **invoices** |
+| `usage_daily_billing` (hourly COPY) | up to 1 h | yes | indefinite | **reports** |
 
 Usage reporting is an at-least-once Temporal activity, so the same event can arrive
 twice. The raw table collapses duplicates because `event_id` is deterministic and the
 engine is a `ReplacingMergeTree` — but a materialized view is a trigger on INSERT and
 never sees that collapse, so `usage_daily` can over-count a redelivery. The
 `usage_daily_billing` copy re-reads the raw table with `FINAL` every hour, which is why
-it is the one to bill from.
+it is the one to reconcile from.
 
 Sanity-check the two against each other after a deploy:
 

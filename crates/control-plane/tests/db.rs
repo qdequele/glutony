@@ -807,7 +807,7 @@ async fn an_indexer_connection_must_exist_for_the_tenant() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
-    // A global connection is usable by every tenant, as at run time.
+    // A global connection is a template: no tenant pipeline may name it, as at run time.
     repo.insert(&connection("shared", None)).await.unwrap();
     let (status, body) = call(
         app(state.clone()),
@@ -816,10 +816,13 @@ async fn an_indexer_connection_must_exist_for_the_tenant() {
     .await;
     assert_eq!(
         status,
-        StatusCode::CREATED,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "{}",
         String::from_utf8_lossy(&body)
     );
+    let err: ErrorBody = json(&body);
+    assert_eq!(err.code, "validation");
+    assert!(err.error.contains("\"shared\""), "{}", err.error);
 
     t.drop_schema().await;
 }

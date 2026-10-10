@@ -58,7 +58,7 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         └──────────────────────────────────────────────┘
 ```
 
-Three binaries, one image (`ghcr.io/meilisearch/meili-ingest`):
+Three binaries, one image (`ghcr.io/qdequele/glutony`):
 
 | Binary | Role |
 |---|---|
@@ -285,7 +285,7 @@ needs no cross-origin grant.
 ## Meilisearch Lab
 
 glutony plugs into the Meilisearch Lab through three seams: an opaque tenant on every
-owned row, a token-protected management API, and signed billing events from a durable
+owned row, a token-protected management API, and signed usage events from a durable
 outbox. All three are off by default, so a deployment that sets none of the `LAB_*`
 variables behaves as a standalone one. See
 [docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx).
@@ -293,10 +293,13 @@ variables behaves as a standalone one. See
 ## Usage & metering
 
 Every job records per-tenant usage — documents, bytes, LLM tokens, transcription
-seconds, pages — into Tinybird (managed ClickHouse). Reporting runs as a Temporal
-activity, so it is retried until it lands and survives worker crashes, and rows carry
-deterministic ids so a redelivery replaces rather than double-counts. Bill from
-`usage_daily_billing`; see [docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
+seconds, pages — into Tinybird (managed ClickHouse) for analytics (dashboards,
+`GET /usage`, reconciliation). Billing is the Meilisearch Lab's: see
+[docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx). Reporting
+runs as a Temporal activity, so it is retried until it lands and survives worker
+crashes, and rows carry deterministic ids so a redelivery replaces rather than
+double-counts. Read `usage_daily_billing` for deduplicated daily totals; see
+[docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
 [tinybird/README.md](tinybird/README.md).
 
 Without `TINYBIRD_TOKEN` the reporting step is a no-op, so self-hosted deployments need

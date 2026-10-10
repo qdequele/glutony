@@ -43,7 +43,7 @@ spec:
               app.kubernetes.io/name: meili-gateway
       containers:
         - name: gateway
-          image: ghcr.io/meilisearch/meili-ingest:latest
+          image: ghcr.io/qdequele/glutony:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/meili-ingest-gateway"]
           ports:
@@ -57,6 +57,46 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: ENVOY_TRUSTED_HEADER
+                  optional: true
+            - name: CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: CONTROL_PLANE_TOKEN
+            - name: SOURCE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: SOURCE_SECRET_KEY
+                  optional: true
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: ADMIN_API_KEY
+                  optional: true
+            # Bearer the Meilisearch Lab presents on management routes (the CREDENTIAL=
+            # given to `bin/rails lab:hosted_engine:create`). Requires ENVOY_TRUSTED_HEADER.
+            - name: LAB_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_SERVICE_TOKEN
+                  optional: true
+            # Meilisearch Lab credentials; LAB_URL comes from the ConfigMap (envFrom).
+            # All three or none: the gateway refuses to boot on a partial set, and
+            # without ENVOY_TRUSTED_HEADER.
+            - name: LAB_INSTANCE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_INSTANCE_ID
+                  optional: true
+            - name: LAB_INSTANCE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_INSTANCE_SECRET
                   optional: true
             # Uncomment for a standalone (non-Envoy) deployment:
             # - name: MEILI_URL

@@ -114,8 +114,8 @@ impl ConnectionRepo {
     /// Fetch one connection by uid: the tenant's row when `tenant_id` is given and it
     /// exists, otherwise the global row.
     ///
-    /// This is the lookup the worker uses to resolve an indexer step's `connection`, so
-    /// a global connection is usable by every tenant and a tenant can shadow it.
+    /// This is the lookup management reads use (a tenant sees its row, else the global
+    /// template). Jobs use [`ConnectionRepo::get_owned`].
     pub async fn get(
         &self,
         uid: &str,
@@ -127,6 +127,25 @@ impl ConnectionRepo {
              WHERE uid = $1 AND (tenant_id IS NULL OR tenant_id = $2) \
              ORDER BY (tenant_id IS NULL) \
              LIMIT 1",
+        )
+        .bind(uid)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// The tenant's own row only. This is the lookup a tenant job uses: a global
+    /// connection is a template an operator may copy, never a key a tenant can write
+    /// with (spec v2, tenant isolation).
+    pub async fn get_owned(
+        &self,
+        uid: &str,
+        tenant_id: &str,
+    ) -> Result<Option<ConnectionRecord>, CpError> {
+        Ok(sqlx::query_as(
+            "SELECT id, uid, name, tenant_id, host, api_key, created_at, updated_at \
+             FROM meili_connections \
+             WHERE uid = $1 AND tenant_id = $2",
         )
         .bind(uid)
         .bind(tenant_id)
@@ -243,7 +262,8 @@ impl ConnectionRepo {
 
 // ---------------------------------------------------------------------------
 // `/internal/connections` handlers. Internal only: the gateway owns validation, sealing
-// and redaction, and the worker resolves an indexer step's connection through `get`.
+// and redaction, and the worker resolves an indexer step's connection through
+// `get_owned` (`scope=tenant`) for a tenant job, `get` for a global one.
 // ---------------------------------------------------------------------------
 
 /// `GET /internal/connections?tenant_id=` → the tenant's plus global connections.
@@ -266,19 +286,39 @@ pub async fn create_connection(
     Ok((StatusCode::CREATED, Json(stored)).into_response())
 }
 
-/// `GET /internal/connections/{uid}?tenant_id=` → tenant row, else global, else 404.
+/// Query of `GET /internal/connections/{uid}`.
+#[derive(Debug, Deserialize)]
+pub struct ConnectionQuery {
+    /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
+    #[serde(default, alias = "project_id")]
+    pub tenant_id: Option<String>,
+    /// `tenant`: only the tenant's own row, what a tenant job may use.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// `GET /internal/connections/{uid}?tenant_id=[&scope=tenant]`.
+///
+/// Without `scope`: the tenant's row, else the global one (management reads). With
+/// `scope=tenant`: the tenant's own row only (job lookups); it needs a tenant.
 pub async fn get_connection(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<TenantQuery>,
+    Query(q): Query<ConnectionQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ConnectionRecord>, CpError> {
     let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
-    state
-        .connections()
-        .get(&uid, tenant_id.as_deref())
-        .await?
-        .map(Json)
+    let row = match (q.scope.as_deref(), tenant_id.as_deref()) {
+        (Some("tenant"), Some(t)) => state.connections().get_owned(&uid, t).await?,
+        (Some("tenant"), None) => {
+            return Err(CpError::Validation("scope=tenant needs a tenant_id".into()));
+        }
+        (Some(other), _) => {
+            return Err(CpError::Validation(format!("unknown scope {other:?}")));
+        }
+        (None, t) => state.connections().get(&uid, t).await?,
+    };
+    row.map(Json)
         .ok_or_else(|| not_found(&uid, tenant_id.as_deref()))
 }
 
