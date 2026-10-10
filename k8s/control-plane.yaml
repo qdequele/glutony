@@ -80,8 +80,12 @@ stringData:
   ENVOY_TRUSTED_HEADER: "CHANGE_ME"
   # Control plane <-> gateway/workers. Generate with `openssl rand -hex 32`.
   CONTROL_PLANE_TOKEN: "CHANGE_ME"
-  # Seals stored Meilisearch keys and source credentials: `openssl rand -base64 32`.
-  SOURCE_SECRET_KEY: "CHANGE_ME"
+  # Seals stored Meilisearch keys and source credentials. Must be 32 bytes, base64:
+  # generate with `openssl rand -base64 32`, set it once and never rotate it casually
+  # (keys sealed with the old value can no longer be opened). Commented out because a
+  # placeholder is not valid base64 and would stop the gateway and workers from booting;
+  # without it /connections answers 501 and connection-based steps fail.
+  # SOURCE_SECRET_KEY: "<openssl rand -base64 32>"
   # Operator bearer for the management routes.
   ADMIN_API_KEY: "CHANGE_ME"
   # Meilisearch Lab credentials. The operator mints them in the Lab with

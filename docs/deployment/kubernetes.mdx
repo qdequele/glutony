@@ -58,6 +58,10 @@ kubectl -n meili-ingest create secret generic meili-ingest-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
+`SOURCE_SECRET_KEY` (32 bytes, base64) seals stored Meilisearch keys and source
+credentials: set it once and do not rotate it casually. Without it `/connections`
+answers 501 and connection-based steps fail.
+
 The control plane runs two replicas; its outbox sender leases rows with
 `SKIP LOCKED`, so both deliver without duplicates.
 

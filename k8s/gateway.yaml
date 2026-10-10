@@ -68,6 +68,7 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: SOURCE_SECRET_KEY
+                  optional: true
             - name: ADMIN_API_KEY
               valueFrom:
                 secretKeyRef:

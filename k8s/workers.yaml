@@ -83,6 +83,7 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: SOURCE_SECRET_KEY
+                  optional: true
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -216,6 +217,7 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: SOURCE_SECRET_KEY
+                  optional: true
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
@@ -349,6 +351,7 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: SOURCE_SECRET_KEY
+                  optional: true
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
