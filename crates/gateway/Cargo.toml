@@ -65,8 +65,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-# `test-util` for `start_paused` (the Lab lookup cache is time-based).
-tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 tower = { workspace = true, features = ["util"] }
 regex.workspace = true

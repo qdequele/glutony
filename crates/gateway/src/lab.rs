@@ -36,6 +36,10 @@ pub struct LabClient {
     http: reqwest::Client,
     identity: RwLock<Option<InstanceInfo>>,
     accounts: Mutex<HashMap<String, Cached>>,
+    /// Test-only offset added to the clock, so tests move the cache windows forward
+    /// without pausing tokio's clock (which auto-advances during real I/O).
+    #[cfg(test)]
+    skew: Mutex<Duration>,
 }
 
 impl std::fmt::Debug for LabClient {
@@ -55,7 +59,24 @@ impl LabClient {
             http,
             identity: RwLock::new(None),
             accounts: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            skew: Mutex::new(Duration::ZERO),
         }
+    }
+
+    /// The clock the account cache is aged by.
+    fn now(&self) -> Instant {
+        #[cfg(not(test))]
+        let skew = Duration::ZERO;
+        #[cfg(test)]
+        let skew = *self.skew.lock().unwrap_or_else(|p| p.into_inner());
+        Instant::now() + skew
+    }
+
+    /// Move this client's clock forward (tests).
+    #[cfg(test)]
+    fn advance(&self, by: Duration) {
+        *self.skew.lock().unwrap_or_else(|p| p.into_inner()) += by;
     }
 
     /// The credentials in use.
@@ -138,7 +159,7 @@ impl LabClient {
     }
 
     async fn lookup(&self, account_id: &str) -> Option<AccountLookup> {
-        let now = Instant::now();
+        let now = self.now();
         if let Some(c) = self.cached(account_id)
             && now.duration_since(c.fetched_at) < FRESH_FOR
         {
@@ -269,14 +290,17 @@ mod tests {
         assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test(start_paused = true)]
+    // The cache is aged by the client's own clock (`advance`), not by pausing tokio's:
+    // a paused clock auto-advances to the next pending timer whenever the runtime waits
+    // on the mock server's I/O, which made the windows jump by hundreds of seconds.
+    #[tokio::test]
     async fn lookups_are_cached_for_30s_and_served_stale_for_300s() {
         let lab = MockServer::start().await;
         mount_balance(&lab, 10, 1).await;
         let c = client(&lab);
         c.set_identity(hosted());
         c.check_credits(ACCOUNT).await.unwrap();
-        tokio::time::advance(Duration::from_secs(29)).await;
+        c.advance(Duration::from_secs(29));
         c.check_credits(ACCOUNT).await.unwrap(); // cached: expect(1) holds
         // Exactly one fetch so far: the 29 s-old entry was served from the cache.
         // (`reset` below drops mocks without checking their `expect`.)
@@ -287,7 +311,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&lab)
             .await;
-        tokio::time::advance(Duration::from_secs(2)).await;
+        c.advance(Duration::from_secs(2));
         c.check_credits(ACCOUNT).await.unwrap();
         // A zero balance seen before the outage keeps refusing while stale.
         c.accounts
@@ -302,7 +326,7 @@ mod tests {
             "insufficient_credits"
         );
         // Past 300 s with no Lab: fail closed (503 lab_unavailable), like Scrapix.
-        tokio::time::advance(Duration::from_secs(300)).await;
+        c.advance(Duration::from_secs(300));
         assert_eq!(
             c.check_credits(ACCOUNT).await.unwrap_err().code(),
             "lab_unavailable"
