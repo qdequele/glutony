@@ -113,7 +113,7 @@ cost:
     "units": { "documents": 12, "bytes_in": 5000, "step_seconds": 4,
                "llm_tokens_in": 1000, "llm_tokens_out": 100, "audio_seconds": 0,
                "ocr_pages": 0, "pages": 9, "images": 0, "llm_requests": 1,
-               "external_requests": 0 },
+               "external_requests": 0, "unpriced_provider_calls": 0 },
     "provider_cost_micro_usd": 210,
     "description": "Job … (builtin.pdf, succeeded, 12 documents)",
     "job_id": "…"
@@ -129,9 +129,11 @@ error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
 - The Lab prices `documents`, `ocr_pages` and `provider_cost_micro_usd` (its
   `pricing.yml`); other units are stored and shown. glutony never computes credits.
 - `provider_cost_micro_usd` is what glutony paid providers, from the provider cost
-  table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). When any call of
-  the job could not be priced it is sent as 0 and the description says
-  `provider cost incomplete`. The bundled prices are placeholders: set yours before
+  table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). When some calls of
+  the job could not be priced it is the sum of the calls that could: the description
+  says `provider cost incomplete` and the `unpriced_provider_calls` unit counts the
+  missing calls (it is always present, 0 when the cost is complete), and the worker
+  logs a warning. The bundled prices are placeholders: set yours before
   reporting to a Lab. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the
   worker at boot; if it ever fails to load later, every call is flagged unpriced
   (never priced at the bundled rates).

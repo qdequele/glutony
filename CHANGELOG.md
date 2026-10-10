@@ -49,3 +49,8 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 ### Removed
 - References to `meili-ingest-plugin-whisper` / `-ffmpeg` sidecar images that nothing
   built.
+
+### Fixed
+- A Lab `usage.recorded` event whose job had an unpriced provider call now bills the
+  priced calls' `provider_cost_micro_usd` (it was sent as 0) and counts the missing
+  calls in a new `unpriced_provider_calls` unit; the worker logs a warning.

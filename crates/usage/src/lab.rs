@@ -61,7 +61,8 @@ pub struct UsageData {
     pub operation: String,
     /// Raw units by name, sorted so the serialized event is byte-stable.
     pub units: BTreeMap<String, u64>,
-    /// What glutony paid providers, or 0 when a call could not be priced.
+    /// What glutony paid providers for the calls it could price; calls it could not
+    /// price are missing from it and counted in the `unpriced_provider_calls` unit.
     pub provider_cost_micro_usd: u64,
     /// Human label for the ledger: pipeline, status, documents, cost completeness.
     pub description: String,
@@ -143,6 +144,12 @@ fn totals(input: &JobUsageInput) -> UsageUnits {
     totals
 }
 
+/// Provider calls of the job the cost table could not price: their cost is missing
+/// from `provider_cost_micro_usd`.
+pub fn unpriced_provider_calls(input: &JobUsageInput) -> u64 {
+    totals(input).unpriced_calls
+}
+
 fn documents_out(input: &JobUsageInput) -> u64 {
     input
         .steps
@@ -178,6 +185,8 @@ pub fn lab_units(input: &JobUsageInput, totals: &UsageUnits) -> BTreeMap<String,
         ("images".to_string(), totals.images),
         ("llm_requests".to_string(), totals.llm_requests),
         ("external_requests".to_string(), totals.external_requests),
+        // Provider calls missing from `provider_cost_micro_usd` (0 when it is complete).
+        ("unpriced_provider_calls".to_string(), totals.unpriced_calls),
     ])
 }
 
@@ -205,13 +214,11 @@ fn envelope(
 pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> {
     let totals = totals(input);
     let complete = totals.unpriced_calls == 0;
-    // The Lab's ledger is a signed bigint; the schema caps the value too. An
-    // incomplete cost is reported as 0 rather than as a number that is too small.
-    let provider_cost_micro_usd = if complete {
-        totals.cost_micro_usd.min(i64::MAX as u64)
-    } else {
-        0
-    };
+    // Always the priced sum, even when some calls could not be priced: those calls are
+    // missing from it (flagged in the description and counted in the
+    // `unpriced_provider_calls` unit), but the priced ones are real money and billed.
+    // The Lab's ledger is a signed bigint; the schema caps the value too.
+    let provider_cost_micro_usd = totals.cost_micro_usd.min(i64::MAX as u64);
     let units = lab_units(input, &totals);
     let description = format!(
         "Job {} ({}, {}, {} documents{})",
@@ -371,8 +378,8 @@ mod tests {
         assert_eq!(v["occurred_at"], "2026-10-01T10:00:09.000Z");
         assert_eq!(v["data"]["operation"], "ingest");
         assert_eq!(v["data"]["job_id"], "11111111-2222-3333-4444-555555555555");
-        // One unpriced call: the pass-through cost is unknown, so it is reported as 0.
-        assert_eq!(v["data"]["provider_cost_micro_usd"], 0);
+        // One unpriced call: the priced part is still billed, and the gap is flagged.
+        assert_eq!(v["data"]["provider_cost_micro_usd"], 210);
         assert!(
             v["data"]["description"]
                 .as_str()
@@ -390,6 +397,7 @@ mod tests {
         // Extra units: stored by the Lab, ignored by pricing (spec §4.3).
         assert_eq!(units["pages"], 9);
         assert_eq!(units["llm_requests"], 1);
+        assert_eq!(units["unpriced_provider_calls"], 1);
         for (name, value) in units.as_object().unwrap() {
             assert!(
                 value.is_u64(),
@@ -420,6 +428,47 @@ mod tests {
         };
         assert_eq!(data.provider_cost_micro_usd, 210);
         assert!(!data.description.contains("incomplete"));
+        assert_eq!(
+            data.units.get("unpriced_provider_calls"),
+            Some(&0),
+            "always present, 0 when the cost is complete"
+        );
+    }
+
+    #[test]
+    fn the_priced_part_of_an_incomplete_cost_is_still_billed() {
+        let mut i = input();
+        i.steps = vec![
+            step(
+                "enrich",
+                2,
+                1,
+                UsageUnits {
+                    cost_micro_usd: 210,
+                    ..UsageUnits::llm(1_000, 100)
+                },
+            ),
+            step(
+                "caption",
+                2,
+                1,
+                UsageUnits {
+                    unpriced_calls: 1,
+                    ..UsageUnits::llm(50, 5)
+                },
+            ),
+        ];
+        let v = serde_json::to_value(lab_event_for_job(&i).unwrap()).unwrap();
+        assert!(errors_of(&v).is_empty(), "{:?}\n{v:#}", errors_of(&v));
+        assert_eq!(v["data"]["provider_cost_micro_usd"], 210);
+        assert!(
+            v["data"]["description"]
+                .as_str()
+                .unwrap()
+                .contains(", provider cost incomplete")
+        );
+        assert_eq!(v["data"]["units"]["unpriced_provider_calls"], 1);
+        assert_eq!(unpriced_provider_calls(&i), 1);
     }
 
     #[test]

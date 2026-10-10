@@ -222,6 +222,15 @@ impl StepActivities {
             )));
         }
         tracing::info!(job_id = %input.job_id, events = events.len(), "lab events recorded");
+        let unpriced = meili_ingest_usage::lab::unpriced_provider_calls(input);
+        if unpriced > 0 {
+            tracing::warn!(
+                job_id = %input.job_id,
+                pipeline = %input.pipeline_uid,
+                unpriced_provider_calls = unpriced,
+                "Lab usage event under-reports provider cost: some calls had no price"
+            );
+        }
         Ok(())
     }
 

@@ -100,9 +100,10 @@ reports raw units and `provider_cost_micro_usd` and never computes credits. See
 `provider_cost_micro_usd` is what glutony paid providers for the job. It comes from
 the provider cost table, `config/provider-costs.toml` (or the file named by
 `PROVIDER_COSTS_FILE`), keyed by plugin and model. A call the table cannot price
-costs 0 and marks the job's cost incomplete: the Lab event then carries
-`provider_cost_micro_usd: 0` and its description says `provider cost incomplete`, so
-the Lab sees the gap instead of a silently low cost. Calls glutony does not pay for,
+costs 0 and marks the job's cost incomplete: the Lab event still carries the cost of
+the calls that could be priced, its description says `provider cost incomplete` and
+its `unpriced_provider_calls` unit counts the missing calls, so the Lab sees the gap
+instead of a silently low cost. Calls glutony does not pay for,
 such as a local gRPC plugin, cost 0 and stay complete. The bundled prices are
 placeholders: set yours before reporting to a Lab. A missing or invalid
 `PROVIDER_COSTS_FILE` stops the worker at boot; if it ever fails to load later, calls
