@@ -10,9 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
-use meili_ingest_lab::{LabCredentials, validate_lab_url};
-use sha2::Sha256;
+use meili_ingest_lab::LabCredentials;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -33,97 +31,41 @@ pub const RETENTION: Duration = Duration::from_secs(7 * 86_400);
 /// Undelivered rows older than this were never acknowledged and are dropped (spec §3.4).
 pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3_600);
 
-/// How the sender authenticates to the Lab.
-#[derive(Clone)]
-pub enum LabAuth {
-    /// `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET` (spec v2 §3.3).
-    Instance(LabCredentials),
-    /// `LAB_EVENTS_SECRET`: the pre-v2 global secret, accepted for one more release. A v2
-    /// Lab does not accept batches signed with it (logged as an error at boot).
-    Legacy {
-        /// HMAC key over the bare body.
-        secret: String,
-    },
-}
-
-/// `LAB_URL` plus either the instance credentials or the legacy secret.
-#[derive(Clone)]
+/// `LAB_URL` + `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`: where the sender delivers and
+/// how it signs (spec v2 §3.3). The control plane's credit check uses the same
+/// credentials.
+#[derive(Clone, Debug)]
 pub struct LabConfig {
-    /// Lab base URL, without trailing slash.
-    pub url: String,
-    auth: LabAuth,
-}
-
-impl std::fmt::Debug for LabConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LabConfig")
-            .field("url", &self.url)
-            .field(
-                "auth",
-                &match &self.auth {
-                    LabAuth::Instance(c) => format!("instance {}", c.instance_id()),
-                    LabAuth::Legacy { .. } => "legacy <redacted>".to_string(),
-                },
-            )
-            .finish()
-    }
+    creds: LabCredentials,
 }
 
 impl LabConfig {
-    /// `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`, or with the legacy
-    /// `LAB_EVENTS_SECRET` (logged as an error: a v2 Lab drops those events; removed next
-    /// release); nothing at all is `None`.
+    /// All three instance values, or none (`None`: no Lab). `legacy_secret` is the
+    /// pre-v2 `LAB_EVENTS_SECRET`: when it is set (non-blank) boot is refused, because
+    /// glutony has no working legacy Lab route (a v2 Lab checks legacy batches as
+    /// Scrapix's and never accepts glutony's).
     pub fn from_values(
         url: Option<String>,
         instance_id: Option<String>,
         instance_secret: Option<String>,
         legacy_secret: Option<String>,
     ) -> anyhow::Result<Option<Self>> {
-        let Some(url) = url else {
-            if instance_id.is_some() || instance_secret.is_some() || legacy_secret.is_some() {
-                anyhow::bail!(
-                    "LAB_INSTANCE_ID / LAB_INSTANCE_SECRET / LAB_EVENTS_SECRET need LAB_URL"
-                );
-            }
-            return Ok(None);
-        };
-        match (instance_id, instance_secret) {
-            (Some(id), Some(secret)) => {
-                if legacy_secret.is_some() {
-                    tracing::warn!(
-                        "LAB_EVENTS_SECRET is ignored because LAB_INSTANCE_ID and LAB_INSTANCE_SECRET are set; remove it"
-                    );
-                }
-                let creds = LabCredentials::new(&url, &id, &secret)?;
-                Ok(Some(Self {
-                    url: creds.url().to_string(),
-                    auth: LabAuth::Instance(creds),
-                }))
-            }
-            (None, None) => match legacy_secret {
-                Some(secret) => {
-                    // Still accepted (removed next release), but a v2 Lab checks legacy
-                    // batches as Scrapix's and never accepts glutony's: say so loudly.
-                    tracing::error!(
-                        "LAB_EVENTS_SECRET is set without LAB_INSTANCE_ID / LAB_INSTANCE_SECRET: \
-                         a v2 Lab does not accept events signed this way, so they are retried \
-                         and dropped after 24 h. Set LAB_INSTANCE_ID and LAB_INSTANCE_SECRET \
-                         (bin/rails lab:hosted_engine:create PRODUCT=glutony) and remove LAB_EVENTS_SECRET"
-                    );
-                    Ok(Some(Self {
-                        url: validate_lab_url(&url)?,
-                        auth: LabAuth::Legacy { secret },
-                    }))
-                }
-                None => anyhow::bail!(
-                    "LAB_URL is set but LAB_INSTANCE_ID and LAB_INSTANCE_SECRET are not"
-                ),
-            },
-            _ => anyhow::bail!("LAB_INSTANCE_ID and LAB_INSTANCE_SECRET go together"),
+        if legacy_secret.is_some_and(|s| !s.trim().is_empty()) {
+            anyhow::bail!(
+                "LAB_EVENTS_SECRET is set, but glutony has no working legacy Lab route: the Lab \
+                 only accepts glutony events signed with instance credentials. Remove \
+                 LAB_EVENTS_SECRET and set LAB_INSTANCE_ID and LAB_INSTANCE_SECRET (mint them \
+                 with `bin/rails lab:hosted_engine:create PRODUCT=glutony ...`)"
+            );
         }
+        Ok(
+            LabCredentials::from_values(url, instance_id, instance_secret)?
+                .map(|creds| Self { creds }),
+        )
     }
 
-    /// Read `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and the legacy `LAB_EVENTS_SECRET`.
+    /// Read `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET`, and refuse a leftover
+    /// `LAB_EVENTS_SECRET` (blank counts as unset).
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         let get = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
         Self::from_values(
@@ -134,31 +76,20 @@ impl LabConfig {
         )
     }
 
+    /// Lab base URL, without trailing slash.
+    pub fn url(&self) -> &str {
+        self.creds.url()
+    }
+
     /// `{url}/internal/events`.
     pub fn events_url(&self) -> String {
-        format!("{}/internal/events", self.url)
+        self.creds.endpoint("/internal/events")
     }
 
-    /// The instance credentials, when not running on the legacy secret.
-    pub fn credentials(&self) -> Option<&LabCredentials> {
-        match &self.auth {
-            LabAuth::Instance(c) => Some(c),
-            LabAuth::Legacy { .. } => None,
-        }
+    /// The instance credentials.
+    pub fn credentials(&self) -> &LabCredentials {
+        &self.creds
     }
-
-    /// Whether the deprecated global secret is in use.
-    pub fn is_legacy(&self) -> bool {
-        matches!(self.auth, LabAuth::Legacy { .. })
-    }
-}
-
-/// `sha256=<hex HMAC-SHA256(secret, body)>`.
-pub fn sign(secret: &[u8], body: &[u8]) -> String {
-    // HMAC accepts keys of any length; new_from_slice cannot fail for Hmac<Sha256>.
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC takes any key length");
-    mac.update(body);
-    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
 /// Read a response body, or `None` if it is larger than `cap` bytes or cannot be read.
@@ -253,17 +184,13 @@ impl LabSender {
                 return self.fail(&ids, "malformed").await;
             }
         };
-        let req = self
-            .http
-            .post(self.config.events_url())
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
-        let req = match &self.config.auth {
-            LabAuth::Instance(creds) => creds.sign_batch(req, meili_ingest_lab::unix_now(), &body),
-            LabAuth::Legacy { secret } => req.header(
-                meili_ingest_lab::H_SIGNATURE,
-                sign(secret.as_bytes(), &body),
-            ),
-        };
+        let req = self.config.credentials().sign_batch(
+            self.http
+                .post(self.config.events_url())
+                .header(reqwest::header::CONTENT_TYPE, "application/json"),
+            meili_ingest_lab::unix_now(),
+            &body,
+        );
         let resp = req.body(body).send().await;
         let resp = match resp {
             Ok(r) => r,
@@ -276,7 +203,7 @@ impl LabSender {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             tracing::error!(
-                "the Lab rejected the instance credentials (401); lab events stay pending"
+                "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); lab events stay pending until the credentials are fixed"
             );
             return self.fail(&ids, "auth").await;
         }
@@ -388,97 +315,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_credentials_legacy_secret_or_nothing() {
-        let fv = |u: Option<&str>, i: Option<&str>, s: Option<&str>, l: Option<&str>| {
+    fn all_three_instance_values_or_nothing() {
+        let fv = |u: Option<&str>, i: Option<&str>, s: Option<&str>| {
             LabConfig::from_values(
                 u.map(String::from),
                 i.map(String::from),
                 s.map(String::from),
-                l.map(String::from),
+                None,
             )
         };
-        assert!(fv(None, None, None, None).unwrap().is_none());
-        let c = fv(Some("https://lab.example/"), Some("id"), Some("s"), None)
+        assert!(fv(None, None, None).unwrap().is_none());
+        let c = fv(Some("https://lab.example/"), Some("id"), Some("s3cret"))
             .unwrap()
             .unwrap();
+        assert_eq!(c.url(), "https://lab.example");
         assert_eq!(c.events_url(), "https://lab.example/internal/events");
-        assert!(!c.is_legacy());
-        assert!(c.credentials().is_some());
-        assert!(!format!("{c:?}").contains("\"s\""));
-        let legacy = fv(Some("https://lab.example"), None, None, Some("old"))
-            .unwrap()
-            .unwrap();
-        assert!(legacy.is_legacy());
-        assert!(legacy.credentials().is_none());
-        assert!(!format!("{legacy:?}").contains("old"));
-        // Instance credentials win over a leftover legacy secret.
-        let both = fv(
-            Some("https://lab.example"),
-            Some("id"),
-            Some("s"),
-            Some("old"),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!both.is_legacy());
+        assert_eq!(c.credentials().instance_id(), "id");
+        assert!(!format!("{c:?}").contains("s3cret"));
         for bad in [
-            fv(Some("https://lab.example"), None, None, None),
-            fv(Some("https://lab.example"), Some("id"), None, None),
-            fv(Some("https://lab.example"), None, Some("s"), None),
-            fv(None, Some("id"), Some("s"), None),
-            fv(None, None, None, Some("old")),
+            fv(Some("https://lab.example"), None, None),
+            fv(Some("https://lab.example"), Some("id"), None),
+            fv(Some("https://lab.example"), None, Some("s")),
+            fv(None, Some("id"), Some("s")),
+            fv(None, Some("id"), None),
+            fv(None, None, Some("s")),
         ] {
             assert!(bad.is_err());
         }
     }
 
-    /// Run `f` with a subscriber that keeps ERROR events only, and return their text.
-    fn errors_logged_by(f: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let out = buf.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
     #[test]
-    fn the_legacy_secret_is_accepted_but_logged_as_an_error() {
+    fn a_legacy_events_secret_refuses_to_boot() {
         // A v2 Lab checks X-Scrapix-Signature on its legacy path and attributes those
-        // events to Scrapix: glutony's legacy batches are never accepted there.
-        let mut config = None;
-        let logged = errors_logged_by(|| {
-            config = LabConfig::from_values(
-                Some("https://lab.example".into()),
-                None,
-                None,
-                Some("old".into()),
+        // events to Scrapix: glutony has no working legacy route, so the secret is an
+        // error whatever else is set.
+        let url = Some("https://lab.example");
+        for (u, i, s) in [
+            (None, None, None),
+            (url, None, None),
+            (url, Some("id"), Some("s")),
+        ] {
+            let err = LabConfig::from_values(
+                u.map(String::from),
+                i.map(String::from),
+                s.map(String::from),
+                Some("leftover-v1-secret".into()),
             )
-            .unwrap();
-        });
-        assert!(config.is_some_and(|c| c.is_legacy()));
-        assert!(logged.contains("LAB_EVENTS_SECRET"), "{logged}");
-        assert!(logged.contains("24 h"), "{logged}");
-        assert!(logged.contains("LAB_INSTANCE_ID"), "{logged}");
-        assert!(logged.contains("LAB_INSTANCE_SECRET"), "{logged}");
+            .unwrap_err()
+            .to_string();
+            for needle in [
+                "LAB_EVENTS_SECRET",
+                "no working legacy Lab route",
+                "LAB_INSTANCE_ID",
+                "LAB_INSTANCE_SECRET",
+                "bin/rails lab:hosted_engine:create PRODUCT=glutony",
+            ] {
+                assert!(err.contains(needle), "{needle:?} missing from {err}");
+            }
+            assert!(
+                !err.contains("leftover-v1-secret"),
+                "the secret is never echoed: {err}"
+            );
+        }
+        // Blank counts as unset, as in from_env.
+        assert!(
+            LabConfig::from_values(
+                url.map(String::from),
+                Some("id".into()),
+                Some("s".into()),
+                Some("  ".into()),
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
@@ -489,6 +398,8 @@ mod tests {
             "http://10.0.0.5",
             "http://192.168.1.2:3000",
             "http://172.20.0.3",
+            // The Lab's dev stack hands engines this one.
+            "http://172.29.81.10:8081",
             "http://[::1]:8091",
             "https://lab.meilisearch.com",
         ] {
@@ -510,23 +421,5 @@ mod tests {
                 "{bad}"
             );
         }
-    }
-
-    #[test]
-    fn signature_matches_a_known_vector() {
-        // echo -n '{"events":[]}' | openssl dgst -sha256 -hmac secret
-        assert_eq!(
-            sign(b"secret", br#"{"events":[]}"#),
-            format!(
-                "sha256={}",
-                hex::encode({
-                    let mut m = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-                    m.update(br#"{"events":[]}"#);
-                    m.finalize().into_bytes()
-                })
-            )
-        );
-        assert!(sign(b"k", b"body").starts_with("sha256="));
-        assert_eq!(sign(b"k", b"body").len(), "sha256=".len() + 64);
     }
 }

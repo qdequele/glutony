@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let lab_config = meili_ingest_control_plane::lab_sender::LabConfig::from_env()
         .context("invalid Lab events configuration")?;
     let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
-    if let Some(creds) = lab_config.as_ref().and_then(|c| c.credentials()) {
+    if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
         // Workers ask `GET /internal/lab/credits/{account}` before a source run; this
         // client is on that path: short timeouts, and no redirects so the bearer
         // secret is never replayed to another host.
@@ -55,34 +55,32 @@ async fn main() -> anyhow::Result<()> {
     let cancel = tokio_util::sync::CancellationToken::new();
     let sender = match lab_config {
         Some(config) => {
-            tracing::info!(url = %config.url, legacy = config.is_legacy(), "lab events sender enabled");
-            if let Some(creds) = config.credentials() {
-                // Bounded like the sender's own client: a hung Lab must not block boot.
-                let http = reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(2))
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()?;
-                match meili_ingest_lab::fetch_instance_info(&http, creds).await {
-                    Ok(info) => {
-                        // Credentials of another product's engine abort boot: its
-                        // events would be attributed to that product.
-                        meili_ingest_lab::check_product(&info)?;
-                        tracing::info!(
-                            kind = ?info.kind,
-                            product = %info.product,
-                            region = ?info.region,
-                            "Lab instance identity confirmed"
-                        )
-                    }
-                    // Spec §3.6: a 401 aborts boot; the credentials are wrong or revoked.
-                    Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
-                        "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"
-                    ),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "could not confirm this deployment's Lab identity; events are sent anyway and retried"
-                    ),
+            tracing::info!(url = %config.url(), "lab events sender enabled");
+            // Bounded like the sender's own client: a hung Lab must not block boot.
+            let http = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(2))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?;
+            match meili_ingest_lab::fetch_instance_info(&http, config.credentials()).await {
+                Ok(info) => {
+                    // Credentials of another product's engine abort boot: its
+                    // events would be attributed to that product.
+                    meili_ingest_lab::check_product(&info)?;
+                    tracing::info!(
+                        kind = ?info.kind,
+                        product = %info.product,
+                        region = ?info.region,
+                        "Lab instance identity confirmed"
+                    )
                 }
+                // Spec §3.6: a 401 aborts boot; the credentials are wrong or revoked.
+                Err(meili_ingest_lab::LabError::Unauthorized) => anyhow::bail!(
+                    "the Lab rejected LAB_INSTANCE_ID / LAB_INSTANCE_SECRET (401); fix the credentials"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not confirm this deployment's Lab identity; events are sent anyway and retried"
+                ),
             }
             let sender = meili_ingest_control_plane::lab_sender::LabSender::new(
                 meili_ingest_control_plane::lab_events::LabEventRepo::new(pool.clone()),

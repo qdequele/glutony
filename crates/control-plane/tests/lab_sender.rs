@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use meili_ingest_control_plane::db;
 use meili_ingest_control_plane::lab_events::LabEventRepo;
-use meili_ingest_control_plane::lab_sender::{Delivery, LabConfig, LabSender, sign};
+use meili_ingest_control_plane::lab_sender::{Delivery, LabConfig, LabSender};
 use meili_ingest_control_plane::metrics::{LabMetrics, render};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -336,49 +336,6 @@ async fn an_oversized_ack_is_malformed_and_stays_pending() {
     );
     assert_eq!(repo.stats().await.unwrap().pending, 1);
     assert!(render(&metrics).contains("glutony_lab_events_failed_total{reason=\"malformed\"} 1"));
-    t.drop_schema().await;
-}
-
-#[tokio::test]
-async fn a_legacy_events_secret_still_signs_the_v1_way() {
-    let Some(t) = setup().await else { return };
-    let lab = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/internal/events"))
-        .respond_with(accept_all)
-        .mount(&lab)
-        .await;
-    let repo = LabEventRepo::new(t.pool.clone());
-    let config = LabConfig::from_values(Some(lab.uri()), None, None, Some("old-secret".into()))
-        .unwrap()
-        .unwrap();
-    assert!(config.is_legacy());
-    let s = LabSender::new(
-        repo.clone(),
-        config,
-        LabMetrics::default(),
-        Default::default(),
-    )
-    .unwrap();
-    repo.insert_many(&[event(Uuid::new_v4())]).await.unwrap();
-    assert_eq!(
-        s.deliver_once().await,
-        Delivery::Sent {
-            delivered: 1,
-            pending: 0
-        }
-    );
-    let req = &lab.received_requests().await.unwrap()[0];
-    assert_eq!(
-        req.headers
-            .get("x-lab-signature")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        sign(b"old-secret", &req.body)
-    );
-    assert!(req.headers.get("x-lab-instance-id").is_none());
-    assert!(req.headers.get("x-lab-timestamp").is_none());
     t.drop_schema().await;
 }
 
