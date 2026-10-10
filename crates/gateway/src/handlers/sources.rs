@@ -386,6 +386,11 @@ pub async fn run_source(
             "source {uid:?} is archived: its pipeline was deleted"
         )));
     }
+    // A manual run starts billable work for the tenant: the same credit pre-check as
+    // POST /ingest (spec v2 §8.1). Scheduled runs fire from Temporal and are not checked.
+    if let (Some(lab), Some(account)) = (&state.lab, tenant_id.as_deref()) {
+        lab.check_credits(account).await?;
+    }
     state
         .schedules
         .trigger(&stored.definition.schedule_id)
@@ -900,6 +905,69 @@ mod tests {
                 "delete source-11111111-1111-1111-1111-111111111111".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_manual_run_for_a_lab_account_without_credits_is_402_and_nothing_runs() {
+        // A manual run starts billable work for the tenant, so it gets the same credit
+        // pre-check as POST /ingest (spec v2 §8.1).
+        const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+        const INSTANCE: &str = "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d";
+        let cp = MockServer::start().await;
+        let mut owned = record(false);
+        owned["tenant_id"] = serde_json::json!(ACCOUNT);
+        Mock::given(method("GET"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(owned))
+            .mount(&cp)
+            .await;
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{ACCOUNT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "account_id": ACCOUNT, "tier": "free",
+                "credits": {"balance": 0}, "cache_ttl": 30
+            })))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let client = Arc::new(crate::lab::LabClient::new(
+            meili_ingest_lab::LabCredentials::new(&lab.uri(), INSTANCE, "s").expect("creds"),
+            reqwest::Client::new(),
+        ));
+        client.set_identity(meili_ingest_lab::InstanceInfo {
+            instance_id: INSTANCE.into(),
+            kind: meili_ingest_lab::InstanceKind::Hosted,
+            product: "glutony".into(),
+            region: None,
+            lab_url: None,
+        });
+        let schedules = Arc::new(FakeSchedules::default());
+        let config = GatewayConfig {
+            control_plane_url: cp.uri(),
+            ..GatewayConfig::default()
+        };
+        let state = AppState::new(
+            config,
+            Arc::new(FakeStarter::default()),
+            BlobStore::memory(),
+            reqwest::Client::new(),
+        )
+        .with_connections(ConnectionConfig::new(Some(key()), HostPolicy::Any))
+        .with_sources(schedules.clone(), HostPolicy::Any)
+        .with_lab(client);
+        let app = crate::router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sources/tmdb/run")
+            .header("x-meili-tenant-id", ACCOUNT)
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(body["code"], "insufficient_credits");
+        assert!(schedules.calls().is_empty(), "nothing was triggered");
     }
 
     #[tokio::test]

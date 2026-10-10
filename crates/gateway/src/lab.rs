@@ -5,7 +5,9 @@
 //! confirmed the credentials at boot, and past the stale window of an outage.
 //!
 //! Lookups are cached per account for [`FRESH_FOR`]; when the Lab cannot answer, an
-//! entry up to [`STALE_FOR`] old is used.
+//! entry up to [`STALE_FOR`] old is used. After a failed fetch the client does not ask
+//! the Lab again for [`FAILURE_BACKOFF`], so a hung Lab costs one timeout, not one per
+//! request.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
@@ -23,6 +25,8 @@ use crate::error::GatewayError;
 pub const FRESH_FOR: Duration = Duration::from_secs(30);
 /// A lookup younger than this is reused when the Lab cannot answer.
 pub const STALE_FOR: Duration = Duration::from_secs(300);
+/// After a failed fetch, the Lab is not asked again for this long (any account).
+pub const FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct Cached {
@@ -36,6 +40,8 @@ pub struct LabClient {
     http: reqwest::Client,
     identity: RwLock<Option<InstanceInfo>>,
     accounts: Mutex<HashMap<String, Cached>>,
+    /// When the last account fetch failed; cleared by the next success.
+    last_failure: Mutex<Option<Instant>>,
     /// Test-only offset added to the clock, so tests move the cache windows forward
     /// without pausing tokio's clock (which auto-advances during real I/O).
     #[cfg(test)]
@@ -59,6 +65,7 @@ impl LabClient {
             http,
             identity: RwLock::new(None),
             accounts: Mutex::new(HashMap::new()),
+            last_failure: Mutex::new(None),
             #[cfg(test)]
             skew: Mutex::new(Duration::ZERO),
         }
@@ -165,7 +172,25 @@ impl LabClient {
         {
             return Some(c.lookup);
         }
-        match fetch_account(&self.http, &self.creds, account_id).await {
+        let backing_off = self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|at| now.duration_since(at) < FAILURE_BACKOFF);
+        let fetched = if backing_off {
+            Err(LabError::Transport(format!(
+                "not asked: the last Lab request failed less than {}s ago",
+                FAILURE_BACKOFF.as_secs()
+            )))
+        } else {
+            let fetched = fetch_account(&self.http, &self.creds, account_id).await;
+            // Timed from when the failure was seen, so a 5 s timeout still leaves the
+            // full backoff before the next attempt.
+            *self.last_failure.lock().unwrap_or_else(|p| p.into_inner()) =
+                fetched.is_err().then(|| self.now());
+            fetched
+        };
+        match fetched {
             Ok(lookup) => {
                 self.accounts
                     .lock()
@@ -331,6 +356,63 @@ mod tests {
             c.check_credits(ACCOUNT).await.unwrap_err().code(),
             "lab_unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_remembered_for_10s() {
+        // A hung or failing Lab must not cost every request a timeout: after one
+        // failure the client stops asking for FAILURE_BACKOFF and answers from what it
+        // has (a stale entry, or 503 without one).
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{ACCOUNT}")))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let c = client(&lab);
+        c.set_identity(hosted());
+        assert_eq!(
+            c.check_credits(ACCOUNT).await.unwrap_err().code(),
+            "lab_unavailable"
+        );
+        c.advance(Duration::from_secs(9));
+        assert_eq!(
+            c.check_credits(ACCOUNT).await.unwrap_err().code(),
+            "lab_unavailable"
+        );
+        // Only the first lookup reached the Lab.
+        lab.verify().await;
+
+        // Past the backoff the client asks again, and a success clears it.
+        lab.reset().await;
+        mount_balance(&lab, 10, 1).await;
+        c.advance(Duration::from_secs(2));
+        c.check_credits(ACCOUNT).await.unwrap();
+        lab.verify().await;
+    }
+
+    #[tokio::test]
+    async fn during_the_failure_backoff_a_stale_entry_is_served_without_asking() {
+        let lab = MockServer::start().await;
+        mount_balance(&lab, 10, 1).await;
+        let c = client(&lab);
+        c.set_identity(hosted());
+        c.check_credits(ACCOUNT).await.unwrap();
+        lab.verify().await;
+        lab.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        // Entry is 31 s old: not fresh, so the Lab is asked once and fails.
+        c.advance(Duration::from_secs(31));
+        c.check_credits(ACCOUNT).await.unwrap();
+        // Within the backoff: served stale, no second request.
+        c.advance(Duration::from_secs(5));
+        c.check_credits(ACCOUNT).await.unwrap();
+        lab.verify().await;
     }
 
     #[tokio::test]
