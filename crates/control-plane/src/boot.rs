@@ -13,8 +13,9 @@ use crate::lab_sender::LabConfig;
 /// Default listen address (SPEC §13).
 pub const DEFAULT_BIND: &str = "0.0.0.0:9000";
 
-/// Everything the control plane reads from the environment.
-#[derive(Debug)]
+/// Everything the control plane reads from the environment. Its `Debug` redacts the
+/// database password and the control-plane token (the Lab secret is redacted by
+/// [`LabConfig`]'s own).
 pub struct BootConfig {
     /// `DATABASE_URL`.
     pub database_url: String,
@@ -24,6 +25,30 @@ pub struct BootConfig {
     pub internal_token: Option<String>,
     /// `LAB_URL` + `LAB_INSTANCE_*`, when the deployment reports to a Lab.
     pub lab: Option<LabConfig>,
+}
+
+impl std::fmt::Debug for BootConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let database_url = match url::Url::parse(&self.database_url) {
+            Ok(mut u) => {
+                if u.password().is_some() {
+                    // Only fails for URLs that cannot carry credentials at all.
+                    let _ = u.set_password(Some("redacted"));
+                }
+                u.to_string()
+            }
+            Err(_) => "<unparseable, redacted>".to_string(),
+        };
+        f.debug_struct("BootConfig")
+            .field("database_url", &database_url)
+            .field("addr", &self.addr)
+            .field(
+                "internal_token",
+                &self.internal_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("lab", &self.lab)
+            .finish()
+    }
 }
 
 impl BootConfig {
@@ -163,6 +188,28 @@ mod tests {
         identity(wiremock::ResponseTemplate::new(200).set_body_string("nope"))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn debug_redacts_the_secrets() {
+        let c = boot(&[
+            (
+                "DATABASE_URL",
+                "postgres://glutony:db-pa55word@db.internal:5432/glutony",
+            ),
+            ("CONTROL_PLANE_TOKEN", "cp-t0ken-value"),
+            ("LAB_URL", "https://lab.example"),
+            ("LAB_INSTANCE_ID", "inst-id"),
+            ("LAB_INSTANCE_SECRET", "lab-s3cret-value"),
+        ])
+        .unwrap();
+        let dbg = format!("{c:?}");
+        for secret in ["db-pa55word", "cp-t0ken-value", "lab-s3cret-value"] {
+            assert!(!dbg.contains(secret), "{secret} leaked: {dbg}");
+        }
+        // Still useful: where it connects and which Lab instance it is.
+        assert!(dbg.contains("db.internal"), "{dbg}");
+        assert!(dbg.contains("inst-id"), "{dbg}");
     }
 
     #[test]
