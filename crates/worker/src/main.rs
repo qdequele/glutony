@@ -41,15 +41,15 @@ async fn main() -> anyhow::Result<()> {
         registry.load_external(spec).await;
     }
     tracing::info!(plugins = ?registry.names(), unavailable = ?registry.unavailable(), "plugins registered");
-    // A provider plugin with no price entry bills every call at 0: say so now, once,
-    // rather than only when its first call is warned about.
+    // A provider plugin with no price entry, or only zero prices, bills every call at
+    // 0: say so now, once, rather than only when its first call is warned about.
     let names = registry.names();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let unpriced = costs.unpriced_plugins(&names);
     if !unpriced.is_empty() {
         tracing::error!(
             plugins = ?unpriced,
-            "provider plugins with no entry in the provider cost table: their calls are billed at 0 provider cost and flagged unpriced; add them to PROVIDER_COSTS_FILE"
+            "provider plugins with no entry, or only zero prices, in the provider cost table: their calls are billed at 0 provider cost (flagged unpriced when there is no entry); add their prices to PROVIDER_COSTS_FILE"
         );
     }
     let registry = Arc::new(registry);

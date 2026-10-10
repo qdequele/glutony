@@ -138,7 +138,8 @@ error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
   missing calls (it is always present, 0 when the cost is complete), and the worker
   logs a warning. The bundled prices are placeholders: set yours before reporting to
   a Lab (`jev_enricher` has no bundled price at all). At boot the worker logs an
-  error naming every registered provider plugin the table has no entry for. A
+  error naming every registered provider plugin the table has no entry, or only zero
+  prices, for. A
   `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at boot; if it
   ever fails to load later, every call is flagged unpriced (never priced at the
   bundled rates).
