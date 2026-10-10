@@ -38,7 +38,8 @@ pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3_600);
 pub enum LabAuth {
     /// `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET` (spec v2 §3.3).
     Instance(LabCredentials),
-    /// `LAB_EVENTS_SECRET`: the pre-v2 global secret, accepted for one more release.
+    /// `LAB_EVENTS_SECRET`: the pre-v2 global secret, accepted for one more release. A v2
+    /// Lab does not accept batches signed with it (logged as an error at boot).
     Legacy {
         /// HMAC key over the bare body.
         secret: String,
@@ -70,7 +71,8 @@ impl std::fmt::Debug for LabConfig {
 
 impl LabConfig {
     /// `LAB_URL` with `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`, or with the legacy
-    /// `LAB_EVENTS_SECRET` (warned, removed next release); nothing at all is `None`.
+    /// `LAB_EVENTS_SECRET` (logged as an error: a v2 Lab drops those events; removed next
+    /// release); nothing at all is `None`.
     pub fn from_values(
         url: Option<String>,
         instance_id: Option<String>,
@@ -100,9 +102,13 @@ impl LabConfig {
             }
             (None, None) => match legacy_secret {
                 Some(secret) => {
-                    tracing::warn!(
-                        "LAB_EVENTS_SECRET is deprecated: set LAB_INSTANCE_ID and LAB_INSTANCE_SECRET \
-                         (the global secret is removed in the next release)"
+                    // Still accepted (removed next release), but a v2 Lab checks legacy
+                    // batches as Scrapix's and never accepts glutony's: say so loudly.
+                    tracing::error!(
+                        "LAB_EVENTS_SECRET is set without LAB_INSTANCE_ID / LAB_INSTANCE_SECRET: \
+                         a v2 Lab does not accept events signed this way, so they are retried \
+                         and dropped after 24 h. Set LAB_INSTANCE_ID and LAB_INSTANCE_SECRET \
+                         (bin/rails lab:hosted_engine:create PRODUCT=glutony) and remove LAB_EVENTS_SECRET"
                     );
                     Ok(Some(Self {
                         url: validate_lab_url(&url)?,
@@ -424,6 +430,55 @@ mod tests {
         ] {
             assert!(bad.is_err());
         }
+    }
+
+    /// Run `f` with a subscriber that keeps ERROR events only, and return their text.
+    fn errors_logged_by(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let out = buf.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn the_legacy_secret_is_accepted_but_logged_as_an_error() {
+        // A v2 Lab checks X-Scrapix-Signature on its legacy path and attributes those
+        // events to Scrapix: glutony's legacy batches are never accepted there.
+        let mut config = None;
+        let logged = errors_logged_by(|| {
+            config = LabConfig::from_values(
+                Some("https://lab.example".into()),
+                None,
+                None,
+                Some("old".into()),
+            )
+            .unwrap();
+        });
+        assert!(config.is_some_and(|c| c.is_legacy()));
+        assert!(logged.contains("LAB_EVENTS_SECRET"), "{logged}");
+        assert!(logged.contains("24 h"), "{logged}");
+        assert!(logged.contains("LAB_INSTANCE_ID"), "{logged}");
+        assert!(logged.contains("LAB_INSTANCE_SECRET"), "{logged}");
     }
 
     #[test]
