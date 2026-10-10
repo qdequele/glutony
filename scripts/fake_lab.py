@@ -44,6 +44,8 @@ def v2_error(event) -> str | None:
     missing = [k for k in ENVELOPE_KEYS if k not in event]
     if missing:
         return f"event {event.get('id')} lacks {missing}"
+    if not isinstance(event["id"], str):
+        return "an event id is not a string"
     data = event["data"]
     if not isinstance(data, dict):
         return f"event {event['id']} has no data object"
