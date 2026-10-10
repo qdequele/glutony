@@ -178,10 +178,10 @@ the worker asks the control plane before fetching anything
 with the control plane's `LAB_INSTANCE_*` credentials and the same cache rules (30 s
 fresh, 300 s stale, 10 s backoff after a failure). Workers never hold Lab credentials,
 and never ask for tenants that are not Lab account ids. An account without credits
-fails the run at once: it is recorded as failed with the reason ("account … has no Lab
-credits left; source run refused", followed by the control plane's message, which says
-to top up in the Lab console), nothing is fetched, staged or billed, its incremental state is not saved, and the next tick
-tries again. When the Lab cannot be asked (`503`, or a control plane that does not
+fails the run at once: it is recorded as failed with the reason ("source run refused:"
+and the control plane's message, which names the account and says to top up in the
+Lab console), nothing is fetched, staged or billed, its incremental state is not
+saved, and the next tick tries again. When the Lab cannot be asked (`503`, or a control plane that does not
 answer the check), the run is retried with the activity's retry policy and, if the Lab
 is still unreachable, recorded as failed: the check fails closed. A control plane
 without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs are checked

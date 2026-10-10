@@ -333,7 +333,7 @@ async fn an_account_without_credits_fails_the_run_before_fetching_and_records_wh
     assert_eq!(runs[0]["outcome"], "failed");
     let why = runs[0]["error"].as_str().unwrap_or_default();
     assert!(
-        why.contains("no Lab credits left"),
+        why.contains("source run refused") && why.contains("no credits left"),
         "the run row says why: {why}"
     );
     assert!(

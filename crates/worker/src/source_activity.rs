@@ -308,11 +308,11 @@ impl SourceActivities {
                 .ok()
                 .and_then(|b| b.get("error")?.as_str().map(str::to_owned))
                 .filter(|m| !m.trim().is_empty());
-            let mut msg = format!("account {account} has no Lab credits left; source run refused");
-            if let Some(d) = detail {
-                msg.push_str(": ");
-                msg.push_str(&d);
-            }
+            // The control plane's message already names the account.
+            let msg = match detail {
+                Some(d) => format!("source run refused: {d}"),
+                None => format!("account {account} has no Lab credits left; source run refused"),
+            };
             return Err(PluginError::NonRetryable(msg));
         }
         Err(PluginError::Retryable(format!(
@@ -1004,12 +1004,13 @@ mod tests {
             .resolve(&input())
             .await
             .expect_err("no credits");
+        // The control plane's message names the account; it is not repeated.
         assert!(
             matches!(&err, PluginError::NonRetryable(m)
-                if m.contains(LAB_ACCOUNT)
-                    && m.contains("no Lab credits left")
-                    && m.contains("source run refused")
-                    && m.contains("top up in the Lab console")),
+            if m == &format!(
+                "source run refused: account {LAB_ACCOUNT} has no credits left; \
+                 top up in the Lab console"
+            )),
             "the run fails now and the next tick tries again: {err:?}"
         );
         let checks = requests_to(&cp, &format!("/internal/lab/credits/{LAB_ACCOUNT}")).await;
@@ -1113,6 +1114,23 @@ mod tests {
                 .count();
             assert_eq!(checks, 0, "{tenant}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_402_without_a_message_names_the_account() {
+        let files = files_never_fetched().await;
+        let cp =
+            control_plane_with_credits(lab_row(&files), pipeline(true), ResponseTemplate::new(402))
+                .await;
+        let err = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect_err("no credits");
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m)
+                if m == &format!("account {LAB_ACCOUNT} has no Lab credits left; source run refused")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
