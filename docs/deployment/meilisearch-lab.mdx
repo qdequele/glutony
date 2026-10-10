@@ -134,9 +134,11 @@ error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
   logs a warning. The bundled prices are placeholders: set yours before reporting to a
   Lab (`jev_enricher` has no bundled price at all). At boot the worker logs an error
   naming every registered provider plugin the table has no entry for, or only zero
-  prices for. A `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at
-  boot; if it ever fails to load later, every call is flagged unpriced (never priced
-  at the bundled rates).
+  prices for. With `LAB_EVENTS_ENABLED` on and the bundled table in use (no
+  `PROVIDER_COSTS_FILE`, or an unedited copy of it), it also logs an error at boot. A
+  `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at boot; if it
+  ever fails to load later, every call is flagged unpriced (never priced at the
+  bundled rates).
 - Jobs without a canonical-UUID tenant (standalone, Cloud projects) are never sent.
   Failed and cancelled jobs are: provider cost already spent is real.
 

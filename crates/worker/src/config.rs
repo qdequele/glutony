@@ -106,8 +106,35 @@ fn parse_flag(raw: Option<&str>) -> bool {
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Whether Lab events would be priced with the bundled placeholder list prices: they
+/// are enabled and the loaded provider cost table is the compiled-in one (no
+/// `PROVIDER_COSTS_FILE`, or an unedited copy of it).
+pub fn lab_events_use_placeholder_prices(
+    lab_events_enabled: bool,
+    costs: &meili_ingest_plugin_sdk::cost::ProviderCosts,
+) -> bool {
+    lab_events_enabled && *costs == meili_ingest_plugin_sdk::cost::ProviderCosts::bundled()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placeholder_prices_are_flagged_only_for_lab_events() {
+        use meili_ingest_plugin_sdk::cost::ProviderCosts;
+        let bundled = ProviderCosts::bundled();
+        assert!(super::lab_events_use_placeholder_prices(true, &bundled));
+        // An unedited copy of the bundled file is the same table.
+        let copy =
+            ProviderCosts::from_toml(include_str!("../../../k8s/provider-costs.toml")).unwrap();
+        assert!(super::lab_events_use_placeholder_prices(true, &copy));
+        assert!(!super::lab_events_use_placeholder_prices(false, &bundled));
+        let own = ProviderCosts::from_toml(
+            "[llm_enricher.default]\ninput_per_mtok = 1\noutput_per_mtok = 2\n",
+        )
+        .unwrap();
+        assert!(!super::lab_events_use_placeholder_prices(true, &own));
+    }
+
     #[test]
     fn lab_events_flag_parsing() {
         for (raw, expected) in [

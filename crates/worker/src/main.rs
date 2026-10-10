@@ -34,6 +34,16 @@ async fn main() -> anyhow::Result<()> {
     let costs = meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
         .map_err(anyhow::Error::msg)
         .context("invalid PROVIDER_COSTS_FILE")?;
+    if meili_ingest_worker::config::lab_events_use_placeholder_prices(
+        config.lab_events_enabled,
+        &costs,
+    ) {
+        tracing::error!(
+            "LAB_EVENTS_ENABLED is on but the provider cost table is the bundled one: Lab \
+             events are priced with placeholder list prices, not what this deployment pays; \
+             set PROVIDER_COSTS_FILE to your own prices"
+        );
+    }
 
     // Plugins
     let mut registry = PluginRegistry::builtin();
