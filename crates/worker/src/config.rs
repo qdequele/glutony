@@ -52,10 +52,7 @@ impl WorkerConfig {
             control_plane_url: std::env::var("CONTROL_PLANE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            control_plane_token: std::env::var("CONTROL_PLANE_TOKEN")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+            control_plane_token: control_plane_token(std::env::var("CONTROL_PLANE_TOKEN").ok())?,
             blob_store_url: std::env::var("BLOB_STORE_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -90,6 +87,19 @@ impl std::fmt::Debug for WorkerConfig {
     }
 }
 
+/// `CONTROL_PLANE_TOKEN`, trimmed; blank is unset. The example Secret's `CHANGE_ME`
+/// placeholder is refused: it is a public value.
+fn control_plane_token(raw: Option<String>) -> anyhow::Result<Option<String>> {
+    let token = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if token.as_deref() == Some("CHANGE_ME") {
+        anyhow::bail!(
+            "CONTROL_PLANE_TOKEN is the example placeholder CHANGE_ME; set the real token \
+             the control plane uses (openssl rand -hex 32)"
+        );
+    }
+    Ok(token)
+}
+
 /// `true`/`1` (any case) -> on; anything else or unset -> off.
 fn parse_flag(raw: Option<&str>) -> bool {
     raw.map(str::trim)
@@ -111,6 +121,27 @@ mod tests {
             assert_eq!(super::parse_flag(Some(raw)), expected, "{raw:?}");
         }
         assert!(!super::parse_flag(None));
+    }
+
+    #[test]
+    fn the_control_plane_token_refuses_the_placeholder() {
+        assert_eq!(super::control_plane_token(None).unwrap(), None);
+        assert_eq!(super::control_plane_token(Some(" ".into())).unwrap(), None);
+        assert_eq!(
+            super::control_plane_token(Some(" tok\n".into()))
+                .unwrap()
+                .as_deref(),
+            Some("tok")
+        );
+        for placeholder in ["CHANGE_ME", " CHANGE_ME\n"] {
+            let err = super::control_plane_token(Some(placeholder.into()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("CONTROL_PLANE_TOKEN") && err.contains("CHANGE_ME"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

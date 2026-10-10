@@ -78,7 +78,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = GatewayConfig::from_env().context("invalid gateway configuration")?;
-    config.validate()?;
+    let lab_creds =
+        meili_ingest_lab::LabCredentials::from_env().context("invalid LAB_* configuration")?;
+    config.validate(lab_creds.as_ref())?;
     tracing::info!(config = ?config, "starting meili-gateway");
     if config.envoy_trusted_header.is_none() {
         tracing::warn!("ENVOY_TRUSTED_HEADER is unset: trusting X-Meili-* headers from any client");
@@ -126,9 +128,7 @@ async fn main() -> anyhow::Result<()> {
     // LAB_INSTANCE_* this gateway never talks to the Lab. One synchronous attempt
     // first: a 401 aborts boot (wrong or revoked credentials); any other failure is
     // retried in the background, and Lab-account jobs are refused until it succeeds.
-    let lab = match meili_ingest_lab::LabCredentials::from_env()
-        .context("invalid LAB_* configuration")?
-    {
+    let lab = match lab_creds {
         Some(creds) => {
             tracing::info!(
                 url = creds.url(),

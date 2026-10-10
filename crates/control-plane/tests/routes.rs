@@ -410,4 +410,16 @@ fn control_plane_token_policy() {
         "{err}"
     );
     assert!(policy(Some("  ".into()), false).is_err(), "blank is unset");
+    // The example Secret's placeholder is refused even with the escape hatch on.
+    for placeholder in ["CHANGE_ME", " CHANGE_ME\n"] {
+        for disabled in [false, true] {
+            let err = policy(Some(placeholder.into()), disabled)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("CONTROL_PLANE_TOKEN") && err.contains("CHANGE_ME"),
+                "{err}"
+            );
+        }
+    }
 }

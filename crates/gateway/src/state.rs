@@ -202,11 +202,36 @@ impl GatewayConfig {
         })
     }
 
-    /// Cross-field checks that must stop the process at boot. A Lab service token without
-    /// the edge secret would let any client claim a tenant with a bare `X-Meili-Tenant-Id`
-    /// header (Lab account ids are not secrets), so that combination is refused.
+    /// Checks that must stop the process at boot.
+    ///
+    /// - The example Secret's `CHANGE_ME` placeholder is refused for every secret: once
+    ///   published, it would let anyone through.
+    /// - A Lab service token, or Lab instance credentials (`lab`), without the edge
+    ///   secret would let any client claim a tenant with a bare `X-Meili-Tenant-Id`
+    ///   header (Lab account ids are not secrets) and, on a Lab engine, bill any account.
+    ///   Both combinations are refused.
+    ///
     /// `ADMIN_API_KEY` alone stays allowed: operator mode may run without an edge.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self, lab: Option<&meili_ingest_lab::LabCredentials>) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("CONTROL_PLANE_TOKEN", &self.control_plane_token),
+            ("ADMIN_API_KEY", &self.admin_api_key),
+            ("ENVOY_TRUSTED_HEADER", &self.envoy_trusted_header),
+        ] {
+            if value.as_deref().is_some_and(is_placeholder) {
+                anyhow::bail!(
+                    "{name} is the example placeholder CHANGE_ME; set a real secret \
+                     (openssl rand -hex 32) or leave it unset"
+                );
+            }
+        }
+        if lab.is_some() && self.envoy_trusted_header.is_none() {
+            anyhow::bail!(
+                "LAB_INSTANCE_ID / LAB_INSTANCE_SECRET are set but ENVOY_TRUSTED_HEADER is not: \
+                 without the edge secret any client could bill any Lab account with \
+                 X-Meili-Tenant-Id; set both"
+            );
+        }
         if self.lab_service_token.is_some() && self.envoy_trusted_header.is_none() {
             anyhow::bail!(
                 "LAB_SERVICE_TOKEN is set but ENVOY_TRUSTED_HEADER is not: without the edge \
@@ -220,6 +245,14 @@ impl GatewayConfig {
     pub fn max_upload_bytes(&self) -> usize {
         self.max_upload_mb.saturating_mul(1024 * 1024)
     }
+}
+
+/// The value the example Secret ships for every secret (`k8s/secrets.example.yaml`).
+pub const PLACEHOLDER: &str = "CHANGE_ME";
+
+/// Whether `value` is the example placeholder (trimmed, exact match).
+fn is_placeholder(value: &str) -> bool {
+    value.trim() == PLACEHOLDER
 }
 
 fn env_opt(name: &str) -> Option<String> {
@@ -994,7 +1027,7 @@ mod tests {
             lab_service_token: Some("lab".into()),
             ..Default::default()
         };
-        let err = lab_only.validate().unwrap_err().to_string();
+        let err = lab_only.validate(None).unwrap_err().to_string();
         assert!(err.contains("LAB_SERVICE_TOKEN"), "{err}");
         assert!(err.contains("ENVOY_TRUSTED_HEADER"), "{err}");
 
@@ -1003,15 +1036,65 @@ mod tests {
             envoy_trusted_header: Some("edge".into()),
             ..Default::default()
         };
-        assert!(both.validate().is_ok());
+        assert!(both.validate(None).is_ok());
 
         // Operator mode may run without an edge.
         let admin_only = GatewayConfig {
             admin_api_key: Some("admin".into()),
             ..Default::default()
         };
-        assert!(admin_only.validate().is_ok());
-        assert!(GatewayConfig::default().validate().is_ok());
+        assert!(admin_only.validate(None).is_ok());
+        assert!(GatewayConfig::default().validate(None).is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_the_change_me_placeholder() {
+        // The example Secret ships CHANGE_ME; booting on it would make these public.
+        let cases: [(&str, fn(&mut GatewayConfig, String)); 3] = [
+            ("CONTROL_PLANE_TOKEN", |c, v| {
+                c.control_plane_token = Some(v)
+            }),
+            ("ADMIN_API_KEY", |c, v| c.admin_api_key = Some(v)),
+            ("ENVOY_TRUSTED_HEADER", |c, v| {
+                c.envoy_trusted_header = Some(v)
+            }),
+        ];
+        for (name, set) in cases {
+            for value in ["CHANGE_ME", " CHANGE_ME\n"] {
+                let mut cfg = GatewayConfig::default();
+                set(&mut cfg, value.to_string());
+                let err = cfg.validate(None).unwrap_err().to_string();
+                assert!(err.contains(name), "{name}: {err}");
+                assert!(err.contains("CHANGE_ME"), "{name}: {err}");
+            }
+            // Only the exact placeholder is refused.
+            let mut cfg = GatewayConfig::default();
+            set(&mut cfg, "change_me_not".to_string());
+            assert!(cfg.validate(None).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn validate_requires_the_edge_secret_on_a_lab_engine() {
+        // With Lab credentials every Lab-account job is billed: without the edge secret
+        // any client could bill any account with X-Meili-Tenant-Id.
+        let creds = meili_ingest_lab::LabCredentials::new(
+            "https://lab.example",
+            "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d",
+            "s",
+        )
+        .unwrap();
+        let err = GatewayConfig::default()
+            .validate(Some(&creds))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LAB_INSTANCE_ID"), "{err}");
+        assert!(err.contains("ENVOY_TRUSTED_HEADER"), "{err}");
+        let with_edge = GatewayConfig {
+            envoy_trusted_header: Some("edge".into()),
+            ..Default::default()
+        };
+        assert!(with_edge.validate(Some(&creds)).is_ok());
     }
 
     #[tokio::test]

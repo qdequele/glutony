@@ -89,7 +89,8 @@ impl AppState {
 }
 
 /// Decide what the control plane runs with: the token, or none only when the operator
-/// said so explicitly (`CONTROL_PLANE_TOKEN_DISABLED=true`, dev).
+/// said so explicitly (`CONTROL_PLANE_TOKEN_DISABLED=true`, dev). The example Secret's
+/// `CHANGE_ME` placeholder is refused: it is a public value.
 pub fn control_plane_token_policy(
     token: Option<String>,
     disabled: bool,
@@ -98,6 +99,10 @@ pub fn control_plane_token_policy(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
     {
+        Some(t) if t == "CHANGE_ME" => anyhow::bail!(
+            "CONTROL_PLANE_TOKEN is the example placeholder CHANGE_ME; set a real token \
+             (openssl rand -hex 32) on the control plane, the gateway and the workers"
+        ),
         Some(t) => Ok(Some(t)),
         None if disabled => {
             tracing::warn!(
