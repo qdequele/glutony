@@ -276,9 +276,11 @@ Lab events still waiting in the outbox from a pre-v2 release (written by the old
 workers, in a shape a v2 Lab rejects) are converted to the v2 `usage.recorded` shape
 when the new control plane first boots, and get a fresh 24 h delivery window. Workers
 not upgraded yet keep posting that old shape while the rollout runs (the control plane
-goes first), so the control plane converts such events as it stores them too: nothing
-from the rollout window goes unbilled. Converted events have the job's wall time as
-`step_seconds`, and carry no job lifecycle event (`job.completed` / `job.failed`).
+goes first), and an old control-plane replica still running stores it as is, so the
+new control plane also converts such events when it stores them and, at the latest,
+just before it sends them: nothing from the rollout window goes unbilled. Converted
+events have the job's wall time as `step_seconds`, and carry no job lifecycle event
+(`job.completed` / `job.failed`).
 
 ## Rollback
 

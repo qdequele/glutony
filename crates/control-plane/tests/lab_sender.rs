@@ -360,3 +360,124 @@ async fn maintain_drops_rows_never_acknowledged_for_24h_and_counts_them() {
     assert!(render(&metrics).contains("glutony_lab_events_dropped_total 1"));
     t.drop_schema().await;
 }
+
+/// A `usage.recorded` row as an old control-plane replica stores it during the rollout:
+/// pre-v2 shape, written straight to the table, due now.
+async fn insert_pre_v2(t: &TestDb) -> (Uuid, Uuid) {
+    let (id, job) = (Uuid::new_v4(), Uuid::new_v4());
+    let body = serde_json::json!({
+        "id": id, "type": "usage.recorded", "occurred_at": "2026-10-01T10:00:09.000Z",
+        "account_id": "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61", "api_key_id": null,
+        "product": "glutony",
+        "data": {
+            "job_id": job, "pipeline_uid": "builtin.json", "status": "succeeded",
+            "duration_ms": 2500, "cost_micro_usd": 7, "cost_complete": true,
+            "units": {"documents_out": 4, "input_bytes": 10, "pages": 0, "images": 0,
+                      "audio_seconds": 0.0, "llm_input_tokens": 0, "llm_output_tokens": 0,
+                      "llm_requests": 0, "external_requests": 0}
+        }
+    });
+    sqlx::query("INSERT INTO lab_events (id, body, attempts) VALUES ($1, $2, 3)")
+        .bind(id)
+        .bind(&body)
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    (id, job)
+}
+
+fn schema_errors(event: &serde_json::Value) -> Vec<String> {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../contracts/vendor/lab/lab-events.schema.json"
+    ))
+    .unwrap();
+    let v = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
+    v.iter_errors(event).map(|e| e.to_string()).collect()
+}
+
+#[tokio::test]
+async fn a_pre_v2_row_is_converted_before_it_is_sent() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/events"))
+        .respond_with(accept_all)
+        .expect(1)
+        .mount(&lab)
+        .await;
+    let (s, repo, _) = sender(&t, &lab).await;
+    let (id, job) = insert_pre_v2(&t).await;
+    let v2 = event(Uuid::new_v4());
+    repo.insert_many(std::slice::from_ref(&v2)).await.unwrap();
+
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Sent {
+            delivered: 2,
+            pending: 0
+        }
+    );
+    let req = &lab.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    let sent = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id.to_string())
+        .expect("the pre-v2 row is in the batch")
+        .clone();
+    assert_eq!(sent["data"]["operation"], "ingest");
+    assert_eq!(sent["data"]["units"]["documents"], 4);
+    assert_eq!(sent["data"]["units"]["step_seconds"], 3);
+    assert_eq!(sent["data"]["job_id"], job.to_string());
+    assert!(
+        schema_errors(&sent).is_empty(),
+        "{:?}",
+        schema_errors(&sent)
+    );
+    let delivered: bool =
+        sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM lab_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(&t.pool)
+            .await
+            .unwrap();
+    assert!(delivered);
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn a_converted_row_keeps_its_lease_and_backs_off_on_failure() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&lab)
+        .await;
+    let (s, _, _) = sender(&t, &lab).await;
+    let (id, _) = insert_pre_v2(&t).await;
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Failed {
+            reason: "status",
+            pending: 1
+        }
+    );
+    // Converted (fresh window: attempts back to 0), then the failure counted once
+    // and backed off: not due again right away.
+    let (body, attempts, due): (serde_json::Value, i32, bool) = sqlx::query_as(
+        "SELECT body, attempts, next_attempt <= now() FROM lab_events WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&t.pool)
+    .await
+    .unwrap();
+    assert_eq!(body["data"]["operation"], "ingest");
+    assert_eq!(attempts, 1);
+    assert!(!due, "the row backs off after the failure");
+    assert_eq!(s.deliver_once().await, Delivery::Idle);
+    t.drop_schema().await;
+}

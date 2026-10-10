@@ -163,6 +163,29 @@ impl LabSender {
         if batch.is_empty() {
             return Delivery::Idle;
         }
+        // Pre-v2 rows (stored by a control plane not upgraded yet, during the rollout)
+        // are accepted by a v2 Lab in the batch, then rejected, and their ids are
+        // consumed: convert them before they leave.
+        let batch = if crate::lab_events::needs_pre_v2_conversion(batch.iter().map(|e| &e.body)) {
+            let ids: Vec<Uuid> = batch.iter().map(|e| e.id).collect();
+            match self.repo.convert_pre_v2_and_reload(&ids, LEASE).await {
+                Ok(b) => b,
+                Err(e) => {
+                    // Not sent: a pre-v2 row would be lost. The lease expires and the
+                    // rows come back.
+                    tracing::error!(error = %e, "cannot convert pre-v2 lab events");
+                    return Delivery::Failed {
+                        reason: "db",
+                        pending: ids.len(),
+                    };
+                }
+            }
+        } else {
+            batch
+        };
+        if batch.is_empty() {
+            return Delivery::Idle;
+        }
         let ids: Vec<Uuid> = batch.iter().map(|e| e.id).collect();
         let bodies: Vec<&serde_json::Value> = batch.iter().map(|e| &e.body).collect();
         let body = match serde_json::to_vec(&serde_json::json!({ "events": bodies })) {

@@ -17,15 +17,18 @@ use uuid::Uuid;
 use crate::{AppState, CpError, JsonBody};
 
 /// Migration 0005: rewrites undelivered pre-v2 `usage.recorded` rows to the v2 shape.
-/// Also run after every insert, so a released migration file must never change.
+/// Also run when such rows are inserted or about to be sent, so a released migration
+/// file must never change.
 const CONVERT_PRE_V2: &str = include_str!("../../../migrations/0005_lab_events_v2.sql");
 
 /// Whether `events` may hold a pre-v2 `usage.recorded` event: one with a `data` object
 /// and no `data.operation`. A superset of what [`CONVERT_PRE_V2`] matches, so skipping
-/// the conversion when this is false never leaves a pre-v2 row unconverted, and v2
-/// batches never pay for a scan of the outbox.
-pub fn needs_pre_v2_conversion(events: &[serde_json::Value]) -> bool {
-    events.iter().any(|e| {
+/// the conversion when this is false never leaves a pre-v2 row of this batch
+/// unconverted, and v2 batches never pay for a scan of the outbox.
+pub fn needs_pre_v2_conversion<'a>(
+    events: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> bool {
+    events.into_iter().any(|e| {
         e.get("type").and_then(|t| t.as_str()) == Some("usage.recorded")
             && e.get("data")
                 .and_then(|d| d.as_object())
@@ -122,6 +125,31 @@ impl LabEventRepo {
         .bind(lease.as_secs_f64())
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// Convert the outbox's pre-v2 rows ([`CONVERT_PRE_V2`]) and return the leased
+    /// rows `ids` again, leased anew for `lease`, in one transaction. The conversion
+    /// resets a converted row's `attempts` (0) and `next_attempt` (now): re-leasing
+    /// before commit means no other sender ever sees the claimed rows due. Rows of
+    /// `ids` delivered meanwhile are left out.
+    pub async fn convert_pre_v2_and_reload(
+        &self,
+        ids: &[Uuid],
+        lease: Duration,
+    ) -> Result<Vec<PendingEvent>, CpError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
+        let rows = sqlx::query_as(
+            "UPDATE lab_events SET next_attempt = now() + make_interval(secs => $2) \
+             WHERE id = ANY($1) AND delivered_at IS NULL \
+             RETURNING id, body, attempts",
+        )
+        .bind(ids)
+        .bind(lease.as_secs_f64())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     /// Mark rows delivered.

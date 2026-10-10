@@ -49,7 +49,8 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 - Lab events still undelivered from a pre-v2 release are converted to the v2
   `usage.recorded` shape on upgrade (migration 0005) and get a fresh 24 h delivery
   window; they carry no job lifecycle event. Pre-v2 events that workers not upgraded
-  yet post during the rollout are converted as they are stored.
+  yet post during the rollout are converted as they are stored, or before they are
+  sent when an old control-plane replica stored them.
 
 ### Removed
 - `LAB_EVENTS_SECRET` (control plane): glutony has no working legacy Lab route (a v2
