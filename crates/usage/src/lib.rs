@@ -274,7 +274,7 @@ pub struct UsageEvent {
     pub step_id: String,
     /// Plugin name, `""` on job rows.
     pub plugin: String,
-    /// Temporal task queue the work ran on (`workers-general`, `workers-llm`, …).
+    /// Temporal task queue the work ran on (`workers-general`, `workers-io`).
     pub task_queue: String,
     /// [`JobStatus::as_str`] of the step (or of the job on job rows).
     pub status: String,

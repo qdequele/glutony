@@ -121,15 +121,14 @@ A plugin's name decides which worker pool runs it:
 
 ```rust
 match plugin {
-    "whisper_transcriber" | "ocr" | "video_audio_extractor" => "workers-gpu",
-    "llm_enricher" | "jev_enricher" | "image_captioner"     => "workers-llm",
-    "s3_downloader"                                          => "workers-io",
-    _                                                        => "workers-general",
+    "s3_downloader" => "workers-io",
+    _               => "workers-general",
 }
 ```
 
-Deploy your external plugin on the pool whose worker declares it in
-`EXTERNAL_PLUGINS`; names not in the table run on `workers-general`.
+No model runs inside a worker: AI steps call hosted APIs, so they share
+`workers-general` with every other plugin. External plugins run there too:
+declare them in `EXTERNAL_PLUGINS` on the `workers-general` pool.
 
 ## The indexer is special
 

@@ -131,10 +131,8 @@ PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
 TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker-general.log" 2>&1 &
 PIDS+=($!)
-TASK_QUEUE=workers-gpu ./target/debug/meili-ingest-worker >"${WORK}/worker-gpu.log" 2>&1 &
-PIDS+=($!)
 sleep 3
-echo "  workers polling"
+echo "  worker polling"
 
 GW="http://localhost:${GW_PORT}"
 

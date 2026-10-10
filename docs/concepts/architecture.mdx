@@ -24,12 +24,13 @@ description: Gateway, control plane, Temporal and worker pools
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                     ┌─────────────────┼──────────────────┐
-                     ▼                 ▼                  ▼
-              workers-general    workers-llm        workers-gpu
-              (pdf,docx,xlsx,    (llm_enricher)     (whisper,ocr)
-               chunker,indexer)
-                     └─────────────────┼──────────────────┘
+                         ┌─────────────┴─────────────┐
+                         ▼                           ▼
+                  workers-general               workers-io
+                  (pdf,docx,xlsx,               (s3_downloader)
+                   chunker,indexer,
+                   AI steps, ocr)
+                         └─────────────┬─────────────┘
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
                         └──────────────────────────────────────────────┘
@@ -77,10 +78,12 @@ per branch on the task queue for that plugin:
 
 | Plugin | Task queue |
 |---|---|
-| `whisper_transcriber`, `ocr`, `video_audio_extractor` | `workers-gpu` |
-| `llm_enricher`, `jev_enricher`, `image_captioner` | `workers-llm` |
 | `s3_downloader` | `workers-io` |
 | everything else | `workers-general` |
+
+No model runs inside a worker: AI steps (`llm_enricher`, `jev_enricher`,
+`image_captioner`, `whisper_transcriber`) call hosted APIs, so they share
+`workers-general` with every other plugin.
 
 Activity options come from the step: `start_to_close = timeout_secs`
 (default 300 s), heartbeat 60 s, retry policy from `retry`. Non-retryable

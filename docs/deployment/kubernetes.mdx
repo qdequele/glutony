@@ -18,7 +18,7 @@ kubectl -n meili-ingest get pods
 | `namespace.yaml` | `meili-ingest` namespace |
 | `control-plane.yaml` | shared `ConfigMap`, control plane `Deployment` + `Service` (9000) |
 | `gateway.yaml` | gateway `Deployment` (2 replicas), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
-| `workers.yaml` | `workers-general`, `workers-llm`, `workers-gpu` `Deployment`s, each with a KEDA `ScaledObject` |
+| `workers.yaml` | `workers-general` `Deployment` with a KEDA `ScaledObject` |
 | `temporal.yaml` | **reference only** single-pod Temporal (`auto-setup`) + Postgres + UI |
 | `kustomization.yaml` | ties it together; pin the image tag here |
 | `secrets.example.yaml` | **example only**, not in the kustomization: every key of the `meili-ingest-secrets` `Secret` |
@@ -32,7 +32,6 @@ kubectl -n meili-ingest get pods
 - A Postgres database for the control plane.
 - An object store bucket for the blob store (pods do not share a disk).
 - Temporal: Temporal Cloud or your own cluster. `temporal.yaml` is for dev/staging.
-- For `workers-gpu`: the NVIDIA device plugin and GPU nodes.
 
 ## 1. Configure
 
@@ -77,8 +76,7 @@ Pods read their environment at start. After any change to the `Secret` or the
 
 ```bash
 kubectl -n meili-ingest rollout restart deployment/meili-control-plane \
-  deployment/meili-gateway deployment/workers-general deployment/workers-llm \
-  deployment/workers-gpu
+  deployment/meili-gateway deployment/workers-general
 ```
 
 `CONTROL_PLANE_TOKEN` guards the control plane's `/internal/*` routes only:
@@ -208,20 +206,23 @@ Pool defaults:
 
 | Pool | min | max | Notes |
 |---|---|---|---|
-| `workers-general` | 1 | 20 | CPU-bound parsing; `MAX_CONCURRENT_ACTIVITIES=20` |
-| `workers-llm` | 0 | 30 | I/O-bound; `MAX_CONCURRENT_ACTIVITIES=50`, `LLM_API_KEY` from the secret |
-| `workers-gpu` | 0 | 4 | `nvidia.com/gpu: 1` on the plugin sidecar, `nodeSelector` + toleration for GPU nodes, long cooldown |
+| `workers-general` | 1 | 20 | every plugin; `MAX_CONCURRENT_ACTIVITIES=20`, `LLM_API_KEY` / `TYPESAFE_API_KEY` / `TRANSCRIBE_API_KEY` from the secret (all optional) |
 
-Give workers a generous `terminationGracePeriodSeconds` (the manifests use
-120–600 s) so in-flight activities finish on scale-down; Temporal retries
+No model runs inside a worker: AI steps call hosted APIs, so they share
+`workers-general` with every other plugin. Set their keys on that pool; a
+plugin whose key is missing registers as unavailable and the rest still run.
+
+Give workers a generous `terminationGracePeriodSeconds` (the manifest uses
+120 s) so in-flight activities finish on scale-down; Temporal retries
 anything that does not.
 
-### GPU pool and gRPC plugins
+### gRPC plugins
 
-The worker binary has no GPU code. `workers-gpu` runs the worker with
-`EXTERNAL_PLUGINS=grpc:http://localhost:50051,...` next to plugin sidecars
-(Whisper, ffmpeg, OCR) that request the GPU. `workers.yaml` ships no sidecar
-image: add yours (implementing `proto/plugin.proto`) under the commented example;
+The worker binary has no GPU code. External plugins such as `ocr` load on
+`workers-general` through `EXTERNAL_PLUGINS=grpc:http://...`, pointing at a
+sidecar or a separate `Deployment` + `Service`. This repo ships no plugin image:
+bring your own, implementing `proto/plugin.proto`. Give a plugin that needs a GPU
+its own `Deployment` on GPU nodes so the worker pool stays on regular nodes;
 see [Authoring a gRPC plugin](/plugins/authoring-grpc).
 
 ## 4. Temporal
