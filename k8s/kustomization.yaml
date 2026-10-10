@@ -1,5 +1,9 @@
 # kubectl apply -k k8s/
 #
+# The Secret `meili-ingest-secrets` is not part of this kustomization: create it
+# once before the first apply (see secrets.example.yaml, never apply that file as
+# is), so re-applying never resets it.
+#
 # Everything is deployed into the `meili-ingest` namespace from the single
 # image ghcr.io/qdequele/glutony. Override the tag with:
 #   kustomize edit set image ghcr.io/qdequele/glutony=ghcr.io/qdequele/glutony:0.1.0

@@ -75,8 +75,17 @@ spec:
                   name: meili-ingest-secrets
                   key: ADMIN_API_KEY
                   optional: true
+            # Bearer the Meilisearch Lab presents on management routes (the CREDENTIAL=
+            # given to `bin/rails lab:hosted_engine:create`). Requires ENVOY_TRUSTED_HEADER.
+            - name: LAB_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_SERVICE_TOKEN
+                  optional: true
             # Meilisearch Lab credentials; LAB_URL comes from the ConfigMap (envFrom).
-            # All three or none: the gateway refuses to boot on a partial set.
+            # All three or none: the gateway refuses to boot on a partial set, and
+            # without ENVOY_TRUSTED_HEADER.
             - name: LAB_INSTANCE_ID
               valueFrom:
                 secretKeyRef:
