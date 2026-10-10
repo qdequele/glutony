@@ -521,7 +521,7 @@ struct UpstreamErrorBody {
 }
 
 /// Thin HTTP client for the control plane's internal API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlPlaneClient {
     /// Base URL without trailing slash.
     pub base_url: String,
@@ -529,6 +529,16 @@ pub struct ControlPlaneClient {
     pub http: reqwest::Client,
     /// `CONTROL_PLANE_TOKEN`, presented as a bearer on every request.
     token: Option<String>,
+}
+
+impl std::fmt::Debug for ControlPlaneClient {
+    /// Redacts the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl ControlPlaneClient {
@@ -1184,6 +1194,7 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(!format!("{cp:?}").contains("cp-token"), "{cp:?}");
         let cfg = GatewayConfig {
             control_plane_token: Some("cp-token-value".into()),
             ..Default::default()

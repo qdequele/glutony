@@ -112,4 +112,23 @@ mod tests {
         }
         assert!(!super::parse_flag(None));
     }
+
+    #[test]
+    fn debug_redacts_the_control_plane_token() {
+        let cfg = super::WorkerConfig {
+            temporal_url: String::new(),
+            temporal_namespace: String::new(),
+            task_queue: String::new(),
+            control_plane_url: None,
+            control_plane_token: Some("cp-token-value".into()),
+            blob_store_url: None,
+            payload_spill_bytes: 0,
+            external_plugins: None,
+            max_concurrent_activities: 1,
+            lab_events_enabled: false,
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("cp-token-value"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
 }
