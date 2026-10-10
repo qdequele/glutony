@@ -18,7 +18,7 @@ transcription, LLM enrichment, …), and pushes the result to a Meilisearch inde
 **Hard constraints:**
 - 100% Rust
 - Open-source (MIT)
-- Kubernetes-native (Deployments, KEDA scaling, Jobs for GPU workloads)
+- Kubernetes-native (Deployments, KEDA scaling)
 - Plugin system so the community can extend it without forking
 
 ---
@@ -49,13 +49,14 @@ transcription, LLM enrichment, …), and pushes the result to a Meilisearch inde
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                     ┌─────────────────┼──────────────────┐
-                     ▼                 ▼                  ▼
-              workers-general    workers-llm        workers-gpu
-              (pdf,docx,xlsx,    (llm_enricher)     (whisper,ocr)
-               chunker,indexer)
-                     │                 │                  │
-                     └─────────────────┼──────────────────┘
+                         ┌─────────────┴─────────────┐
+                         ▼                           ▼
+                  workers-general               workers-io
+                  (pdf,docx,xlsx,               (s3_downloader)
+                   chunker,indexer,
+                   AI steps, ocr)
+                         │                           │
+                         └─────────────┬─────────────┘
                                        │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
@@ -511,19 +512,20 @@ pub struct PipelineWorkflowInput {
 ### 8.3 Task queue routing
 
 The workflow dispatches activities to **typed task queues** based on plugin name.
-This allows specialized worker pools (GPU, LLM, general) to each poll only
-their own queue.
+This allows specialized worker pools to each poll only their own queue.
 
 ```rust
 fn plugin_task_queue(plugin: &str) -> &'static str {
     match plugin {
-        "whisper_transcriber" | "ocr" | "video_audio_extractor" => "workers-gpu",
-        "llm_enricher" | "image_captioner"                      => "workers-llm",
-        "s3_downloader"                                          => "workers-io",
-        _                                                        => "workers-general",
+        "s3_downloader" => "workers-io",
+        _               => "workers-general",
     }
 }
 ```
+
+No model runs inside a worker: AI steps (`llm_enricher`, `jev_enricher`,
+`image_captioner`, `whisper_transcriber`) call hosted APIs, so they share
+`workers-general` with every other plugin. Set their API keys on that pool.
 
 ### 8.4 Important Temporal constraints
 
@@ -658,7 +660,7 @@ CREATE TABLE jobs (
 |---|---|---|
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | |
 | `TASK_QUEUE` | `workers-general` | Which queue this worker polls |
-| `LLM_API_KEY` | — | Required for workers-llm pool |
+| `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (on workers-general) |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint |
 
 ### Control Plane

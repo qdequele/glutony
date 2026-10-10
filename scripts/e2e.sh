@@ -126,8 +126,6 @@ fi
 export TINYBIRD_TOKEN=e2e-tinybird-token
 export TINYBIRD_BASE_URL="http://localhost:${TINYBIRD_PORT:-58122}"
 export TINYBIRD_DATASOURCE=meili_ingest_usage
-env ${WORKER_LAB_ENV[@]+"${WORKER_LAB_ENV[@]}"} TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
-PIDS+=($!)
 
 # Mock OpenAI-compatible transcription endpoint so the audio pipeline can be tested
 # without an API key. Returns a fixed transcript plus segments.
@@ -203,10 +201,11 @@ PYEOF
 python3 "${WORK}/mock_tinybird.py" "${TINYBIRD_PORT:-58122}" "${WORK}/usage.ndjson" >"${WORK}/tinybird.log" 2>&1 &
 PIDS+=($!)
 
-TASK_QUEUE=workers-gpu \
+# One worker runs every plugin; the transcription key points at the mock above.
+env ${WORKER_LAB_ENV[@]+"${WORKER_LAB_ENV[@]}"} TASK_QUEUE=workers-general \
   TRANSCRIBE_API_KEY=test-key \
   TRANSCRIBE_BASE_URL="http://localhost:${TRANSCRIBE_PORT:-58111}/v1" \
-  ./target/debug/meili-ingest-worker >"${WORK}/worker-gpu.log" 2>&1 &
+  ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
 PIDS+=($!)
 sleep 3
 
@@ -413,7 +412,7 @@ sleep 1
 PH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_slides/search" -H 'Content-Type: application/json' -d '{"q":"vector search"}' | jq '.estimatedTotalHits')
 echo "e2e_slides hits for 'vector search': $PH"; [ "$PH" -ge 1 ] || exit 1
 
-echo "--- audio transcription (builtin.audio on the workers-gpu pool)"
+echo "--- audio transcription (builtin.audio)"
 python3 - "${WORK}/clip.wav" <<'PYEOF'
 import math, struct, sys, wave
 path = sys.argv[1]
@@ -430,8 +429,8 @@ RESP8=$(curl -fsS -F "file=@${WORK}/clip.wav" -F "index=e2e_audio" "${GW}/ingest
 echo "$RESP8" | jq -c .
 [ "$(echo "$RESP8" | jq -r .pipeline_used)" = "builtin.audio" ] || { echo "wav did not route to builtin.audio" >&2; exit 1; }
 JOB8=$(echo "$RESP8" | jq -r .job_id)
-for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB8}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB8}" | jq .; tail -30 "${WORK}/worker-gpu.log"; exit 1; }; sleep 1; done
-[ "$S" = succeeded ] || { echo "audio job ended $S" >&2; tail -30 "${WORK}/worker-gpu.log"; exit 1; }
+for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB8}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB8}" | jq .; tail -30 "${WORK}/worker.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "audio job ended $S" >&2; tail -30 "${WORK}/worker.log"; exit 1; }
 sleep 1
 AH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_audio/search" -H 'Content-Type: application/json' -d '{"q":"whisper transcriber"}' | jq '.estimatedTotalHits')
 echo "e2e_audio hits for 'whisper transcriber': $AH"; [ "$AH" -ge 1 ] || exit 1
@@ -454,8 +453,8 @@ curl -fsS -X POST -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/
 RESP9=$(curl -fsS -F "file=@${WORK}/clip.wav" "${GW}/ingest/pipeline/e2e-media?index=e2e_media")
 echo "$RESP9" | jq -c .
 JOB9=$(echo "$RESP9" | jq -r .job_id)
-for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB9}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB9}" | jq .; tail -40 "${WORK}/worker-gpu.log"; exit 1; }; sleep 1; done
-[ "$S" = succeeded ] || { echo "media job ended $S" >&2; tail -40 "${WORK}/worker-gpu.log"; exit 1; }
+for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB9}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB9}" | jq .; tail -40 "${WORK}/worker.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "media job ended $S" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
 sleep 1
 MD=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_media/stats" | jq .numberOfDocuments)
 echo "e2e_media documents (one per transcript segment): $MD"; [ "$MD" -ge 2 ] || { echo "expected segment documents" >&2; exit 1; }

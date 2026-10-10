@@ -38,20 +38,20 @@ inside plugins or workflow code.
 |---|---|---|
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
-| `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general`, `workers-llm`, `workers-gpu`, `workers-io`. |
+| `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general` or `workers-io`. AI steps run on `workers-general`. |
 | `CONTROL_PLANE_URL` | — | Plugin manifests are published there at boot (`POST /internal/plugins`). Required for Meilisearch connections and scheduled sources, which the worker loads from it. |
 | `CONTROL_PLANE_TOKEN` | — | Bearer token presented on every control-plane call. Required when the control plane enforces it (production). `CHANGE_ME` is refused at boot. |
 | `BLOB_STORE_URL` | `file://./blobs` | Same store as the gateway. |
 | `PAYLOAD_SPILL_BYTES` | `1048576` | Step outputs larger than this are spilled to the blob store. |
 | `MAX_CONCURRENT_ACTIVITIES` | `20` | Activities executed concurrently by this process. |
 | `EXTERNAL_PLUGINS` | — | Comma-separated external plugins: `wasm:/path/plugin.wasm`, `grpc:http://host:50051`. |
-| `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-llm` pool). Without it those plugins register as unavailable. |
+| `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-general` pool). Without it those plugins register as unavailable. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
 | `LLM_MODEL` | `gpt-4o-mini` | Default model when a step's `config.model` is absent. |
-| `TYPESAFE_API_KEY` | — | Required for `jev_enricher` (the `workers-llm` pool). Without it the plugin registers as unavailable. |
+| `TYPESAFE_API_KEY` | — | Required for `jev_enricher` (the `workers-general` pool). Without it the plugin registers as unavailable. |
 | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai/v1` | TypeSafe API endpoint exposing `/systemone`. |
 | `JEV_MODEL` | `jev-latest` | Default Jev model when a step's `config.model` is absent. |
-| `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-gpu` pool). |
+| `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-general` pool). Without it (and without `LLM_API_KEY`) the plugin registers as unavailable. |
 | `TRANSCRIBE_BASE_URL` | falls back to `LLM_BASE_URL`, then `https://api.openai.com/v1` | OpenAI-compatible endpoint exposing `/audio/transcriptions`. |
 | `TRANSCRIBE_MODEL` | `whisper-1` | Default transcription model. |
 | `INDEXER_TASK_TIMEOUT_SECS` | `120` | How long `meili_indexer` waits for one Meilisearch task before retrying the step; a step's `task_timeout_secs` overrides it. Raise it when Meilisearch is shared with a busy writer (tasks run one at a time), and keep it below the index step's `timeout_secs` (built-in pipelines: 1800). |

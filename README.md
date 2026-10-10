@@ -11,7 +11,7 @@ orchestrated by [Temporal](https://temporal.io), and pushes the result into a
 Meilisearch index.
 
 - **100% Rust** — axum gateway, Temporal workers, sqlx control plane.
-- **Kubernetes-native** — Deployments, KEDA autoscaling per task queue, GPU pools.
+- **Kubernetes-native** — Deployments, KEDA autoscaling per task queue.
 - **Multi-tenant** — one deployment serves every Meilisearch Cloud project via Envoy-injected headers; also runs standalone.
 - **Extensible** — built-in, WASM (extism) and gRPC plugins share one `Plugin` trait (`meili-ingest-plugin-sdk`).
 
@@ -43,13 +43,14 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                     ┌─────────────────┼──────────────────┐
-                     ▼                 ▼                  ▼
-              workers-general    workers-llm        workers-gpu
-              (pdf,docx,xlsx,    (llm_enricher)     (whisper,ocr)
-               chunker,indexer)
-                     │                 │                  │
-                     └─────────────────┼──────────────────┘
+                         ┌─────────────┴─────────────┐
+                         ▼                           ▼
+                  workers-general               workers-io
+                  (pdf,docx,xlsx,               (s3_downloader)
+                   chunker,indexer,
+                   AI steps, ocr)
+                         │                           │
+                         └─────────────┬─────────────┘
                                        │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │

@@ -2,8 +2,8 @@
 #
 # video_audio_extractor (pure Rust decoding) and whisper_transcriber (an HTTP
 # client for an OpenAI-compatible transcription endpoint) are compiled into the
-# worker. llm_enricher runs on `workers-llm`, everything else on
-# `workers-general`. The workflow routes each step to the right queue.
+# worker. Every step runs on `workers-general`; the AI steps need
+# TRANSCRIBE_API_KEY (or LLM_API_KEY) and LLM_API_KEY on that worker.
 #
 # Auto-selected for any video/* upload (overrides builtin.video). The
 # trigger's index_pattern sends every document to the `videos` index, taking

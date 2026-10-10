@@ -80,8 +80,8 @@ steps:
   collected into a `Many` output; the next step receives it as its input
   (fan-in). Plugins that accept `documents` flatten `Many` automatically.
 - **Routing.** Each activity is scheduled on the task queue of its plugin
-  (`workers-general` / `workers-llm` / `workers-gpu` / `workers-io`), so GPU
-  and LLM work never blocks parsing.
+  (`workers-general` / `workers-io`). AI steps call hosted APIs, so they run
+  on `workers-general` with parsing; downloads run on `workers-io`.
 - **Failure.** A step that exhausts its retries, or returns a non-retryable
   error, fails the job with `status: failed` and the message in `error`.
   Already-completed steps are not rolled back (documents indexed by an
@@ -129,10 +129,10 @@ Default retry: `max_attempts: 3, backoff: exponential`.
 <Note>
 Every plugin these pipelines reference is compiled into the worker, including
 `pptx_extractor`, `video_audio_extractor` and `whisper_transcriber`. The audio
-and video pipelines run on the `workers-gpu` queue, and `whisper_transcriber`
+and video pipelines run on the `workers-general` queue, and `whisper_transcriber`
 needs `TRANSCRIBE_API_KEY` (or `LLM_API_KEY`) pointing at an OpenAI-compatible
 `/audio/transcriptions` endpoint; without it that step fails with a clear
-message. `ocr` is the one routed name still expecting a
+message. `ocr` is the one referenced name still expecting a
 [gRPC plugin](/plugins/authoring-grpc).
 </Note>
 
