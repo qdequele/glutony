@@ -6,6 +6,8 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-11
+
 ### Added
 - Lab platform contract v2: per-instance credentials (`LAB_INSTANCE_ID`,
   `LAB_INSTANCE_SECRET`), `X-Lab-Instance-Id` / `X-Lab-Timestamp` / `X-Lab-Signature`
