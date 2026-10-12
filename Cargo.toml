@@ -120,8 +120,6 @@ meilisearch-sdk = "0.33"
 # detection / parsing
 infer = "0.22"
 mime_guess = "2"
-# Compiles the exported admin UI into the gateway binary (feature `ui`).
-rust-embed = { version = "8", features = ["mime-guess"] }
 globset = "0.4"
 regex = "1"
 serde_json_path = "0.7"

@@ -2,15 +2,13 @@
 # Bring the whole meili-ingest stack up locally and keep it running.
 #
 #   ./scripts/dev-stack.sh
-#   open http://localhost:8080/ui/
 #
 # Starts Postgres and Meilisearch in Docker, a Temporal dev server, a local
 # stand-in for Tinybird (so the usage dashboard has data), then the control
-# plane, the gateway with the admin UI embedded, and two workers. Seeds a few
-# jobs so the screens are not empty. Ctrl-C tears everything down.
+# plane, the gateway and two workers. Seeds a few jobs so the API has data to
+# show. Ctrl-C tears everything down.
 #
-# Requirements: docker, the temporal CLI, curl, jq, python3, cargo, and a UI
-# export at ui/out (cd ui && NEXT_PUBLIC_BASE_PATH=/ui pnpm build).
+# Requirements: docker, the temporal CLI, curl, jq, python3, cargo.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -94,16 +92,8 @@ for port in "$GW_PORT" "$CP_PORT" "$MEILI_PORT" "$TEMPORAL_PORT" "$TINYBIRD_PORT
   fi
 done
 
-echo "--- building (gateway with the admin UI embedded)"
-UI_FEATURES=""
-if [ -f ui/out/index.html ]; then
-  UI_FEATURES="--features meili-ingest-gateway/ui"
-else
-  echo "  no ui/out export found — the gateway will be API-only."
-  echo "  build it with: (cd ui && NEXT_PUBLIC_BASE_PATH=/ui pnpm build)"
-fi
-# shellcheck disable=SC2086
-cargo build -q $UI_FEATURES --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
+echo "--- building"
+cargo build -q --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
 
 echo "--- infrastructure"
 PG_CID=$(docker run -d --rm --name "$PG_NAME" -p "${PG_PORT}:5432" \
@@ -178,7 +168,6 @@ cat <<BANNER
 
   meili-ingest is up.
 
-    Admin UI      http://localhost:${GW_PORT}/ui/
     Gateway API   http://localhost:${GW_PORT}
     Temporal UI   http://localhost:${TEMPORAL_UI_PORT}
     Meilisearch   http://localhost:${MEILI_PORT}  (key: masterKey)

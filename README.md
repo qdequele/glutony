@@ -253,36 +253,6 @@ pub trait Plugin: Send + Sync + 'static {
 `crates/plugins/llm-enricher` is the canonical example. See
 `docs/plugins/authoring-builtin.mdx`, `authoring-wasm.mdx`, `authoring-grpc.mdx`.
 
-## Admin UI
-
-> **Frozen.** This admin UI takes bug fixes only. New screens go to the Meilisearch
-> Lab console, built from `docs/openapi.yaml`. It works in open mode only (no
-> `LAB_SERVICE_TOKEN` / `ADMIN_API_KEY`), or behind a proxy that injects the admin key.
-
-The gateway can serve a built-in admin UI at `/ui`: a pipeline editor whose config
-forms are generated from each plugin's JSON Schema, job monitoring with a per-step
-timeline and cancellation, an ingest playground that shows which pipeline auto-routed
-a file, and a per-tenant usage dashboard.
-
-It is a Next.js static export compiled into the binary, so production stays one
-container with no Node runtime and the browser talks to the API same-origin. The
-feature is off by default; `cargo build` needs no Node toolchain.
-
-```bash
-cd ui && NEXT_PUBLIC_BASE_PATH=/ui pnpm install && pnpm build
-cd .. && cargo run --features meili-ingest-gateway/ui --bin meili-ingest-gateway
-```
-
-The published image builds it automatically.
-
-In the Docker dev stack the UI is a service of its own instead
-(`docker compose watch`, then <http://ui.meili-ingest.orb.local:3000>): `next dev` gives hot reload,
-which embedding cannot, since a UI edit would mean a full rebuild of the gateway
-binary. The trade-off is that the UI is no longer same-origin, so the dev gateway
-allows its origin with `CORS_ALLOW_ORIGINS` (set in `compose.yaml`). That variable is
-unset in production — no `CorsLayer` is mounted at all — because the embedded UI
-needs no cross-origin grant.
-
 ## Meilisearch Lab
 
 glutony plugs into the Meilisearch Lab through three seams: an opaque tenant on every
