@@ -44,11 +44,6 @@ admin without one sees every job) or a trusted edge tenant, and anything else ge
 `401`. Ingest callers keep polling their jobs on the public hostname with the edge
 headers.
 
-The frozen admin UI (`ui/`) cannot send a token. Once auth is on, the proxy in front
-of the admin hostname must send `Authorization: Bearer <ADMIN_API_KEY>` for it, and
-the Meilisearch key it used to inject as the bearer token moves to
-`X-Meili-Api-Key` (with `X-Meili-Host` and `X-Meili-Envoy-Secret`).
-
 ## Reporting to the Lab
 
 Engines are run by Meilisearch. The operator mints each deployment's credentials in

@@ -18,7 +18,6 @@ pub mod routes;
 pub mod schedules;
 pub mod sources;
 pub mod state;
-pub mod ui;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
@@ -32,9 +31,9 @@ pub use state::{AppState, GatewayConfig, WorkflowStarter};
 
 /// `GET /health` — liveness plus the facts a client needs to render itself.
 ///
-/// Reports the tenant resolved from this very request, so the admin UI can show who
-/// it is acting as instead of guessing from the data it happens to have fetched. Also
-/// reports which optional features this deployment has, so the UI can present an
+/// Reports the tenant resolved from this very request, so a client can show who it is
+/// acting as instead of guessing from the data it happens to have fetched. Also
+/// reports which optional features this deployment has, so a client can present an
 /// honest "not enabled" state rather than an error.
 async fn health(
     State(state): State<AppState>,
@@ -46,7 +45,6 @@ async fn health(
         "tenant_id": context::resolve_tenant_id(&headers, &state.config).ok().flatten(),
         "features": {
             "usage_analytics": state.config.usage_api.is_some(),
-            "embedded_ui": ui::is_embedded(),
         },
     }))
 }
@@ -176,7 +174,6 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))
         .route("/usage", get(handlers::usage::get_usage))
-        .merge(ui::router())
         .layer(DefaultBodyLimit::max(limit))
         .layer(RequestBodyLimitLayer::new(limit))
         .layer(TraceLayer::new_for_http());
@@ -635,74 +632,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[cfg(feature = "ui")]
-    #[tokio::test]
-    async fn embedded_ui_is_served_under_its_own_prefix() {
-        use axum::http::header;
-
-        let server = MockServer::start().await;
-        let (app, _) = test_app(&server, GatewayConfig::default()).await;
-
-        // The shell, under both spellings a human might type.
-        for path in ["/ui", "/ui/"] {
-            let resp = app
-                .clone()
-                .oneshot(Request::get(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{path} did not serve the shell"
-            );
-        }
-        let resp = app
-            .clone()
-            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(ct.starts_with("text/html"), "content type was {ct:?}");
-        let body = axum::body::to_bytes(resp.into_body(), 4_000_000)
-            .await
-            .unwrap();
-        let html = String::from_utf8_lossy(&body);
-        assert!(
-            html.contains("/ui/_next/"),
-            "assets must be prefixed with /ui"
-        );
-
-        // A client-side route survives a refresh.
-        let resp = app
-            .clone()
-            .oneshot(Request::get("/ui/pipelines/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // The API is not shadowed by the UI: /pipelines still reaches the handler,
-        // which without a control plane fails upstream rather than returning HTML.
-        let resp = app
-            .oneshot(Request::get("/pipelines").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_ne!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert!(
-            !ct.starts_with("text/html"),
-            "API route was shadowed by the UI"
-        );
     }
 }

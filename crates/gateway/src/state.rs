@@ -89,9 +89,9 @@ pub struct GatewayConfig {
     pub usage_api: Option<UsageApiConfig>,
     /// Browser origins allowed to call the API cross-origin
     /// (`CORS_ALLOW_ORIGINS`, comma-separated). Empty means no `CorsLayer` is
-    /// mounted at all, which is what production wants: the embedded UI is
-    /// same-origin. It exists for `next dev`, which serves the UI from another
-    /// port and would otherwise be blocked by the browser.
+    /// mounted at all, which is what a server-to-server deployment (the Lab, an
+    /// edge proxy) wants. Set it only for a browser app that calls the API
+    /// directly from another origin.
     pub cors_allow_origins: Vec<String>,
     /// Check the request's Meilisearch key against the target index before queueing a
     /// job (`WRITE_PREFLIGHT`, default off). See [`crate::preflight`].

@@ -6,6 +6,12 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+### Removed
+- The admin UI (`ui/`), the gateway's `ui` cargo feature, its `/ui` routes and the
+  `features.embedded_ui` field of `GET /health`. The Meilisearch Lab console is
+  glutony's UI; the gateway is API-only. The image no longer has a Node build stage,
+  and the dev stack no longer runs a `ui` service or sets `CORS_ALLOW_ORIGINS`.
+
 ## [0.1.0] - 2026-10-11
 
 ### Added
