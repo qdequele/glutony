@@ -163,15 +163,32 @@ async fn main() -> anyhow::Result<()> {
         .register_activities(activities)
         .register_activities(source_activities)
         .tuner(tuner)
-        .graceful_shutdown_period(std::time::Duration::from_secs(30))
+        // On SIGTERM the worker stops polling at once; activities still running after
+        // this long are cancelled, which Temporal records as a retryable `WorkerShutdown`
+        // failure and retries on another worker.
+        .graceful_shutdown_period(config.shutdown_grace)
         .build();
     let mut worker = Worker::new(&runtime, client, options)?;
 
     let shutdown = worker.shutdown_handle();
+    let grace = config.shutdown_grace;
     tokio::spawn(async move {
         wait_for_signal().await;
-        tracing::info!("shutdown signal received, draining worker");
+        tracing::info!(
+            grace_secs = grace.as_secs(),
+            "shutdown signal received, draining worker"
+        );
         shutdown();
+        // Backstop: an activity that never returns would hold `worker.run()` until the
+        // orchestrator's SIGKILL. Exit first; Temporal retries what it had once its
+        // heartbeat (or start-to-close) timeout passes.
+        let deadline = grace + meili_ingest_worker::config::SHUTDOWN_HARD_MARGIN;
+        tokio::time::sleep(deadline).await;
+        tracing::error!(
+            after_secs = deadline.as_secs(),
+            "worker did not drain in time, exiting with activities still running"
+        );
+        std::process::exit(1);
     });
 
     tracing::info!(task_queue = %config.task_queue, "worker polling");

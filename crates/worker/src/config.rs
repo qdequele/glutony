@@ -25,7 +25,19 @@ pub struct WorkerConfig {
     pub max_concurrent_activities: usize,
     /// Post Lab billing events to the control plane's outbox (`LAB_EVENTS_ENABLED`).
     pub lab_events_enabled: bool,
+    /// How long in-flight activities may run after SIGTERM / SIGINT before they are
+    /// cancelled and handed back to Temporal (`SHUTDOWN_GRACE_SECS`, default 60).
+    pub shutdown_grace: std::time::Duration,
 }
+
+/// Default of `SHUTDOWN_GRACE_SECS`: with [`SHUTDOWN_HARD_MARGIN`] the worker is gone
+/// 90 s after SIGTERM, inside ECS's 120 s stop timeout and the Kubernetes manifests'
+/// `terminationGracePeriodSeconds: 120`.
+pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 60;
+
+/// After the grace period, how long cancelled activities get to report back before
+/// the process exits anyway.
+pub const SHUTDOWN_HARD_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl WorkerConfig {
     /// Read configuration from the environment.
@@ -42,6 +54,7 @@ impl WorkerConfig {
                 .context("MAX_CONCURRENT_ACTIVITIES must be an integer")?,
             Err(_) => 20,
         };
+        let shutdown_grace = shutdown_grace(std::env::var("SHUTDOWN_GRACE_SECS").ok().as_deref())?;
         Ok(Self {
             temporal_url: std::env::var("TEMPORAL_URL")
                 .unwrap_or_else(|_| "http://temporal-frontend:7233".to_string()),
@@ -62,6 +75,7 @@ impl WorkerConfig {
                 .filter(|s| !s.is_empty()),
             max_concurrent_activities,
             lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
+            shutdown_grace,
         })
     }
 }
@@ -83,6 +97,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("external_plugins", &self.external_plugins)
             .field("max_concurrent_activities", &self.max_concurrent_activities)
             .field("lab_events_enabled", &self.lab_events_enabled)
+            .field("shutdown_grace", &self.shutdown_grace)
             .finish()
     }
 }
@@ -98,6 +113,17 @@ fn control_plane_token(raw: Option<String>) -> anyhow::Result<Option<String>> {
         );
     }
     Ok(token)
+}
+
+/// `SHUTDOWN_GRACE_SECS`: whole seconds; blank or unset is the default.
+fn shutdown_grace(raw: Option<&str>) -> anyhow::Result<std::time::Duration> {
+    let secs = match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) => v
+            .parse::<u64>()
+            .context("SHUTDOWN_GRACE_SECS must be an integer number of seconds")?,
+        None => DEFAULT_SHUTDOWN_GRACE_SECS,
+    };
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 /// `true`/`1` (any case) -> on; anything else or unset -> off.
@@ -133,6 +159,24 @@ mod tests {
         )
         .unwrap();
         assert!(!super::lab_events_use_placeholder_prices(true, &own));
+    }
+
+    #[test]
+    fn shutdown_grace_parsing() {
+        use std::time::Duration;
+        assert_eq!(
+            super::shutdown_grace(None).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            super::shutdown_grace(Some(" ")).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            super::shutdown_grace(Some("45\n")).unwrap(),
+            Duration::from_secs(45)
+        );
+        assert!(super::shutdown_grace(Some("1m")).is_err());
     }
 
     #[test]
@@ -184,6 +228,7 @@ mod tests {
             external_plugins: None,
             max_concurrent_activities: 1,
             lab_events_enabled: false,
+            shutdown_grace: std::time::Duration::from_secs(1),
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("cp-token-value"), "{shown}");
