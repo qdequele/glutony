@@ -434,6 +434,8 @@ mod tests {
             "http://localhost:3000",
             "http://127.0.0.1:8091",
             "http://10.0.0.5",
+            // A VPC-private Lab address, as an AWS deployment configures it.
+            "http://10.0.1.10:8091",
             "http://172.16.1.1",
             "http://192.168.1.10/",
             "http://[::1]:3000",
@@ -441,6 +443,10 @@ mod tests {
         ] {
             assert!(validate_lab_url(url).is_ok(), "{url}");
         }
+        assert_eq!(
+            validate_lab_url("http://10.0.1.10:8091").unwrap(),
+            "http://10.0.1.10:8091"
+        );
         for url in [
             "http://lab.example",
             "http://8.8.8.8",
