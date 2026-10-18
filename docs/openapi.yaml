@@ -1585,7 +1585,7 @@ components:
             retry policy.
         s3:
           type: string
-          description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. Streamed by the worker with its ambient cloud credentials: not subject to `SOURCE_FETCH_HOSTS`, so scope those credentials to what callers may read."
+          description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. The blob store's own bucket, and any bucket outside the deployment's `OBJECT_REF_BUCKETS` when set, is a `422` too. Streamed by the worker anonymously (public objects only) unless the deployment sets `OBJECT_REF_AMBIENT_CREDENTIALS=true`; not subject to `SOURCE_FETCH_HOSTS`."
         documents:
           type: array
           description: Inline documents, indexed directly (no extraction). Must be JSON objects with an `id`.

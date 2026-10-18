@@ -139,7 +139,9 @@ See [Meilisearch Lab](/deployment/meilisearch-lab) for what the Lab receives.
 Object-store credentials follow the provider's conventions
 (`AWS_ACCESS_KEY_ID` / IRSA, `GOOGLE_APPLICATION_CREDENTIALS` / Workload
 Identity, `AZURE_STORAGE_ACCOUNT_*`); add them to the worker and gateway pods
-as env vars or a service account annotation.
+as env vars or a service account annotation, with `AWS_REGION` for S3. Tenants'
+`{"s3": …}` refs are not read with them unless `OBJECT_REF_AMBIENT_CREDENTIALS=true`
+(see [object refs](/deployment/environment-variables#object-refs)).
 
 ## 2. Gateway
 

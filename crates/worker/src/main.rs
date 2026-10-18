@@ -78,7 +78,12 @@ async fn main() -> anyhow::Result<()> {
     }
     .with_fetch_guard(meili_ingest_worker::fetch_guard::fetch_guard(
         fetch_policy.clone(),
-    ));
+    ))
+    .with_object_ref_policy(
+        meili_ingest_blob::ObjectRefPolicy::from_env()
+            .context("invalid OBJECT_REF_AMBIENT_CREDENTIALS or OBJECT_REF_BUCKETS")?,
+    );
+    tracing::info!(policy = ?blob.object_ref_policy(), "object ref policy (s3://, gs://, az:// refs)");
 
     // Publish manifests to the control plane (best effort).
     if let Some(cp) = &config.control_plane_url {

@@ -128,10 +128,11 @@ pub async fn submit_one(
             )));
         }
     }
-    // `{"s3": …}` refs must name a cloud object store; the worker refuses the rest
-    // (`file://` would read its own filesystem), so say so now instead of queueing.
+    // `{"s3": …}` refs must name a cloud object store other than the blob store's bucket
+    // (and one of OBJECT_REF_BUCKETS when set); the worker refuses the rest (`file://`
+    // would read its own filesystem), so say so now instead of queueing.
     if let IngestPayload::S3 { uri, .. } = &payload {
-        match meili_ingest_blob::check_object_ref(uri) {
+        match state.blob.authorize_object_ref(uri) {
             Ok(_) => {}
             Err(e @ meili_ingest_blob::BlobError::Blocked(_)) => {
                 return Err(GatewayError::Unprocessable(e.to_string()));
@@ -681,6 +682,45 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
         }
+        assert!(starter.inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_object_ref_to_the_blob_store_bucket_is_422_and_queues_nothing() {
+        // Tenants' staged uploads live in the blob store's bucket: naming it would read
+        // another tenant's files with the platform's credentials.
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let config = GatewayConfig {
+            control_plane_url: server.uri(),
+            ..GatewayConfig::default()
+        };
+        let starter = std::sync::Arc::new(FakeStarter::default());
+        let blob = meili_ingest_blob::BlobStore::from_url("s3://lab-blobs/glutony").unwrap();
+        let app = crate::router(AppState::new(
+            config,
+            starter.clone(),
+            blob,
+            reqwest::Client::new(),
+        ));
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest",
+                "application/json",
+                json!({ "s3": "s3://lab-blobs/glutony/jobs/other/input/a.pdf" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            json_body(resp).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("blob store's bucket")
+        );
         assert!(starter.inputs().is_empty());
     }
 
