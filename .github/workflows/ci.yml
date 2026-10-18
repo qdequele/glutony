@@ -71,8 +71,16 @@ jobs:
         run: cargo test -p meili-ingest-control-plane -- --ignored
 
   docker:
-    name: docker build
-    runs-on: ubuntu-latest
+    name: docker build (${{ matrix.arch }})
+    # Native runners per architecture: the release publishes both (arm64 for Graviton).
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     needs: [fmt, clippy]
     steps:
       - uses: actions/checkout@v4
@@ -82,11 +90,12 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
           push: false
           load: true
           tags: ghcr.io/qdequele/glutony:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
       - name: Smoke test binaries
         run: |
           for bin in meili-ingest-gateway meili-ingest-control-plane meili-ingest-worker; do
