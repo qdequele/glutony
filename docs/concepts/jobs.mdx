@@ -102,7 +102,14 @@ When a step's input is a URL (`POST /ingest {"url": ...}`), the worker fetches i
 before the plugin runs. A transport error, `408`, `429` or `5xx` goes through the
 step's retry policy; any other `4xx` (`404`, `403`, `410`…), including one returned
 after a redirect, fails the step at once, since the same request gets the same
-answer. A URL refused by `SOURCE_FETCH_HOSTS` is non-retryable too.
+answer. A URL refused by `SOURCE_FETCH_HOSTS` is non-retryable too, and so is an
+object ref (`{"s3": ...}`) the deployment refuses (the blob store's own bucket, or a
+bucket outside `OBJECT_REF_BUCKETS`; see
+[object refs](/deployment/environment-variables#object-refs)).
+
+A step cut short because its worker shut down (scale-in, Spot interruption,
+deploy) fails as a retryable `WorkerShutdown` error and is retried at once on
+another worker. It counts as one attempt of the step's retry policy.
 
 ## Observability
 

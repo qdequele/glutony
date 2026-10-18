@@ -6,6 +6,32 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+### Changed
+- **Breaking default:** tenant object refs (`{"s3": "s3://…"}`, `gs://`, `az://`)
+  are read anonymously (unsigned, public objects only). They were read with the
+  worker's ambient cloud credentials, which on a shared deployment can read the
+  blob store where every tenant's uploads are staged. Set
+  `OBJECT_REF_AMBIENT_CREDENTIALS=true` on the workers to sign them again, ideally
+  with `OBJECT_REF_BUCKETS`. For S3 the bucket's region is looked up before an
+  anonymous or signed read (skipped with a custom `AWS_ENDPOINT`).
+- A ref to the blob store's own bucket is always refused: `422` at the gateway, a
+  non-retryable step failure at the worker. `OBJECT_REF_BUCKETS` (comma-separated
+  bucket names) restricts refs to an allowlist, on the gateway and the workers.
+- Workers wait `SHUTDOWN_GRACE_SECS` (default 60, was a fixed 30) after `SIGTERM`
+  before cancelling running activities, which Temporal then retries elsewhere; a
+  plugin that ignores the cancellation is abandoned 10 s later, and the process
+  exits at the latest 30 s after the grace.
+- Release images are multi-arch (`linux/amd64` and `linux/arm64`), built on native
+  runners; CI builds both.
+
+### Fixed
+- `s3://` blob stores (and object refs) now read the standard `AWS_*` variables:
+  `AWS_REGION` (requests always went to `us-east-1`), `AWS_ENDPOINT`, static keys,
+  web identity and the ECS task role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`).
+  Only the EC2 instance profile worked before, so a blob store on ECS, Fargate or
+  IRSA could not authenticate. `gs://` and `az://` stores read `GOOGLE_*` and
+  `AZURE_*` likewise.
+
 ### Removed
 - The admin UI (`ui/`), the gateway's `ui` cargo feature, its `/ui` routes and the
   `features.embedded_ui` field of `GET /health`. The Meilisearch Lab console is
