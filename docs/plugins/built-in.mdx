@@ -305,10 +305,16 @@ the workflow injects — never from env vars and never from your config.
 
 | Key | Default | Description |
 |---|---|---|
-| `primary_key` | `"id"` | Primary key declared when creating the index. |
+| `primary_key` | `"id"` | Primary key declared when creating the index, and sent as `?primaryKey` on additions while the index has none. An index that already has a primary key keeps its own. |
 | `auto_create_index` | `true` | Create the index when it does not exist. |
 | `batch_size` | `1000` | Documents per `addDocuments` request. |
 | `wait_for_completion` | `true` | Wait for Meilisearch tasks before finishing the step. |
+
+If the target index already exists with a primary key (for example `uid` on an
+index a Scrapix crawl created), additions are sent without `?primaryKey` and
+Meilisearch uses the index's own key, whatever `primary_key` says. Documents are
+not rewritten: if they lack that field, Meilisearch rejects them and the step
+fails with its error. The index is looked up even with `auto_create_index: false`.
 
 Returns `Indexed { index, document_count, task_uids }`.
 
