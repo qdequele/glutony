@@ -9,15 +9,17 @@
 //!
 //! Behaviour:
 //! 1. validate the config (`host`, `api_key` and `index` are mandatory);
-//! 2. when `auto_create_index` (default `true`), enqueue the index creation with
-//!    `primary_key` if `GET /indexes/{uid}` says it does not exist — without waiting:
-//!    Meilisearch runs tasks in enqueue order, so the document additions sent next
-//!    always run after it, and waiting would only double the time spent behind other
-//!    tenants' tasks on a busy instance. Its outcome is checked once the documents are
-//!    done
-//!    for that task;
+//! 2. look the index up with `GET /indexes/{uid}`. When it does not exist and
+//!    `auto_create_index` (default `true`) is set, enqueue its creation with
+//!    `primary_key`, without waiting: Meilisearch runs tasks in enqueue order, so the
+//!    document additions sent next always run after it, and waiting would only double
+//!    the time spent behind other tenants' tasks on a busy instance. Its outcome is
+//!    checked once the documents are done;
 //! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it via
-//!    `addOrReplace` in batches cut at whichever of `batch_size` (documents, default
+//!    `addOrReplace` with `?primaryKey=<primary_key>`, except when the index already
+//!    has a primary key: then no `primaryKey` is sent and Meilisearch uses the index's
+//!    own (any other value is rejected with `index_primary_key_already_exists`).
+//!    Batches are cut at whichever of `batch_size` (documents, default
 //!    1000) and `max_batch_bytes` (serialized bytes, default 50 MiB) comes first. A
 //!    document too large for any batch is a [`PluginError::NonRetryable`] naming it;
 //!    sending it would earn a `413` the retry policy would repeat forever;
@@ -300,21 +302,72 @@ async fn wait_for_task(
     }
 }
 
-/// Enqueue the index creation (with `primary_key`) when it does not exist yet, without
-/// waiting for it. Returns the creation task, if one was enqueued.
+/// What [`ensure_index`] found (or did) for the target index.
+#[derive(Debug)]
+enum IndexState {
+    /// The index did not exist and `auto_create_index` is off: nothing was enqueued.
+    Missing,
+    /// The index did not exist; its creation (with the configured key) was enqueued.
+    Creating(TaskInfo),
+    /// The index exists, with its own primary key or none yet.
+    Existing { primary_key: Option<String> },
+}
+
+impl IndexState {
+    /// The `?primaryKey` to send on document additions. An index that already has a
+    /// primary key gets none: Meilisearch rejects any other key with
+    /// `index_primary_key_already_exists`, and without the parameter it uses its own.
+    fn addition_primary_key<'a>(&self, configured: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Existing {
+                primary_key: Some(_),
+            } => None,
+            Self::Missing | Self::Creating(_) | Self::Existing { primary_key: None } => {
+                Some(configured)
+            }
+        }
+    }
+
+    fn creation(&self) -> Option<&TaskInfo> {
+        match self {
+            Self::Creating(task) => Some(task),
+            Self::Missing | Self::Existing { .. } => None,
+        }
+    }
+}
+
+/// Look the index up. When it does not exist and `create` is set, enqueue its creation
+/// (with `primary_key`) without waiting for it.
 async fn ensure_index(
     client: &Client,
     uid: &str,
     primary_key: &str,
-) -> Result<Option<TaskInfo>, PluginError> {
+    create: bool,
+) -> Result<IndexState, PluginError> {
     match client.get_index(uid).await {
-        Ok(_) => Ok(None),
+        Ok(index) => {
+            if let Some(existing) = index.primary_key.as_deref()
+                && existing != primary_key
+            {
+                tracing::info!(
+                    plugin = NAME,
+                    index = %uid,
+                    primary_key = %existing,
+                    configured_primary_key = %primary_key,
+                    "index already has a primary key; using it instead of the configured one"
+                );
+            }
+            Ok(IndexState::Existing {
+                primary_key: index.primary_key,
+            })
+        }
+        Err(e) if is_index_not_found(&e) && !create => Ok(IndexState::Missing),
         Err(e) if is_index_not_found(&e) => {
             tracing::info!(plugin = NAME, index = %uid, primary_key = %primary_key, "creating index");
             client
                 .create_index(uid, Some(primary_key))
                 .await
-                .map(Some)
+                .map(IndexState::Creating)
                 .map_err(|e| map_error(e, &format!("creating index {uid:?}")))
         }
         Err(e) => Err(map_error(e, &format!("fetching index {uid:?}"))),
@@ -395,12 +448,12 @@ impl Plugin for MeiliIndexerPlugin {
                     "primary_key": {
                         "type": "string",
                         "default": "id",
-                        "description": "Primary key declared when creating the index and sent as ?primaryKey on document additions."
+                        "description": "Primary key declared when creating the index, and sent as ?primaryKey on document additions while the index has none. An index that already has a primary key keeps its own: additions then carry no ?primaryKey."
                     },
                     "auto_create_index": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Create the index when GET /indexes/{uid} returns 404."
+                        "description": "Create the index when GET /indexes/{uid} returns 404. The lookup runs either way, so an existing primary key is respected."
                     },
                     "batch_size": {
                         "type": "integer",
@@ -456,14 +509,13 @@ impl Plugin for MeiliIndexerPlugin {
             .map_err(|e| map_error(e, "building the Meilisearch client"))?;
 
         let timeout = task_timeout(cfg.task_timeout_secs);
-        let creation = if cfg.auto_create_index {
-            ensure_index(&client, &index_uid, &cfg.primary_key).await?
-        } else {
-            None
-        };
+        let state =
+            ensure_index(&client, &index_uid, &cfg.primary_key, cfg.auto_create_index).await?;
+        let creation = state.creation();
+        let addition_primary_key = state.addition_primary_key(&cfg.primary_key);
 
         if docs.is_empty() {
-            if let Some(task) = &creation
+            if let Some(task) = creation
                 && cfg.wait_for_completion
             {
                 check_creation(&client, ctx, task, timeout).await?;
@@ -502,7 +554,7 @@ impl Plugin for MeiliIndexerPlugin {
                 payload.len()
             ));
             let info = index
-                .add_or_replace(payload, Some(&cfg.primary_key))
+                .add_or_replace(payload, addition_primary_key)
                 .await
                 .map_err(|e| map_error(e, &format!("adding documents (batch {})", batch_no + 1)))?;
             tracing::debug!(
@@ -525,7 +577,7 @@ impl Plugin for MeiliIndexerPlugin {
                 }
             }
             // Enqueued before the additions, so it finished before them: no extra wait.
-            if let Some(task) = &creation {
+            if let Some(task) = creation {
                 check_creation(&client, ctx, task, timeout).await?;
             }
         }
@@ -542,7 +594,9 @@ impl Plugin for MeiliIndexerPlugin {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const INDEX: &str = "documents";
@@ -647,18 +701,28 @@ mod tests {
             .await;
     }
 
-    async fn mount_documents_add(server: &MockServer, task_uid: u32, expected_calls: u64) {
-        Mock::given(method("POST"))
+    /// Accept document additions sent with `?primaryKey=<primary_key>`, or without the
+    /// parameter at all when `primary_key` is `None`.
+    async fn mount_documents_add(
+        server: &MockServer,
+        task_uid: u32,
+        expected_calls: u64,
+        primary_key: Option<&str>,
+    ) {
+        let mock = Mock::given(method("POST"))
             .and(path(format!("/indexes/{INDEX}/documents")))
-            .and(query_param("primaryKey", "id"))
-            .and(header("authorization", "Bearer test-key"))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .set_body_json(task_info(task_uid, "documentAdditionOrUpdate")),
-            )
-            .expect(expected_calls)
-            .mount(server)
-            .await;
+            .and(header("authorization", "Bearer test-key"));
+        let mock = match primary_key {
+            Some(pk) => mock.and(query_param("primaryKey", pk)),
+            None => mock.and(query_param_is_missing("primaryKey")),
+        };
+        mock.respond_with(
+            ResponseTemplate::new(202)
+                .set_body_json(task_info(task_uid, "documentAdditionOrUpdate")),
+        )
+        .expect(expected_calls)
+        .mount(server)
+        .await;
     }
 
     async fn run(
@@ -698,7 +762,7 @@ mod tests {
     async fn creates_index_then_adds_documents_and_waits() {
         let server = MockServer::start().await;
         mount_index_creation(&server).await;
-        mount_documents_add(&server, 2, 1).await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
         Mock::given(method("GET"))
             .and(path("/tasks/2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -753,7 +817,7 @@ mod tests {
         // not after the creation finished.
         let server = MockServer::start().await;
         mount_index_creation(&server).await;
-        mount_documents_add(&server, 2, 1).await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
         Mock::given(method("GET"))
             .and(path("/tasks/2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -811,7 +875,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
             .mount(&server)
             .await;
-        mount_documents_add(&server, 7, 1).await;
+        mount_documents_add(&server, 7, 1, None).await;
         Mock::given(method("GET"))
             .and(path("/tasks/7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -899,7 +963,7 @@ mod tests {
     async fn empty_input_only_ensures_the_index() {
         let server = MockServer::start().await;
         mount_index_creation(&server).await;
-        mount_documents_add(&server, 2, 0).await;
+        mount_documents_add(&server, 2, 0, Some("id")).await;
 
         let out = run(
             &server,
@@ -940,7 +1004,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        mount_documents_add(&server, 9, 3).await;
+        mount_documents_add(&server, 9, 3, None).await;
         Mock::given(method("GET"))
             .and(path("/tasks/9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -985,19 +1049,206 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_create_index_false_skips_the_lookup() {
+    async fn auto_create_index_false_does_not_create_a_missing_index() {
+        // The index is still looked up (to learn its primary key), but a missing one is
+        // not created: the additions go out with the configured key, as before.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/indexes/{INDEX}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(index_not_found()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")))
             .expect(0)
             .mount(&server)
             .await;
-        mount_documents_add(&server, 3, 1).await;
+        mount_documents_add(&server, 3, 1, Some("id")).await;
         let mut cfg = config(&server.uri());
         cfg["auto_create_index"] = json!(false);
         cfg["wait_for_completion"] = json!(false);
         let out = run(&server, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap();
+        assert_eq!(out.document_count(), 2);
+    }
+
+    fn index_with_primary_key(primary_key: Value) -> Value {
+        json!({
+            "uid": INDEX,
+            "primaryKey": primary_key,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    async fn mount_succeeded_addition(server: &MockServer, task_uid: u32) {
+        Mock::given(method("GET"))
+            .and(path(format!("/tasks/{task_uid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                task_uid,
+                "succeeded",
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 2, "indexedDocuments": 2}),
+                None,
+            )))
+            .mount(server)
+            .await;
+    }
+
+    /// Documents as a Scrapix crawl writes them: the index key is `uid`, not `id`.
+    fn docs_with_uid() -> Vec<Document> {
+        docs()
+            .into_iter()
+            .map(|mut d| {
+                d.fields.insert("uid".into(), json!(format!("u-{}", d.id)));
+                d
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_existing_index_keeps_its_own_primary_key() {
+        // An index created elsewhere (a Scrapix crawl) with `uid` as its key. Sending
+        // `?primaryKey=id` makes Meilisearch reject every addition with
+        // `index_primary_key_already_exists`, so the parameter must be left out.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(json!("uid"))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param("primaryKey", "id"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(8, "documentAdditionOrUpdate")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tasks/8"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                8,
+                "failed",
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 2, "indexedDocuments": 0}),
+                Some(meili_error(
+                    "index_primary_key_already_exists",
+                    "invalid_request",
+                    "Index already has a primary key: `uid`.",
+                )),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param_is_missing("primaryKey"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(2, "documentAdditionOrUpdate")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_succeeded_addition(&server, 2).await;
+
+        let input_docs = docs_with_uid();
+        let out = run(
+            &server,
+            PluginInput::Documents(input_docs.clone()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            PluginOutput::Indexed(IndexReport {
+                index: INDEX.into(),
+                document_count: 2,
+                task_uids: vec![2],
+            })
+        );
+        // The documents themselves are unchanged.
+        let requests = server.received_requests().await.unwrap();
+        let add = requests
+            .iter()
+            .find(|r| r.method == "POST")
+            .expect("documents request");
+        let sent: Vec<Value> = add.body_json().unwrap();
+        let expected: Vec<Value> = input_docs.iter().map(Document::to_index_json).collect();
+        assert_eq!(sent, expected);
+        assert_eq!(sent[0]["uid"], "u-a");
+    }
+
+    #[tokio::test]
+    async fn an_existing_index_without_a_primary_key_gets_the_configured_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(Value::Null)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param_is_missing("primaryKey"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(5, "documentAdditionOrUpdate")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
+        mount_succeeded_addition(&server, 2).await;
+
+        let out = run(
+            &server,
+            PluginInput::Documents(docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.document_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_create_index_false_still_respects_an_existing_primary_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(json!("uid"))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param_is_missing("primaryKey"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(3, "documentAdditionOrUpdate")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg = config(&server.uri());
+        cfg["auto_create_index"] = json!(false);
+        cfg["wait_for_completion"] = json!(false);
+        let out = run(&server, PluginInput::Documents(docs_with_uid()), cfg)
             .await
             .unwrap();
         assert_eq!(out.document_count(), 2);

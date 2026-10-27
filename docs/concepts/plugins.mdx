@@ -134,6 +134,6 @@ declare them in `EXTERNAL_PLUGINS` on the `workers-general` pool.
 
 `meili_indexer` is the **only** plugin that talks to Meilisearch. It reads the
 `MeiliContext` (host, api_key, index) that the workflow flattened into its
-config, creates the index if needed (`auto_create_index`, `primary_key`),
-batches `addDocuments` calls (`batch_size`) and waits for the tasks
-(`wait_for_completion`). It never reads environment variables.
+config, creates the index if needed (`auto_create_index`, `primary_key`; an
+existing index keeps its own primary key), batches `addDocuments` calls
+(`batch_size`) and waits for the tasks (`wait_for_completion`). It never reads environment variables.

@@ -1327,7 +1327,9 @@ pub struct IndexerConfig {
     /// reads this config both are set; the name is kept for error messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
-    /// Primary key to declare when creating the index.
+    /// Primary key to declare when creating the index. The indexer also sends it on
+    /// document additions while the index has no primary key; an index that already
+    /// has one keeps its own.
     #[serde(default = "default_primary_key")]
     pub primary_key: String,
     /// Create the index if missing.

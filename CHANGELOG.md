@@ -25,6 +25,14 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   runners; CI builds both.
 
 ### Fixed
+- `meili_indexer` no longer sends `?primaryKey=<primary_key>` on document additions
+  to an index that already has a primary key. An index created elsewhere with another
+  key (`uid`, as Scrapix crawls create them) rejected every addition with
+  `index_primary_key_already_exists`, failing the job even when the documents carried
+  that field. The index's own key is now used (logged at info); `primary_key` still
+  applies to indexes the indexer creates and to existing ones without a key yet. The
+  index is now looked up with `auto_create_index: false` too, so the same rule
+  applies; a missing index is still not created.
 - `s3://` blob stores (and object refs) now read the standard `AWS_*` variables:
   `AWS_REGION` (requests always went to `us-east-1`), `AWS_ENDPOINT`, static keys,
   web identity and the ECS task role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`).
