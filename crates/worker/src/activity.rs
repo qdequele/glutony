@@ -29,6 +29,37 @@ use crate::registry::PluginRegistry;
 /// Interval at which the activity heartbeats on its own, independent of the plugin.
 const KEEPALIVE_HEARTBEAT: Duration = Duration::from_secs(20);
 
+/// How long a plugin may keep running after its activity is cancelled (a job cancel,
+/// or the worker shutting down) before it is abandoned and the activity reports the
+/// cancellation. Plugins that poll the cancellation flag stop well within it.
+const CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// Run `work`, but once `cancelled` resolves give it only `grace` more before giving up
+/// with [`PluginError::Cancelled`]. Without this a plugin that never polls the flag
+/// would keep a shutting-down worker alive until it is killed, and Temporal would only
+/// retry the step after its heartbeat timeout.
+async fn abandon_after_cancel<T>(
+    work: impl std::future::Future<Output = Result<T, PluginError>>,
+    cancelled: impl std::future::Future<Output = ()>,
+    grace: Duration,
+) -> Result<T, PluginError> {
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => return result,
+        () = cancelled => {}
+    }
+    match tokio::time::timeout(grace, work).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "plugin ignored cancellation, abandoning it"
+            );
+            Err(PluginError::Cancelled)
+        }
+    }
+}
+
 /// Input of the `expand_fan_out` activity: split a (possibly spilled) upstream output
 /// into branch inputs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -503,7 +534,12 @@ impl StepActivities {
         input: StepActivityInput,
     ) -> Result<StepActivityOutput, ActivityError> {
         let (plugin_ctx, forwarder) = bridge_context(&ctx, input.job_id, &input.step_id);
-        let result = self.run_step(&plugin_ctx, input).await;
+        let result = abandon_after_cancel(
+            self.run_step(&plugin_ctx, input),
+            ctx.cancelled(),
+            CANCEL_GRACE,
+        )
+        .await;
         forwarder.abort();
         result.map_err(to_activity_error)
     }
@@ -557,6 +593,31 @@ mod tests {
     use super::*;
     use meili_ingest_plugin_sdk::Document;
     use meili_ingest_plugin_sdk::prelude::*;
+
+    #[tokio::test]
+    async fn a_plugin_ignoring_cancellation_is_abandoned_after_the_grace() {
+        let never = std::future::pending::<Result<(), PluginError>>();
+        let result = abandon_after_cancel(never, async {}, Duration::from_millis(10)).await;
+        assert!(matches!(result, Err(PluginError::Cancelled)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_finishing_within_the_grace_keeps_its_result() {
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, PluginError>(7)
+        };
+        let result = abandon_after_cancel(work, async {}, Duration::from_secs(5)).await;
+        assert_eq!(result.unwrap(), 7);
+        // Not cancelled: the work runs as long as it needs.
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok::<_, PluginError>(8)
+        };
+        let result =
+            abandon_after_cancel(work, std::future::pending(), Duration::from_millis(1)).await;
+        assert_eq!(result.unwrap(), 8);
+    }
 
     struct Upper;
     #[async_trait]

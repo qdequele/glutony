@@ -99,7 +99,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let blob = BlobStore::from_url(&config.blob_store_url)
-        .with_context(|| format!("cannot open blob store {:?}", config.blob_store_url))?;
+        .with_context(|| format!("cannot open blob store {:?}", config.blob_store_url))?
+        .with_object_ref_policy(
+            meili_ingest_blob::ObjectRefPolicy::from_env()
+                .context("invalid OBJECT_REF_AMBIENT_CREDENTIALS or OBJECT_REF_BUCKETS")?,
+        );
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
