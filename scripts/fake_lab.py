@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A stand-in for the Meilisearch Lab (platform contract v2), for scripts/e2e.sh --lab.
 
-    fake_lab.py PORT INSTANCE_ID INSTANCE_SECRET OUT
+    fake_lab.py PORT INSTANCE_ID INSTANCE_SECRET OUT [LLM_PORT]
 
 POST /internal/events          checks X-Lab-Instance-Id, X-Lab-Timestamp (at most
                                300 s off) and X-Lab-Signature
@@ -11,6 +11,11 @@ POST /internal/events          checks X-Lab-Instance-Id, X-Lab-Timestamp (at mos
                                (appended to OUT), answers {"accepted": [ids]}.
 GET  /internal/instances/me    this deployment: a hosted glutony engine.
 GET  /internal/accounts/{id}   every account is active with 100 credits.
+GET  /internal/accounts/{id}/ai[?rejected_key_id=]
+                               the account's Gateway target: an OpenAI-compatible
+                               base_url (http://127.0.0.1:LLM_PORT/v1, a mock the
+                               script starts) and the fixed key AI_API_KEY. Only
+                               served when LLM_PORT is given, else 404 (no Gateway).
 GET  /events                   every stored event, as a JSON array.
 
 The two /internal GETs require Authorization: Bearer <secret> and X-Lab-Instance-Id.
@@ -30,10 +35,15 @@ PORT, INSTANCE_ID, SECRET, OUT = (
     sys.argv[3].encode(),
     sys.argv[4],
 )
+LLM_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else None
+# The team's Gateway key, which scripts/e2e.sh expects the mock LLM to be called with.
+AI_API_KEY = "e2e-lab-gateway-key"
+AI_KEY_ID = "e2e-lab-key-1"
 LAB_URL = f"http://127.0.0.1:{PORT}"
 MAX_SKEW = 300
 EVENTS: dict[str, dict] = {}
 ACCOUNT = re.compile(r"^/internal/accounts/([0-9a-f-]{36})$")
+ACCOUNT_AI = re.compile(r"^/internal/accounts/([0-9a-f-]{36})/ai$")
 ENVELOPE_KEYS = ("id", "type", "occurred_at", "account_id", "api_key_id", "product", "data")
 
 
@@ -130,7 +140,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         if not self._bearer_ok():
             return self._json(401, {"error": "unauthorized"})
-        if self.path == "/internal/instances/me":
+        path = self.path.split("?", 1)[0]
+        if path == "/internal/instances/me":
             return self._json(
                 200,
                 {
@@ -141,7 +152,22 @@ class Handler(BaseHTTPRequestHandler):
                     "lab_url": LAB_URL,
                 },
             )
-        m = ACCOUNT.match(self.path)
+        m = ACCOUNT_AI.match(path)
+        if m:
+            if LLM_PORT is None:
+                return self._json(404, {"error": "no gateway"})
+            return self._json(
+                200,
+                {
+                    "base_url": f"http://127.0.0.1:{LLM_PORT}/v1",
+                    "api_key": AI_API_KEY,
+                    "key_id": AI_KEY_ID,
+                    "default_model": "e2e-text-model",
+                    "vision_model": "e2e-vision-model",
+                    "cache_ttl": 30,
+                },
+            )
+        m = ACCOUNT.match(path)
         if m:
             return self._json(
                 200,

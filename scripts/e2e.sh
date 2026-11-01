@@ -10,7 +10,10 @@
 # scripts/fake_lab.py) the control plane and a second gateway report to with instance
 # credentials, management auth on that gateway (LAB_SERVICE_TOKEN), per-tenant
 # isolation checks, and the signed usage and lifecycle events of one job delivered to
-# the fake Lab.
+# the fake Lab. That leg also runs the "PDF with LLM enrichment" pipeline for a Lab
+# tenant on a worker with LAB_AI_GATEWAY=true and no LLM_API_KEY: the AI step must call
+# the Gateway target the fake Lab serves (a mock OpenAI-compatible chat server) with the
+# team's key, and the job's Lab event must carry its tokens and no provider cost.
 #
 # Requirements: docker, temporal CLI, curl, jq, python3, cargo.
 set -euo pipefail
@@ -19,10 +22,13 @@ LAB=0
 [ "${1:-}" = "--lab" ] && LAB=1
 LAB_PORT=${LAB_PORT:-58191}
 GW_LAB_PORT=${GW_LAB_PORT:-58081}
+LLM_PORT=${LLM_PORT:-58133}
 # Dev-only Lab instance credentials, checked by the fake Lab.
 LAB_INSTANCE_ID_VALUE=7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d
 LAB_INSTANCE_SECRET_VALUE=e2e0000000000000000000000000000000000000000000000000000000000000
 LAB_TOKEN=e2e-lab-service-token
+# The team's Gateway key the fake Lab serves (scripts/fake_lab.py AI_API_KEY).
+LAB_AI_KEY=e2e-lab-gateway-key
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -94,14 +100,15 @@ CP_LAB_ENV=()
 WORKER_LAB_ENV=()
 if [ "$LAB" = 1 ]; then
   python3 scripts/fake_lab.py "${LAB_PORT}" "${LAB_INSTANCE_ID_VALUE}" "${LAB_INSTANCE_SECRET_VALUE}" \
-    "${WORK}/lab-events.ndjson" >"${WORK}/lab.log" 2>&1 &
+    "${WORK}/lab-events.ndjson" "${LLM_PORT}" >"${WORK}/lab.log" 2>&1 &
   PIDS+=($!)
   wait_for "http://127.0.0.1:${LAB_PORT}/events" fake-lab
   # The control plane and the Lab gateway confirm these with the Lab at boot.
   LAB_CREDS_ENV=(LAB_URL="http://127.0.0.1:${LAB_PORT}" LAB_INSTANCE_ID="${LAB_INSTANCE_ID_VALUE}"
     LAB_INSTANCE_SECRET="${LAB_INSTANCE_SECRET_VALUE}")
   CP_LAB_ENV=("${LAB_CREDS_ENV[@]}")
-  WORKER_LAB_ENV=(LAB_EVENTS_ENABLED=true)
+  # No provider key of its own: Lab tenants' AI steps can only run on the team's Gateway.
+  WORKER_LAB_ENV=(-u LLM_API_KEY -u TYPESAFE_API_KEY LAB_EVENTS_ENABLED=true LAB_AI_GATEWAY=true)
 fi
 env ${CP_LAB_ENV[@]+"${CP_LAB_ENV[@]}"} BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
 PIDS+=($!)
@@ -192,6 +199,52 @@ PYEOF
 : > "${WORK}/usage.ndjson"
 python3 "${WORK}/mock_tinybird.py" "${TINYBIRD_PORT:-58122}" "${WORK}/usage.ndjson" >"${WORK}/tinybird.log" 2>&1 &
 PIDS+=($!)
+
+# Mock OpenAI-compatible chat-completions endpoint standing in for the team's Gateway in
+# the Lab leg. Answers a JSON object plus token usage and appends what each request
+# carried (path, bearer, model) to llm-requests.ndjson so the test can assert it.
+if [ "$LAB" = 1 ]; then
+cat > "${WORK}/mock_llm.py" <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+OUT = sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path != "/v1/chat/completions":
+            self.send_response(404); self.end_headers(); return
+        model = json.loads(raw).get("model")
+        with open(OUT, "a") as fh:
+            fh.write(json.dumps({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "model": model,
+            }) + "\n")
+        reply = {"title": "Mock title", "summary": "Mock summary.",
+                 "keywords": ["meilisearch", "search"], "language": "en"}
+        body = json.dumps({
+            "id": "chatcmpl-e2e", "object": "chat.completion", "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": json.dumps(reply)}}],
+            "usage": {"prompt_tokens": 37, "completion_tokens": 11, "total_tokens": 48},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PYEOF
+: > "${WORK}/llm-requests.ndjson"
+python3 "${WORK}/mock_llm.py" "${LLM_PORT}" "${WORK}/llm-requests.ndjson" >"${WORK}/mock-llm.log" 2>&1 &
+PIDS+=($!)
+fi
 
 # One worker runs every plugin; the transcription key points at the mock above.
 env ${WORKER_LAB_ENV[@]+"${WORKER_LAB_ENV[@]}"} TASK_QUEUE=workers-general \
@@ -703,6 +756,47 @@ if [ "$LAB" = 1 ]; then
   [ "$NL" = 1 ] || { echo "the Lab did not receive exactly one job.completed event for ${JOBL} (${NL})" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
   curl -fsS "http://localhost:${CP_PORT}/metrics" | grep -q '^glutony_lab_events_delivered_total [1-9]' \
     || { echo "delivered_total did not move" >&2; exit 1; }
+
+  echo "--- Meilisearch Lab: AI steps run on the team's Gateway target"
+  # The worker has LAB_AI_GATEWAY=true and no LLM_API_KEY: the llm_enricher step of this Lab
+  # tenant can only run on the target the fake Lab serves (the mock OpenAI-compatible server).
+  curl -fsS -X POST -H "Authorization: Bearer ${LAB_TOKEN}" -H "X-Glutony-Tenant-Id: ${TA}" \
+    -H 'Content-Type: application/x-yaml' --data-binary @config/pipelines/pdf-with-enrichment.yaml \
+    "${GWL}/pipelines" | jq -e ".tenant_id == \"${TA}\" and .name == \"PDF with LLM enrichment\"" >/dev/null \
+    || { echo "tenant A could not create the PDF with LLM enrichment pipeline" >&2; exit 1; }
+  RESPAI=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" -F "file=@${WORK}/sample.pdf" \
+    "${GWL}/ingest/pipeline/my-pdf-with-enrichment?index=e2e_lab_ai")
+  JOBAI=$(echo "$RESPAI" | jq -r .job_id)
+  for _ in $(seq 1 90); do
+    S=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" "${GWL}/jobs/${JOBAI}" | jq -r .status)
+    [ "$S" = succeeded ] && break
+    [ "$S" = failed ] && { echo "AI job failed" >&2; curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" "${GWL}/jobs/${JOBAI}" | jq . >&2; tail -40 "${WORK}/worker.log"; tail -20 "${WORK}/cp.log"; exit 1; }
+    sleep 1
+  done
+  [ "$S" = succeeded ] || { echo "AI job state ${S}" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
+  echo "AI job ${JOBAI} succeeded"
+
+  # The mock LLM was called, and only ever with the team's Gateway key.
+  LLM_CALLS=$(wc -l < "${WORK}/llm-requests.ndjson" | tr -d ' ')
+  echo "mock LLM requests: ${LLM_CALLS}"
+  [ "$LLM_CALLS" -ge 1 ] || { echo "the mock LLM was never called" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
+  BAD=$(jq -s --arg k "Bearer ${LAB_AI_KEY}" '[.[] | select(.authorization != $k)] | length' "${WORK}/llm-requests.ndjson")
+  [ "$BAD" = 0 ] || { echo "${BAD} LLM request(s) did not carry Authorization: Bearer <the Lab's key>" >&2; cat "${WORK}/llm-requests.ndjson" >&2; exit 1; }
+
+  # The job's Lab event: units keep the tokens, the provider cost is zero (the Gateway bills the team).
+  for _ in $(seq 1 30); do
+    AIEV=$(curl -fsS "http://127.0.0.1:${LAB_PORT}/events" \
+      | jq -c "[.[] | select(.type == \"usage.recorded\" and .data.job_id == \"${JOBAI}\" and .account_id == \"${TA}\")]")
+    [ "$(echo "$AIEV" | jq length)" = 1 ] && break
+    sleep 1
+  done
+  [ "$(echo "$AIEV" | jq length)" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBAI}" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
+  echo "$AIEV" | jq -c '.[0].data | {provider_cost_micro_usd, llm_tokens_in: .units.llm_tokens_in, llm_tokens_out: .units.llm_tokens_out}'
+  echo "$AIEV" | jq -e '.[0].data.provider_cost_micro_usd == 0' >/dev/null \
+    || { echo "provider_cost_micro_usd is not 0 for a Lab Gateway AI step" >&2; exit 1; }
+  echo "$AIEV" | jq -e '.[0].data.units.llm_tokens_in > 0' >/dev/null \
+    || { echo "llm_tokens_in is not above 0 for a Lab Gateway AI step" >&2; exit 1; }
+  echo "AI steps of Lab tenants run on the Gateway target"
   echo "Lab leg passed"
 fi
 
