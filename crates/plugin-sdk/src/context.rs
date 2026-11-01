@@ -2,11 +2,12 @@
 //! heartbeat, observe cancellation, and report billable usage.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::ai::AiTarget;
 use crate::types::UsageUnits;
 
 /// Handle a plugin uses to heartbeat and observe cancellation.
@@ -23,6 +24,7 @@ pub struct ActivityContext {
     heartbeat_tx: Option<mpsc::UnboundedSender<String>>,
     cancelled: Arc<AtomicBool>,
     usage: Arc<Mutex<UsageUnits>>,
+    ai_target: Arc<OnceLock<AiTarget>>,
 }
 
 impl ActivityContext {
@@ -41,6 +43,7 @@ impl ActivityContext {
             heartbeat_tx: Some(heartbeat_tx),
             cancelled,
             usage: Arc::new(Mutex::new(UsageUnits::default())),
+            ai_target: Arc::new(OnceLock::new()),
         }
     }
 
@@ -53,6 +56,7 @@ impl ActivityContext {
             heartbeat_tx: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             usage: Arc::new(Mutex::new(UsageUnits::default())),
+            ai_target: Arc::new(OnceLock::new()),
         }
     }
 
@@ -122,6 +126,21 @@ impl ActivityContext {
     pub fn usage(&self) -> UsageUnits {
         self.usage.lock().map(|u| *u).unwrap_or_default()
     }
+
+    /// Attach the Gateway target AI plugins call for this step. The worker sets it before
+    /// `execute`; the first call wins and later ones are ignored. Clones of the context see it.
+    ///
+    /// The target holds the team's API key, so it stays in memory: it is never serialized
+    /// into Temporal history and its `Debug` output redacts the key.
+    pub fn set_ai_target(&self, target: AiTarget) {
+        let _ = self.ai_target.set(target);
+    }
+
+    /// The Gateway target for this step, if the worker attached one (hosted runs behind the
+    /// Lab). `None` means the plugin falls back to its own configuration.
+    pub fn ai_target(&self) -> Option<&AiTarget> {
+        self.ai_target.get()
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +169,25 @@ mod tests {
         let clone = ctx.clone();
         clone.record_usage(UsageUnits::transcription(2.0));
         assert_eq!(ctx.usage().audio_seconds, 2.0);
+    }
+
+    fn ai_target() -> crate::AiTarget {
+        serde_json::from_str(
+            r#"{"base_url":"http://l/v1","api_key":"k","key_id":"id","default_model":"m","vision_model":"v"}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ai_target_is_shared_by_clones() {
+        let ctx = ActivityContext::noop();
+        assert!(ctx.ai_target().is_none());
+        ctx.clone().set_ai_target(ai_target());
+        assert_eq!(ctx.ai_target().unwrap().key_id, "id");
+        // First call wins.
+        let mut other = ai_target();
+        other.key_id = "other".into();
+        ctx.set_ai_target(other);
+        assert_eq!(ctx.ai_target().unwrap().key_id, "id");
     }
 }
