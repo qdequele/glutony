@@ -33,8 +33,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
     if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
-        // Workers ask `GET /internal/lab/credits/{account}` before a source run; this
-        // client is on that path: short timeouts, and no redirects so the bearer
+        // Workers ask `GET /internal/lab/credits/{account}` before a source run and
+        // `GET /internal/lab/ai/{account}` before an AI step; this client is on that path: short timeouts, and no redirects so the bearer
         // secret is never replayed to another host.
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(2))
@@ -42,10 +42,15 @@ async fn main() -> anyhow::Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("cannot build the Lab HTTP client")?;
-        state = state.with_lab_credits(std::sync::Arc::new(
-            meili_ingest_lab::AccountCreditCache::new(creds.clone(), http),
-        ));
-        tracing::info!("credit pre-check for source runs enabled");
+        state = state
+            .with_lab_credits(std::sync::Arc::new(
+                meili_ingest_lab::AccountCreditCache::new(creds.clone(), http.clone()),
+            ))
+            .with_lab_ai(std::sync::Arc::new(meili_ingest_lab::AiTargetCache::new(
+                creds.clone(),
+                http,
+            )));
+        tracing::info!("credit pre-check and AI target lookup enabled");
     }
     let cancel = tokio_util::sync::CancellationToken::new();
     let sender = match lab_config {

@@ -11,7 +11,9 @@
 //! * scheduled sources (`/internal/sources`, `/internal/sources-by-id`,
 //!   `/internal/source-runs`);
 //! * the Lab credit pre-check workers run before a source run
-//!   (`/internal/lab/credits/{account_id}`).
+//!   (`/internal/lab/credits/{account_id}`);
+//! * the tenant's Lab Gateway target workers fetch before an AI step
+//!   (`/internal/lab/ai/{account_id}`).
 //!
 //! The binary lives in `main.rs`; everything else is exposed as a library so the
 //! router can be exercised in tests without opening a socket.
@@ -22,6 +24,7 @@ pub mod connections;
 pub mod db;
 pub mod error;
 pub mod jobs;
+pub mod lab_ai;
 pub mod lab_credits;
 pub mod lab_events;
 pub mod lab_sender;
@@ -62,6 +65,9 @@ pub struct AppState {
     /// Lab account lookups behind `GET /internal/lab/credits/{account_id}`; `None`
     /// when the control plane has no Lab instance credentials (nothing is checked).
     pub lab_credits: Option<std::sync::Arc<meili_ingest_lab::AccountCreditCache>>,
+    /// Lab Gateway targets behind `GET /internal/lab/ai/{account_id}`; `None` when the
+    /// control plane has no Lab instance credentials (no target is served).
+    pub lab_ai: Option<std::sync::Arc<meili_ingest_lab::AiTargetCache>>,
 }
 
 impl AppState {
@@ -74,6 +80,7 @@ impl AppState {
             metrics: metrics::LabMetrics::default(),
             internal_token: None,
             lab_credits: None,
+            lab_ai: None,
         }
     }
 
@@ -83,6 +90,12 @@ impl AppState {
         cache: std::sync::Arc<meili_ingest_lab::AccountCreditCache>,
     ) -> Self {
         self.lab_credits = Some(cache);
+        self
+    }
+
+    /// Answer the workers' AI target lookups from this cache.
+    pub fn with_lab_ai(mut self, cache: std::sync::Arc<meili_ingest_lab::AiTargetCache>) -> Self {
+        self.lab_ai = Some(cache);
         self
     }
 
@@ -295,6 +308,7 @@ pub fn app(state: AppState) -> Router {
             "/internal/lab/credits/{account_id}",
             get(lab_credits::check_credits),
         )
+        .route("/internal/lab/ai/{account_id}", get(lab_ai::get_ai_target))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_internal_token,

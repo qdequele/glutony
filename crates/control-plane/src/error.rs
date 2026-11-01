@@ -36,6 +36,9 @@ pub enum CpError {
     /// (503, `lab_unavailable`): the caller must not start billable work.
     #[error("{0}")]
     LabUnavailable(String),
+    /// The Lab has no Gateway for the account (404, `no_gateway`).
+    #[error("{0}")]
+    NoGateway(String),
     /// Database failure (500, `db`).
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -62,7 +65,9 @@ impl CpError {
             CpError::Builtin(_) => StatusCode::FORBIDDEN,
             CpError::InsufficientCredits(_) => StatusCode::PAYMENT_REQUIRED,
             CpError::LabUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            CpError::NotFound(_) | CpError::NoPipeline(_) => StatusCode::NOT_FOUND,
+            CpError::NotFound(_) | CpError::NoPipeline(_) | CpError::NoGateway(_) => {
+                StatusCode::NOT_FOUND
+            }
             CpError::Validation(_) | CpError::UnknownPlugin(_) => StatusCode::UNPROCESSABLE_ENTITY,
             CpError::Db(_) | CpError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -80,6 +85,7 @@ impl CpError {
             CpError::UnknownPlugin(_) => "unknown_plugin",
             CpError::InsufficientCredits(_) => "insufficient_credits",
             CpError::LabUnavailable(_) => "lab_unavailable",
+            CpError::NoGateway(_) => "no_gateway",
             CpError::Db(_) => "db",
             CpError::Internal(_) => "internal",
         }
@@ -162,6 +168,11 @@ mod tests {
                 CpError::LabUnavailable("x".into()),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "lab_unavailable",
+            ),
+            (
+                CpError::NoGateway("x".into()),
+                StatusCode::NOT_FOUND,
+                "no_gateway",
             ),
             (
                 CpError::Db(sqlx::Error::RowNotFound),
