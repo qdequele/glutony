@@ -50,8 +50,8 @@
 //! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
 //! plugin calls it instead of the env-configured API, with the target's `default_model`
 //! (a step's `config.model` still wins), and even a [`LlmEnricherPlugin::disabled`]
-//! instance works. A Gateway 401 / 403 marks the target rejected and is retried with a
-//! fresh key; a 402 means the team's budget is spent and is final. Without a target
+//! instance works. A Gateway 401 marks the target rejected and is retried with a fresh
+//! key; a 402 means the team's budget is spent and is final; a 403 is final. Without a target
 //! nothing changes: the env client is used, and `LLM_API_KEY not set` is the error.
 //!
 //! ## Reply mapping
@@ -517,8 +517,8 @@ pub async fn chat_completion_with_usage(
 }
 
 /// The one chat-completions call behind [`chat_completion_with_usage`] and the plugin.
-/// When `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say: 401 /
-/// 403 mark the target rejected and are `Retryable`, 402 is a final "budget exhausted".
+/// When `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say: 401
+/// marks the target rejected and is `Retryable`, 402 is a final "budget exhausted".
 async fn complete(
     http: &reqwest::Client,
     base_url: &str,
@@ -1299,6 +1299,28 @@ mod tests {
         assert!(err.is_retryable(), "{err:?}");
         assert!(ctx.ai_target().unwrap().is_rejected());
         assert!(!err.to_string().contains("lab-key"));
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_lab_403_is_final_and_keeps_the_key() {
+        // Lumen's 403s are filtered content (LM-2013) or platform-only routes, not a
+        // refused key.
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string(r#"{"error":{"code":"LM-2013"}}"#),
+            )
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let err = run_with(&LlmEnricherPlugin::disabled(), &ctx, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("403")),
+            "{err:?}"
+        );
+        assert!(!ctx.ai_target().unwrap().is_rejected());
     }
 
     #[tokio::test]

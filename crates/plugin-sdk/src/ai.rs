@@ -93,15 +93,21 @@ impl fmt::Debug for AiTarget {
 /// Map a Gateway-specific HTTP failure to a [`PluginError`], or `None` when the status is not
 /// the Gateway's own (the plugin then applies its usual mapping).
 ///
-/// * 401 / 403: the key was revoked or rotated. Marks `target` rejected and returns a
-///   retryable error, so the retry runs with a freshly fetched key.
+/// * 401: the key was revoked or rotated (Lumen's `LM-4004`, its only answer to a refused
+///   key). Marks `target` rejected and returns a retryable error, so the retry runs with a
+///   freshly fetched key.
 /// * 402: the team's Gateway budget is spent. Retrying cannot help until the team adds Lab
 ///   credits, so the error is final.
 ///
-/// The error never contains the API key.
+/// A 403 is not a refused key (Lumen answers 403 for filtered content, `LM-2013`, and
+/// platform-only routes, `LM-4005`): it returns `None`, so the plugin's usual final
+/// mapping applies.
+///
+/// The error never includes the key in `target`; the 402 message quotes the start of the
+/// Gateway's body.
 pub fn gateway_failure(target: &AiTarget, code: u16, body: &str) -> Option<PluginError> {
     match code {
-        401 | 403 => {
+        401 => {
             target.mark_rejected();
             Some(PluginError::Retryable(format!(
                 "the Gateway refused the Lab key (HTTP {code}); retrying with a new key"
@@ -173,6 +179,14 @@ mod tests {
         assert!(err.is_retryable());
         assert!(clone.is_rejected());
         assert!(!err.to_string().contains("sk-test"));
+    }
+
+    #[test]
+    fn gateway_failure_403_is_not_a_refused_key() {
+        let t = target();
+        let body = r#"{"error":{"code":"LM-2013","message":"content filtered"}}"#;
+        assert!(gateway_failure(&t, 403, body).is_none());
+        assert!(!t.is_rejected());
     }
 
     #[test]

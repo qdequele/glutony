@@ -48,8 +48,8 @@
 //! plugin posts to `{target.base_url}/systemone` instead of the env-configured API, with
 //! the target's `decision_model` (falling back to [`DEFAULT_MODEL`]; a step's
 //! `config.model` still wins), and even a [`JevEnricherPlugin::disabled`] instance works.
-//! A Gateway 401 / 403 marks the target rejected and is retried with a fresh key; a 402
-//! means the team's budget is spent and is final. Without a target nothing changes: the
+//! A Gateway 401 marks the target rejected and is retried with a fresh key; a 402 means
+//! the team's budget is spent and is final; a 403 is final. Without a target nothing changes: the
 //! env client is used, and `TYPESAFE_API_KEY not set` is the error.
 //!
 //! ## Answer mapping
@@ -590,7 +590,7 @@ impl JevClient {
     /// 429 / 5xx (incl. Jev's 529 "overloaded") / transport errors → `Retryable`;
     /// 401 / 403 → `NonRetryable` (credentials); 400 / 422 → `NonRetryable` with the
     /// body; other statuses → `NonRetryable`. With the Lab's target, a Gateway refusal
-    /// (401 / 403 / 402) is mapped by [`gateway_failure`] first.
+    /// (401 / 402) is mapped by [`gateway_failure`] first.
     async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, PluginError> {
         let url = format!("{}/systemone", self.base_url);
         let resp = self

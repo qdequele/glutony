@@ -31,8 +31,8 @@
 //! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
 //! plugin calls it instead of the env-configured API, with the target's `vision_model`
 //! (a step's `config.model` still wins), and even a [`ImageCaptionerPlugin::disabled`]
-//! instance works. A Gateway 401 / 403 marks the target rejected and is retried with a
-//! fresh key; a 402 means the team's budget is spent and is final. Without a target
+//! instance works. A Gateway 401 marks the target rejected and is retried with a fresh
+//! key; a 402 means the team's budget is spent and is final; a 403 is final. Without a target
 //! nothing changes: the env client is used, and `LLM_API_KEY not set` is the error.
 //!
 //! ## Output
@@ -480,7 +480,7 @@ async fn chat_completion(
 }
 
 /// Map a non-2xx reply to a [`PluginError`]. With the Lab's target, a Gateway refusal
-/// (401 / 403 / 402) is mapped by [`gateway_failure`] first.
+/// (401 / 402) is mapped by [`gateway_failure`] first.
 fn map_http_failure(
     status: reqwest::StatusCode,
     body: &str,
