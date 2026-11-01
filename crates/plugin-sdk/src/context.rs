@@ -1,5 +1,6 @@
 //! [`ActivityContext`]: what a plugin can do with the activity it runs inside of —
-//! heartbeat, observe cancellation, and report billable usage.
+//! heartbeat, observe cancellation, report billable usage, and reach the team's AI Gateway
+//! ([`AiTarget`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,7 +11,8 @@ use uuid::Uuid;
 use crate::ai::AiTarget;
 use crate::types::UsageUnits;
 
-/// Handle a plugin uses to heartbeat and observe cancellation.
+/// Handle a plugin uses to heartbeat, observe cancellation, record usage and, for AI plugins,
+/// read the step's Gateway [`AiTarget`] (set by the worker, in memory only).
 ///
 /// Heartbeats are fire-and-forget: they are pushed into a channel that the worker
 /// drains and forwards to Temporal, so calling [`ActivityContext::heartbeat`] is cheap and

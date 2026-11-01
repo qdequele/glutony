@@ -10,7 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::PluginError;
 
@@ -22,7 +22,9 @@ const SNIPPET_CHARS: usize = 512;
 /// Deserializes from the Lab's answer (`base_url`, `api_key`, `key_id`, `default_model`,
 /// `vision_model`, optional `decision_model`); other fields such as `cache_ttl` are ignored.
 /// Clones share the "rejected" flag, so a failure seen by one concurrent task is seen by all.
-#[derive(Clone, Deserialize, Serialize)]
+///
+/// Deliberately not `Serialize`: the key must never end up in Temporal inputs or results.
+#[derive(Clone, Deserialize)]
 pub struct AiTarget {
     /// Base URL of the Gateway's OpenAI-compatible API (e.g. `https://gw.example/v1`).
     pub base_url: String,
@@ -43,6 +45,26 @@ pub struct AiTarget {
 }
 
 impl AiTarget {
+    /// Build a target in code (plugins' tests, the worker). Starts not rejected.
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        key_id: impl Into<String>,
+        default_model: impl Into<String>,
+        vision_model: impl Into<String>,
+        decision_model: Option<String>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            key_id: key_id.into(),
+            default_model: default_model.into(),
+            vision_model: vision_model.into(),
+            decision_model,
+            rejected: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Record that the Gateway refused this key, so the worker fetches a new one.
     pub fn mark_rejected(&self) {
         self.rejected.store(true, Ordering::Relaxed);
@@ -118,6 +140,18 @@ mod tests {
         let shown = format!("{t:?}");
         assert!(!shown.contains("sk-test"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    #[test]
+    fn new_starts_not_rejected() {
+        let t = AiTarget::new("http://l/v1", "k", "id", "m", "v", Some("d".into()));
+        assert_eq!(t.base_url, "http://l/v1");
+        assert_eq!(t.api_key, "k");
+        assert_eq!(t.key_id, "id");
+        assert_eq!(t.default_model, "m");
+        assert_eq!(t.vision_model, "v");
+        assert_eq!(t.decision_model.as_deref(), Some("d"));
+        assert!(!t.is_rejected());
     }
 
     #[test]
