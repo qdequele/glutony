@@ -210,6 +210,9 @@ impl StepActivities {
     /// steps on the Lab, the plugin is one of [`LAB_AI_PLUGINS`] and `tenant` is a Lab
     /// account. Returns whether one was attached. The key stays in memory: it is not
     /// part of the activity input, so it never reaches Temporal history.
+    ///
+    /// A retried attempt asks the control plane to refresh its cached target: the
+    /// replica answering may still hold a key another one saw rotated.
     async fn attach_ai_target(
         &self,
         plugin_ctx: &PluginContext,
@@ -222,12 +225,22 @@ impl StepActivities {
         let Some(tenant) = tenant.filter(|t| meili_ingest_lab::is_lab_account(t)) else {
             return Ok(false);
         };
-        match fetch_ai_target(&self.control_plane(), tenant, None).await? {
+        let refresh = plugin_ctx.attempt() > 1;
+        match fetch_ai_target(&self.control_plane(), tenant, None, refresh).await? {
             Some(target) => {
                 plugin_ctx.set_ai_target(target);
                 Ok(true)
             }
-            None => Ok(false),
+            None => {
+                tracing::warn!(
+                    tenant,
+                    plugin,
+                    "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target \
+                     for this Lab account (it has no LAB_INSTANCE_* credentials?); the step \
+                     falls back to this worker's own provider key"
+                );
+                Ok(false)
+            }
         }
     }
 
@@ -242,7 +255,7 @@ impl StepActivities {
             return;
         }
         let rejected = target.key_id.as_str();
-        match fetch_ai_target(&self.control_plane(), tenant, Some(rejected)).await {
+        match fetch_ai_target(&self.control_plane(), tenant, Some(rejected), false).await {
             Ok(Some(next)) => tracing::warn!(
                 tenant,
                 rejected_key_id = rejected,
@@ -1062,6 +1075,32 @@ mod tests {
             })
             .count();
         assert_eq!(reported, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retried_step_asks_for_a_refreshed_target() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let ctx_at = |attempt| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            PluginContext::new(
+                uuid::Uuid::nil(),
+                "s",
+                attempt,
+                tx,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        };
+        a.run_step(&ctx_at(1), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("attempt 1 runs");
+        a.run_step(&ctx_at(2), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("attempt 2 runs");
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].url.query(), None, "attempt 1 uses the cache");
+        assert_eq!(reqs[1].url.query(), Some("refresh=true"));
     }
 
     #[tokio::test]

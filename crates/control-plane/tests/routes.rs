@@ -526,12 +526,16 @@ async fn credit_checks_need_the_control_plane_token() {
 
 const TEAM_KEY: &str = "sk-team-key-do-not-leak";
 
+/// A state serving AI targets from `lab_url`, with the control plane token `cp-token`
+/// (the route refuses without one).
 fn with_lab_ai(lab_url: &str) -> AppState {
     let creds = meili_ingest_lab::LabCredentials::new(lab_url, LAB_INSTANCE, "s").unwrap();
-    state().with_lab_ai(std::sync::Arc::new(meili_ingest_lab::AiTargetCache::new(
-        creds,
-        reqwest::Client::new(),
-    )))
+    state()
+        .with_internal_token(Some("cp-token".into()))
+        .with_lab_ai(std::sync::Arc::new(meili_ingest_lab::AiTargetCache::new(
+            creds,
+            reqwest::Client::new(),
+        )))
 }
 
 fn ai_body(key_id: &str) -> serde_json::Value {
@@ -545,8 +549,13 @@ fn ai_body(key_id: &str) -> serde_json::Value {
     })
 }
 
+/// `GET uri` with the `cp-token` bearer.
 async fn ai_target(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
-    let (status, body) = call(app(state), Request::get(uri).body(Body::empty()).unwrap()).await;
+    let req = Request::get(uri)
+        .header(header::AUTHORIZATION, "Bearer cp-token")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(app(state), req).await;
     (status, json(&body))
 }
 
@@ -556,7 +565,8 @@ fn ai_uri() -> String {
 
 #[tokio::test]
 async fn ai_target_without_lab_credentials_is_null() {
-    let (status, body) = ai_target(state(), &ai_uri()).await;
+    let state = state().with_internal_token(Some("cp-token".into()));
+    let (status, body) = ai_target(state, &ai_uri()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, serde_json::json!({"target": null}));
 }
@@ -610,6 +620,53 @@ async fn ai_target_passes_rejected_key_id() {
 }
 
 #[tokio::test]
+async fn ai_target_refresh_asks_the_lab_past_a_fresh_entry() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
+        .mount(&lab)
+        .await;
+    let state = with_lab_ai(&lab.uri());
+    let lab_calls = || async { lab.received_requests().await.unwrap().len() };
+    ai_target(state.clone(), &ai_uri()).await;
+    // Cached (cache_ttl 60 s): no second Lab call.
+    ai_target(state.clone(), &ai_uri()).await;
+    assert_eq!(lab_calls().await, 1);
+    // `refresh=true` (a retried step) skips the fresh entry.
+    let (status, body) = ai_target(state.clone(), &format!("{}?refresh=true", ai_uri())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["target"]["key_id"], "k1");
+    assert_eq!(lab_calls().await, 2);
+    // `refresh=false` is the default.
+    ai_target(state, &format!("{}?refresh=false", ai_uri())).await;
+    assert_eq!(lab_calls().await, 2);
+}
+
+#[tokio::test]
+async fn ai_target_is_refused_when_the_token_is_disabled() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
+        .mount(&lab)
+        .await;
+    // CONTROL_PLANE_TOKEN_DISABLED=true: no token on the state.
+    let state = with_lab_ai(&lab.uri()).with_internal_token(None);
+    let (status, body) = call(
+        app(state),
+        Request::get(ai_uri()).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json::<serde_json::Value>(&body)["code"], "token_required");
+    assert!(!String::from_utf8_lossy(&body).contains(TEAM_KEY));
+    assert!(lab.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn ai_target_lab_404_is_no_gateway() {
     use wiremock::matchers::{method, path};
     let lab = wiremock::MockServer::start().await;
@@ -647,7 +704,7 @@ async fn ai_target_needs_the_control_plane_token() {
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
         .mount(&lab)
         .await;
-    let state = with_lab_ai(&lab.uri()).with_internal_token(Some("cp-token".into()));
+    let state = with_lab_ai(&lab.uri());
     let (status, body) = call(
         app(state.clone()),
         Request::get(ai_uri()).body(Body::empty()).unwrap(),

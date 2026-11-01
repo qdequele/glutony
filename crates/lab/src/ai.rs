@@ -152,18 +152,27 @@ impl AiTargetCache {
     /// The Gateway target of `account_id`.
     ///
     /// A cached target younger than `min(cache_ttl, 300 s)` is returned without asking
-    /// the Lab. With `rejected_key_id` (the Gateway refused that key) the Lab is always
-    /// asked, with `?rejected_key_id=`, so it can mint a new key; the cached entry is
-    /// dropped first only when it holds that very key. When the Lab cannot answer, a
-    /// cached target up to [`STALE_FOR`] old is returned instead.
-    pub async fn get(&self, account_id: &str, rejected_key_id: Option<&str>) -> AiLookup {
+    /// the Lab, unless `refresh` is set: a retried step asks for it, because another
+    /// control plane replica may have seen a key rotation this one has not, and a fresh
+    /// entry here can still hold the revoked key. With `rejected_key_id` (the Gateway
+    /// refused that key) the Lab is always asked, with `?rejected_key_id=`, so it can
+    /// mint a new key; the cached entry is dropped first only when it holds that very
+    /// key. When the Lab cannot answer, a cached target up to [`STALE_FOR`] old is
+    /// returned instead (with `refresh` too), but never the rejected key.
+    pub async fn get(
+        &self,
+        account_id: &str,
+        rejected_key_id: Option<&str>,
+        refresh: bool,
+    ) -> AiLookup {
         if !is_lab_account(account_id) {
             return AiLookup::NotALabAccount;
         }
         let now = self.now();
         match rejected_key_id {
             None => {
-                if let Some(c) = self.cached(account_id)
+                if !refresh
+                    && let Some(c) = self.cached(account_id)
                     && c.fresh(now)
                 {
                     return AiLookup::Target(c.target);
@@ -319,8 +328,14 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::Target(target("k1")));
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::Target(target("k1")));
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
         lab.verify().await;
         assert_eq!(requests(&lab).await, 1);
     }
@@ -334,12 +349,12 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         c.advance(Duration::from_secs(59));
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         assert_eq!(requests(&lab).await, 1);
         c.advance(Duration::from_secs(2));
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         assert_eq!(requests(&lab).await, 2);
 
         // A cache_ttl above 300 is capped.
@@ -350,12 +365,12 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         c.advance(Duration::from_secs(299));
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         assert_eq!(requests(&lab).await, 1);
         c.advance(Duration::from_secs(2));
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         assert_eq!(requests(&lab).await, 2);
     }
 
@@ -376,14 +391,20 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::Target(target("k1")));
         assert_eq!(
-            c.get(ACCOUNT, Some("k1")).await,
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
+        assert_eq!(
+            c.get(ACCOUNT, Some("k1"), false).await,
             AiLookup::Target(target("k2"))
         );
         lab.verify().await;
         // The new key is what is cached now.
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::Target(target("k2")));
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k2"))
+        );
         assert_eq!(requests(&lab).await, 2);
     }
 
@@ -406,7 +427,7 @@ mod tests {
             },
         );
         assert_eq!(
-            c.get(ACCOUNT, Some("k1")).await,
+            c.get(ACCOUNT, Some("k1"), false).await,
             AiLookup::Target(target("k2"))
         );
         lab.verify().await;
@@ -419,11 +440,95 @@ mod tests {
             .mount(&lab)
             .await;
         assert_eq!(
-            c.get(ACCOUNT, Some("k1")).await,
+            c.get(ACCOUNT, Some("k1"), false).await,
             AiLookup::Target(target("k2"))
         );
         // A rejected key that is cached is never served, even stale.
-        assert!(is_unavailable(&c.get(ACCOUNT, Some("k2")).await));
+        assert!(is_unavailable(&c.get(ACCOUNT, Some("k2"), false).await));
+    }
+
+    #[tokio::test]
+    async fn refresh_asks_the_lab_past_a_fresh_entry() {
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ai_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body("k1", 60)))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let c = cache(&lab);
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
+        lab.verify().await;
+
+        // Another replica rotated the key: this cache's entry is fresh but outdated.
+        lab.reset().await;
+        Mock::given(method("GET"))
+            .and(path(ai_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body("k2", 60)))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1")),
+            "without refresh the fresh entry is reused"
+        );
+        assert_eq!(requests(&lab).await, 0);
+        assert_eq!(
+            c.get(ACCOUNT, None, true).await,
+            AiLookup::Target(target("k2"))
+        );
+        lab.verify().await;
+        // The refreshed answer is what is cached now.
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k2"))
+        );
+        assert_eq!(requests(&lab).await, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_with_the_lab_down_serves_the_cached_entry() {
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ai_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body("k1", 60)))
+            .mount(&lab)
+            .await;
+        let c = cache(&lab);
+        c.get(ACCOUNT, None, false).await;
+        lab.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&lab)
+            .await;
+        // Fresh, then stale (past cache_ttl, within 300 s): both are still served.
+        assert_eq!(
+            c.get(ACCOUNT, None, true).await,
+            AiLookup::Target(target("k1"))
+        );
+        c.advance(Duration::from_secs(120));
+        assert_eq!(
+            c.get(ACCOUNT, None, true).await,
+            AiLookup::Target(target("k1"))
+        );
+        assert_eq!(requests(&lab).await, 2, "refresh asked the Lab each time");
+        // Past 300 s: nothing usable.
+        c.advance(Duration::from_secs(181));
+        assert!(is_unavailable(&c.get(ACCOUNT, None, true).await));
+        // Refresh never serves a rejected key.
+        let c = cache(&lab);
+        c.targets.lock().unwrap().insert(
+            ACCOUNT.to_string(),
+            Cached {
+                fetched_at: c.now(),
+                target: target("k1"),
+            },
+        );
+        assert!(is_unavailable(&c.get(ACCOUNT, Some("k1"), true).await));
     }
 
     #[tokio::test]
@@ -438,8 +543,8 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::NoGateway);
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::NoGateway);
+        assert_eq!(c.get(ACCOUNT, None, false).await, AiLookup::NoGateway);
+        assert_eq!(c.get(ACCOUNT, None, false).await, AiLookup::NoGateway);
         lab.verify().await;
     }
 
@@ -452,21 +557,21 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        c.get(ACCOUNT, None).await;
+        c.get(ACCOUNT, None, false).await;
         lab.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&lab)
             .await;
         c.advance(Duration::from_secs(61));
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::NoGateway);
+        assert_eq!(c.get(ACCOUNT, None, false).await, AiLookup::NoGateway);
         // Gone for good: not served stale on the next hiccup.
         lab.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(503))
             .mount(&lab)
             .await;
-        assert!(is_unavailable(&c.get(ACCOUNT, None).await));
+        assert!(is_unavailable(&c.get(ACCOUNT, None, false).await));
     }
 
     // The cache is aged by its own clock (`advance`), as `AccountCreditCache` is.
@@ -479,7 +584,10 @@ mod tests {
             .mount(&lab)
             .await;
         let c = cache(&lab);
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::Target(target("k1")));
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
         lab.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(503))
@@ -487,11 +595,14 @@ mod tests {
             .await;
         // Past cache_ttl but within 300 s: the Lab is asked, fails, the entry is served.
         c.advance(Duration::from_secs(120)); // past cache_ttl (60 s)
-        assert_eq!(c.get(ACCOUNT, None).await, AiLookup::Target(target("k1")));
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
         assert_eq!(requests(&lab).await, 1);
         // Past 300 s: nothing usable.
         c.advance(Duration::from_secs(181));
-        let l = c.get(ACCOUNT, None).await;
+        let l = c.get(ACCOUNT, None, false).await;
         assert!(is_unavailable(&l), "{l:?}");
     }
 
@@ -499,9 +610,12 @@ mod tests {
     async fn non_lab_ids_make_no_request() {
         let lab = MockServer::start().await;
         let c = cache(&lab);
-        assert_eq!(c.get("tenant-1", None).await, AiLookup::NotALabAccount);
         assert_eq!(
-            c.get(&ACCOUNT.to_uppercase(), Some("k1")).await,
+            c.get("tenant-1", None, false).await,
+            AiLookup::NotALabAccount
+        );
+        assert_eq!(
+            c.get(&ACCOUNT.to_uppercase(), Some("k1"), false).await,
             AiLookup::NotALabAccount
         );
         assert_eq!(requests(&lab).await, 0);
@@ -518,7 +632,7 @@ mod tests {
                 )
                 .mount(&lab)
                 .await;
-            let l = cache(&lab).get(ACCOUNT, None).await;
+            let l = cache(&lab).get(ACCOUNT, None, false).await;
             assert!(is_unavailable(&l), "{status}: {l:?}");
             assert!(!format!("{l:?}").contains(KEY), "{status}: {l:?}");
         }
@@ -530,7 +644,7 @@ mod tests {
             LabCredentials::new("http://127.0.0.1:1", ID, SECRET).unwrap(),
             reqwest::Client::new(),
         );
-        let l = c.get(ACCOUNT, None).await;
+        let l = c.get(ACCOUNT, None, false).await;
         assert!(is_unavailable(&l), "{l:?}");
     }
 
@@ -544,7 +658,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(bad))
             .mount(&lab)
             .await;
-        let l = cache(&lab).get(ACCOUNT, None).await;
+        let l = cache(&lab).get(ACCOUNT, None, false).await;
         assert!(is_unavailable(&l), "{l:?}");
         assert!(!format!("{l:?}").contains(KEY), "{l:?}");
 
@@ -553,7 +667,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
             .mount(&lab)
             .await;
-        assert!(is_unavailable(&cache(&lab).get(ACCOUNT, None).await));
+        assert!(is_unavailable(&cache(&lab).get(ACCOUNT, None, false).await));
     }
 
     #[test]

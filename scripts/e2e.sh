@@ -760,8 +760,10 @@ if [ "$LAB" = 1 ]; then
   echo "--- Meilisearch Lab: AI steps run on the team's Gateway target"
   # The worker has LAB_AI_GATEWAY=true and no LLM_API_KEY: the llm_enricher step of this Lab
   # tenant can only run on the target the fake Lab serves (the mock OpenAI-compatible server).
+  # The step's own `model:` is dropped so it asks for the Lab's default_model.
+  grep -v '^ *model:' config/pipelines/pdf-with-enrichment.yaml >"${WORK}/pdf-with-enrichment-lab.yaml"
   curl -fsS -X POST -H "Authorization: Bearer ${LAB_TOKEN}" -H "X-Glutony-Tenant-Id: ${TA}" \
-    -H 'Content-Type: application/x-yaml' --data-binary @config/pipelines/pdf-with-enrichment.yaml \
+    -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/pdf-with-enrichment-lab.yaml" \
     "${GWL}/pipelines" | jq -e ".tenant_id == \"${TA}\" and .name == \"PDF with LLM enrichment\"" >/dev/null \
     || { echo "tenant A could not create the PDF with LLM enrichment pipeline" >&2; exit 1; }
   RESPAI=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" -F "file=@${WORK}/sample.pdf" \
@@ -782,6 +784,9 @@ if [ "$LAB" = 1 ]; then
   [ "$LLM_CALLS" -ge 1 ] || { echo "the mock LLM was never called" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
   BAD=$(jq -s --arg k "Bearer ${LAB_AI_KEY}" '[.[] | select(.authorization != $k)] | length' "${WORK}/llm-requests.ndjson")
   [ "$BAD" = 0 ] || { echo "${BAD} LLM request(s) did not carry Authorization: Bearer <the Lab's key>" >&2; cat "${WORK}/llm-requests.ndjson" >&2; exit 1; }
+  # ... and asked for the Lab's default_model (scripts/fake_lab.py).
+  BADM=$(jq -s '[.[] | select(.model != "e2e-text-model")] | length' "${WORK}/llm-requests.ndjson")
+  [ "$BADM" = 0 ] || { echo "${BADM} LLM request(s) did not ask for the Lab's default_model" >&2; cat "${WORK}/llm-requests.ndjson" >&2; exit 1; }
 
   # The job's Lab event: units keep the tokens, the provider cost is zero (the Gateway bills the team).
   for _ in $(seq 1 30); do
@@ -791,9 +796,11 @@ if [ "$LAB" = 1 ]; then
     sleep 1
   done
   [ "$(echo "$AIEV" | jq length)" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBAI}" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
-  echo "$AIEV" | jq -c '.[0].data | {provider_cost_micro_usd, llm_tokens_in: .units.llm_tokens_in, llm_tokens_out: .units.llm_tokens_out}'
+  echo "$AIEV" | jq -c '.[0].data | {provider_cost_micro_usd, llm_tokens_in: .units.llm_tokens_in, llm_tokens_out: .units.llm_tokens_out, unpriced_provider_calls: .units.unpriced_provider_calls}'
   echo "$AIEV" | jq -e '.[0].data.provider_cost_micro_usd == 0' >/dev/null \
     || { echo "provider_cost_micro_usd is not 0 for a Lab Gateway AI step" >&2; exit 1; }
+  echo "$AIEV" | jq -e '.[0].data.units.unpriced_provider_calls == 0' >/dev/null \
+    || { echo "unpriced_provider_calls is not 0 for a Lab Gateway AI step" >&2; exit 1; }
   echo "$AIEV" | jq -e '.[0].data.units.llm_tokens_in > 0' >/dev/null \
     || { echo "llm_tokens_in is not above 0 for a Lab Gateway AI step" >&2; exit 1; }
   echo "AI steps of Lab tenants run on the Gateway target"

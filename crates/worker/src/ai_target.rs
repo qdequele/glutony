@@ -24,16 +24,34 @@ struct Answer {
     target: Option<AiTarget>,
 }
 
+/// Error body of the control plane (`{"error": "...", "code": "..."}`). Its messages
+/// never carry a key.
+#[derive(Deserialize, Default)]
+struct ErrorBody {
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    code: String,
+}
+
+/// Longest control plane error message carried into a step error, in chars.
+const ERROR_CHARS: usize = 300;
+
 /// The Gateway target of Lab account `tenant`, or `None` when the control plane has
 /// none to serve (no Lab credentials, or not a Lab account).
 ///
 /// `rejected_key_id` reports a key the Gateway just refused, so the Lab replaces it.
-/// A team without a Gateway is final (non-retryable); a Lab or control plane that
-/// cannot answer is retryable.
+/// `refresh` (a retried step) makes the control plane ask the Lab even when it holds a
+/// fresh cached target: with several replicas, the one answering may not have seen a
+/// key rotation yet. A team without a Gateway (`404 no_gateway`) and a control plane
+/// that refuses to serve keys without its token (`403 token_required`) are final
+/// (non-retryable); any other failure, including a 404 without `no_gateway` (the route
+/// missing during a rolling deploy), is retryable.
 pub async fn fetch_ai_target(
     cp: &ControlPlane<'_>,
     tenant: &str,
     rejected_key_id: Option<&str>,
+    refresh: bool,
 ) -> Result<Option<AiTarget>, PluginError> {
     let base = cp.base_url.ok_or_else(|| {
         PluginError::NonRetryable(
@@ -52,6 +70,9 @@ pub async fn fetch_ai_target(
     if let Some(key_id) = rejected_key_id {
         url.query_pairs_mut().append_pair("rejected_key_id", key_id);
     }
+    if refresh {
+        url.query_pairs_mut().append_pair("refresh", "true");
+    }
 
     let resp = authed(cp.http.get(url), cp.token)
         .send()
@@ -63,15 +84,39 @@ pub async fn fetch_ai_target(
             ))
         })?;
     let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(PluginError::NonRetryable(
-            "this team has no Gateway in the Lab".into(),
-        ));
-    }
     if !status.is_success() {
-        return Err(PluginError::Retryable(format!(
-            "control plane returned {status} for the Lab Gateway target"
-        )));
+        // Only the `error` and `code` fields are kept: never the raw body.
+        let body: ErrorBody = resp
+            .bytes()
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let detail = if body.code.is_empty() && body.error.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {} ({})",
+                truncate_chars(&body.error, ERROR_CHARS),
+                truncate_chars(&body.code, 64)
+            )
+        };
+        return Err(match (status.as_u16(), body.code.as_str()) {
+            (404, "no_gateway") => {
+                PluginError::NonRetryable(format!("this team has no Gateway in the Lab{detail}"))
+            }
+            (403, "token_required") => PluginError::NonRetryable(format!(
+                "the control plane serves no Lab Gateway target without CONTROL_PLANE_TOKEN \
+                 (HTTP 403){detail}"
+            )),
+            (404, _) => PluginError::Retryable(format!(
+                "control plane answered 404 for the Lab Gateway target (is \
+                 /internal/lab/ai deployed on every replica?){detail}"
+            )),
+            _ => PluginError::Retryable(format!(
+                "control plane returned {status} for the Lab Gateway target{detail}"
+            )),
+        });
     }
     // The body carries the key: never put the parse error (which can quote it) in
     // the message.
@@ -79,6 +124,14 @@ pub async fn fetch_ai_target(
         PluginError::Retryable("control plane sent an unreadable Lab Gateway target".into())
     })?;
     Ok(answer.target)
+}
+
+/// Truncate to at most `max` chars on a char boundary.
+fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
 
 #[cfg(test)]
@@ -122,7 +175,7 @@ mod tests {
         .await;
         let http = reqwest::Client::new();
         let base = server.uri();
-        let t = fetch_ai_target(&cp(&http, &base), ACCOUNT, None)
+        let t = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
             .await
             .expect("answer")
             .expect("a target");
@@ -137,7 +190,7 @@ mod tests {
         let server = answering(200, serde_json::json!({ "target": null })).await;
         let http = reqwest::Client::new();
         let base = server.uri();
-        let t = fetch_ai_target(&cp(&http, &base), ACCOUNT, None)
+        let t = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
             .await
             .expect("answer");
         assert!(t.is_none());
@@ -157,7 +210,7 @@ mod tests {
             .await;
         let http = reqwest::Client::new();
         let base = server.uri();
-        fetch_ai_target(&cp(&http, &base), ACCOUNT, Some("k1"))
+        fetch_ai_target(&cp(&http, &base), ACCOUNT, Some("k1"), false)
             .await
             .expect("answer");
     }
@@ -171,26 +224,99 @@ mod tests {
         )
         .await;
         let base = no_gateway.uri();
-        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None)
+        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
             .await
             .expect_err("404");
         assert!(
-            matches!(&err, PluginError::NonRetryable(m) if m == "this team has no Gateway in the Lab"),
+            matches!(&err, PluginError::NonRetryable(m)
+                if m.starts_with("this team has no Gateway in the Lab")
+                    && m.contains("account has no Gateway (no_gateway)")),
+            "{err:?}"
+        );
+
+        let token_required = answering(
+            403,
+            serde_json::json!({"error": "no token", "code": "token_required"}),
+        )
+        .await;
+        let base = token_required.uri();
+        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
+            .await
+            .expect_err("403");
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("token_required")),
             "{err:?}"
         );
 
         for status in [503, 500, 401] {
             let server = answering(
                 status,
-                serde_json::json!({"error": "x", "code": "lab_unavailable"}),
+                serde_json::json!({"error": "the Lab is down", "code": "lab_unavailable"}),
             )
             .await;
             let base = server.uri();
-            let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None)
+            let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
                 .await
                 .expect_err("failure");
             assert!(err.is_retryable(), "{status}: {err:?}");
+            assert!(
+                err.to_string()
+                    .contains("the Lab is down (lab_unavailable)"),
+                "{status}: {err}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn a_404_without_no_gateway_is_retryable() {
+        let http = reqwest::Client::new();
+        // A replica without the route (rolling deploy): axum's bare 404, or another code.
+        let empty = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&empty)
+            .await;
+        let base = empty.uri();
+        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
+            .await
+            .expect_err("404");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("control plane"), "{err}");
+
+        let other = answering(
+            404,
+            serde_json::json!({"error": "no such thing", "code": "not_found"}),
+        )
+        .await;
+        let base = other.uri();
+        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
+            .await
+            .expect_err("404");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("(not_found)"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refresh_is_sent_only_when_asked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/lab/ai/{ACCOUNT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "target": null
+            })))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
+            .await
+            .expect("answer");
+        fetch_ai_target(&cp(&http, &base), ACCOUNT, None, true)
+            .await
+            .expect("answer");
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs[0].url.query(), None);
+        assert_eq!(reqs[1].url.query(), Some("refresh=true"));
     }
 
     #[tokio::test]
@@ -206,7 +332,7 @@ mod tests {
         .await;
         let http = reqwest::Client::new();
         let base = server.uri();
-        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None)
+        let err = fetch_ai_target(&cp(&http, &base), ACCOUNT, None, false)
             .await
             .expect_err("unreadable");
         assert!(err.is_retryable(), "{err:?}");
@@ -217,7 +343,7 @@ mod tests {
     async fn transport_errors_are_retryable_and_no_url_is_final() {
         let http = reqwest::Client::new();
         // Nothing listens on port 9 of the loopback.
-        let err = fetch_ai_target(&cp(&http, "http://127.0.0.1:9"), ACCOUNT, None)
+        let err = fetch_ai_target(&cp(&http, "http://127.0.0.1:9"), ACCOUNT, None, false)
             .await
             .expect_err("unreachable");
         assert!(err.is_retryable(), "{err:?}");
@@ -227,7 +353,7 @@ mod tests {
             base_url: None,
             token: None,
         };
-        let err = fetch_ai_target(&none, ACCOUNT, None)
+        let err = fetch_ai_target(&none, ACCOUNT, None, false)
             .await
             .expect_err("no control plane");
         assert!(
@@ -249,6 +375,6 @@ mod tests {
             .await;
         let http = reqwest::Client::new();
         let base = server.uri();
-        let _ = fetch_ai_target(&cp(&http, &base), "../jobs", None).await;
+        let _ = fetch_ai_target(&cp(&http, &base), "../jobs", None, false).await;
     }
 }

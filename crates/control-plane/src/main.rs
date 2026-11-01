@@ -31,11 +31,18 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await.context("applying migrations")?;
     tracing::info!("migrations applied");
 
+    if internal_token.is_none() && lab_config.is_some() {
+        tracing::warn!(
+            "CONTROL_PLANE_TOKEN_DISABLED=true with Lab credentials: GET /internal/lab/ai \
+             answers 403 token_required, so LAB_AI_GATEWAY workers cannot run Lab AI steps"
+        );
+    }
     let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
     if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
         // Workers ask `GET /internal/lab/credits/{account}` before a source run and
-        // `GET /internal/lab/ai/{account}` before an AI step; this client is on that path: short timeouts, and no redirects so the bearer
-        // secret is never replayed to another host.
+        // `GET /internal/lab/ai/{account}` before an AI step. This client is on that
+        // path: short timeouts, and no redirects so the bearer secret is never
+        // replayed to another host.
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(2))
             .timeout(std::time::Duration::from_secs(5))

@@ -18,7 +18,7 @@ GET  /internal/accounts/{id}/ai[?rejected_key_id=]
                                served when LLM_PORT is given, else 404 (no Gateway).
 GET  /events                   every stored event, as a JSON array.
 
-The two /internal GETs require Authorization: Bearer <secret> and X-Lab-Instance-Id.
+The three /internal GETs require Authorization: Bearer <secret> and X-Lab-Instance-Id.
 """
 
 import hashlib
