@@ -46,7 +46,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Plugins
-    let mut registry = PluginRegistry::builtin();
+    // With LAB_AI_GATEWAY, AI plugins without their env key still register: a Lab
+    // tenant's step runs on the team's Gateway; any other fails naming the key.
+    let mut registry = PluginRegistry::builtin_with(config.lab_ai_gateway);
     if let Some(spec) = &config.external_plugins {
         registry.load_external(spec).await;
     }
@@ -141,10 +143,20 @@ async fn main() -> anyhow::Result<()> {
     if config.lab_events_enabled {
         tracing::info!("Lab billing events enabled");
     }
+    if config.lab_ai_gateway && config.control_plane_url.is_none() {
+        anyhow::bail!(
+            "LAB_AI_GATEWAY needs CONTROL_PLANE_URL: AI steps of Lab accounts ask it for \
+             the team's Gateway"
+        );
+    }
+    if config.lab_ai_gateway {
+        tracing::info!("AI steps of Lab accounts run on the team's Gateway");
+    }
 
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
         .with_usage(usage)
         .with_lab_events(config.lab_events_enabled)
+        .with_lab_ai_gateway(config.lab_ai_gateway)
         .with_control_plane(config.control_plane_url.clone())
         .with_control_plane_token(config.control_plane_token.clone())
         .with_connections(meili_ingest_worker::connection::ConnectionSettings {

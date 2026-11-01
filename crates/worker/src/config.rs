@@ -25,6 +25,9 @@ pub struct WorkerConfig {
     pub max_concurrent_activities: usize,
     /// Post Lab billing events to the control plane's outbox (`LAB_EVENTS_ENABLED`).
     pub lab_events_enabled: bool,
+    /// Run the AI steps of Lab accounts on the team's Gateway, with the target the
+    /// control plane serves (`LAB_AI_GATEWAY`).
+    pub lab_ai_gateway: bool,
     /// How long in-flight activities may run after SIGTERM / SIGINT before they are
     /// cancelled and handed back to Temporal (`SHUTDOWN_GRACE_SECS`, default 60).
     pub shutdown_grace: std::time::Duration,
@@ -75,6 +78,7 @@ impl WorkerConfig {
                 .filter(|s| !s.is_empty()),
             max_concurrent_activities,
             lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
+            lab_ai_gateway: lab_ai_gateway(std::env::var("LAB_AI_GATEWAY").ok().as_deref()),
             shutdown_grace,
         })
     }
@@ -97,6 +101,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("external_plugins", &self.external_plugins)
             .field("max_concurrent_activities", &self.max_concurrent_activities)
             .field("lab_events_enabled", &self.lab_events_enabled)
+            .field("lab_ai_gateway", &self.lab_ai_gateway)
             .field("shutdown_grace", &self.shutdown_grace)
             .finish()
     }
@@ -130,6 +135,11 @@ fn shutdown_grace(raw: Option<&str>) -> anyhow::Result<std::time::Duration> {
 fn parse_flag(raw: Option<&str>) -> bool {
     raw.map(str::trim)
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// `LAB_AI_GATEWAY`: a [`parse_flag`], off unless set.
+fn lab_ai_gateway(raw: Option<&str>) -> bool {
+    parse_flag(raw)
 }
 
 /// Whether Lab events would be priced with the bundled placeholder list prices: they
@@ -195,6 +205,14 @@ mod tests {
     }
 
     #[test]
+    fn lab_ai_gateway_flag_parsing() {
+        assert!(super::lab_ai_gateway(Some(" true\n")));
+        assert!(super::lab_ai_gateway(Some("1")));
+        assert!(!super::lab_ai_gateway(Some("yes")));
+        assert!(!super::lab_ai_gateway(None), "off unless asked for");
+    }
+
+    #[test]
     fn the_control_plane_token_refuses_the_placeholder() {
         assert_eq!(super::control_plane_token(None).unwrap(), None);
         assert_eq!(super::control_plane_token(Some(" ".into())).unwrap(), None);
@@ -228,10 +246,12 @@ mod tests {
             external_plugins: None,
             max_concurrent_activities: 1,
             lab_events_enabled: false,
+            lab_ai_gateway: true,
             shutdown_grace: std::time::Duration::from_secs(1),
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("cp-token-value"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("lab_ai_gateway: true"), "{shown}");
     }
 }

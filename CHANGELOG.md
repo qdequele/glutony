@@ -6,6 +6,17 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+- `LAB_AI_GATEWAY` (workers): behind the Lab, the AI steps of Lab accounts
+  (`llm_enricher`, `image_captioner`, `jev_enricher`) run on the team's hosted
+  Gateway with a per-team key, fetched before each step from the control plane's
+  new `GET /internal/lab/ai/{account_id}`, which asks the Lab with its
+  `LAB_INSTANCE_*` credentials. The key stays in the worker's memory, never in
+  Temporal history or logs. A key the Gateway refuses is reported so the retry gets
+  a new one; a spent Gateway budget (`402`) or a team without a Gateway fails the
+  step. Those steps report no provider cost: the Gateway bills the team. With the
+  flag on, the AI plugins register without `LLM_API_KEY` / `TYPESAFE_API_KEY`.
+
 ### Changed
 - **Breaking default:** tenant object refs (`{"s3": "s3://…"}`, `gs://`, `az://`)
   are read anonymously (unsigned, public objects only). They were read with the
