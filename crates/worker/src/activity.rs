@@ -23,6 +23,7 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::ai_target::{LAB_AI_PLUGINS, fetch_ai_target};
 use crate::connection::{ConnectionSettings, ControlPlane, authed, resolve_connection};
 use crate::registry::PluginRegistry;
 
@@ -138,6 +139,8 @@ pub struct StepActivities {
     pub connections: ConnectionSettings,
     /// Post Lab billing events to the control plane (spec §5.3).
     pub lab_events: bool,
+    /// Run the AI steps of Lab accounts on the team's Gateway (`LAB_AI_GATEWAY`).
+    pub lab_ai_gateway: bool,
 }
 
 impl StepActivities {
@@ -153,6 +156,7 @@ impl StepActivities {
             control_plane_token: None,
             connections: ConnectionSettings::default(),
             lab_events: false,
+            lab_ai_gateway: false,
         }
     }
 
@@ -185,6 +189,91 @@ impl StepActivities {
     pub fn with_lab_events(mut self, enabled: bool) -> Self {
         self.lab_events = enabled;
         self
+    }
+
+    /// Run the AI steps ([`LAB_AI_PLUGINS`]) of Lab accounts on the team's Gateway,
+    /// with the target the control plane serves (`GET /internal/lab/ai/{account}`).
+    pub fn with_lab_ai_gateway(mut self, enabled: bool) -> Self {
+        self.lab_ai_gateway = enabled;
+        self
+    }
+
+    fn control_plane(&self) -> ControlPlane<'_> {
+        ControlPlane {
+            http: &self.http,
+            base_url: self.control_plane_url.as_deref(),
+            token: self.control_plane_token.as_deref(),
+        }
+    }
+
+    /// Attach the step's Lab Gateway target to `plugin_ctx` when this worker runs AI
+    /// steps on the Lab, the plugin is one of [`LAB_AI_PLUGINS`] and `tenant` is a Lab
+    /// account. Returns whether one was attached. The key stays in memory: it is not
+    /// part of the activity input, so it never reaches Temporal history.
+    ///
+    /// A retried attempt asks the control plane to refresh its cached target: the
+    /// replica answering may still hold a key another one saw rotated.
+    async fn attach_ai_target(
+        &self,
+        plugin_ctx: &PluginContext,
+        plugin: &str,
+        tenant: Option<&str>,
+    ) -> Result<bool, PluginError> {
+        if !self.lab_ai_gateway || !LAB_AI_PLUGINS.contains(&plugin) {
+            return Ok(false);
+        }
+        let Some(tenant) = tenant.filter(|t| meili_ingest_lab::is_lab_account(t)) else {
+            return Ok(false);
+        };
+        let refresh = plugin_ctx.attempt() > 1;
+        match fetch_ai_target(&self.control_plane(), tenant, None, refresh).await? {
+            Some(target) => {
+                plugin_ctx.set_ai_target(target);
+                Ok(true)
+            }
+            None => {
+                tracing::warn!(
+                    tenant,
+                    plugin,
+                    "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target \
+                     for this Lab account (it has no LAB_INSTANCE_* credentials?); the step \
+                     falls back to this worker's own provider key"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// After a failed step: when the Gateway refused the Lab key, report it once so the
+    /// Lab replaces it before Temporal retries the step. The answer only matters to the
+    /// next attempt (which fetches again), so it is logged, never returned.
+    async fn report_rejected_key(&self, plugin_ctx: &PluginContext, tenant: Option<&str>) {
+        let (Some(target), Some(tenant)) = (plugin_ctx.ai_target(), tenant) else {
+            return;
+        };
+        if !target.is_rejected() {
+            return;
+        }
+        let rejected = target.key_id.as_str();
+        match fetch_ai_target(&self.control_plane(), tenant, Some(rejected), false).await {
+            Ok(Some(next)) => tracing::warn!(
+                tenant,
+                rejected_key_id = rejected,
+                key_id = %next.key_id,
+                "the Gateway refused the Lab key; reported it, the retry uses the Lab's answer"
+            ),
+            Ok(None) => tracing::warn!(
+                tenant,
+                rejected_key_id = rejected,
+                "the Gateway refused the Lab key; reported it, the Lab served no target"
+            ),
+            Err(e) => tracing::warn!(
+                tenant,
+                rejected_key_id = rejected,
+                error = %e,
+                "the Gateway refused the Lab key and reporting it failed"
+            ),
+        }
     }
 
     /// Record a finished job: status write-back, then the Lab events, then
@@ -362,18 +451,25 @@ impl StepActivities {
         // Resolved here, in memory, rather than in the workflow: the activity input only
         // ever names the connection, so its key never reaches Temporal history.
         let config = resolve_connection(
-            &ControlPlane {
-                http: &self.http,
-                base_url: self.control_plane_url.as_deref(),
-                token: self.control_plane_token.as_deref(),
-            },
+            &self.control_plane(),
             &self.connections,
             &input.plugin,
             input.config,
             input.tenant_id.as_deref(),
         )
         .await?;
-        let output = plugin.execute(plugin_ctx, resolved, config).await?;
+        // Same rule for a Lab tenant's Gateway key: fetched here, held by the context.
+        let lab_target = self
+            .attach_ai_target(plugin_ctx, &input.plugin, input.tenant_id.as_deref())
+            .await?;
+        let output = match plugin.execute(plugin_ctx, resolved, config).await {
+            Ok(output) => output,
+            Err(e) => {
+                self.report_rejected_key(plugin_ctx, input.tenant_id.as_deref())
+                    .await;
+                return Err(e);
+            }
+        };
         let doc_count = output.document_count();
         let output = self
             .blob
@@ -388,7 +484,12 @@ impl StepActivities {
             .map_err(|e| PluginError::Retryable(format!("failed to spill step output: {e}")))?;
         let duration_ms = started.elapsed().as_millis() as u64;
         // Whatever the plugin spent on external services during `execute`.
-        let usage = plugin_ctx.usage();
+        let mut usage = plugin_ctx.usage();
+        if lab_target {
+            // The team's Gateway bills these calls to the team; glutony paid no provider.
+            usage.cost_micro_usd = 0;
+            usage.unpriced_calls = 0;
+        }
         tracing::info!(
             job_id = %input.job_id,
             step = %input.step_id,
@@ -756,6 +857,314 @@ mod tests {
         );
         assert_eq!(received["host"], "http://meilisearch:7700");
         assert_eq!(received["connection"], "prod-movies");
+    }
+
+    /// A Lab account id (canonical UUID), so its AI steps go through the Lab.
+    const LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+    const OTHER_LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62";
+    const LAB_KEY: &str = "sk-lab-NEVER-IN-HISTORY";
+
+    /// Stands in for an AI plugin: answers with the `key_id` of the target it saw
+    /// (`"none"` without one), records priced usage, and can refuse the key.
+    struct Probe {
+        name: &'static str,
+        reject: bool,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Probe {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                reject: false,
+                runs: Arc::default(),
+            }
+        }
+
+        fn rejecting(mut self) -> Self {
+            self.reject = true;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for Probe {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new(self.name, "0")
+        }
+        async fn execute(
+            &self,
+            ctx: &PluginContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            ctx.record_usage(UsageUnits {
+                llm_input_tokens: 10,
+                cost_micro_usd: 50,
+                unpriced_calls: 1,
+                ..Default::default()
+            });
+            let target = ctx.ai_target();
+            if self.reject
+                && let Some(t) = target
+            {
+                t.mark_rejected();
+                return Err(PluginError::Retryable("the Gateway refused the key".into()));
+            }
+            let seen = target.map_or_else(|| "none".to_string(), |t| t.key_id.clone());
+            Ok(PluginOutput::Documents(vec![Document::with_id(
+                "seen", seen,
+            )]))
+        }
+    }
+
+    fn seen_key(out: &StepActivityOutput) -> String {
+        match &out.output {
+            PluginOutput::Documents(d) => d[0].content.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn lab_target(key_id: &str) -> serde_json::Value {
+        serde_json::json!({ "target": {
+            "base_url": "http://lumen:8080/v1",
+            "api_key": LAB_KEY,
+            "key_id": key_id,
+            "default_model": "gpt-4o-mini",
+            "vision_model": "gpt-4o-mini",
+            "cache_ttl": 300,
+        }})
+    }
+
+    /// A control plane answering `GET /internal/lab/ai/{account}` with `answer`.
+    async fn ai_control_plane(answer: ResponseTemplate) -> MockServer {
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/internal/lab/ai/[^/]+$"))
+            .respond_with(answer)
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    async fn ai_requests(cp: &MockServer) -> Vec<wiremock::Request> {
+        cp.received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().starts_with("/internal/lab/ai/"))
+            .collect()
+    }
+
+    fn ai_acts(cp: &MockServer, plugin: Probe, lab_ai_gateway: bool) -> StepActivities {
+        acts(vec![Arc::new(plugin)])
+            .with_control_plane(Some(cp.uri()))
+            .with_control_plane_token(Some("cp-token".into()))
+            .with_lab_ai_gateway(lab_ai_gateway)
+    }
+
+    fn ai_step(plugin: &str, tenant: &str) -> StepActivityInput {
+        let mut input = step_input(plugin, PluginInput::Empty);
+        input.tenant_id = Some(tenant.into());
+        input
+    }
+
+    #[tokio::test]
+    async fn a_lab_tenant_ai_step_gets_its_target() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let input = ai_step("llm_enricher", LAB_ACCOUNT);
+
+        // What Temporal records for this activity.
+        let recorded = serde_json::to_string(&input).expect("serialize");
+        assert!(
+            !recorded.contains("api_key") && !recorded.contains(LAB_KEY),
+            "the activity input must not carry the Gateway key: {recorded}"
+        );
+
+        let out = a
+            .run_step(&PluginContext::noop(), input)
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "k1");
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].url.path(),
+            format!("/internal/lab/ai/{LAB_ACCOUNT}")
+        );
+        assert_eq!(
+            reqs[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer cp-token")
+        );
+        let shown = format!("{out:?}");
+        assert!(!shown.contains(LAB_KEY), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_non_lab_tenant_gets_no_target_and_no_call() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", "tenant-1"))
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+
+        let no_tenant = step_input("llm_enricher", PluginInput::Empty);
+        let out = a
+            .run_step(&PluginContext::noop(), no_tenant)
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_flag_off_makes_no_call() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), false);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_non_ai_plugin_makes_no_call() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("chunker"), true);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("chunker", LAB_ACCOUNT))
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_is_reported_once() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let probe = Probe::new("llm_enricher").rejecting();
+        let runs = probe.runs.clone();
+        let a = ai_acts(&cp, probe, true);
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("the Gateway refused the key");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(!err.to_string().contains(LAB_KEY), "{err}");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 2, "the lookup, then one report: {reqs:?}");
+        assert!(reqs[0].url.query().is_none(), "{:?}", reqs[0].url);
+        let reported = reqs
+            .iter()
+            .filter(|r| {
+                r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "rejected_key_id" && v == "k1")
+            })
+            .count();
+        assert_eq!(reported, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retried_step_asks_for_a_refreshed_target() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let ctx_at = |attempt| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            PluginContext::new(
+                uuid::Uuid::nil(),
+                "s",
+                attempt,
+                tx,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        };
+        a.run_step(&ctx_at(1), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("attempt 1 runs");
+        a.run_step(&ctx_at(2), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("attempt 2 runs");
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].url.query(), None, "attempt 1 uses the cache");
+        assert_eq!(reqs[1].url.query(), Some("refresh=true"));
+    }
+
+    #[tokio::test]
+    async fn a_lab_target_step_reports_no_provider_cost() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("step runs");
+        assert_eq!(out.usage.cost_micro_usd, 0, "the Gateway bills the team");
+        assert_eq!(out.usage.unpriced_calls, 0);
+        assert_eq!(out.usage.llm_input_tokens, 10, "units are still metered");
+
+        // Without a Lab target the provider cost is ours and stays.
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", "tenant-1"))
+            .await
+            .expect("step runs");
+        assert_eq!(out.usage.cost_micro_usd, 50);
+        assert_eq!(out.usage.unpriced_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn two_tenants_get_their_own_keys() {
+        let cp = MockServer::start().await;
+        for (account, key_id) in [(LAB_ACCOUNT, "k-a"), (OTHER_LAB_ACCOUNT, "k-b")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/internal/lab/ai/{account}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(lab_target(key_id))
+                        .set_delay(Duration::from_millis(20)),
+                )
+                .mount(&cp)
+                .await;
+        }
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let (ctx_a, ctx_b) = (PluginContext::noop(), PluginContext::noop());
+        let (out_a, out_b) = tokio::join!(
+            a.run_step(&ctx_a, ai_step("llm_enricher", LAB_ACCOUNT)),
+            a.run_step(&ctx_b, ai_step("llm_enricher", OTHER_LAB_ACCOUNT)),
+        );
+        assert_eq!(seen_key(&out_a.expect("a runs")), "k-a");
+        assert_eq!(seen_key(&out_b.expect("b runs")), "k-b");
+    }
+
+    #[tokio::test]
+    async fn no_gateway_is_final() {
+        let cp = ai_control_plane(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": format!("account {LAB_ACCOUNT} has no Gateway"),
+            "code": "no_gateway",
+        })))
+        .await;
+        let probe = Probe::new("llm_enricher");
+        let runs = probe.runs.clone();
+        let a = ai_acts(&cp, probe, true);
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("no Gateway");
+        assert!(!err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("no Gateway"), "{err}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the plugin never runs");
     }
 
     #[tokio::test]

@@ -37,9 +37,20 @@
 //!
 //! | var | required | default |
 //! |---|---|---|
-//! | `TYPESAFE_API_KEY` | yes | — |
+//! | `TYPESAFE_API_KEY` | yes (unless the Lab provides a target, see below) | — |
 //! | `TYPESAFE_BASE_URL` | no | `https://api.typesafe.ai/v1` |
 //! | `JEV_MODEL` | no | `jev-latest` |
+//!
+//! ## Behind the Lab
+//!
+//! Behind the Meilisearch Lab the worker attaches the team's [`AiTarget`] (its hosted
+//! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
+//! plugin posts to `{target.base_url}/systemone` instead of the env-configured API, with
+//! the target's `decision_model` (falling back to [`DEFAULT_MODEL`]; a step's
+//! `config.model` still wins), and even a [`JevEnricherPlugin::disabled`] instance works.
+//! A Gateway 401 marks the target rejected and is retried with a fresh key; a 402 means
+//! the team's budget is spent and is final; a 403 is final. Without a target nothing changes: the
+//! env client is used, and `TYPESAFE_API_KEY not set` is the error.
 //!
 //! ## Answer mapping
 //!
@@ -63,6 +74,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures::StreamExt;
+use meili_ingest_plugin_sdk::ai::gateway_failure;
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -249,6 +261,9 @@ struct JevClient {
     api_key: String,
     default_model: String,
     http: reqwest::Client,
+    /// Set when this client was built from the Lab's target: Gateway failures then map
+    /// through [`gateway_failure`], and a rejected key is flagged on the shared target.
+    lab: Option<AiTarget>,
 }
 
 /// The `jev_enricher` plugin. See the crate docs.
@@ -322,6 +337,7 @@ impl JevEnricherPlugin {
                 api_key: api_key.into(),
                 default_model: default_model.into(),
                 http,
+                lab: None,
             }),
         }
     }
@@ -331,9 +347,32 @@ impl JevEnricherPlugin {
         self.client.is_some()
     }
 
-    fn client(&self) -> Result<&JevClient, PluginError> {
+    /// The client for one step: the Lab's target when the context carries one, else the
+    /// env client, else `InvalidConfig("TYPESAFE_API_KEY not set")`.
+    fn client_for(&self, ctx: &ActivityContext) -> Result<JevClient, PluginError> {
+        if let Some(target) = ctx.ai_target() {
+            let http = match &self.client {
+                Some(c) => c.http.clone(),
+                None => reqwest::Client::builder()
+                    .timeout(DEFAULT_TIMEOUT)
+                    .build()
+                    .map_err(|e| {
+                        PluginError::non_retryable(format!("cannot build HTTP client: {e}"))
+                    })?,
+            };
+            return Ok(JevClient {
+                base_url: target.base_url.trim_end_matches('/').to_string(),
+                api_key: target.api_key.clone(),
+                default_model: target
+                    .decision_model
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                http,
+                lab: Some(target.clone()),
+            });
+        }
         self.client
-            .as_ref()
+            .clone()
             .ok_or_else(|| PluginError::invalid_config(MISSING_KEY))
     }
 }
@@ -359,7 +398,7 @@ impl Plugin for JevEnricherPlugin {
         let cfg: JevEnricherConfig = serde_json::from_value(config)
             .map_err(|e| PluginError::invalid_config(e.to_string()))?;
         cfg.validate()?;
-        let client = self.client()?;
+        let client = self.client_for(ctx)?;
 
         let docs = input.into_documents()?;
         let total = docs.len();
@@ -373,7 +412,7 @@ impl Plugin for JevEnricherPlugin {
             std::iter::repeat_with(|| None).take(total).collect();
         let mut stream = futures::stream::iter(docs.into_iter().enumerate())
             .map(|(i, doc)| {
-                let cfg = &cfg;
+                let (cfg, client) = (&cfg, &client);
                 async move { (i, client.enrich(ctx, cfg, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
@@ -550,7 +589,8 @@ impl JevClient {
     ///
     /// 429 / 5xx (incl. Jev's 529 "overloaded") / transport errors → `Retryable`;
     /// 401 / 403 → `NonRetryable` (credentials); 400 / 422 → `NonRetryable` with the
-    /// body; other statuses → `NonRetryable`.
+    /// body; other statuses → `NonRetryable`. With the Lab's target, a Gateway refusal
+    /// (401 / 402) is mapped by [`gateway_failure`] first.
     async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, PluginError> {
         let url = format!("{}/systemone", self.base_url);
         let resp = self
@@ -568,7 +608,7 @@ impl JevClient {
             .await
             .map_err(|e| PluginError::retryable(format!("Jev response body unreadable: {e}")))?;
         if !status.is_success() {
-            return Err(map_http_failure(status.as_u16(), &text));
+            return Err(map_http_failure(status.as_u16(), &text, self.lab.as_ref()));
         }
         serde_json::from_str(&text).map_err(|e| {
             PluginError::non_retryable(format!(
@@ -579,7 +619,10 @@ impl JevClient {
     }
 }
 
-fn map_http_failure(code: u16, body: &str) -> PluginError {
+fn map_http_failure(code: u16, body: &str, lab: Option<&AiTarget>) -> PluginError {
+    if let Some(err) = lab.and_then(|t| gateway_failure(t, code, body)) {
+        return err;
+    }
     let snippet = truncate_chars(body, 512);
     match code {
         429 | 500..=599 => {
@@ -1254,5 +1297,190 @@ mod tests {
         assert_eq!(state_for(&doc, 100), "Title\n\nbody");
         assert_eq!(state_for(&doc, 3), "Tit");
         assert_eq!(truncate_chars("héllo", 2), "hé");
+    }
+
+    // -- Behind the Lab: the target on the context wins over the env client --------------
+
+    fn lab_target(server: &MockServer, decision_model: Option<&str>) -> AiTarget {
+        AiTarget::new(
+            format!("{}/v1", server.uri()),
+            "lab-key",
+            "key-1",
+            "lab-model",
+            "lab-vision",
+            decision_model.map(str::to_string),
+        )
+    }
+
+    fn ctx_with_target(target: AiTarget) -> ActivityContext {
+        let ctx = ActivityContext::noop();
+        ctx.set_ai_target(target);
+        ctx
+    }
+
+    async fn run_with(
+        p: &JevEnricherPlugin,
+        ctx: &ActivityContext,
+        cfg: serde_json::Value,
+    ) -> Result<Vec<Document>, PluginError> {
+        p.execute(
+            ctx,
+            PluginInput::Documents(vec![Document::with_id("d1", "hello")]),
+            cfg,
+        )
+        .await?
+        .into_documents()
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_uses_the_lab_target_over_env() {
+        let env = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(0)
+            .mount(&env)
+            .await;
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header("authorization", "Bearer lab-key"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "lab-decision"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+
+        let ctx = ctx_with_target(lab_target(&lab, Some("lab-decision")));
+        let out = run_with(&plugin(&env), &ctx, three_questions())
+            .await
+            .unwrap();
+        assert_eq!(out[0].fields["category"], "api");
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_lab_target_without_decision_model_uses_the_default_model() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"model": DEFAULT_MODEL}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, None));
+        run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_step_model_wins_over_the_lab_decision_model() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "step-model"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, Some("lab-decision")));
+        run_with(
+            &JevEnricherPlugin::disabled(),
+            &ctx,
+            with_config(serde_json::json!({"model": "step-model"})),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_disabled_works_with_a_lab_target() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header("authorization", "Bearer lab-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, None));
+        run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_disabled_without_target_names_the_env_key() {
+        let err = run_with(
+            &JevEnricherPlugin::disabled(),
+            &ActivityContext::noop(),
+            three_questions(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("TYPESAFE_API_KEY")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_lab_401_marks_the_target_rejected() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
+            )
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, None));
+        let err = run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(ctx.ai_target().unwrap().is_rejected());
+        assert!(!err.to_string().contains("lab-key"));
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_lab_402_is_final() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("no budget"))
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, None));
+        let err = run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("budget is exhausted")),
+            "{err:?}"
+        );
+        assert!(!ctx.ai_target().unwrap().is_rejected());
+    }
+
+    #[tokio::test]
+    async fn jev_enricher_env_401_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .mount(&server)
+            .await;
+        let err = run_with(
+            &plugin(&server),
+            &ActivityContext::noop(),
+            three_questions(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("TYPESAFE_API_KEY")),
+            "{err:?}"
+        );
     }
 }

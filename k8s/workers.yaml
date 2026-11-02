@@ -85,6 +85,10 @@ spec:
                   name: meili-ingest-secrets
                   key: TRANSCRIBE_API_KEY
                   optional: true
+            # Behind the Lab: the AI steps of Lab accounts run on the team's
+            # Gateway, with the target the control plane gets from the Lab.
+            # - name: LAB_AI_GATEWAY
+            #   value: "true"
             # Usage analytics. Optional: without the key the reporting step no-ops.
             - name: TINYBIRD_TOKEN
               valueFrom:

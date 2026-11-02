@@ -66,6 +66,7 @@ The task prints:
 | `LAB_INSTANCE_ID` | control plane, gateway | this deployment's id in the Lab |
 | `LAB_INSTANCE_SECRET` | control plane, gateway | 64 hex chars; rotate or revoke in the Lab |
 | `LAB_EVENTS_ENABLED` | workers | `true` writes events to the control plane's outbox |
+| `LAB_AI_GATEWAY` | workers | `true` runs Lab accounts' AI steps on the team's Gateway ([below](#ai-steps-on-the-teams-gateway)) |
 
 On the gateway the three `LAB_*` variables go together: all three or none, and they
 require `ENVOY_TRUSTED_HEADER` (without the edge secret any client could bill any Lab
@@ -213,6 +214,47 @@ threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
     summary: glutony dropped usage events the Lab never accepted within 24 h
 ```
 
+## AI steps on the team's Gateway
+
+With `LAB_AI_GATEWAY=true` on the workers, the AI steps of a Lab account
+(`llm_enricher`, `image_captioner`, `jev_enricher`) run on the team's hosted Gateway
+with a per-team key instead of the worker's own `LLM_API_KEY` / `TYPESAFE_API_KEY`:
+
+1. Just before the step, the worker asks the control plane
+   (`GET /internal/lab/ai/{account}`, with `CONTROL_PLANE_TOKEN`), which asks the Lab
+   (`GET {LAB_URL}/internal/accounts/{account}/ai`) with its `LAB_INSTANCE_*`
+   credentials. The answer is reused for the Lab's `cache_ttl`, at most 300 s, and
+   when the Lab cannot answer, a cached one up to 300 s old is used. Each control
+   plane replica keeps its own cache, so a retried step (attempt 2 and later) asks
+   with `?refresh=true`: the replica then asks the Lab even when its cached answer is
+   fresh, so a retry never reuses a key another replica saw rotated. When the Lab
+   cannot answer that refresh, the cached answer is still used, as above.
+2. The plugin calls the Gateway's URL with the team's key and models. The key stays
+   in the worker's memory for that step: it is not part of the activity input, so it
+   never reaches Temporal history, and no log line or error carries it.
+3. When the Gateway refuses the key (`401`), the step fails retryably and the
+   worker reports the key id once (`?rejected_key_id=`) so the Lab replaces it before
+   the retry. A `402` (the team's Gateway budget is spent) fails the step for good, and
+   so does a `403` (filtered content or a platform-only route: not a key problem).
+
+A team without a Gateway (`404 no_gateway`) fails the step for good; a Lab that cannot
+answer (`503 lab_unavailable`), or a control plane answering any other error (a `404`
+without `no_gateway`, for example a replica not yet running this route during a
+rolling deploy), is retried with the activity's retry policy. The route serves team
+keys, so it needs `CONTROL_PLANE_TOKEN`: with `CONTROL_PLANE_TOKEN_DISABLED=true` it
+answers `403 token_required` and the step fails for good. A control plane without
+`LAB_INSTANCE_*` serves no target, and the step uses the worker's own key (the
+worker logs a warning for a Lab account). Tenants that are not Lab account ids are
+never looked up. On such a worker the AI plugins register even without their env
+key, so another tenant's AI step fails with `InvalidConfig` naming it
+(`LLM_API_KEY`, `TYPESAFE_API_KEY`).
+`whisper_transcriber` does not use the Gateway and still needs `TRANSCRIBE_API_KEY`.
+
+**No provider cost on Lab-target steps.** The Gateway bills the team for those calls,
+so a step that ran on a Lab target still reports its tokens and requests, with
+`cost_micro_usd` 0 and no unpriced calls: the provider cost in the Lab's
+`usage.recorded` event is only what glutony paid providers itself.
+
 ## Spend enforcement
 
 The gateway refuses work for an account out of credits (`402`) and refuses rather than
@@ -265,6 +307,8 @@ the token set answers them `401`. Upgrade in this order:
    run when it does not answer it: upgrade the control plane first.
 4. Set `CONTROL_PLANE_TOKEN` on the control plane, remove
    `CONTROL_PLANE_TOKEN_DISABLED`, and restart it.
+5. Only then set `LAB_AI_GATEWAY=true` on the workers: until the control plane
+   enforces its token it refuses to serve Gateway targets (`403 token_required`).
 
 On Kubernetes, [Upgrading to Lab contract v2](/deployment/kubernetes#upgrading-to-lab-contract-v2)
 gives the commands.

@@ -228,6 +228,8 @@ services:
       TRANSCRIBE_API_KEY: ${TRANSCRIBE_API_KEY:-${LLM_API_KEY:-}}
       TRANSCRIBE_BASE_URL: ${TRANSCRIBE_BASE_URL:-${LLM_BASE_URL:-https://api.openai.com/v1}}
       TRANSCRIBE_MODEL: ${TRANSCRIBE_MODEL:-whisper-1}
+      # true behind the Lab: Lab accounts' AI steps use the team's Gateway.
+      LAB_AI_GATEWAY: ${LAB_AI_GATEWAY:-}
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
