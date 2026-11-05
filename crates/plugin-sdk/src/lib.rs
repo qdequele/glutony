@@ -48,6 +48,7 @@ pub mod cost;
 pub mod error;
 pub mod tenant;
 pub mod types;
+pub mod vendor;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 

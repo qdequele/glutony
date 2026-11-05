@@ -11,6 +11,13 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   fixtures use that form, and the provider cost table prices a prefixed id like its
   bare model (an exact `[plugin."provider/model"]` entry still wins). The docs of
   `llm_enricher` and `image_captioner` say a step's `model` uses that form behind the Lab.
+- The pipeline examples (`config/pipelines/`, the marketplace `llm_enricher` template,
+  README, SPEC, OpenAPI) use `openai/gpt-4o-mini`. Self-hosted, AI plugins calling a
+  vendor's public API directly (`llm_enricher`, `image_captioner`, `jev_enricher`,
+  `whisper_transcriber`) drop that vendor's own `provider/` prefix (`openai/gpt-4o-mini`
+  → `gpt-4o-mini` on `api.openai.com`, `typesafe/jev` → `jev` on `api.typesafe.ai`), so
+  the same pipeline runs behind the Lab and standalone. Bare ids, and ids sent to any
+  other host (a proxy, vLLM, a self-hosted Gateway), are unchanged.
 
 ### Added
 - `LAB_AI_GATEWAY` (workers): behind the Lab, the AI steps of Lab accounts

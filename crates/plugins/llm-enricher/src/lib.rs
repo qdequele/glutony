@@ -73,6 +73,7 @@ use futures::StreamExt;
 use meili_ingest_plugin_sdk::ai::gateway_failure;
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
 /// Plugin name referenced by `steps[].plugin`.
@@ -436,6 +437,16 @@ fn request_without_token_counts() -> UsageUnits {
 }
 
 impl LlmClient {
+    /// The id to send for `model`: as written to the Lab's Gateway, else without the
+    /// `<provider>/` prefix of the vendor called directly (see [`direct_model`]).
+    fn wire_model<'a>(&self, model: &'a str) -> &'a str {
+        if self.lab.is_some() {
+            model
+        } else {
+            direct_model(&self.base_url, model)
+        }
+    }
+
     /// Ask the model about one document and merge the reply into it.
     ///
     /// Records the call's usage on `ctx` before returning. This runs inside the
@@ -455,7 +466,7 @@ impl LlmClient {
             .unwrap_or(DEFAULT_SYSTEM_PROMPT);
         let model = cfg.model.as_deref().unwrap_or(&self.default_model);
         let mut body = serde_json::json!({
-            "model": model,
+            "model": self.wire_model(model),
             "temperature": cfg.temperature,
             "response_format": { "type": "json_object" },
             "messages": [
@@ -1377,5 +1388,95 @@ mod tests {
         assert!(parse_json_object("[1,2]").is_none());
         let cfg: LlmEnricherConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(cfg, LlmEnricherConfig::default());
+    }
+
+    /// A plugin whose env client calls `host` (a vendor's public API host) but reaches
+    /// `server`: the HTTP client resolves `host` to the mock, and the base URL keeps its port.
+    fn plugin_on_host(server: &MockServer, host: &str, model: &str) -> LlmEnricherPlugin {
+        let http = reqwest::Client::builder()
+            .resolve(host, *server.address())
+            .build()
+            .unwrap();
+        let base = format!("http://{host}:{}/v1", server.address().port());
+        LlmEnricherPlugin::with_client(base, "test-key", model, http)
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_to_the_vendor_drops_its_gateway_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "gpt-4o-mini"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(2)
+            .mount(&server)
+            .await;
+        // From the step's config and from the plugin default (`LLM_MODEL`).
+        let p = plugin_on_host(&server, "api.openai.com", "openai/gpt-4o-mini");
+        run(
+            &p,
+            vec![Document::with_id("d1", "x")],
+            serde_json::json!({"model": "openai/gpt-4o-mini"}),
+        )
+        .await
+        .unwrap();
+        run(
+            &p,
+            vec![Document::with_id("d2", "y")],
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_elsewhere_keeps_the_id_as_written() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "openai/gpt-4o-mini"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // An unknown host (a proxy, vLLM, a self-hosted Gateway) gets the id unchanged.
+        run(
+            &plugin(&server),
+            vec![Document::with_id("d1", "x")],
+            serde_json::json!({"model": "openai/gpt-4o-mini"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_gets_the_prefixed_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer lab-key"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "openai/gpt-4o-mini"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Even on a vendor's host, the Gateway target is never stripped.
+        let p = plugin_on_host(&server, "api.openai.com", "unused");
+        let target = AiTarget::new(
+            format!("http://api.openai.com:{}/v1", server.address().port()),
+            "lab-key",
+            "key-1",
+            "openai/gpt-4o-mini",
+            "openai/gpt-4o",
+            None,
+        );
+        run_with(&p, &ctx_with_target(target), serde_json::json!({}))
+            .await
+            .unwrap();
     }
 }

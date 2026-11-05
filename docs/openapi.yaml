@@ -618,7 +618,7 @@ paths:
                   plugin: llm_enricher
                   depends_on: [chunk]
                   fan_out: "$.documents"
-                  config: { model: gpt-4o-mini }
+                  config: { model: openai/gpt-4o-mini }
                 - id: index
                   plugin: meili_indexer
                   depends_on: [enrich]

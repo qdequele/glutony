@@ -58,7 +58,7 @@ steps:
     depends_on: [chunk]
     fan_out: "$.documents"
     config:
-      model: gpt-4o-mini
+      model: openai/gpt-4o-mini
       max_concurrent: 20
       temperature: 0
       prompt: |

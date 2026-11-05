@@ -52,6 +52,7 @@ use base64::Engine;
 use meili_ingest_plugin_sdk::ai::gateway_failure;
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
 /// Plugin name referenced by `steps[].plugin`.
@@ -315,8 +316,15 @@ impl Plugin for ImageCaptionerPlugin {
             base64::engine::general_purpose::STANDARD.encode(&blob.data)
         );
         let model = cfg.model.as_deref().unwrap_or(&client.default_model);
+        // The Lab's Gateway takes the id as written; a vendor called directly gets it
+        // without its own `<provider>/` prefix.
+        let wire_model = if client.lab.is_some() {
+            model
+        } else {
+            direct_model(&client.base_url, model)
+        };
         let mut body = serde_json::json!({
-            "model": model,
+            "model": wire_model,
             "max_tokens": cfg.max_tokens,
             "messages": [{
                 "role": "user",
@@ -1003,5 +1011,53 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("LLM_API_KEY")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_to_the_vendor_drops_its_gateway_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "gpt-4o"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A cat"}"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .resolve("api.openai.com", *server.address())
+            .build()
+            .unwrap();
+        let base = format!("http://api.openai.com:{}/v1", server.address().port());
+        ImageCaptionerPlugin::with_client(base, "test-key", "vision-model", http)
+            .execute(
+                &ActivityContext::noop(),
+                image(),
+                serde_json::json!({"model": "openai/gpt-4o"}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_gets_the_prefixed_id() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "openai/gpt-4o"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A cat"}"#)),
+            )
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        ImageCaptionerPlugin::disabled()
+            .execute(&ctx, image(), serde_json::json!({"model": "openai/gpt-4o"}))
+            .await
+            .unwrap();
     }
 }
