@@ -931,8 +931,8 @@ mod tests {
             "base_url": "http://lumen:8080/v1",
             "api_key": LAB_KEY,
             "key_id": key_id,
-            "default_model": "gpt-4o-mini",
-            "vision_model": "gpt-4o-mini",
+            "default_model": "openai/gpt-4o-mini",
+            "vision_model": "openai/gpt-4o-mini",
             "cache_ttl": 300,
         }})
     }

@@ -543,8 +543,8 @@ fn ai_body(key_id: &str) -> serde_json::Value {
         "base_url": "https://gateway.example/v1",
         "api_key": TEAM_KEY,
         "key_id": key_id,
-        "default_model": "gpt-4o-mini",
-        "vision_model": "gpt-4o",
+        "default_model": "openai/gpt-4o-mini",
+        "vision_model": "openai/gpt-4o",
         "cache_ttl": 60,
     })
 }
@@ -596,7 +596,7 @@ async fn ai_target_is_served_from_the_lab() {
     // Workers need the key; the route is behind the control plane token.
     assert_eq!(body["target"]["api_key"], TEAM_KEY);
     assert_eq!(body["target"]["base_url"], "https://gateway.example/v1");
-    assert_eq!(body["target"]["default_model"], "gpt-4o-mini");
+    assert_eq!(body["target"]["default_model"], "openai/gpt-4o-mini");
 }
 
 #[tokio::test]

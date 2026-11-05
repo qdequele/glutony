@@ -6,6 +6,12 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+### Changed
+- Gateway model ids are `provider/model` (`openai/gpt-4o-mini`): the Lab AI target
+  fixtures use that form, and the provider cost table prices a prefixed id like its
+  bare model (an exact `[plugin."provider/model"]` entry still wins). The docs of
+  `llm_enricher` and `image_captioner` say a step's `model` uses that form behind the Lab.
+
 ### Added
 - `LAB_AI_GATEWAY` (workers): behind the Lab, the AI steps of Lab accounts
   (`llm_enricher`, `image_captioner`, `jev_enricher`) run on the team's hosted

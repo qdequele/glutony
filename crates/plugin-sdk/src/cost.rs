@@ -113,9 +113,17 @@ impl ProviderCosts {
     }
 
     /// The price of `model` for `plugin`, falling back to the plugin's `default`.
+    ///
+    /// A Gateway (Lumen) model id is `provider/model` (`openai/gpt-4o-mini`): an exact
+    /// entry wins, else the entry of the model after the provider prefix, so one
+    /// `[llm_enricher."gpt-4o-mini"]` prices both the direct and the Gateway call.
     pub fn price(&self, plugin: &str, model: &str) -> Option<Price> {
         let models = self.entries.get(plugin)?;
-        models.get(model).or_else(|| models.get("default")).copied()
+        models
+            .get(model)
+            .or_else(|| model.split_once('/').and_then(|(_, bare)| models.get(bare)))
+            .or_else(|| models.get("default"))
+            .copied()
     }
 
     /// The `registered` plugins that pay a provider ([`PRICED_PLUGINS`]) but have no
@@ -250,6 +258,16 @@ mod tests {
         let mut j = UsageUnits::llm(10, 2);
         costs().apply("jev_enricher", "jev-latest", &mut j);
         assert_eq!(j.cost_micro_usd, 250, "the plugin's default entry applies");
+    }
+
+    #[test]
+    fn a_gateway_provider_prefixed_id_is_priced_like_the_bare_model() {
+        let mut u = UsageUnits::llm(1_000, 100);
+        costs().apply("llm_enricher", "openai/gpt-4o-mini", &mut u);
+        assert_eq!((u.cost_micro_usd, u.unpriced_calls), (210, 0));
+        let mut unknown = UsageUnits::llm(1_000, 100);
+        costs().apply("llm_enricher", "openai/gpt-9", &mut unknown);
+        assert_eq!((unknown.cost_micro_usd, unknown.unpriced_calls), (0, 1));
     }
 
     #[test]

@@ -140,6 +140,9 @@ Vision captioning through an OpenAI-compatible chat endpoint. One document
 whose `content` is the caption. Queue: `workers-general`. Requires `LLM_API_KEY`
 on the worker (`LLM_BASE_URL`, `LLM_MODEL` optional).
 
+Behind the Meilisearch Lab, the call goes to the team's hosted Gateway, whose model ids are
+`provider/model` (`openai/gpt-4o-mini`, not `gpt-4o-mini`); without `model` the Lab's default is used.
+
 | Key | Default | Description |
 |---|---|---|
 | `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Vision-capable chat model. |
@@ -229,6 +232,9 @@ Calls an OpenAI-compatible `/chat/completions` endpoint with
 `response_format: {type: json_object}` for each document and merges the JSON
 reply into the document. Accepts `documents` and `many`; usually used with
 `fan_out: "$.documents"`. Queue: `workers-general`. Requires `LLM_API_KEY`.
+
+Behind the Meilisearch Lab, the call goes to the team's hosted Gateway, whose model ids are
+`provider/model` (`openai/gpt-4o-mini`, not `gpt-4o-mini`); without `model` the Lab's default is used.
 
 | Key | Default | Description |
 |---|---|---|
