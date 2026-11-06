@@ -20,6 +20,14 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   other host (a proxy, vLLM, a self-hosted Gateway), are unchanged.
 
 ### Added
+- Automated releases: `scripts/prepare-release.sh` bumps the crate version
+  (`Cargo.toml`, its pinned path dependencies, `Cargo.lock`) and
+  `docs/openapi.yaml` `info.version` and folds `Unreleased` into a dated
+  section in one step. The "Prepare release" workflow opens the
+  `chore(release): vX.Y.Z` PR; merging it tags the commit and runs
+  `release.yml`, whose GitHub release notes now come from this file, and which
+  notifies `meilisearch/lab` (`glutony-released`) when `LAB_DISPATCH_TOKEN` is
+  set. CI's new `version sync` job fails when the copies disagree.
 - `LAB_AI_GATEWAY` (workers): behind the Lab, the AI steps of Lab accounts
   (`llm_enricher`, `image_captioner`, `jev_enricher`) run on the team's hosted
   Gateway with a per-team key, fetched before each step from the control plane's
