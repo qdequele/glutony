@@ -1,0 +1,350 @@
+---
+title: Meilisearch Lab
+description: Run glutony as a Meilisearch Lab data plane - tenants, management auth, usage events, credit pre-check
+---
+
+glutony runs on its own. The Meilisearch Lab plugs into it through three seams,
+each off until you configure it.
+
+## Tenants
+
+Every pipeline, source, connection and job belongs to a **tenant** or to the global
+scope. Behind the Lab the tenant is the Lab account id (a UUID). Ingest traffic
+arrives on a Meilisearch hostname, so the Lab's edge injects it:
+
+| Header | Value |
+|---|---|
+| `X-Meili-Envoy-Secret` | the gateway's `ENVOY_TRUSTED_HEADER` |
+| `X-Meili-Tenant-Id` | the account id that owns the instance |
+
+`X-Meili-Project-Id` still works (Meilisearch Cloud's Envoy sends it);
+`X-Meili-Tenant-Id` wins when both are present.
+
+## Management auth
+
+| `LAB_SERVICE_TOKEN` | `ADMIN_API_KEY` | Caller sends | Acts as |
+|---|---|---|---|
+| set | - | `Authorization: Bearer <token>` + `X-Glutony-Tenant-Id` | that tenant |
+| - | set | `Authorization: Bearer <key>` (+ optional `X-Glutony-Tenant-Id`) | global, or that tenant |
+| unset | unset | nothing | open: tenant from the trusted edge |
+
+Management routes are every route except ingest, `GET /jobs/{id}` and `/health`.
+`LAB_SERVICE_TOKEN` requires `ENVOY_TRUSTED_HEADER`: the gateway refuses to start with
+the token and no edge secret, because Lab account ids are not secrets and any client
+could otherwise claim a tenant with a bare `X-Meili-Tenant-Id` header. `ADMIN_API_KEY`
+alone keeps working without an edge (operator mode; the gateway only warns).
+Once either secret is set, `X-Meili-*` headers no longer grant management access.
+The Lab console calls these routes **server side only**: the token never reaches a
+browser.
+
+`GET /jobs/{id}` is the one data route that follows management rules once auth is
+on. With auth off it is scoped by the trusted edge tenant, as before. With auth on it
+accepts either a valid management token (scoped by its `X-Glutony-Tenant-Id`; an
+admin without one sees every job) or a trusted edge tenant, and anything else gets
+`401`. Ingest callers keep polling their jobs on the public hostname with the edge
+headers.
+
+## Reporting to the Lab
+
+Engines are run by Meilisearch. The operator mints each deployment's credentials in
+the Lab with
+`bin/rails lab:hosted_engine:create PRODUCT=glutony REGION=... URL=... CREDENTIAL=... EDGE_SECRET=...`,
+which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once (rotate them
+with `lab:hosted_engine:rotate`, revoke them with `lab:hosted_engine:revoke`). The two
+inputs map to glutony's gateway variables:
+
+| Lab task input | glutony variable | Notes |
+|---|---|---|
+| `CREDENTIAL=` | `LAB_SERVICE_TOKEN` | generate with `openssl rand -hex 32` and set it on the gateway; never reuse `ADMIN_API_KEY` |
+| `EDGE_SECRET=` | `ENVOY_TRUSTED_HEADER` | the edge secret the Lab sends in `X-Meili-Envoy-Secret` |
+
+The task prints:
+
+| Variable | Service | Notes |
+|---|---|---|
+| `LAB_URL` | control plane, gateway | base URL only (no path or query); `https` unless the host is loopback or private |
+| `LAB_INSTANCE_ID` | control plane, gateway | this deployment's id in the Lab |
+| `LAB_INSTANCE_SECRET` | control plane, gateway | 64 hex chars; rotate or revoke in the Lab |
+| `LAB_EVENTS_ENABLED` | workers | `true` writes events to the control plane's outbox |
+| `LAB_AI_GATEWAY` | workers | `true` runs Lab accounts' AI steps on the team's Gateway ([below](#ai-steps-on-the-teams-gateway)) |
+
+On the gateway the three `LAB_*` variables go together: all three or none, and they
+require `ENVOY_TRUSTED_HEADER` (without the edge secret any client could bill any Lab
+account with `X-Meili-Tenant-Id`, so the gateway refuses to boot). The control plane
+takes the same three values, all three or none. The Lab accepts glutony's event
+batches only when they are signed with these instance credentials, so the pre-v2
+global events secret is gone: the control plane refuses to boot while it is still set
+and says what to set instead.
+
+At boot the gateway and the control plane call `GET {LAB_URL}/internal/instances/me`
+to confirm the credentials and log the product and region. A 401 aborts boot, and so
+does an answer whose `product` is not `glutony` (the credentials belong to another
+product's engine). Any other failure is logged and boot goes on: the control plane
+sends events anyway, and the gateway retries every 30 s and, until the Lab answers,
+refuses jobs for Lab accounts with `503 {"code": "lab_unavailable"}` (every job is
+billed, so none runs unchecked). If the Lab, once reachable, names another product,
+the gateway stops retrying and keeps refusing those jobs.
+
+### Events
+
+Each finished Lab job produces two events, built once and delivered at least once
+with deterministic ids. First `usage.recorded`, with the job's raw units and provider
+cost:
+
+```json
+{
+  "id": "<UUIDv5 of job:{job_id}:usage>",
+  "type": "usage.recorded",
+  "occurred_at": "2026-10-01T10:00:09.000Z",
+  "account_id": "<tenant id>",
+  "api_key_id": null,
+  "product": "glutony",
+  "data": {
+    "operation": "ingest",
+    "units": { "documents": 12, "bytes_in": 5000, "step_seconds": 4,
+               "llm_tokens_in": 1000, "llm_tokens_out": 100, "audio_seconds": 0,
+               "ocr_pages": 0, "pages": 9, "images": 0, "llm_requests": 1,
+               "external_requests": 0, "unpriced_provider_calls": 0 },
+    "provider_cost_micro_usd": 210,
+    "description": "Job … (builtin.pdf, succeeded, 12 documents)",
+    "job_id": "…"
+  }
+}
+```
+
+Then `job.completed` (`{job_id, index_uid: <pipeline uid>, pages_crawled: 0,
+documents_indexed, duration_secs}`) for a succeeded job, or `job.failed` (`{job_id,
+error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
+`<UUIDv5 of job:{job_id}:lifecycle>`.
+
+- The Lab prices `documents`, `ocr_pages` and `provider_cost_micro_usd` (its
+  `pricing.yml`); other units are stored and shown. glutony never computes credits.
+- `ocr_pages` counts the job's `ocr` plugin steps: the pages a step reports, or else
+  its output documents (the OCR plugin emits one document per page). The PDF
+  extractor's pages are not OCR and stay in the unpriced `pages` unit.
+- `provider_cost_micro_usd` is what glutony paid providers, from the provider cost
+  table (`config/provider-costs.toml`, or `PROVIDER_COSTS_FILE`). When some calls of
+  the job could not be priced it is the sum of the calls that could: the description
+  says `provider cost incomplete` and the `unpriced_provider_calls` unit counts the
+  missing calls (it is always present, 0 when the cost is complete), and the worker
+  logs a warning. The bundled prices are placeholders: set yours before reporting to a
+  Lab (`jev_enricher` has no bundled price at all). At boot the worker logs an error
+  naming every registered provider plugin the table has no entry for, or only zero
+  prices for. With `LAB_EVENTS_ENABLED` on and the bundled table in use (no
+  `PROVIDER_COSTS_FILE`, or an unedited copy of it), it also logs an error at boot. A
+  `PROVIDER_COSTS_FILE` that is missing or invalid stops the worker at boot; if it
+  ever fails to load later, every call is flagged unpriced (never priced at the
+  bundled rates).
+- Jobs without a canonical-UUID tenant (standalone, Cloud projects) are never sent.
+  Failed and cancelled jobs are: provider cost already spent is real.
+
+### Delivery
+
+Workers post events to `POST /internal/lab-events` on the control plane (with
+`CONTROL_PLANE_TOKEN`), which stores them in its `lab_events` outbox. The control
+plane sends batches of up to 500 to `POST {LAB_URL}/internal/events` with
+`X-Lab-Instance-Id`, `X-Lab-Timestamp` and
+`X-Lab-Signature: sha256=<hex HMAC-SHA256(LAB_INSTANCE_SECRET, "<timestamp>.<body>")>`,
+marks the ids the Lab lists in `accepted`, and retries the rest with backoff (max
+5 min). A Lab `401` is logged and retried like any other failure.
+
+An event the Lab has not accepted **24 h** after it was written to the outbox (its
+`created_at`) was skipped on purpose (for example `product mismatch`): it is dropped
+with an error log and counted in `glutony_lab_events_dropped_total`. The check runs
+hourly. Set `LAB_URL` before enabling `LAB_EVENTS_ENABLED`: events already older than
+24 h when the sender first starts get at most one delivery attempt before they are
+dropped.
+
+### Credit pre-check
+
+Before queueing an ingest job or a manual source run (`POST /sources/{uid}/run`) for
+a Lab account, the gateway calls `GET {LAB_URL}/internal/accounts/{account}` (cached
+30 s; when the Lab cannot answer, a cached answer up to 300 s old is used) and answers
+`402 {"code": "insufficient_credits"}` when the balance is 0 or the account is
+inactive. When the Lab cannot answer and no cached answer is that recent, or before
+the Lab has confirmed the credentials at boot, it answers
+`503 {"code": "lab_unavailable"}` and starts nothing. After a failed call the gateway
+does not ask the Lab again for 10 s (for any account): requests in that window use a
+cached answer or get the `503` straight away, so a hung Lab costs one timeout, not one
+per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
+
+Scheduled source runs start from Temporal, not through the gateway, so they are
+checked at the start of each run instead: when the source's tenant is a Lab account
+id, the worker asks the control plane before fetching anything
+(`GET /internal/lab/credits/{account}`, with `CONTROL_PLANE_TOKEN`), which asks the Lab
+with the control plane's `LAB_INSTANCE_*` credentials and the same cache rules (30 s
+fresh, 300 s stale, 10 s backoff after a failure). Workers never hold Lab credentials,
+and never ask for tenants that are not Lab account ids. An account without credits fails
+the run at once: it is recorded as failed with the reason ("source run refused:" and
+the control plane's message, which names the account and says to top up in the Lab
+console), nothing is fetched, staged or billed, its incremental state is not saved,
+and the next tick tries again. When the Lab cannot be asked (`503`, or a control plane
+that does not answer the check), the run is retried with the activity's retry policy
+and, if the Lab is still unreachable, recorded as failed: the check fails closed. A
+control plane without `LAB_INSTANCE_*` answers that nothing is checked. Manual runs
+are checked twice, by the gateway, then by the worker through the control plane; each
+keeps its own 30 s cache.
+
+### Monitoring
+
+The control plane serves `GET /metrics`:
+
+- `glutony_lab_events_pending`
+- `glutony_lab_events_oldest_pending_seconds`
+- `glutony_lab_events_delivered_total`
+- `glutony_lab_events_dropped_total`
+- `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`)
+
+The pending gauges are refreshed on every scrape, so they are correct even when
+`LAB_URL` is unset and events are waiting in the outbox. The sender reads at most
+1 MiB of the Lab's acknowledgement body; a larger one counts as `malformed`.
+
+Alert on `glutony_lab_events_oldest_pending_seconds > 900` for 5 minutes (same
+threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
+
+```yaml
+- alert: GlutonyLabEventsStuck
+  expr: glutony_lab_events_oldest_pending_seconds > 900
+  for: 5m
+  annotations:
+    summary: glutony has usage events the Lab has not accepted for 15 minutes
+- alert: GlutonyLabEventsDropped
+  expr: increase(glutony_lab_events_dropped_total[1h]) > 0
+  annotations:
+    summary: glutony dropped usage events the Lab never accepted within 24 h
+```
+
+## AI steps on the team's Gateway
+
+With `LAB_AI_GATEWAY=true` on the workers, the AI steps of a Lab account
+(`llm_enricher`, `image_captioner`, `jev_enricher`) run on the team's hosted Gateway
+with a per-team key instead of the worker's own `LLM_API_KEY` / `TYPESAFE_API_KEY`:
+
+1. Just before the step, the worker asks the control plane
+   (`GET /internal/lab/ai/{account}`, with `CONTROL_PLANE_TOKEN`), which asks the Lab
+   (`GET {LAB_URL}/internal/accounts/{account}/ai`) with its `LAB_INSTANCE_*`
+   credentials. The answer is reused for the Lab's `cache_ttl`, at most 300 s, and
+   when the Lab cannot answer, a cached one up to 300 s old is used. Each control
+   plane replica keeps its own cache, so a retried step (attempt 2 and later) asks
+   with `?refresh=true`: the replica then asks the Lab even when its cached answer is
+   fresh, so a retry never reuses a key another replica saw rotated. When the Lab
+   cannot answer that refresh, the cached answer is still used, as above.
+2. The plugin calls the Gateway's URL with the team's key and models. The key stays
+   in the worker's memory for that step: it is not part of the activity input, so it
+   never reaches Temporal history, and no log line or error carries it.
+3. When the Gateway refuses the key (`401`), the step fails retryably and the
+   worker reports the key id once (`?rejected_key_id=`) so the Lab replaces it before
+   the retry. A `402` (the team's Gateway budget is spent) fails the step for good, and
+   so does a `403` (filtered content or a platform-only route: not a key problem).
+
+A team without a Gateway (`404 no_gateway`) fails the step for good; a Lab that cannot
+answer (`503 lab_unavailable`), or a control plane answering any other error (a `404`
+without `no_gateway`, for example a replica not yet running this route during a
+rolling deploy), is retried with the activity's retry policy. The route serves team
+keys, so it needs `CONTROL_PLANE_TOKEN`: with `CONTROL_PLANE_TOKEN_DISABLED=true` it
+answers `403 token_required` and the step fails for good. A control plane without
+`LAB_INSTANCE_*` serves no target, and the step uses the worker's own key (the
+worker logs a warning for a Lab account). Tenants that are not Lab account ids are
+never looked up. On such a worker the AI plugins register even without their env
+key, so another tenant's AI step fails with `InvalidConfig` naming it
+(`LLM_API_KEY`, `TYPESAFE_API_KEY`).
+`whisper_transcriber` does not use the Gateway and still needs `TRANSCRIBE_API_KEY`.
+
+**No provider cost on Lab-target steps.** The Gateway bills the team for those calls,
+so a step that ran on a Lab target still reports its tokens and requests, with
+`cost_micro_usd` 0 and no unpriced calls: the provider cost in the Lab's
+`usage.recorded` event is only what glutony paid providers itself.
+
+## Spend enforcement
+
+The gateway refuses work for an account out of credits (`402`) and refuses rather than
+runs unbilled work when it cannot check (`503`): before the Lab has confirmed the
+credentials, and when the Lab cannot answer and the account has no lookup from the
+last 5 minutes. The pre-check is a snapshot: work already running keeps running. It
+guards ingest requests and manual `POST /sources/{uid}/run` in the gateway, and every
+source run of a Lab account, scheduled or manual, at its start in the worker (through
+the control plane). A scheduled run refused for credits is recorded as failed with the
+reason and retried on the next tick.
+
+## Isolation
+
+- A tenant job may only write with a connection its tenant owns. Global connections
+  are templates: a tenant pipeline that names one fails validation on save and, if
+  it was saved before this rule, fails the indexer step with "a tenant job may only
+  use its own connections".
+- A request that carries a tenant never falls back to `MEILI_URL` / `MEILI_API_KEY`:
+  it brings its own `X-Meili-Host` / key, or its pipeline is pinned to a connection.
+- The control plane's `/internal/*` routes require `CONTROL_PLANE_TOKEN`. That token
+  guards `/internal/*` only: `/pipelines`, `/jobs` and `/plugins` on port 9000 stay
+  open, so port 9000 must never be reachable from outside the cluster network.
+
+Before upgrading, copy any global connection a tenant pipeline relies on into that
+tenant, and deploy the control plane before the workers (a new worker against an old
+control plane silently falls back to the global row). [Rollout order](#rollout-order)
+gives the full sequence.
+
+## What the Lab provides
+
+1. The events schema this repo vendors (`contracts/vendor/lab/lab-events.schema.json`).
+2. Per-deployment credentials (`LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET`) and
+   `GET /internal/instances/me`.
+3. `GET /internal/accounts/{id}` for the hosted pre-check.
+4. `X-Meili-Tenant-Id` and `X-Meili-Envoy-Secret` injected on glutony's ingest routes.
+5. The console calls the management routes server side with `LAB_SERVICE_TOKEN` and
+   `X-Glutony-Tenant-Id`.
+
+## Rollout order
+
+The control plane enforces `CONTROL_PLANE_TOKEN` from this release on, and the
+previous gateway and workers do not send it: a control plane rolled out first with
+the token set answers them `401`. Upgrade in this order:
+
+1. Copy any global connection a tenant pipeline relies on into that tenant.
+2. Deploy the control plane with `CONTROL_PLANE_TOKEN_DISABLED=true` and without
+   `CONTROL_PLANE_TOKEN` (when the token is set it is enforced, whatever the flag).
+3. Deploy the gateway and the workers with `CONTROL_PLANE_TOKEN`. The workers ask the
+   control plane for the credit check of every Lab-account source run, and fail the
+   run when it does not answer it: upgrade the control plane first.
+4. Set `CONTROL_PLANE_TOKEN` on the control plane, remove
+   `CONTROL_PLANE_TOKEN_DISABLED`, and restart it.
+5. Only then set `LAB_AI_GATEWAY=true` on the workers: until the control plane
+   enforces its token it refuses to serve Gateway targets (`403 token_required`).
+
+On Kubernetes, [Upgrading to Lab contract v2](/deployment/kubernetes#upgrading-to-lab-contract-v2)
+gives the commands.
+
+Lab events still waiting in the outbox from a pre-v2 release (written by the old
+workers, in a shape a v2 Lab rejects) are converted to the v2 `usage.recorded` shape
+when the new control plane first boots, and get a fresh 24 h delivery window. Workers
+not upgraded yet keep posting that old shape while the rollout runs (the control plane
+goes first), and an old control-plane replica still running stores it as is, so the
+new control plane also converts such events when it stores them and, at the latest,
+just before it sends them: nothing from the rollout window goes unbilled. Converted
+events have the job's wall time as `step_seconds`, and carry no job lifecycle event
+(`job.completed` / `job.failed`).
+
+## Rollback
+
+Let in-flight pipeline workflows finish (or drain them) before rolling back:
+workflows started by the new binary carry `tenant_id`, which the previous binary does
+not read, so they would run without a tenant.
+
+`scripts/rollback-lab-seams.sql` undoes the tenant rename and drops the outbox so the
+previous binary starts. Stop every glutony service first, then run it once:
+
+```bash
+psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql
+```
+
+The script is not idempotent: a second run fails. It refuses while events are
+undelivered unless you force it, which loses them:
+
+```bash
+PGOPTIONS='-c glutony.rollback_force=on' \
+  psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql
+```
+
+To go back only to a build that already has the outbox (migration 0004, not 0005),
+skip the script: stop every glutony service and forget the event conversion, which
+that build does not know, with `DELETE FROM _sqlx_migrations WHERE version = 5;`.
+Converted events stay in the v2 shape.

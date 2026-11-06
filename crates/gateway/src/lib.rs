@@ -6,16 +6,23 @@
 //! starts one Temporal `PipelineWorkflow` per job. The binary lives in `main.rs`; this
 //! library exposes the router so it can be exercised in tests without a network.
 
+pub mod auth;
+pub mod connections;
 pub mod context;
 pub mod error;
 pub mod extract;
 pub mod handlers;
+pub mod lab;
+pub mod preflight;
+pub mod routes;
+pub mod schedules;
+pub mod sources;
 pub mod state;
-pub mod ui;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -24,9 +31,9 @@ pub use state::{AppState, GatewayConfig, WorkflowStarter};
 
 /// `GET /health` — liveness plus the facts a client needs to render itself.
 ///
-/// Reports the tenant resolved from this very request, so the admin UI can show who
-/// it is acting as instead of guessing from the data it happens to have fetched. Also
-/// reports which optional features this deployment has, so the UI can present an
+/// Reports the tenant resolved from this very request, so a client can show who it is
+/// acting as instead of guessing from the data it happens to have fetched. Also
+/// reports which optional features this deployment has, so a client can present an
 /// honest "not enabled" state rather than an error.
 async fn health(
     State(state): State<AppState>,
@@ -35,25 +42,87 @@ async fn health(
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "project_id": context::resolve_project_id(&headers, &state.config),
+        "tenant_id": context::resolve_tenant_id(&headers, &state.config).ok().flatten(),
         "features": {
             "usage_analytics": state.config.usage_api.is_some(),
-            "embedded_ui": ui::is_embedded(),
         },
     }))
+}
+
+/// Normalise one `CORS_ALLOW_ORIGINS` entry into the exact value a browser sends in
+/// its `Origin` header, or `None` when it cannot be an origin.
+///
+/// Origins match byte-for-byte on scheme, host and port, so an entry that merely
+/// parses as a header value is not enough: `localhost:3000` (no scheme) or
+/// `http://host/app` (a path) would be accepted and then never match anything. A
+/// trailing slash is the one typo that is safe to repair.
+fn normalize_origin(raw: &str) -> Option<axum::http::HeaderValue> {
+    let origin = raw.trim().trim_end_matches('/');
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    if authority.is_empty() || authority.contains(['/', '?', '#']) {
+        return None;
+    }
+    origin.parse().ok()
+}
+
+/// Cross-origin layer for `CORS_ALLOW_ORIGINS`, or `None` when it is unset.
+///
+/// Production embeds the UI in this binary and is same-origin, so no layer is
+/// mounted and the browser's default same-origin policy stands. `next dev` serves
+/// the UI from its own port, so the dev stack names that origin explicitly. An
+/// entry that is not an origin is dropped with a warning rather than silently
+/// widening the policy; if that leaves nothing, no layer is mounted.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let mut accepted = Vec::new();
+    for raw in origins {
+        match normalize_origin(raw) {
+            Some(origin) => accepted.push(origin),
+            None => tracing::warn!(
+                origin = %raw,
+                "ignoring CORS_ALLOW_ORIGINS entry: expected scheme://host[:port]"
+            ),
+        }
+    }
+    if accepted.is_empty() {
+        return None;
+    }
+    tracing::info!(origins = ?accepted, "CORS enabled");
+    Some(
+        CorsLayer::new()
+            .allow_origin(accepted)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
 }
 
 /// Build the axum router with every route of SPEC §4 plus `GET /health`, the body
 /// limits (`MAX_UPLOAD_MB`) and request tracing.
 pub fn router(state: AppState) -> Router {
     let limit = state.config.max_upload_bytes();
-    Router::new()
+    let cors = cors_layer(&state.config.cors_allow_origins);
+    let router = Router::new()
         .route("/health", get(health))
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/ingest/batch", post(handlers::ingest::ingest_batch))
         .route(
             "/ingest/pipeline/{name}",
             post(handlers::pipeline::ingest_with_pipeline),
+        )
+        // Index-scoped aliases, the Meilisearch-style URLs a Cloud project exposes: the
+        // path names the index and nothing in the request can override it.
+        .route(
+            "/indexes/{index_uid}/ingest",
+            post(handlers::ingest::ingest_into_index),
+        )
+        .route(
+            "/indexes/{index_uid}/ingest/batch",
+            post(handlers::ingest::ingest_batch_into_index),
+        )
+        .route(
+            "/indexes/{index_uid}/ingest/pipeline/{name}",
+            post(handlers::pipeline::ingest_into_index_with_pipeline),
         )
         .route("/jobs", get(handlers::jobs::list_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))
@@ -71,14 +140,50 @@ pub fn router(state: AppState) -> Router {
             "/pipelines/{name}",
             get(handlers::pipelines::get_pipeline).delete(handlers::pipelines::delete_pipeline),
         )
+        .route(
+            "/connections",
+            get(handlers::connections::list_connections)
+                .post(handlers::connections::create_connection),
+        )
+        .route(
+            "/connections/{uid}",
+            get(handlers::connections::get_connection)
+                .patch(handlers::connections::patch_connection)
+                .delete(handlers::connections::delete_connection),
+        )
+        .route(
+            "/sources",
+            get(handlers::sources::list_sources).post(handlers::sources::create_source),
+        )
+        .route(
+            "/sources/{uid}",
+            get(handlers::sources::get_source)
+                .patch(handlers::sources::patch_source)
+                .delete(handlers::sources::delete_source),
+        )
+        .route(
+            "/sources/{uid}/pause",
+            post(handlers::sources::pause_source),
+        )
+        .route(
+            "/sources/{uid}/unpause",
+            post(handlers::sources::unpause_source),
+        )
+        .route("/sources/{uid}/run", post(handlers::sources::run_source))
+        .route("/sources/{uid}/runs", get(handlers::sources::list_runs))
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))
         .route("/usage", get(handlers::usage::get_usage))
-        .merge(ui::router())
         .layer(DefaultBodyLimit::max(limit))
         .layer(RequestBodyLimitLayer::new(limit))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .layer(TraceLayer::new_for_http());
+    // Applied with a `match` rather than an `Option` layer so the gateway does not
+    // need tower's `util` feature just for `option_layer`.
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+    .with_state(state)
 }
 
 /// Shared fixtures for handler tests: a recording [`WorkflowStarter`], an in-memory blob
@@ -116,6 +221,7 @@ pub mod test_support {
         inputs: Mutex<Vec<PipelineWorkflowInput>>,
         cancelled: Mutex<Vec<Uuid>>,
         snapshots: Mutex<HashMap<Uuid, JobSnapshot>>,
+        forgotten: Mutex<Vec<Uuid>>,
         fail_start: Mutex<bool>,
     }
 
@@ -131,6 +237,11 @@ pub mod test_support {
         /// Make `progress(job_id)` return this snapshot.
         pub fn set_snapshot(&self, job_id: Uuid, snapshot: JobSnapshot) {
             self.snapshots.lock().unwrap().insert(job_id, snapshot);
+        }
+        /// Make Temporal not know `job_id` at all, as for an unknown id or a workflow
+        /// past its retention: `cancel` is `NotFound` and `progress` is `None`.
+        pub fn forget(&self, job_id: Uuid) {
+            self.forgotten.lock().unwrap().push(job_id);
         }
         /// Make `start` fail with an upstream error.
         pub fn fail_start(&self) {
@@ -156,7 +267,20 @@ pub mod test_support {
         async fn progress(&self, job_id: Uuid) -> Result<Option<JobSnapshot>, GatewayError> {
             Ok(self.snapshots.lock().unwrap().get(&job_id).cloned())
         }
+        /// Like Temporal: signalling or cancelling a closed workflow is `NotFound`,
+        /// exactly as for a workflow that never existed.
         async fn cancel(&self, job_id: Uuid) -> Result<(), GatewayError> {
+            let forgotten = self.forgotten.lock().unwrap().contains(&job_id);
+            let closed = forgotten
+                || self
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .get(&job_id)
+                    .is_some_and(|s| s.status.is_terminal());
+            if closed {
+                return Err(GatewayError::NotFound(format!("job {job_id} not found")));
+            }
             self.cancelled.lock().unwrap().push(job_id);
             Ok(())
         }
@@ -186,6 +310,24 @@ pub mod test_support {
         test_app_with_url(config, &server.uri()).await
     }
 
+    /// Router + starter wired to a `wiremock` control plane and a Lab client.
+    pub async fn test_app_with_lab(
+        server: &MockServer,
+        mut config: GatewayConfig,
+        lab: Arc<crate::lab::LabClient>,
+    ) -> (Router, Arc<FakeStarter>) {
+        config.control_plane_url = server.uri();
+        let starter = Arc::new(FakeStarter::default());
+        let state = AppState::new(
+            config,
+            starter.clone(),
+            BlobStore::memory(),
+            reqwest::Client::new(),
+        )
+        .with_lab(lab);
+        (crate::router(state), starter)
+    }
+
     /// A one-step pipeline definition.
     pub fn sample_pipeline(uid: &str, index_pattern: Option<&str>) -> PipelineDefinition {
         PipelineDefinition {
@@ -200,7 +342,7 @@ pub mod test_support {
             }),
             steps: vec![StepDefinition::new("index", "meili_indexer")],
             builtin: uid.starts_with("builtin."),
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -284,6 +426,7 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
+    use super::{cors_layer, normalize_origin};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -302,7 +445,7 @@ mod tests {
         assert_eq!(body["status"], "ok");
         // The UI reads these to render the tenant and to hide features that are off.
         assert_eq!(body["features"]["usage_analytics"], false);
-        assert!(body["project_id"].is_null());
+        assert!(body["tenant_id"].is_null());
     }
 
     #[tokio::test]
@@ -323,7 +466,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(json_body(resp).await["project_id"], "acme");
+        assert_eq!(json_body(resp).await["tenant_id"], "acme");
     }
 
     #[tokio::test]
@@ -346,7 +489,138 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(json_body(resp).await["project_id"].is_null());
+        assert!(json_body(resp).await["tenant_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn no_cors_headers_without_an_allowed_origin() {
+        // The production shape: the UI is embedded and same-origin, so the gateway
+        // must not hand out cross-origin permission to anybody.
+        let server = MockServer::start().await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !resp
+                .headers()
+                .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "unconfigured gateway should not send Access-Control-Allow-Origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_allows_only_the_configured_origins() {
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            cors_allow_origins: vec!["http://localhost:3000".into()],
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://localhost:3000"
+        );
+
+        // An origin that was not listed gets no grant, so naming one dev origin
+        // does not quietly open the API to every site the browser visits.
+        let resp = app
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !resp
+                .headers()
+                .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "unlisted origin should not be granted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_grants_the_ui_json_writes() {
+        // The UI's POST/DELETE calls send `Content-Type: application/json`, which
+        // makes the browser preflight them. Without this grant, reads would work
+        // and every pipeline save would fail.
+        use axum::http::header;
+
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            cors_allow_origins: vec!["http://localhost:3000".into()],
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+        let resp = app
+            .oneshot(
+                Request::options("/pipelines")
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let headers = resp.headers();
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "http://localhost:3000"
+        );
+        assert!(
+            headers.contains_key(header::ACCESS_CONTROL_ALLOW_METHODS),
+            "preflight must grant the method"
+        );
+        assert!(
+            headers.contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            "preflight must grant content-type"
+        );
+    }
+
+    #[test]
+    fn origin_entries_are_normalised_or_rejected() {
+        let ok = |raw: &str| normalize_origin(raw).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            ok("http://localhost:3000").as_deref(),
+            Some("http://localhost:3000")
+        );
+        // The trailing slash a browser never sends is repaired, not kept.
+        assert_eq!(
+            ok("http://localhost:3000/").as_deref(),
+            Some("http://localhost:3000")
+        );
+        assert_eq!(
+            ok(" https://ui.example ").as_deref(),
+            Some("https://ui.example")
+        );
+        // These would parse as header values yet could never match an Origin.
+        assert_eq!(ok("localhost:3000"), None);
+        assert_eq!(ok("http://"), None);
+        assert_eq!(ok("http://host/app"), None);
+        assert_eq!(ok("http://host?x=1"), None);
+        assert!(cors_layer(&["localhost:3000".into()]).is_none());
     }
 
     #[tokio::test]
@@ -358,74 +632,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[cfg(feature = "ui")]
-    #[tokio::test]
-    async fn embedded_ui_is_served_under_its_own_prefix() {
-        use axum::http::header;
-
-        let server = MockServer::start().await;
-        let (app, _) = test_app(&server, GatewayConfig::default()).await;
-
-        // The shell, under both spellings a human might type.
-        for path in ["/ui", "/ui/"] {
-            let resp = app
-                .clone()
-                .oneshot(Request::get(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{path} did not serve the shell"
-            );
-        }
-        let resp = app
-            .clone()
-            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(ct.starts_with("text/html"), "content type was {ct:?}");
-        let body = axum::body::to_bytes(resp.into_body(), 4_000_000)
-            .await
-            .unwrap();
-        let html = String::from_utf8_lossy(&body);
-        assert!(
-            html.contains("/ui/_next/"),
-            "assets must be prefixed with /ui"
-        );
-
-        // A client-side route survives a refresh.
-        let resp = app
-            .clone()
-            .oneshot(Request::get("/ui/pipelines/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // The API is not shadowed by the UI: /pipelines still reaches the handler,
-        // which without a control plane fails upstream rather than returning HTML.
-        let resp = app
-            .oneshot(Request::get("/pipelines").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_ne!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert!(
-            !ct.starts_with("text/html"),
-            "API route was shadowed by the UI"
-        );
     }
 }

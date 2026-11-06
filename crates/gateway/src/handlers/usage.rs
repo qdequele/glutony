@@ -2,8 +2,8 @@
 //!
 //! The browser never talks to Tinybird directly. A read token in front-end code would
 //! be extractable by anyone with dev tools, and Tinybird endpoint parameters are
-//! caller-supplied, so a tenant could simply ask for another tenant's `project_id`.
-//! This handler holds the token server-side and forces `project_id` to the value
+//! caller-supplied, so a tenant could simply ask for another tenant's `tenant_id`.
+//! This handler holds the token server-side and forces `tenant_id` to the value
 //! resolved from the request's own context, which the tenant cannot influence when
 //! Envoy is in front.
 
@@ -11,10 +11,9 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
-use crate::context::resolve_project_id;
+use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
@@ -49,7 +48,8 @@ pub struct UsageRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageResponse {
     /// Tenant the rows belong to (empty when self-hosted).
-    pub project_id: String,
+    #[serde(alias = "project_id")]
+    pub tenant_id: String,
     /// Daily rows, oldest first.
     pub data: Vec<UsageRow>,
 }
@@ -60,7 +60,7 @@ pub struct UsageResponse {
 /// honest "not enabled" state instead of an error.
 pub async fn get_usage(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    scope: Scope,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsageResponse>, GatewayError> {
     let Some(usage) = &state.config.usage_api else {
@@ -70,7 +70,7 @@ pub async fn get_usage(
     };
     validate_date(&q.date_from, "date_from")?;
     validate_date(&q.date_to, "date_to")?;
-    let project_id = resolve_project_id(&headers, &state.config).unwrap_or_default();
+    let tenant_id = scope.tenant_id.clone().unwrap_or_default();
 
     let url = format!("{}/v0/pipes/{}.json", usage.base_url, usage.pipe);
     let resp = state
@@ -78,7 +78,8 @@ pub async fn get_usage(
         .get(&url)
         .bearer_auth(&usage.token)
         .query(&[
-            ("project_id", project_id.as_str()),
+            // The Tinybird pipe parameter keeps its historical name (spec §3.5).
+            ("project_id", tenant_id.as_str()),
             ("date_from", q.date_from.as_str()),
             ("date_to", q.date_to.as_str()),
         ])
@@ -98,7 +99,7 @@ pub async fn get_usage(
     let parsed: TinybirdResponse = serde_json::from_str(&body)
         .map_err(|e| GatewayError::Upstream(format!("unexpected usage response: {e}")))?;
     Ok(Json(UsageResponse {
-        project_id,
+        tenant_id,
         data: parsed.data,
     }))
 }

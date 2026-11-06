@@ -6,8 +6,29 @@
 # PDF and a JSON document through the gateway, and checks that documents land in
 # Meilisearch. Everything is torn down at the end.
 #
+# Pass --lab to also run the Meilisearch Lab leg: a fake Lab (platform contract v2,
+# scripts/fake_lab.py) the control plane and a second gateway report to with instance
+# credentials, management auth on that gateway (LAB_SERVICE_TOKEN), per-tenant
+# isolation checks, and the signed usage and lifecycle events of one job delivered to
+# the fake Lab. That leg also runs the "PDF with LLM enrichment" pipeline for a Lab
+# tenant on a worker with LAB_AI_GATEWAY=true and no LLM_API_KEY: the AI step must call
+# the Gateway target the fake Lab serves (a mock OpenAI-compatible chat server) with the
+# team's key, and the job's Lab event must carry its tokens and no provider cost.
+#
 # Requirements: docker, temporal CLI, curl, jq, python3, cargo.
 set -euo pipefail
+
+LAB=0
+[ "${1:-}" = "--lab" ] && LAB=1
+LAB_PORT=${LAB_PORT:-58191}
+GW_LAB_PORT=${GW_LAB_PORT:-58081}
+LLM_PORT=${LLM_PORT:-58133}
+# Dev-only Lab instance credentials, checked by the fake Lab.
+LAB_INSTANCE_ID_VALUE=7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d
+LAB_INSTANCE_SECRET_VALUE=e2e0000000000000000000000000000000000000000000000000000000000000
+LAB_TOKEN=e2e-lab-service-token
+# The team's Gateway key the fake Lab serves (scripts/fake_lab.py AI_API_KEY).
+LAB_AI_KEY=e2e-lab-gateway-key
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -21,7 +42,12 @@ WORK="$(mktemp -d)"
 export DATABASE_URL="postgres://postgres:dev@localhost:${PG_PORT}/postgres"
 export TEMPORAL_URL="http://localhost:${TEMPORAL_PORT}"
 export TEMPORAL_NAMESPACE=default
+# Address for the `temporal` CLI: 127.0.0.1, not localhost. With localhost the CLI
+# (seen with 1.7.0 on macOS) times out against the dev server while 127.0.0.1 works.
+TEMPORAL_CLI_ADDRESS="127.0.0.1:${TEMPORAL_PORT}"
 export CONTROL_PLANE_URL="http://localhost:${CP_PORT}"
+# Shared by the control plane, gateway and workers this script starts (dev-only value).
+export CONTROL_PLANE_TOKEN="${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}"
 export MEILI_URL="http://localhost:${MEILI_PORT}"
 export MEILI_API_KEY=masterKey
 export BLOB_STORE_URL="file://${WORK}/blobs"
@@ -29,6 +55,13 @@ export INLINE_MAX_BYTES=${INLINE_MAX_BYTES:-1048576}
 export LOG_FORMAT=text
 ENVOY_SECRET=e2e-envoy-secret
 export RUST_LOG=${RUST_LOG:-info,meili_ingest=debug}
+FILE_PORT=${FILE_PORT:-58099}
+# Connections and scheduled sources: a sealing key, and host policies that let the
+# gateway and the worker reach this machine's Meilisearch and fixture file server.
+export SOURCE_SECRET_KEY="ZTJlLW9ubHktc291cmNlLXNlY3JldC1rZXktMzJieXQ="
+export MEILI_CONNECTION_HOSTS="localhost:${MEILI_PORT}"
+export SOURCE_FETCH_HOSTS="localhost:${FILE_PORT}"
+FETCH_TOKEN=e2e-fetch-token
 
 PIDS=()
 cleanup() {
@@ -49,15 +82,7 @@ wait_for() { # url, name
 }
 
 echo "--- building"
-# Embed the admin UI when it has been exported (pnpm build in ui/). Without it the
-# gateway is API-only and the UI assertions below are skipped.
-UI_FEATURES=""
-if [ -f ui/out/index.html ]; then
-  UI_FEATURES="--features meili-ingest-gateway/ui"
-  echo "admin UI export found; building the gateway with it embedded"
-fi
-# shellcheck disable=SC2086
-cargo build -q $UI_FEATURES --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
+cargo build -q --bin meili-ingest-gateway --bin meili-ingest-control-plane --bin meili-ingest-worker
 
 echo "--- infra"
 docker rm -f mi-e2e-pg mi-e2e-meili >/dev/null 2>&1 || true
@@ -67,21 +92,39 @@ temporal server start-dev --headless --port "${TEMPORAL_PORT}" --db-filename "${
 PIDS+=($!)
 wait_for "${MEILI_URL}/health" meilisearch
 for _ in $(seq 1 60); do docker exec mi-e2e-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
-for _ in $(seq 1 60); do temporal operator cluster health --address "localhost:${TEMPORAL_PORT}" >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 60); do temporal operator cluster health --address "${TEMPORAL_CLI_ADDRESS}" >/dev/null 2>&1 && break; sleep 1; done
 echo "temporal ready"
 
 echo "--- services"
-BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
+CP_LAB_ENV=()
+WORKER_LAB_ENV=()
+if [ "$LAB" = 1 ]; then
+  python3 scripts/fake_lab.py "${LAB_PORT}" "${LAB_INSTANCE_ID_VALUE}" "${LAB_INSTANCE_SECRET_VALUE}" \
+    "${WORK}/lab-events.ndjson" "${LLM_PORT}" >"${WORK}/lab.log" 2>&1 &
+  PIDS+=($!)
+  wait_for "http://127.0.0.1:${LAB_PORT}/events" fake-lab
+  # The control plane and the Lab gateway confirm these with the Lab at boot.
+  LAB_CREDS_ENV=(LAB_URL="http://127.0.0.1:${LAB_PORT}" LAB_INSTANCE_ID="${LAB_INSTANCE_ID_VALUE}"
+    LAB_INSTANCE_SECRET="${LAB_INSTANCE_SECRET_VALUE}")
+  CP_LAB_ENV=("${LAB_CREDS_ENV[@]}")
+  # No provider key of its own: Lab tenants' AI steps can only run on the team's Gateway.
+  WORKER_LAB_ENV=(-u LLM_API_KEY -u TYPESAFE_API_KEY LAB_EVENTS_ENABLED=true LAB_AI_GATEWAY=true)
+fi
+env ${CP_LAB_ENV[@]+"${CP_LAB_ENV[@]}"} BIND="0.0.0.0:${CP_PORT}" ./target/debug/meili-ingest-control-plane >"${WORK}/cp.log" 2>&1 &
 PIDS+=($!)
 wait_for "${CONTROL_PLANE_URL}/health" control-plane
 BIND="0.0.0.0:${GW_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" ./target/debug/meili-ingest-gateway >"${WORK}/gw.log" 2>&1 &
 PIDS+=($!)
 wait_for "http://localhost:${GW_PORT}/health" gateway
+if [ "$LAB" = 1 ]; then
+  env "${LAB_CREDS_ENV[@]}" BIND="0.0.0.0:${GW_LAB_PORT}" ENVOY_TRUSTED_HEADER="${ENVOY_SECRET}" \
+    LAB_SERVICE_TOKEN="${LAB_TOKEN}" ./target/debug/meili-ingest-gateway >"${WORK}/gw-lab.log" 2>&1 &
+  PIDS+=($!)
+  wait_for "http://localhost:${GW_LAB_PORT}/health" gateway-lab
+fi
 export TINYBIRD_TOKEN=e2e-tinybird-token
 export TINYBIRD_BASE_URL="http://localhost:${TINYBIRD_PORT:-58122}"
 export TINYBIRD_DATASOURCE=meili_ingest_usage
-TASK_QUEUE=workers-general ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
-PIDS+=($!)
 
 # Mock OpenAI-compatible transcription endpoint so the audio pipeline can be tested
 # without an API key. Returns a fixed transcript plus segments.
@@ -157,10 +200,57 @@ PYEOF
 python3 "${WORK}/mock_tinybird.py" "${TINYBIRD_PORT:-58122}" "${WORK}/usage.ndjson" >"${WORK}/tinybird.log" 2>&1 &
 PIDS+=($!)
 
-TASK_QUEUE=workers-gpu \
+# Mock OpenAI-compatible chat-completions endpoint standing in for the team's Gateway in
+# the Lab leg. Answers a JSON object plus token usage and appends what each request
+# carried (path, bearer, model) to llm-requests.ndjson so the test can assert it.
+if [ "$LAB" = 1 ]; then
+cat > "${WORK}/mock_llm.py" <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+OUT = sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path != "/v1/chat/completions":
+            self.send_response(404); self.end_headers(); return
+        model = json.loads(raw).get("model")
+        with open(OUT, "a") as fh:
+            fh.write(json.dumps({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "model": model,
+            }) + "\n")
+        reply = {"title": "Mock title", "summary": "Mock summary.",
+                 "keywords": ["meilisearch", "search"], "language": "en"}
+        body = json.dumps({
+            "id": "chatcmpl-e2e", "object": "chat.completion", "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": json.dumps(reply)}}],
+            "usage": {"prompt_tokens": 37, "completion_tokens": 11, "total_tokens": 48},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+PYEOF
+: > "${WORK}/llm-requests.ndjson"
+python3 "${WORK}/mock_llm.py" "${LLM_PORT}" "${WORK}/llm-requests.ndjson" >"${WORK}/mock-llm.log" 2>&1 &
+PIDS+=($!)
+fi
+
+# One worker runs every plugin; the transcription key points at the mock above.
+env ${WORKER_LAB_ENV[@]+"${WORKER_LAB_ENV[@]}"} TASK_QUEUE=workers-general \
   TRANSCRIBE_API_KEY=test-key \
   TRANSCRIBE_BASE_URL="http://localhost:${TRANSCRIBE_PORT:-58111}/v1" \
-  ./target/debug/meili-ingest-worker >"${WORK}/worker-gpu.log" 2>&1 &
+  ./target/debug/meili-ingest-worker >"${WORK}/worker.log" 2>&1 &
 PIDS+=($!)
 sleep 3
 
@@ -367,7 +457,7 @@ sleep 1
 PH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_slides/search" -H 'Content-Type: application/json' -d '{"q":"vector search"}' | jq '.estimatedTotalHits')
 echo "e2e_slides hits for 'vector search': $PH"; [ "$PH" -ge 1 ] || exit 1
 
-echo "--- audio transcription (builtin.audio on the workers-gpu pool)"
+echo "--- audio transcription (builtin.audio)"
 python3 - "${WORK}/clip.wav" <<'PYEOF'
 import math, struct, sys, wave
 path = sys.argv[1]
@@ -384,8 +474,8 @@ RESP8=$(curl -fsS -F "file=@${WORK}/clip.wav" -F "index=e2e_audio" "${GW}/ingest
 echo "$RESP8" | jq -c .
 [ "$(echo "$RESP8" | jq -r .pipeline_used)" = "builtin.audio" ] || { echo "wav did not route to builtin.audio" >&2; exit 1; }
 JOB8=$(echo "$RESP8" | jq -r .job_id)
-for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB8}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB8}" | jq .; tail -30 "${WORK}/worker-gpu.log"; exit 1; }; sleep 1; done
-[ "$S" = succeeded ] || { echo "audio job ended $S" >&2; tail -30 "${WORK}/worker-gpu.log"; exit 1; }
+for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB8}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB8}" | jq .; tail -30 "${WORK}/worker.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "audio job ended $S" >&2; tail -30 "${WORK}/worker.log"; exit 1; }
 sleep 1
 AH=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_audio/search" -H 'Content-Type: application/json' -d '{"q":"whisper transcriber"}' | jq '.estimatedTotalHits')
 echo "e2e_audio hits for 'whisper transcriber': $AH"; [ "$AH" -ge 1 ] || exit 1
@@ -408,12 +498,114 @@ curl -fsS -X POST -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/
 RESP9=$(curl -fsS -F "file=@${WORK}/clip.wav" "${GW}/ingest/pipeline/e2e-media?index=e2e_media")
 echo "$RESP9" | jq -c .
 JOB9=$(echo "$RESP9" | jq -r .job_id)
-for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB9}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB9}" | jq .; tail -40 "${WORK}/worker-gpu.log"; exit 1; }; sleep 1; done
-[ "$S" = succeeded ] || { echo "media job ended $S" >&2; tail -40 "${WORK}/worker-gpu.log"; exit 1; }
+for _ in $(seq 1 90); do S=$(curl -fsS "${GW}/jobs/${JOB9}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB9}" | jq .; tail -40 "${WORK}/worker.log"; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "media job ended $S" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
 sleep 1
 MD=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_media/stats" | jq .numberOfDocuments)
 echo "e2e_media documents (one per transcript segment): $MD"; [ "$MD" -ge 2 ] || { echo "expected segment documents" >&2; exit 1; }
 curl -fsS -X DELETE "${GW}/pipelines/e2e-media" -o /dev/null -w "delete pipeline → %{http_code}\n"
+
+echo "--- Meilisearch connection pins a pipeline's destination"
+CONN=$(curl -fsS -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"e2e-local\",\"host\":\"${MEILI_URL}\",\"api_key\":\"masterKey\"}" "${GW}/connections")
+echo "$CONN" | jq -c .
+[ "$(echo "$CONN" | jq -r .api_key)" = "****" ] || { echo "connection key was not masked" >&2; exit 1; }
+code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"e2e-badkey\",\"host\":\"${MEILI_URL}\",\"api_key\":\"wrong\"}" "${GW}/connections")
+echo "connection with a wrong key → ${code} (expect 422)"; [ "$code" = "422" ] || exit 1
+cat > "${WORK}/movies.yaml" <<'YAML'
+uid: e2e-movies
+name: "Movies into a pinned connection"
+steps:
+  - id: parse
+    plugin: json_flattener
+    config: { id_field: id, title_field: title }
+  - id: index
+    plugin: meili_indexer
+    config: { connection: e2e-local, index: e2e_movies, primary_key: id }
+YAML
+curl -fsS -X POST -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/movies.yaml" "${GW}/pipelines" | jq -r .uid
+# Trusted Envoy headers name a host that does not exist: the connection must win, and
+# the documents must land in the real Meilisearch.
+PIN=$(curl -fsS -H "X-Meili-Envoy-Secret: ${ENVOY_SECRET}" \
+  -H 'X-Meili-Host: http://evil.invalid:9' -H 'X-Meili-Api-Key: spoofed' \
+  -H 'Content-Type: application/json' \
+  -d '{"documents":[{"id":900,"title":"Pinned by connection"}]}' "${GW}/ingest/pipeline/e2e-movies")
+JOB_P=$(echo "$PIN" | jq -r .job_id)
+for _ in $(seq 1 60); do S=$(curl -fsS "${GW}/jobs/${JOB_P}" | jq -r .status); [ "$S" = succeeded ] && break; [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB_P}" | jq .; exit 1; }; sleep 1; done
+[ "$S" = succeeded ] || { echo "pinned job ended $S" >&2; exit 1; }
+
+echo "--- scheduled source: first run ingests"
+python3 - "${WORK}/movies_$(date -u +%Y).json.gz" <<'PYEOF'
+import gzip, json, sys
+rows = [{"id": 1, "title": "Heat"}, {"id": 2, "title": "Ran"}, {"id": 3, "title": "Alien"}]
+# TMDB-style: gzipped NDJSON named .json.gz, with an mtime of 0 so the bytes are stable.
+with open(sys.argv[1], "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as fh:
+    fh.write("".join(json.dumps(r) + "\n" for r in rows).encode())
+PYEOF
+SRC=$(curl -fsS -H 'Content-Type: application/json' -d "{
+  \"uid\": \"e2e-movies\",
+  \"pipeline\": \"e2e-movies\",
+  \"location\": {\"kind\": \"url\", \"url\": \"http://localhost:${FILE_PORT}/movies_{{ date:%Y }}.json.gz\"},
+  \"cron\": \"0 3 * * *\",
+  \"auth\": {\"kind\": \"bearer\", \"token\": \"${FETCH_TOKEN}\"}
+}" "${GW}/sources")
+echo "$SRC" | jq -c .
+[ "$(echo "$SRC" | jq -r .auth.token)" = "****" ] || { echo "fetch token was not masked" >&2; exit 1; }
+echo "$SRC" | grep -q "${FETCH_TOKEN}" && { echo "fetch token leaked in the API" >&2; exit 1; }
+# An allowed host, so the 422 can only come from the pipeline having no connection.
+UNPINNED=$(curl -sS -w '\n%{http_code}' -H 'Content-Type: application/json' \
+  -d "{\"uid\":\"e2e-unpinned\",\"pipeline\":\"builtin.json\",\"location\":{\"kind\":\"url\",\"url\":\"http://localhost:${FILE_PORT}/x.json\"},\"cron\":\"0 3 * * *\"}" "${GW}/sources")
+code=$(echo "$UNPINNED" | tail -1)
+echo "source on an unpinned pipeline → ${code} (expect 422)"; [ "$code" = "422" ] || exit 1
+echo "$UNPINNED" | head -1 | grep -q "connection" || { echo "422 did not explain the missing connection" >&2; exit 1; }
+
+wait_runs() { # count
+  for _ in $(seq 1 90); do
+    RUNS=$(curl -fsS "${GW}/sources/e2e-movies/runs")
+    [ "$(echo "$RUNS" | jq length)" -ge "$1" ] && return 0
+    sleep 1
+  done
+  echo "source run $1 did not finish" >&2; echo "$RUNS" | jq .; tail -60 "${WORK}/worker.log"; return 1
+}
+curl -fsS -X POST "${GW}/sources/e2e-movies/run" | jq -c .
+wait_runs 1
+FIRST=$(echo "$RUNS" | jq '.[0]')
+echo "$FIRST" | jq -c .
+[ "$(echo "$FIRST" | jq -r .outcome)" = "ingested" ] || { echo "first run was not ingested" >&2; tail -60 "${WORK}/worker.log"; exit 1; }
+SJOB=$(echo "$FIRST" | jq -r '.job_ids[0]')
+[ "$(curl -fsS "${GW}/jobs/${SJOB}" | jq -r .status)" = "succeeded" ] || { echo "source job did not succeed" >&2; exit 1; }
+sleep 1
+MN=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_movies/stats" | jq .numberOfDocuments)
+echo "e2e_movies documents: $MN"; [ "$MN" -eq 4 ] || { echo "expected 3 fetched + 1 pinned documents" >&2; exit 1; }
+
+echo "--- scheduled source: an unchanged upstream starts no job"
+curl -fsS -X POST "${GW}/sources/e2e-movies/run" | jq -c .
+wait_runs 2
+SECOND=$(echo "$RUNS" | jq '.[0]')
+echo "$SECOND" | jq -c .
+[ "$(echo "$SECOND" | jq -r .outcome)" = "unchanged" ] || { echo "second run was not unchanged" >&2; exit 1; }
+[ "$(echo "$SECOND" | jq '.job_ids | length')" -eq 0 ] || { echo "an unchanged run started a job" >&2; exit 1; }
+[ "$(curl -fsS "${GW}/sources/e2e-movies" | jq -r .last_status)" = "unchanged" ] || { echo "last_status not updated" >&2; exit 1; }
+
+echo "--- no secret reached Temporal history for source runs"
+for WF in $(temporal workflow list --address "${TEMPORAL_CLI_ADDRESS}" \
+    --query 'WorkflowType="SourceRunWorkflow"' -o json | jq -r '.[].execution.workflowId') \
+    "ingest-${SJOB}" "ingest-${JOB_P}"; do
+  HIST=$(temporal workflow show --address "${TEMPORAL_CLI_ADDRESS}" -w "$WF" -o json)
+  for secret in "${FETCH_TOKEN}" masterKey; do
+    echo "$HIST" | grep -q "$secret" && { echo "secret ${secret} is in the history of ${WF}" >&2; exit 1; }
+  done
+done
+echo "histories clean"
+
+echo "--- deleting the pipeline archives its source"
+curl -fsS -X DELETE "${GW}/pipelines/e2e-movies" -o /dev/null -w "delete pipeline → %{http_code}\n"
+[ "$(curl -fsS "${GW}/sources/e2e-movies" | jq -r '.archived_at != null')" = "true" ] || { echo "source was not archived" >&2; exit 1; }
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${GW}/sources/e2e-movies/run")
+echo "run an archived source → ${code} (expect 422)"; [ "$code" = "422" ] || exit 1
+curl -fsS -X DELETE "${GW}/sources/e2e-movies" -o /dev/null -w "delete source → %{http_code}\n"
+curl -fsS -X DELETE "${GW}/connections/e2e-local" -o /dev/null -w "delete connection → %{http_code}\n"
 
 echo "--- usage events reached the analytics store"
 sleep 2
@@ -481,7 +673,7 @@ if secs <= 0:
 
 # No credential ever reaches the analytics store.
 blob = json.dumps(rows)
-for secret in ("masterKey", "e2e-envoy-secret", "test-key"):
+for secret in ("masterKey", "e2e-envoy-secret", "test-key", "e2e-fetch-token"):
     if secret in blob:
         fail(f"secret {secret!r} leaked into usage events")
 
@@ -516,33 +708,103 @@ if status not in ("cancelled", "succeeded"):
 print(f"cancelled job metered with status {status}")
 PYEOF
 
-if [ -n "$UI_FEATURES" ]; then
-  echo "--- admin UI is served from the gateway binary"
-  UI_HTML=$(curl -fsS "${GW}/ui")
-  echo "$UI_HTML" | grep -q "/ui/_next/" || { echo "UI shell did not reference its assets" >&2; exit 1; }
-  # A hashed bundle referenced by the shell must actually resolve.
-  ASSET=$(echo "$UI_HTML" | grep -o '/ui/_next/static/[^"]*\.js' | head -1)
-  [ -n "$ASSET" ] || { echo "no js bundle referenced by the shell" >&2; exit 1; }
-  code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}${ASSET}")
-  echo "asset ${ASSET} → ${code}"
-  [ "$code" = "200" ] || { echo "hashed asset did not resolve" >&2; exit 1; }
-  # Client-side routes survive a refresh.
-  # The trailing-slash root is the URL people actually type.
-  code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/")
-  echo "/ui/ → ${code}"
-  [ "$code" = "200" ] || { echo "the trailing-slash UI root did not serve" >&2; exit 1; }
-  for route in pipelines jobs playground usage; do
-    code=$(curl -sS -o /dev/null -w '%{http_code}' "${GW}/ui/${route}/")
-    echo "/ui/${route}/ → ${code}"
-    [ "$code" = "200" ] || { echo "route ${route} did not serve" >&2; exit 1; }
-  done
-  # And the API is not shadowed by the UI despite sharing names.
-  curl -fsS "${GW}/pipelines" | jq -e 'type == "array"' >/dev/null \
-    || { echo "GET /pipelines no longer returns the API payload" >&2; exit 1; }
-  echo "UI served and API intact"
-fi
-
 echo "--- health advertises the tenant and enabled features"
 curl -fsS "${GW}/health" | jq -c .
+
+if [ "$LAB" = 1 ]; then
+  echo "--- Meilisearch Lab: tenants, management auth, billing events"
+  GWL="http://localhost:${GW_LAB_PORT}"
+  TA=0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61
+  TB=0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "${GWL}/pipelines")
+  [ "$code" = 401 ] || { echo "management without a token → ${code}, expected 401" >&2; exit 1; }
+
+  curl -fsS -X POST -H "Authorization: Bearer ${LAB_TOKEN}" -H "X-Glutony-Tenant-Id: ${TA}" \
+    -H 'Content-Type: application/json' \
+    -d '{"uid":"e2e-lab-docs","name":"Lab docs","steps":[{"id":"index","plugin":"meili_indexer"}]}' \
+    "${GWL}/pipelines" | jq -e ".tenant_id == \"${TA}\" and .scope == \"tenant\"" >/dev/null \
+    || { echo "tenant A could not create its pipeline" >&2; exit 1; }
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${LAB_TOKEN}" \
+    -H "X-Glutony-Tenant-Id: ${TB}" "${GWL}/pipelines/e2e-lab-docs")
+  [ "$code" = 404 ] || { echo "tenant B saw tenant A's pipeline (${code})" >&2; exit 1; }
+
+  EDGE=(-H "X-Meili-Envoy-Secret: ${ENVOY_SECRET}" -H "X-Meili-Host: ${MEILI_URL}" -H 'X-Meili-Api-Key: masterKey')
+  RESPL=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" -H 'Content-Type: application/json' \
+    -d '{"documents":[{"id":"lab-1","title":"billed through the Lab"}]}' \
+    "${GWL}/ingest/pipeline/e2e-lab-docs?index=e2e_lab")
+  JOBL=$(echo "$RESPL" | jq -r .job_id)
+  for _ in $(seq 1 60); do
+    S=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" "${GWL}/jobs/${JOBL}" | jq -r .status)
+    [ "$S" = succeeded ] && break
+    [ "$S" = failed ] && { echo "lab job failed" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
+    sleep 1
+  done
+  [ "$S" = succeeded ] || { echo "lab job state ${S}" >&2; exit 1; }
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TB}" "${GWL}/jobs/${JOBL}")
+  [ "$code" = 404 ] || { echo "tenant B saw tenant A's job (${code})" >&2; exit 1; }
+
+  # One usage.recorded (v2: operation ingest) and one job.completed per job.
+  for _ in $(seq 1 30); do
+    EV=$(curl -fsS "http://127.0.0.1:${LAB_PORT}/events" \
+      | jq -c "[.[] | select(.data.job_id == \"${JOBL}\" and .account_id == \"${TA}\" and .product == \"glutony\")]")
+    N=$(echo "$EV" | jq '[.[] | select(.type == "usage.recorded" and .data.operation == "ingest")] | length')
+    NL=$(echo "$EV" | jq '[.[] | select(.type == "job.completed")] | length')
+    [ "$N" = 1 ] && [ "$NL" = 1 ] && break
+    sleep 1
+  done
+  [ "$N" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBL} (${N})" >&2; tail -40 "${WORK}/cp.log"; tail -20 "${WORK}/lab.log"; exit 1; }
+  [ "$NL" = 1 ] || { echo "the Lab did not receive exactly one job.completed event for ${JOBL} (${NL})" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
+  curl -fsS "http://localhost:${CP_PORT}/metrics" | grep -q '^glutony_lab_events_delivered_total [1-9]' \
+    || { echo "delivered_total did not move" >&2; exit 1; }
+
+  echo "--- Meilisearch Lab: AI steps run on the team's Gateway target"
+  # The worker has LAB_AI_GATEWAY=true and no LLM_API_KEY: the llm_enricher step of this Lab
+  # tenant can only run on the target the fake Lab serves (the mock OpenAI-compatible server).
+  # The step's own `model:` is dropped so it asks for the Lab's default_model.
+  grep -v '^ *model:' config/pipelines/pdf-with-enrichment.yaml >"${WORK}/pdf-with-enrichment-lab.yaml"
+  curl -fsS -X POST -H "Authorization: Bearer ${LAB_TOKEN}" -H "X-Glutony-Tenant-Id: ${TA}" \
+    -H 'Content-Type: application/x-yaml' --data-binary @"${WORK}/pdf-with-enrichment-lab.yaml" \
+    "${GWL}/pipelines" | jq -e ".tenant_id == \"${TA}\" and .name == \"PDF with LLM enrichment\"" >/dev/null \
+    || { echo "tenant A could not create the PDF with LLM enrichment pipeline" >&2; exit 1; }
+  RESPAI=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" -F "file=@${WORK}/sample.pdf" \
+    "${GWL}/ingest/pipeline/my-pdf-with-enrichment?index=e2e_lab_ai")
+  JOBAI=$(echo "$RESPAI" | jq -r .job_id)
+  for _ in $(seq 1 90); do
+    S=$(curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" "${GWL}/jobs/${JOBAI}" | jq -r .status)
+    [ "$S" = succeeded ] && break
+    [ "$S" = failed ] && { echo "AI job failed" >&2; curl -fsS "${EDGE[@]}" -H "X-Meili-Tenant-Id: ${TA}" "${GWL}/jobs/${JOBAI}" | jq . >&2; tail -40 "${WORK}/worker.log"; tail -20 "${WORK}/cp.log"; exit 1; }
+    sleep 1
+  done
+  [ "$S" = succeeded ] || { echo "AI job state ${S}" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
+  echo "AI job ${JOBAI} succeeded"
+
+  # The mock LLM was called, and only ever with the team's Gateway key.
+  LLM_CALLS=$(wc -l < "${WORK}/llm-requests.ndjson" | tr -d ' ')
+  echo "mock LLM requests: ${LLM_CALLS}"
+  [ "$LLM_CALLS" -ge 1 ] || { echo "the mock LLM was never called" >&2; tail -40 "${WORK}/worker.log"; exit 1; }
+  BAD=$(jq -s --arg k "Bearer ${LAB_AI_KEY}" '[.[] | select(.authorization != $k)] | length' "${WORK}/llm-requests.ndjson")
+  [ "$BAD" = 0 ] || { echo "${BAD} LLM request(s) did not carry Authorization: Bearer <the Lab's key>" >&2; cat "${WORK}/llm-requests.ndjson" >&2; exit 1; }
+  # ... and asked for the Lab's default_model (scripts/fake_lab.py).
+  BADM=$(jq -s '[.[] | select(.model != "e2e-text-model")] | length' "${WORK}/llm-requests.ndjson")
+  [ "$BADM" = 0 ] || { echo "${BADM} LLM request(s) did not ask for the Lab's default_model" >&2; cat "${WORK}/llm-requests.ndjson" >&2; exit 1; }
+
+  # The job's Lab event: units keep the tokens, the provider cost is zero (the Gateway bills the team).
+  for _ in $(seq 1 30); do
+    AIEV=$(curl -fsS "http://127.0.0.1:${LAB_PORT}/events" \
+      | jq -c "[.[] | select(.type == \"usage.recorded\" and .data.job_id == \"${JOBAI}\" and .account_id == \"${TA}\")]")
+    [ "$(echo "$AIEV" | jq length)" = 1 ] && break
+    sleep 1
+  done
+  [ "$(echo "$AIEV" | jq length)" = 1 ] || { echo "the Lab did not receive exactly one usage event for ${JOBAI}" >&2; tail -40 "${WORK}/cp.log"; exit 1; }
+  echo "$AIEV" | jq -c '.[0].data | {provider_cost_micro_usd, llm_tokens_in: .units.llm_tokens_in, llm_tokens_out: .units.llm_tokens_out, unpriced_provider_calls: .units.unpriced_provider_calls}'
+  echo "$AIEV" | jq -e '.[0].data.provider_cost_micro_usd == 0' >/dev/null \
+    || { echo "provider_cost_micro_usd is not 0 for a Lab Gateway AI step" >&2; exit 1; }
+  echo "$AIEV" | jq -e '.[0].data.units.unpriced_provider_calls == 0' >/dev/null \
+    || { echo "unpriced_provider_calls is not 0 for a Lab Gateway AI step" >&2; exit 1; }
+  echo "$AIEV" | jq -e '.[0].data.units.llm_tokens_in > 0' >/dev/null \
+    || { echo "llm_tokens_in is not above 0 for a Lab Gateway AI step" >&2; exit 1; }
+  echo "AI steps of Lab tenants run on the Gateway target"
+  echo "Lab leg passed"
+fi
 
 echo "=== E2E PASSED ==="

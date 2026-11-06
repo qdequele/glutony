@@ -24,8 +24,8 @@ pub struct JobRecord {
     /// Pipeline that was started.
     pub pipeline_uid: String,
     /// Tenant scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Resolved target index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_name: Option<String>,
@@ -42,6 +42,9 @@ pub struct JobRecord {
     pub started_at: DateTime<Utc>,
     /// Last write.
     pub updated_at: DateTime<Utc>,
+    /// Scheduled source that started this job; `None` for request-driven jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Uuid>,
 }
 
 /// Partial update for `PATCH /internal/jobs/{job_id}`; absent fields are left as-is.
@@ -79,13 +82,14 @@ struct JobRow {
     job_id: Uuid,
     workflow_id: String,
     pipeline_uid: String,
-    project_id: Option<String>,
+    tenant_id: Option<String>,
     index_name: Option<String>,
     status: String,
     current_step: Option<String>,
     error: Option<String>,
     started_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    source_id: Option<Uuid>,
 }
 
 impl TryFrom<JobRow> for JobRecord {
@@ -102,13 +106,14 @@ impl TryFrom<JobRow> for JobRecord {
             job_id: r.job_id,
             workflow_id: r.workflow_id,
             pipeline_uid: r.pipeline_uid,
-            project_id: r.project_id,
+            tenant_id: r.tenant_id,
             index_name: r.index_name,
             status,
             current_step: r.current_step,
             error: r.error,
             started_at: r.started_at,
             updated_at: r.updated_at,
+            source_id: r.source_id,
         })
     }
 }
@@ -116,27 +121,29 @@ impl TryFrom<JobRow> for JobRecord {
 /// Insert a job row (idempotent: a repeated insert of the same `job_id` overwrites).
 pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpError> {
     let row: JobRow = sqlx::query_as(
-        "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                           current_step, error, started_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+        "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
+                           current_step, error, started_at, updated_at, source_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (job_id) DO UPDATE SET \
             workflow_id = EXCLUDED.workflow_id, pipeline_uid = EXCLUDED.pipeline_uid, \
-            project_id = EXCLUDED.project_id, index_name = EXCLUDED.index_name, \
+            tenant_id = EXCLUDED.tenant_id, index_name = EXCLUDED.index_name, \
             status = EXCLUDED.status, current_step = EXCLUDED.current_step, \
-            error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now() \
-         RETURNING job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                   current_step, error, started_at, updated_at",
+            error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now(), \
+            source_id = COALESCE(EXCLUDED.source_id, jobs.source_id) \
+         RETURNING job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
+                   current_step, error, started_at, updated_at, source_id",
     )
     .bind(job.job_id)
     .bind(&job.workflow_id)
     .bind(&job.pipeline_uid)
-    .bind(job.project_id.as_deref())
+    .bind(job.tenant_id.as_deref())
     .bind(job.index_name.as_deref())
     .bind(job.status.as_str())
     .bind(job.current_step.as_deref())
     .bind(job.error.as_deref())
     .bind(job.started_at)
     .bind(job.updated_at)
+    .bind(job.source_id)
     .fetch_one(pool)
     .await?;
     JobRecord::try_from(row)
@@ -161,8 +168,8 @@ pub async fn update_job_row(
             index_name = COALESCE($5, index_name), \
             updated_at = now() \
          WHERE job_id = $1 \
-         RETURNING job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                   current_step, error, started_at, updated_at",
+         RETURNING job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
+                   current_step, error, started_at, updated_at, source_id",
     )
     .bind(job_id)
     .bind(upd.status.map(|s| s.as_str()))
@@ -178,8 +185,8 @@ pub async fn update_job_row(
 /// Fetch one job.
 pub async fn fetch_job(pool: &PgPool, job_id: Uuid) -> Result<Option<JobRecord>, CpError> {
     let row: Option<JobRow> = sqlx::query_as(
-        "SELECT job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                current_step, error, started_at, updated_at \
+        "SELECT job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
+                current_step, error, started_at, updated_at, source_id \
          FROM jobs WHERE job_id = $1",
     )
     .bind(job_id)
@@ -214,7 +221,8 @@ pub async fn update_job(
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct JobListQuery {
     /// Tenant scope. Falls back to the `X-Meili-Project-Id` header.
-    pub project_id: Option<String>,
+    #[serde(alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Only jobs in this status.
     pub status: Option<String>,
     /// Only jobs started by this pipeline.
@@ -240,7 +248,7 @@ pub struct JobList {
     pub total: i64,
 }
 
-/// `GET /jobs?project_id=&status=&pipeline_uid=&limit=&offset=` → newest first.
+/// `GET /jobs?tenant_id=&status=&pipeline_uid=&limit=&offset=` → newest first.
 ///
 /// Reads the denormalized `jobs` table rather than Temporal: listing is a browsing
 /// operation and must not fan out gRPC calls per row. Individual job detail still
@@ -250,23 +258,23 @@ pub async fn list_jobs(
     Query(q): Query<JobListQuery>,
     headers: HeaderMap,
 ) -> Result<Json<JobList>, CpError> {
-    let project_id = crate::project_scope(q.project_id.as_deref(), &headers);
+    let tenant_id = crate::tenant_scope(q.tenant_id.as_deref(), &headers);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
 
     // A single statement with NULL-tolerant predicates keeps the SQL static, which
-    // sqlx 0.9 requires, and lets Postgres use the (project_id, started_at) index.
+    // sqlx 0.9 requires, and lets Postgres use the (tenant_id, started_at) index.
     let rows: Vec<JobRow> = sqlx::query_as(
-        "SELECT job_id, workflow_id, pipeline_uid, project_id, index_name, status, \
-                current_step, error, started_at, updated_at \
+        "SELECT job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
+                current_step, error, started_at, updated_at, source_id \
          FROM jobs \
-         WHERE ($1::text IS NULL OR project_id = $1) \
+         WHERE ($1::text IS NULL OR tenant_id = $1) \
            AND ($2::text IS NULL OR status = $2) \
            AND ($3::text IS NULL OR pipeline_uid = $3) \
          ORDER BY started_at DESC \
          LIMIT $4 OFFSET $5",
     )
-    .bind(project_id.as_deref())
+    .bind(tenant_id.as_deref())
     .bind(q.status.as_deref())
     .bind(q.pipeline_uid.as_deref())
     .bind(limit)
@@ -281,11 +289,11 @@ pub async fn list_jobs(
 
     let (total,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM jobs \
-         WHERE ($1::text IS NULL OR project_id = $1) \
+         WHERE ($1::text IS NULL OR tenant_id = $1) \
            AND ($2::text IS NULL OR status = $2) \
            AND ($3::text IS NULL OR pipeline_uid = $3)",
     )
-    .bind(project_id.as_deref())
+    .bind(tenant_id.as_deref())
     .bind(q.status.as_deref())
     .bind(q.pipeline_uid.as_deref())
     .fetch_one(&state.pool)
@@ -339,13 +347,14 @@ mod tests {
             job_id: Uuid::nil(),
             workflow_id: "ingest-x".into(),
             pipeline_uid: "builtin.pdf".into(),
-            project_id: None,
+            tenant_id: None,
             index_name: None,
             status: "weird".into(),
             current_step: None,
             error: None,
             started_at: now,
             updated_at: now,
+            source_id: None,
         };
         assert_eq!(JobRecord::try_from(row).unwrap_err().code(), "internal");
     }
@@ -367,17 +376,22 @@ mod tests {
             job_id: Uuid::nil(),
             workflow_id: "ingest-00000000-0000-0000-0000-000000000000".into(),
             pipeline_uid: "builtin.pdf".into(),
-            project_id: Some("t1".into()),
+            tenant_id: Some("t1".into()),
             index_name: None,
             status: JobStatus::Queued,
             current_step: None,
             error: None,
             started_at: now,
             updated_at: now,
+            source_id: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
+        assert!(
+            v.get("source_id").is_none(),
+            "request-driven jobs omit source_id, so older readers are unaffected"
+        );
         assert_eq!(v["status"], "queued");
-        assert_eq!(v["project_id"], "t1");
+        assert_eq!(v["tenant_id"], "t1");
         assert!(v.get("index_name").is_none());
         let back: JobRecord = serde_json::from_value(v).unwrap();
         assert_eq!(back, rec);

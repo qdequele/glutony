@@ -6,3 +6,7 @@
 .DS_Store
 /blobs
 .dev-stack/
+
+# Tinybird CLI: credentials and the fixtures `tb build` writes
+tinybird/.tinyb
+tinybird/fixtures/

@@ -17,15 +17,14 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Compile the Next.js static export at `ui/out` into the binary and serve it at /ui.
-# Requires `pnpm build` in `ui/` first; without the feature the gateway is API-only.
-ui = ["dep:rust-embed"]
 
 [dependencies]
 # internal
 meili-ingest-plugin-sdk.workspace = true
 meili-ingest-router.workspace = true
 meili-ingest-blob.workspace = true
+meili-ingest-source.workspace = true
+meili-ingest-lab.workspace = true
 
 # http
 axum.workspace = true
@@ -50,9 +49,9 @@ temporalio-common.workspace = true
 # misc
 uuid.workspace = true
 chrono.workspace = true
+url.workspace = true
+subtle.workspace = true
 mime_guess.workspace = true
-# Only pulled in with the `ui` feature: embeds the exported admin UI.
-rust-embed = { workspace = true, optional = true }
 
 # errors / logging
 anyhow.workspace = true
@@ -63,3 +62,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 tower = { workspace = true, features = ["util"] }
+regex.workspace = true
+http-body-util = "0.1"

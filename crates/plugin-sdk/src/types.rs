@@ -17,15 +17,22 @@ use crate::error::PluginError;
 /// headers (or from env vars in standalone mode) and carried immutably through the
 /// whole pipeline as part of the workflow input. Workers never read Meilisearch
 /// credentials from the environment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `host` and `api_key` are optional because a pipeline whose `meili_indexer` step names
+/// a Meilisearch **connection** takes its destination from that connection, not from
+/// the request — and a scheduled source run has no request at all. The `Option`
+/// fields still deserialize the plain strings recorded in older workflow histories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeiliContext {
-    /// Tenant / project identifier (from `X-Meili-Project-Id`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    /// Tenant id (from `X-Meili-Tenant-Id` or `X-Meili-Project-Id`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Full Meilisearch host URL (e.g. `https://xxx.us-west.meilisearch.io`).
-    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Meilisearch API key with write access.
-    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Target index. Fully resolved before the workflow starts (see index chain in SPEC §3.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
@@ -38,8 +45,8 @@ impl MeiliContext {
     /// Redacted view for logs: never prints the API key.
     pub fn redacted(&self) -> String {
         format!(
-            "MeiliContext{{project_id={:?}, host={}, index={:?}, region={:?}}}",
-            self.project_id, self.host, self.index, self.region
+            "MeiliContext{{tenant_id={:?}, host={:?}, index={:?}, region={:?}}}",
+            self.tenant_id, self.host, self.index, self.region
         )
     }
 }
@@ -612,6 +619,12 @@ pub struct UsageUnits {
     /// Any other billable call to a third-party service.
     #[serde(default)]
     pub external_requests: u64,
+    /// What glutony paid providers for these units, in micro-USD (spec §5.1).
+    #[serde(default)]
+    pub cost_micro_usd: u64,
+    /// Provider calls the cost table could not price (billed at 0, flagged).
+    #[serde(default)]
+    pub unpriced_calls: u64,
 }
 
 impl UsageUnits {
@@ -627,13 +640,21 @@ impl UsageUnits {
 
     /// Add another set of units into this one.
     pub fn merge(&mut self, other: UsageUnits) {
-        self.llm_input_tokens += other.llm_input_tokens;
-        self.llm_output_tokens += other.llm_output_tokens;
-        self.llm_requests += other.llm_requests;
+        // Saturating: a wrap would turn an over-count into an under-charge (release) or a
+        // panic (debug). `audio_seconds` is a float and cannot wrap.
+        self.llm_input_tokens = self.llm_input_tokens.saturating_add(other.llm_input_tokens);
+        self.llm_output_tokens = self
+            .llm_output_tokens
+            .saturating_add(other.llm_output_tokens);
+        self.llm_requests = self.llm_requests.saturating_add(other.llm_requests);
         self.audio_seconds += other.audio_seconds;
-        self.pages += other.pages;
-        self.images += other.images;
-        self.external_requests += other.external_requests;
+        self.pages = self.pages.saturating_add(other.pages);
+        self.images = self.images.saturating_add(other.images);
+        self.external_requests = self
+            .external_requests
+            .saturating_add(other.external_requests);
+        self.cost_micro_usd = self.cost_micro_usd.saturating_add(other.cost_micro_usd);
+        self.unpriced_calls = self.unpriced_calls.saturating_add(other.unpriced_calls);
     }
 
     /// One LLM call with its token counts.
@@ -822,8 +843,8 @@ pub struct PipelineDefinition {
     #[serde(default)]
     pub builtin: bool,
     /// Tenant scope. `None` = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 fn one() -> u32 {
@@ -999,6 +1020,52 @@ impl PipelineDefinition {
     /// Look up a step by id.
     pub fn step(&self, id: &str) -> Option<&StepDefinition> {
         self.steps.iter().find(|s| s.id == id)
+    }
+
+    /// Whether this pipeline supplies its own Meilisearch destination: it has at least
+    /// one `meili_indexer` step and **every** such step names a connection.
+    ///
+    /// When true, a request needs no `X-Meili-*` context and a scheduled source may run
+    /// the pipeline. A pipeline with no indexer step returns false, so it keeps
+    /// requiring a context exactly as before connections existed.
+    pub fn pins_destination(&self) -> bool {
+        let mut indexers = self
+            .steps
+            .iter()
+            .filter(|s| s.plugin == INDEXER_PLUGIN)
+            .peekable();
+        indexers.peek().is_some() && indexers.all(|s| pinned_connection(&s.config).is_some())
+    }
+
+    /// The `index` each `meili_indexer` step names in its own config, in step order.
+    ///
+    /// A step-level `index` beats the request's ([`inject_meili_context`] only fills an
+    /// unset one), so these are where the pipeline writes whatever the request says.
+    pub fn step_indexes(&self) -> impl Iterator<Item = &str> {
+        self.steps
+            .iter()
+            .filter(|s| s.plugin == INDEXER_PLUGIN)
+            .filter_map(|s| s.config.get("index").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The one index this pipeline always writes to: every `meili_indexer` step names
+    /// it itself. `None` when there is no indexer, or any indexer leaves its index to
+    /// the request, or two indexers disagree.
+    pub fn fixed_index(&self) -> Option<&str> {
+        let indexers = self
+            .steps
+            .iter()
+            .filter(|s| s.plugin == INDEXER_PLUGIN)
+            .count();
+        let named: Vec<&str> = self.step_indexes().collect();
+        match named.first() {
+            Some(first) if named.len() == indexers && named.iter().all(|i| i == first) => {
+                Some(first)
+            }
+            _ => None,
+        }
     }
 
     /// Whether this pipeline's trigger matches a MIME type / filename.
@@ -1222,9 +1289,9 @@ pub struct StepActivityInput {
     /// Total branches when fanned out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_total: Option<usize>,
-    /// Tenant project id for logging / scoping.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    /// Tenant id for logging / scoping.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Output of the `execute_step` activity.
@@ -1254,18 +1321,37 @@ pub struct IndexerConfig {
     /// Tenant context (flattened into the config object).
     #[serde(flatten)]
     pub meili: MeiliContext,
-    /// Primary key to declare when creating the index.
+    /// Named Meilisearch connection pinning `host` and `api_key` (see
+    /// [`inject_meili_context`]). The worker activity resolves it into
+    /// `meili.host`/`meili.api_key` before the plugin runs, so by the time the indexer
+    /// reads this config both are set; the name is kept for error messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+    /// Primary key to declare when creating the index. The indexer also sends it on
+    /// document additions while the index has no primary key; an index that already
+    /// has one keeps its own.
     #[serde(default = "default_primary_key")]
     pub primary_key: String,
     /// Create the index if missing.
     #[serde(default = "default_true")]
     pub auto_create_index: bool,
-    /// Documents per `addDocuments` request.
+    /// Maximum documents per `addDocuments` request.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum serialized bytes per `addDocuments` request. A batch is cut at whichever
+    /// of this and [`IndexerConfig::batch_size`] is reached first. The default stays
+    /// under Meilisearch's 100 MB `http_payload_size_limit`; document count alone is the
+    /// wrong knob, since 1000 id rows are kilobytes and 1000 chunked PDFs can exceed it.
+    #[serde(default = "default_max_batch_bytes")]
+    pub max_batch_bytes: u64,
     /// Wait for Meilisearch tasks to complete before returning.
     #[serde(default = "default_true")]
     pub wait_for_completion: bool,
+    /// How long to wait for one Meilisearch task before giving up (retryable). `None`
+    /// means the worker's `INDEXER_TASK_TIMEOUT_SECS`, else 120. Keep it below the step's
+    /// `timeout_secs`, or Temporal cuts the activity first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_timeout_secs: Option<u64>,
 }
 
 fn default_primary_key() -> String {
@@ -1277,21 +1363,54 @@ fn default_true() -> bool {
 fn default_batch_size() -> usize {
     1000
 }
+/// Default [`IndexerConfig::max_batch_bytes`]: 50 MiB.
+pub const DEFAULT_MAX_BATCH_BYTES: u64 = 50 * 1024 * 1024;
+fn default_max_batch_bytes() -> u64 {
+    DEFAULT_MAX_BATCH_BYTES
+}
+
+/// Step-config key naming a Meilisearch connection on a `meili_indexer` step.
+pub const CONNECTION_KEY: &str = "connection";
+
+/// The connection a step config pins, if any. Blank values do not count.
+pub fn pinned_connection(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get(CONNECTION_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
 
 /// Merge a [`MeiliContext`] into a step config object (used by the workflow for the
-/// indexer step). Existing keys in `config` win, except `host`/`api_key` which always
-/// come from the context.
+/// indexer step).
+///
+/// * When the step pins a **connection**, the request's `host` and `api_key` are never
+///   injected: the connection is the destination, and the worker activity resolves it
+///   just before the plugin runs so the key stays out of workflow history.
+/// * Otherwise `host`/`api_key` always come from the context, overwriting whatever the
+///   step set — exactly the behaviour pipelines relied on before connections existed.
+///
+/// Every other key (`tenant_id`, `index`, `region`) only fills what the step left
+/// unset, in both cases.
 pub fn inject_meili_context(config: &mut serde_json::Value, ctx: &MeiliContext) {
     if !config.is_object() {
         *config = serde_json::Value::Object(Default::default());
     }
-    let obj = config.as_object_mut().expect("just ensured object");
-    let ctx_val = serde_json::to_value(ctx).unwrap_or_default();
-    if let serde_json::Value::Object(m) = ctx_val {
-        for (k, v) in m {
-            if k == "host" || k == "api_key" || !obj.contains_key(&k) {
-                obj.insert(k, v);
-            }
+    let pinned = pinned_connection(config).is_some();
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let serde_json::Value::Object(ctx_fields) = serde_json::to_value(ctx).unwrap_or_default()
+    else {
+        return;
+    };
+    for (k, v) in ctx_fields {
+        let destination = k == "host" || k == "api_key";
+        if destination && pinned {
+            continue;
+        }
+        if destination || !obj.contains_key(&k) {
+            obj.insert(k, v);
         }
     }
 }
@@ -1327,6 +1446,50 @@ mod base64_bytes {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cost_fields_merge_and_default_for_old_payloads() {
+        let mut a = UsageUnits {
+            cost_micro_usd: 100,
+            unpriced_calls: 1,
+            ..UsageUnits::llm(10, 2)
+        };
+        a.merge(UsageUnits {
+            cost_micro_usd: 50,
+            ..UsageUnits::llm(1, 1)
+        });
+        assert_eq!(a.cost_micro_usd, 150);
+        assert_eq!(a.unpriced_calls, 1);
+        // A payload written before the fields existed.
+        let old: UsageUnits =
+            serde_json::from_value(serde_json::json!({"llm_requests": 1})).unwrap();
+        assert_eq!((old.cost_micro_usd, old.unpriced_calls), (0, 0));
+    }
+
+    #[test]
+    fn merge_saturates_instead_of_wrapping_or_panicking() {
+        let big = UsageUnits {
+            llm_input_tokens: u64::MAX - 1,
+            llm_output_tokens: u64::MAX - 1,
+            llm_requests: u64::MAX - 1,
+            pages: u64::MAX - 1,
+            images: u64::MAX - 1,
+            external_requests: u64::MAX - 1,
+            cost_micro_usd: u64::MAX - 1,
+            unpriced_calls: u64::MAX - 1,
+            ..UsageUnits::default()
+        };
+        let mut a = big;
+        a.merge(big);
+        assert_eq!(a.llm_input_tokens, u64::MAX);
+        assert_eq!(a.llm_output_tokens, u64::MAX);
+        assert_eq!(a.llm_requests, u64::MAX);
+        assert_eq!(a.pages, u64::MAX);
+        assert_eq!(a.images, u64::MAX);
+        assert_eq!(a.external_requests, u64::MAX);
+        assert_eq!(a.cost_micro_usd, u64::MAX);
+        assert_eq!(a.unpriced_calls, u64::MAX);
+    }
+
     fn step(id: &str, deps: &[&str]) -> StepDefinition {
         StepDefinition::new(id, "noop").depends_on(deps.iter().copied())
     }
@@ -1340,7 +1503,7 @@ mod tests {
             trigger: None,
             steps,
             builtin: false,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -1527,12 +1690,149 @@ steps:
         );
     }
 
+    fn request_ctx() -> MeiliContext {
+        MeiliContext {
+            tenant_id: Some("tenant".into()),
+            host: Some("https://request.example".into()),
+            api_key: Some("requestKey".into()),
+            index: Some("from-request".into()),
+            region: Some("eu".into()),
+        }
+    }
+
+    fn pipeline_with(steps: Vec<StepDefinition>) -> PipelineDefinition {
+        PipelineDefinition {
+            uid: "p".into(),
+            name: "p".into(),
+            description: None,
+            version: 1,
+            trigger: None,
+            steps,
+            builtin: false,
+            tenant_id: None,
+        }
+    }
+
+    #[test]
+    fn pins_destination_needs_every_indexer_to_name_a_connection() {
+        let pinned = || {
+            StepDefinition::new("i", INDEXER_PLUGIN).config(serde_json::json!({"connection": "c"}))
+        };
+        let unpinned = || StepDefinition::new("j", INDEXER_PLUGIN);
+
+        assert!(
+            pipeline_with(vec![StepDefinition::new("p", "json_parser"), pinned()])
+                .pins_destination()
+        );
+        assert!(
+            !pipeline_with(vec![pinned(), unpinned()]).pins_destination(),
+            "one unpinned indexer still needs the request's context"
+        );
+        assert!(!pipeline_with(vec![unpinned()]).pins_destination());
+        assert!(
+            !pipeline_with(vec![StepDefinition::new("p", "json_parser")]).pins_destination(),
+            "a pipeline without an indexer keeps today's requirement"
+        );
+    }
+
+    #[test]
+    fn fixed_index_needs_every_indexer_to_name_the_same_index() {
+        let named = |id: &str, index: &str| {
+            StepDefinition::new(id, INDEXER_PLUGIN).config(serde_json::json!({"index": index}))
+        };
+        let unnamed = || StepDefinition::new("u", INDEXER_PLUGIN);
+
+        let one = pipeline_with(vec![
+            StepDefinition::new("p", "json_parser"),
+            named("i", "movies"),
+        ]);
+        assert_eq!(one.fixed_index(), Some("movies"));
+        assert_eq!(one.step_indexes().collect::<Vec<_>>(), ["movies"]);
+        assert_eq!(
+            pipeline_with(vec![named("a", "movies"), named("b", "movies")]).fixed_index(),
+            Some("movies")
+        );
+        assert_eq!(
+            pipeline_with(vec![named("a", "movies"), named("b", "hn")]).fixed_index(),
+            None
+        );
+        assert_eq!(
+            pipeline_with(vec![named("a", "movies"), unnamed()]).fixed_index(),
+            None
+        );
+        assert_eq!(pipeline_with(vec![named("a", "  ")]).fixed_index(), None);
+        assert_eq!(
+            pipeline_with(vec![StepDefinition::new("p", "json_parser")]).fixed_index(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pinned_connection_wins_over_the_request_context() {
+        let mut config = serde_json::json!({ "connection": "prod-movies" });
+        inject_meili_context(&mut config, &request_ctx());
+        assert!(
+            config.get("host").is_none() && config.get("api_key").is_none(),
+            "no request host/key may reach a step that pins a connection: {config}"
+        );
+        assert_eq!(config["connection"], "prod-movies");
+        // Non-secret context still fills in what the step did not set.
+        assert_eq!(config["tenant_id"], "tenant");
+        assert_eq!(config["index"], "from-request");
+    }
+
+    #[test]
+    fn a_pinned_connection_keeps_the_steps_own_index() {
+        let mut config = serde_json::json!({ "connection": "prod-movies", "index": "movies" });
+        inject_meili_context(&mut config, &request_ctx());
+        assert_eq!(config["index"], "movies", "step index beats the request's");
+    }
+
+    #[test]
+    fn without_a_connection_the_request_still_overwrites_host_and_key() {
+        // Today's behaviour, unchanged: an inline host/key in the step config is replaced.
+        let mut config = serde_json::json!({ "host": "https://inline.example", "api_key": "x" });
+        inject_meili_context(&mut config, &request_ctx());
+        assert_eq!(config["host"], "https://request.example");
+        assert_eq!(config["api_key"], "requestKey");
+    }
+
+    #[test]
+    fn a_blank_connection_does_not_count_as_pinned() {
+        let mut config = serde_json::json!({ "connection": "  " });
+        inject_meili_context(&mut config, &request_ctx());
+        assert_eq!(config["host"], "https://request.example");
+    }
+
+    #[test]
+    fn a_context_without_host_or_key_injects_neither() {
+        // A source-driven run carries only project and index (spec: SourceRunWorkflow).
+        let ctx = MeiliContext {
+            tenant_id: Some("tenant".into()),
+            index: Some("movies".into()),
+            ..Default::default()
+        };
+        let mut config = serde_json::json!({});
+        inject_meili_context(&mut config, &ctx);
+        assert!(config.get("host").is_none() && config.get("api_key").is_none());
+        assert_eq!(config["index"], "movies");
+    }
+
+    #[test]
+    fn a_context_serialized_with_string_fields_still_deserializes() {
+        // Workflow inputs already recorded in Temporal history predate the Option change.
+        let old = serde_json::json!({ "host": "http://h", "api_key": "k", "index": "i" });
+        let ctx: MeiliContext = serde_json::from_value(old).expect("back-compatible");
+        assert_eq!(ctx.host.as_deref(), Some("http://h"));
+        assert_eq!(ctx.api_key.as_deref(), Some("k"));
+    }
+
     #[test]
     fn indexer_config_deserializes_from_flattened_context() {
         let ctx = MeiliContext {
-            project_id: Some("xxx".into()),
-            host: "http://localhost:7700".into(),
-            api_key: "masterKey".into(),
+            tenant_id: Some("xxx".into()),
+            host: Some("http://localhost:7700".into()),
+            api_key: Some("masterKey".into()),
             index: Some("documents".into()),
             region: None,
         };
@@ -1562,13 +1862,15 @@ steps:
     #[test]
     fn redacted_context_hides_key() {
         let ctx = MeiliContext {
-            project_id: None,
-            host: "h".into(),
-            api_key: "SECRET".into(),
+            tenant_id: None,
+            host: Some("h".into()),
+            api_key: Some("SECRET".into()),
             index: None,
             region: None,
         };
         assert!(!ctx.redacted().contains("SECRET"));
+        // And a context with no key at all still renders.
+        assert!(MeiliContext::default().redacted().contains("host=None"));
     }
 
     #[test]
@@ -1600,5 +1902,84 @@ steps:
         let step: StepResult = serde_json::from_str(old).unwrap();
         assert!(step.usage.is_empty());
         assert_eq!(step.duration_ms, 0);
+    }
+
+    /// Rename every `tenant_id` key back to the pre-rename `tenant_id`, recursively,
+    /// to build the payloads Temporal already holds.
+    fn with_old_key(v: serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| {
+                        let k = if k == "tenant_id" {
+                            "project_id".to_string()
+                        } else {
+                            k
+                        };
+                        (k, with_old_key(v))
+                    })
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(with_old_key).collect())
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn pre_rename_payloads_still_deserialize() {
+        let context = MeiliContext {
+            tenant_id: Some("acme".into()),
+            host: Some("http://meili:7700".into()),
+            api_key: Some("k".into()),
+            index: Some("docs".into()),
+            region: None,
+        };
+        let old = with_old_key(serde_json::to_value(&context).unwrap());
+        assert_eq!(
+            old["project_id"], "acme",
+            "the fixture must use the old key"
+        );
+        let back: MeiliContext = serde_json::from_value(old).unwrap();
+        assert_eq!(back, context);
+
+        let pipeline: PipelineDefinition = serde_json::from_value(serde_json::json!({
+            "uid": "p",
+            "name": "p",
+            "steps": [{"id": "index", "plugin": "meili_indexer"}],
+            "project_id": "acme"
+        }))
+        .unwrap();
+        assert_eq!(pipeline.tenant_id.as_deref(), Some("acme"));
+
+        let step = StepActivityInput {
+            job_id: uuid::Uuid::nil(),
+            step_id: "index".into(),
+            plugin: "meili_indexer".into(),
+            config: serde_json::json!({}),
+            input: PluginInput::Documents(vec![]),
+            branch: None,
+            branch_total: None,
+            tenant_id: Some("acme".into()),
+        };
+        let back: StepActivityInput =
+            serde_json::from_value(with_old_key(serde_json::to_value(&step).unwrap())).unwrap();
+        assert_eq!(back, step);
+
+        let wf = PipelineWorkflowInput {
+            job_id: uuid::Uuid::nil(),
+            pipeline: pipeline.clone(),
+            input: PluginInput::Documents(vec![]),
+            context: context.clone(),
+        };
+        let back: PipelineWorkflowInput =
+            serde_json::from_value(with_old_key(serde_json::to_value(&wf).unwrap())).unwrap();
+        assert_eq!(back, wf);
+
+        // The indexer received the context flattened into its config under the old key.
+        let config: IndexerConfig =
+            serde_json::from_value(with_old_key(serde_json::to_value(&context).unwrap())).unwrap();
+        assert_eq!(config.meili.tenant_id.as_deref(), Some("acme"));
     }
 }

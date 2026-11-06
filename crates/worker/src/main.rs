@@ -1,12 +1,16 @@
 //! meili-ingest worker binary. Polls one Temporal task queue (`TASK_QUEUE`) and runs
-//! the `PipelineWorkflow` plus the `execute_step` / `expand_fan_out` activities.
+//! the `PipelineWorkflow` plus the `execute_step` / `expand_fan_out` activities, and the
+//! `SourceRunWorkflow` that scheduled sources start.
 
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
 use meili_ingest_blob::BlobStore;
-use meili_ingest_worker::{PipelineWorkflow, PluginRegistry, StepActivities, WorkerConfig};
+use meili_ingest_worker::{
+    PipelineWorkflow, PluginRegistry, SourceActivities, SourceRunWorkflow, StepActivities,
+    WorkerConfig,
+};
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Url};
 use temporalio_sdk::runtime::worker_tuner::{FixedSizeSlotSupplier, TunerHolder};
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
@@ -24,23 +28,68 @@ async fn main() -> anyhow::Result<()> {
         "starting meili-ingest worker"
     );
 
+    // The provider cost table loads lazily on the first paid call; load it now so a bad
+    // PROVIDER_COSTS_FILE stops the worker before it takes traffic instead of surfacing
+    // mid-run as unpriced events.
+    let costs = meili_ingest_plugin_sdk::cost::ProviderCosts::load_from_env()
+        .map_err(anyhow::Error::msg)
+        .context("invalid PROVIDER_COSTS_FILE")?;
+    if meili_ingest_worker::config::lab_events_use_placeholder_prices(
+        config.lab_events_enabled,
+        &costs,
+    ) {
+        tracing::error!(
+            "LAB_EVENTS_ENABLED is on but the provider cost table is the bundled one: Lab \
+             events are priced with placeholder list prices, not what this deployment pays; \
+             set PROVIDER_COSTS_FILE to your own prices"
+        );
+    }
+
     // Plugins
-    let mut registry = PluginRegistry::builtin();
+    // With LAB_AI_GATEWAY, AI plugins without their env key still register: a Lab
+    // tenant's step runs on the team's Gateway; any other fails naming the key.
+    let mut registry = PluginRegistry::builtin_with(config.lab_ai_gateway);
     if let Some(spec) = &config.external_plugins {
         registry.load_external(spec).await;
     }
     tracing::info!(plugins = ?registry.names(), unavailable = ?registry.unavailable(), "plugins registered");
+    // A provider plugin with no price entry, or only zero prices, bills every call at
+    // 0: say so now, once, rather than only when its first call is warned about.
+    let names = registry.names();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let unpriced = costs.unpriced_plugins(&names);
+    if !unpriced.is_empty() {
+        tracing::error!(
+            plugins = ?unpriced,
+            "provider plugins with no entry, or only zero prices, in the provider cost table: their calls are billed at 0 provider cost (flagged unpriced when there is no entry); add their prices to PROVIDER_COSTS_FILE"
+        );
+    }
     let registry = Arc::new(registry);
+
+    // URL fetches on a tenant's behalf — scheduled sources AND `{"url": …}` refs in
+    // step inputs — obey SOURCE_FETCH_HOSTS, re-checked on every redirect hop.
+    let fetch_policy =
+        meili_ingest_source::HostPolicy::from_env_var(meili_ingest_source::FETCH_HOSTS_ENV)
+            .context("invalid SOURCE_FETCH_HOSTS")?;
+    tracing::info!(policy = ?fetch_policy, "fetch host policy (sources and URL refs)");
 
     // Blob store
     let blob = match &config.blob_store_url {
         Some(url) => BlobStore::from_url(url).context("invalid BLOB_STORE_URL")?,
         None => BlobStore::from_env()?,
-    };
+    }
+    .with_fetch_guard(meili_ingest_worker::fetch_guard::fetch_guard(
+        fetch_policy.clone(),
+    ))
+    .with_object_ref_policy(
+        meili_ingest_blob::ObjectRefPolicy::from_env()
+            .context("invalid OBJECT_REF_AMBIENT_CREDENTIALS or OBJECT_REF_BUCKETS")?,
+    );
+    tracing::info!(policy = ?blob.object_ref_policy(), "object ref policy (s3://, gs://, az:// refs)");
 
     // Publish manifests to the control plane (best effort).
     if let Some(cp) = &config.control_plane_url {
-        publish_manifests(cp, &registry).await;
+        publish_manifests(cp, config.control_plane_token.as_deref(), &registry).await;
     }
 
     // Temporal
@@ -62,9 +111,58 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::warn!("usage analytics disabled (TINYBIRD_TOKEN is not set)"),
     }
 
+    // Meilisearch connections: optional, so a worker without SOURCE_SECRET_KEY still
+    // runs every request-driven pipeline and only fails steps that name a connection. A
+    // malformed policy, unlike a missing key, stops the worker: silently falling back
+    // to a different policy than the operator wrote would be worse than not starting.
+    let connection_key = meili_ingest_source::SecretKey::from_env()
+        .context("invalid SOURCE_SECRET_KEY")?
+        .map(Arc::new);
+    let host_policy =
+        meili_ingest_source::HostPolicy::from_env().context("invalid MEILI_CONNECTION_HOSTS")?;
+    if connection_key.is_none() {
+        tracing::warn!(
+            "SOURCE_SECRET_KEY is not set: steps that name a Meilisearch connection will fail"
+        );
+    }
+    tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
+
+    let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
+        .with_control_plane_token(config.control_plane_token.clone())
+        .with_security(connection_key.clone(), fetch_policy)
+        .with_default_index(
+            std::env::var("DEFAULT_INDEX")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "documents".to_string()),
+        );
+
+    if config.lab_events_enabled && config.control_plane_url.is_none() {
+        anyhow::bail!("LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL: the events go to its outbox");
+    }
+    if config.lab_events_enabled {
+        tracing::info!("Lab billing events enabled");
+    }
+    if config.lab_ai_gateway && config.control_plane_url.is_none() {
+        anyhow::bail!(
+            "LAB_AI_GATEWAY needs CONTROL_PLANE_URL: AI steps of Lab accounts ask it for \
+             the team's Gateway"
+        );
+    }
+    if config.lab_ai_gateway {
+        tracing::info!("AI steps of Lab accounts run on the team's Gateway");
+    }
+
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
         .with_usage(usage)
-        .with_control_plane(config.control_plane_url.clone());
+        .with_lab_events(config.lab_events_enabled)
+        .with_lab_ai_gateway(config.lab_ai_gateway)
+        .with_control_plane(config.control_plane_url.clone())
+        .with_control_plane_token(config.control_plane_token.clone())
+        .with_connections(meili_ingest_worker::connection::ConnectionSettings {
+            key: connection_key,
+            policy: host_policy,
+        });
     let tuner = TunerHolder::builder()
         .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(50))
         .activity_task_slot_supplier(FixedSizeSlotSupplier::new(config.max_concurrent_activities))
@@ -73,17 +171,36 @@ async fn main() -> anyhow::Result<()> {
         .build();
     let options = WorkerOptions::new(config.task_queue.clone())
         .register_workflow::<PipelineWorkflow>()?
+        .register_workflow::<SourceRunWorkflow>()?
         .register_activities(activities)
+        .register_activities(source_activities)
         .tuner(tuner)
-        .graceful_shutdown_period(std::time::Duration::from_secs(30))
+        // On SIGTERM the worker stops polling at once; activities still running after
+        // this long are cancelled, which Temporal records as a retryable `WorkerShutdown`
+        // failure and retries on another worker.
+        .graceful_shutdown_period(config.shutdown_grace)
         .build();
     let mut worker = Worker::new(&runtime, client, options)?;
 
     let shutdown = worker.shutdown_handle();
+    let grace = config.shutdown_grace;
     tokio::spawn(async move {
         wait_for_signal().await;
-        tracing::info!("shutdown signal received, draining worker");
+        tracing::info!(
+            grace_secs = grace.as_secs(),
+            "shutdown signal received, draining worker"
+        );
         shutdown();
+        // Backstop: an activity that never returns would hold `worker.run()` until the
+        // orchestrator's SIGKILL. Exit first; Temporal retries what it had once its
+        // heartbeat (or start-to-close) timeout passes.
+        let deadline = grace + meili_ingest_worker::config::SHUTDOWN_HARD_MARGIN;
+        tokio::time::sleep(deadline).await;
+        tracing::error!(
+            after_secs = deadline.as_secs(),
+            "worker did not drain in time, exiting with activities still running"
+        );
+        std::process::exit(1);
     });
 
     tracing::info!(task_queue = %config.task_queue, "worker polling");
@@ -130,14 +247,17 @@ async fn wait_for_signal() {
     }
 }
 
-async fn publish_manifests(control_plane_url: &str, registry: &PluginRegistry) {
+async fn publish_manifests(
+    control_plane_url: &str,
+    token: Option<&str>,
+    registry: &PluginRegistry,
+) {
     let url = format!(
         "{}/internal/plugins",
         control_plane_url.trim_end_matches('/')
     );
     let manifests = registry.manifests();
-    match reqwest::Client::new()
-        .post(&url)
+    match meili_ingest_worker::connection::authed(reqwest::Client::new().post(&url), token)
         .json(&manifests)
         .send()
         .await

@@ -21,6 +21,7 @@ pub const IN_REPO_PLUGINS: &[&str] = &[
     "document_script",
     "meili_indexer",
     "llm_enricher",
+    "jev_enricher",
     "image_captioner",
     "pptx_extractor",
     "whisper_transcriber",
@@ -46,6 +47,7 @@ const ALL_KNOWN: &[&str] = &[
     "document_script",
     "meili_indexer",
     "llm_enricher",
+    "jev_enricher",
     "image_captioner",
     "pptx_extractor",
     "whisper_transcriber",
@@ -55,7 +57,7 @@ const ALL_KNOWN: &[&str] = &[
 ];
 
 /// Every plugin name the control plane accepts in a user pipeline without a worker
-/// having registered it first: the 18 in-repo plugins plus the known gRPC plugins.
+/// having registered it first: the 19 in-repo plugins plus the known gRPC plugins.
 pub fn builtin_plugin_names() -> &'static [&'static str] {
     ALL_KNOWN
 }

@@ -31,10 +31,13 @@ meili-ingest-plugin-chunker.workspace = true
 meili-ingest-plugin-script.workspace = true
 meili-ingest-plugin-meili-indexer.workspace = true
 meili-ingest-plugin-llm-enricher.workspace = true
+meili-ingest-plugin-jev-enricher.workspace = true
 meili-ingest-plugin-image-captioner.workspace = true
 meili-ingest-plugin-pptx.workspace = true
 meili-ingest-plugin-audio-transcriber.workspace = true
 meili-ingest-plugin-video-audio.workspace = true
+meili-ingest-source.workspace = true
+meili-ingest-lab.workspace = true
 
 temporalio-sdk.workspace = true
 temporalio-client.workspace = true
@@ -57,3 +60,8 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+jsonschema = { version = "0.45", default-features = false }
+serde_yaml.workspace = true

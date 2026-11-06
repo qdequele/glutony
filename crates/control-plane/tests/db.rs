@@ -111,7 +111,7 @@ fn get(uri: &str) -> Request<Body> {
     Request::get(uri).body(Body::empty()).unwrap()
 }
 
-fn pdf_pipeline(uid: &str, project_id: Option<&str>) -> PipelineDefinition {
+fn pdf_pipeline(uid: &str, tenant_id: Option<&str>) -> PipelineDefinition {
     PipelineDefinition {
         uid: uid.into(),
         name: format!("{uid} name"),
@@ -127,7 +127,7 @@ fn pdf_pipeline(uid: &str, project_id: Option<&str>) -> PipelineDefinition {
             StepDefinition::new("index", "meili_indexer"),
         ],
         builtin: false,
-        project_id: project_id.map(str::to_owned),
+        tenant_id: tenant_id.map(str::to_owned),
     }
 }
 
@@ -150,13 +150,13 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
     // Create global, then the same uid for a tenant.
     let global = repo.upsert(&pdf_pipeline("shared", None)).await.unwrap();
     assert_eq!(global.version, 1);
-    assert_eq!(global.project_id, None);
+    assert_eq!(global.tenant_id, None);
     assert!(!global.builtin);
     let tenant = repo
         .upsert(&pdf_pipeline("shared", Some("t1")))
         .await
         .unwrap();
-    assert_eq!(tenant.project_id.as_deref(), Some("t1"));
+    assert_eq!(tenant.tenant_id.as_deref(), Some("t1"));
 
     // Update bumps version.
     let mut v2 = pdf_pipeline("shared", None);
@@ -169,13 +169,13 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
 
     // get: tenant row first, then global.
     let got = repo.get("shared", Some("t1")).await.unwrap().unwrap();
-    assert_eq!(got.project_id.as_deref(), Some("t1"));
+    assert_eq!(got.tenant_id.as_deref(), Some("t1"));
     assert_eq!(got.version, 1);
     let got = repo.get("shared", Some("t2")).await.unwrap().unwrap();
-    assert_eq!(got.project_id, None);
+    assert_eq!(got.tenant_id, None);
     assert_eq!(got.version, 3);
     let got = repo.get("shared", None).await.unwrap().unwrap();
-    assert_eq!(got.project_id, None);
+    assert_eq!(got.tenant_id, None);
     assert!(repo.get("missing", None).await.unwrap().is_none());
 
     // list: tenant rows first, then global; other tenants excluded.
@@ -185,7 +185,7 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
     let list = repo.list(Some("t1")).await.unwrap();
     let ids: Vec<(String, Option<String>)> = list
         .iter()
-        .map(|p| (p.uid.clone(), p.project_id.clone()))
+        .map(|p| (p.uid.clone(), p.tenant_id.clone()))
         .collect();
     assert_eq!(
         ids,
@@ -205,7 +205,7 @@ async fn pipeline_repo_crud_with_tenant_scoping() {
             .await
             .unwrap()
             .unwrap()
-            .project_id
+            .tenant_id
             .is_none()
     );
     assert!(repo.delete("shared", None).await.unwrap());
@@ -234,7 +234,7 @@ async fn pipeline_routes_end_to_end() {
         String::from_utf8_lossy(&body)
     );
     let stored: PipelineDefinition = json(&body);
-    assert_eq!(stored.project_id.as_deref(), Some("t1"));
+    assert_eq!(stored.tenant_id.as_deref(), Some("t1"));
     assert_eq!(stored.version, 1);
     assert_eq!(stored.steps[1].depends_on, vec!["extract"]);
 
@@ -272,7 +272,7 @@ async fn pipeline_routes_end_to_end() {
     // GET list: the two user rows first, then every built-in. Counted from
     // `builtin_pipelines()` rather than hardcoded: the literal that used to live
     // here went stale the moment parquet/avro/msgpack were added.
-    let (status, body) = call(app(state.clone()), get("/pipelines?project_id=t1")).await;
+    let (status, body) = call(app(state.clone()), get("/pipelines?tenant_id=t1")).await;
     assert_eq!(status, StatusCode::OK);
     let list: Vec<PipelineDefinition> = json(&body);
     assert_eq!(list[0].uid, "hdr-scoped");
@@ -286,7 +286,7 @@ async fn pipeline_routes_end_to_end() {
     // GET one (scoped) / 404 for other tenant / builtin fallback.
     let (status, body) = call(
         app(state.clone()),
-        get("/pipelines/hdr-scoped?project_id=t1"),
+        get("/pipelines/hdr-scoped?tenant_id=t1"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -294,7 +294,7 @@ async fn pipeline_routes_end_to_end() {
     assert_eq!(one.version, 2);
     let (status, _) = call(
         app(state.clone()),
-        get("/pipelines/hdr-scoped?project_id=t2"),
+        get("/pipelines/hdr-scoped?tenant_id=t2"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -308,7 +308,7 @@ async fn pipeline_routes_end_to_end() {
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t1"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t1"}),
         ),
     )
     .await;
@@ -321,7 +321,7 @@ async fn pipeline_routes_end_to_end() {
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t2"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t2"}),
         ),
     )
     .await;
@@ -337,17 +337,23 @@ async fn pipeline_routes_end_to_end() {
         .unwrap();
     let (status, _) = call(app(state.clone()), req).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let req = Request::delete("/pipelines/hdr-scoped?project_id=t1")
+    let req = Request::delete("/pipelines/hdr-scoped?tenant_id=t1")
         .body(Body::empty())
         .unwrap();
-    let (status, _) = call(app(state.clone()), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(app(state.clone()), req).await;
+    // 200 with the sources the delete archived, so the gateway can drop their
+    // Temporal schedules. None feed this pipeline.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json::<serde_json::Value>(&body),
+        serde_json::json!({ "archived_sources": [] })
+    );
     let (status, body) = call(
         app(state.clone()),
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t1"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t1"}),
         ),
     )
     .await;
@@ -359,13 +365,13 @@ async fn pipeline_routes_end_to_end() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = call(app(state.clone()), req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
     let (status, body) = call(
         app(state.clone()),
         req_json(
             "POST",
             "/internal/resolve",
-            &serde_json::json!({"mime": "application/pdf", "project_id": "t1"}),
+            &serde_json::json!({"mime": "application/pdf", "tenant_id": "t1"}),
         ),
     )
     .await;
@@ -430,13 +436,14 @@ async fn jobs_insert_patch_get() {
         job_id: id,
         workflow_id: format!("ingest-{id}"),
         pipeline_uid: "builtin.pdf".into(),
-        project_id: Some("t1".into()),
+        tenant_id: Some("t1".into()),
         index_name: Some("documents".into()),
         status: JobStatus::Queued,
         current_step: None,
         error: None,
         started_at: now,
         updated_at: now,
+        source_id: None,
     };
 
     let (status, body) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
@@ -449,7 +456,7 @@ async fn jobs_insert_patch_get() {
     let stored: JobRecord = json(&body);
     assert_eq!(stored.job_id, id);
     assert_eq!(stored.status, JobStatus::Queued);
-    assert_eq!(stored.project_id.as_deref(), Some("t1"));
+    assert_eq!(stored.tenant_id.as_deref(), Some("t1"));
 
     let upd = JobUpdate {
         status: Some(JobStatus::Running),
@@ -528,13 +535,14 @@ async fn terminal_status_clears_the_current_step() {
         job_id: id,
         workflow_id: format!("ingest-{id}"),
         pipeline_uid: "builtin.pdf".into(),
-        project_id: None,
+        tenant_id: None,
         index_name: Some("documents".into()),
         status: JobStatus::Queued,
         current_step: None,
         error: None,
         started_at: now,
         updated_at: now,
+        source_id: None,
     };
     let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -567,6 +575,293 @@ async fn terminal_status_clears_the_current_step() {
         stored.current_step, None,
         "a finished job must not keep a current step"
     );
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn tenant_id_replaces_project_id() {
+    let Some(t) = setup().await else { return };
+
+    let cols: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND column_name IN ('project_id', 'tenant_id') \
+         ORDER BY 1",
+    )
+    .fetch_all(&t.pool)
+    .await
+    .unwrap();
+    let expected: Vec<(String, String)> = ["jobs", "meili_connections", "pipelines", "sources"]
+        .into_iter()
+        .map(|table| (table.to_string(), "tenant_id".to_string()))
+        .collect();
+    assert_eq!(cols, expected);
+
+    let indexes: Vec<(String,)> = sqlx::query_as(
+        "SELECT indexname::text FROM pg_indexes \
+         WHERE schemaname = current_schema() AND indexname LIKE '%tenant%' ORDER BY 1",
+    )
+    .fetch_all(&t.pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = indexes.iter().map(|(n,)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "jobs_tenant_started",
+            "meili_connections_uid_tenant",
+            "pipelines_uid_tenant",
+            "sources_pipeline_tenant",
+            "sources_uid_tenant"
+        ]
+    );
+
+    // Still one row per (uid, tenant), NULL counting as one global scope.
+    let insert = |tenant: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO pipelines (uid, name, definition, tenant_id) \
+             VALUES ('dup', 'dup', '{}'::jsonb, $1)",
+        )
+        .bind(tenant)
+    };
+    insert(Some("t1")).execute(&t.pool).await.unwrap();
+    assert!(insert(Some("t1")).execute(&t.pool).await.is_err());
+    insert(Some("t2")).execute(&t.pool).await.unwrap();
+    insert(None).execute(&t.pool).await.unwrap();
+    assert!(insert(None).execute(&t.pool).await.is_err());
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn a_tenant_delete_never_reaches_the_global_pipeline() {
+    let Some(t) = setup().await else { return };
+    let app = app(AppState::new(t.pool.clone()));
+    let def = serde_json::json!({
+        "uid": "shared", "name": "shared",
+        "steps": [{"id": "index", "plugin": "meili_indexer"}]
+    });
+    let (status, _) = call(app.clone(), req_json("POST", "/pipelines", &def)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        app.clone(),
+        Request::delete("/pipelines/shared?tenant_id=t1")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(app, get("/pipelines/shared")).await;
+    assert_eq!(status, StatusCode::OK, "the global pipeline is still there");
+    t.drop_schema().await;
+}
+
+/// The chunker's manifest as a worker registers it: a draft 2020-12 schema that
+/// rejects unknown keys.
+fn chunker_manifest() -> PluginManifest {
+    PluginManifest::new("chunker", "0.1.0").config_schema(serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "chunk_size": { "type": "integer", "minimum": 1 },
+            "overlap": { "type": "integer", "minimum": 0 }
+        }
+    }))
+}
+
+fn chunk_pipeline(uid: &str, config: serde_json::Value) -> PipelineDefinition {
+    PipelineDefinition {
+        uid: uid.into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            StepDefinition::new("c", "chunker").config(config),
+            StepDefinition::new("index", "meili_indexer"),
+        ],
+        builtin: false,
+        tenant_id: Some("t1".into()),
+    }
+}
+
+#[tokio::test]
+async fn step_config_is_checked_against_the_plugin_schema() {
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let (status, _) = call(
+        app(state.clone()),
+        req_json("POST", "/internal/plugins", &vec![chunker_manifest()]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A wrong type: the run would fail with "expected usize".
+    let bad_type = chunk_pipeline("cfg-type", serde_json::json!({ "chunk_size": "big" }));
+    for uri in ["/pipelines/validate", "/pipelines"] {
+        let (status, body) = call(app(state.clone()), req_json("POST", uri, &bad_type)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation", "{uri}");
+        assert!(
+            err.error.contains("\"c\"")
+                && err.error.contains("chunker")
+                && err.error.contains("chunk_size"),
+            "{uri}: {}",
+            err.error
+        );
+    }
+    // Nothing was stored by the rejected create.
+    let (status, _) = call(app(state.clone()), get("/pipelines/cfg-type?tenant_id=t1")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // An unknown key, against `additionalProperties: false`.
+    let unknown_key = chunk_pipeline("cfg-key", serde_json::json!({ "nope": 1 }));
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines/validate", &unknown_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let err: ErrorBody = json(&body);
+    assert!(err.error.contains("nope"), "{}", err.error);
+
+    // A valid config passes, and so does a plugin with no registered manifest
+    // (meili_indexer here): there is no schema to check it against.
+    let good = chunk_pipeline("cfg-ok", serde_json::json!({ "chunk_size": 100 }));
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines/validate", &good),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = call(app(state.clone()), req_json("POST", "/pipelines", &good)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn an_indexer_connection_must_exist_for_the_tenant() {
+    use meili_ingest_control_plane::connections::{ConnectionRepo, NewConnection};
+
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let pinned = |uid: &str, tenant: &str, connection: &str| PipelineDefinition {
+        uid: uid.into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            StepDefinition::new("index", "meili_indexer")
+                .config(serde_json::json!({ "connection": connection })),
+        ],
+        builtin: false,
+        tenant_id: Some(tenant.into()),
+    };
+    let connection = |uid: &str, tenant: Option<&str>| NewConnection {
+        id: Uuid::new_v4(),
+        uid: uid.into(),
+        name: uid.into(),
+        tenant_id: tenant.map(str::to_owned),
+        host: "https://movies.example".into(),
+        api_key: vec![1, 2, 3],
+    };
+
+    let missing = pinned("pin-missing", "t1", "does-not-exist");
+    for uri in ["/pipelines/validate", "/pipelines"] {
+        let (status, body) = call(app(state.clone()), req_json("POST", uri, &missing)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation");
+        assert!(
+            err.error.contains("\"does-not-exist\"") && err.error.contains("connection"),
+            "{uri}: {}",
+            err.error
+        );
+    }
+
+    // The tenant's own connection is accepted; another tenant's is not.
+    let repo = ConnectionRepo::new(t.pool.clone());
+    repo.insert(&connection("mine", Some("t1"))).await.unwrap();
+    let (status, body) = call(
+        app(state.clone()),
+        req_json(
+            "POST",
+            "/pipelines/validate",
+            &pinned("pin-own", "t1", "mine"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = call(
+        app(state.clone()),
+        req_json(
+            "POST",
+            "/pipelines/validate",
+            &pinned("pin-other", "t2", "mine"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A global connection is a template: no tenant pipeline may name it, as at run time.
+    repo.insert(&connection("shared", None)).await.unwrap();
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines", &pinned("pin-shared", "t2", "shared")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: ErrorBody = json(&body);
+    assert_eq!(err.code, "validation");
+    assert!(err.error.contains("\"shared\""), "{}", err.error);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn validate_returns_generated_scripts_for_builder_steps_only() {
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let script_step = |id: &str, config: serde_json::Value| {
+        StepDefinition::new(id, "document_script").config(config)
+    };
+    let def = PipelineDefinition {
+        uid: "scripts".into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            script_step(
+                "shape",
+                serde_json::json!({"ops": [{"rename": {"from": "a", "to": "b"}}]}),
+            ),
+            script_step("raw", serde_json::json!({"script": "1"})),
+        ],
+        builtin: false,
+        tenant_id: Some("t1".into()),
+    };
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines/validate", &def),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body: serde_json::Value = json(&body);
+    assert_eq!(
+        body["generated_scripts"]["shape"],
+        "doc.rename_field(\"a\", \"b\");\n"
+    );
+    assert!(body["generated_scripts"].get("raw").is_none());
 
     t.drop_schema().await;
 }

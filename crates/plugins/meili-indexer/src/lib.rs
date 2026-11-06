@@ -9,11 +9,20 @@
 //!
 //! Behaviour:
 //! 1. validate the config (`host`, `api_key` and `index` are mandatory);
-//! 2. when `auto_create_index` (default `true`), create the index with
-//!    `primary_key` if `GET /indexes/{uid}` says it does not exist, and wait
-//!    for that task;
-//! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it
-//!    in batches of `batch_size` (default 1000) via `addOrReplace`;
+//! 2. look the index up with `GET /indexes/{uid}`. When it does not exist and
+//!    `auto_create_index` (default `true`) is set, enqueue its creation with
+//!    `primary_key`, without waiting: Meilisearch runs tasks in enqueue order, so the
+//!    document additions sent next always run after it, and waiting would only double
+//!    the time spent behind other tenants' tasks on a busy instance. Its outcome is
+//!    checked once the documents are done;
+//! 3. flatten every [`Document`] with [`Document::to_index_json`] and send it via
+//!    `addOrReplace` with `?primaryKey=<primary_key>`, except when the index already
+//!    has a primary key: then no `primaryKey` is sent and Meilisearch uses the index's
+//!    own (any other value is rejected with `index_primary_key_already_exists`).
+//!    Batches are cut at whichever of `batch_size` (documents, default
+//!    1000) and `max_batch_bytes` (serialized bytes, default 50 MiB) comes first. A
+//!    document too large for any batch is a [`PluginError::NonRetryable`] naming it;
+//!    sending it would earn a `413` the retry policy would repeat forever;
 //! 4. when `wait_for_completion` (default `true`), poll each task until it
 //!    finishes; a `failed` task is a [`PluginError::NonRetryable`] carrying the
 //!    Meilisearch error message;
@@ -40,8 +49,25 @@ pub const NAME: &str = INDEXER_PLUGIN;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Waiting is done in slices so a heartbeat is emitted between them.
 const WAIT_SLICE: Duration = Duration::from_secs(10);
-/// Total time to wait for one task before giving up (retryable).
-const TASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default time to wait for one task before giving up (retryable), when neither the
+/// step's `task_timeout_secs` nor the worker's [`TASK_TIMEOUT_ENV`] says otherwise.
+const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Worker-wide default for the per-task wait. A deployment whose Meilisearch is shared
+/// with a busy writer raises it (and keeps it below the index step's timeout).
+pub const TASK_TIMEOUT_ENV: &str = "INDEXER_TASK_TIMEOUT_SECS";
+
+/// The per-task wait: step config, then [`TASK_TIMEOUT_ENV`], then the default.
+fn task_timeout(configured: Option<u64>) -> Duration {
+    configured
+        .or_else(|| {
+            std::env::var(TASK_TIMEOUT_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TASK_TIMEOUT)
+}
 
 /// The Meilisearch indexer plugin. Stateless; construct with [`MeiliIndexerPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -54,28 +80,55 @@ impl MeiliIndexerPlugin {
     }
 }
 
+/// A validated indexer config, with the destination resolved to plain strings.
+struct ParsedConfig {
+    cfg: IndexerConfig,
+    index: String,
+    host: String,
+    api_key: String,
+}
+
 /// Validate and deserialize the step config into an [`IndexerConfig`].
-fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
-    let obj = config.as_object().ok_or_else(|| {
-        PluginError::InvalidConfig(format!("{NAME}: config must be a JSON object"))
-    })?;
-    let present = |key: &str| {
-        obj.get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-    };
-    if !present("host") || !present("api_key") {
+fn parse_config(config: Value) -> Result<ParsedConfig, PluginError> {
+    if !config.is_object() {
         return Err(PluginError::InvalidConfig(format!(
-            "{NAME}: config has no `host`/`api_key`. The Meilisearch tenant context \
-             (MeiliContext) must be injected into this step's config by the gateway/workflow; \
-             this plugin never reads MEILI_URL/MEILI_API_KEY from the environment (SPEC §7.4)"
+            "{NAME}: config must be a JSON object"
         )));
     }
     let cfg: IndexerConfig = serde_json::from_value(config)
         .map_err(|e| PluginError::InvalidConfig(format!("{NAME}: {e}")))?;
+    let non_blank = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let (Some(host), Some(api_key)) = (non_blank(&cfg.meili.host), non_blank(&cfg.meili.api_key))
+    else {
+        let why = match cfg.connection.as_deref() {
+            // The worker activity resolves a connection before calling this plugin, so
+            // reaching here means that step was skipped (an older worker, say).
+            Some(name) => format!(
+                "{NAME}: connection {name:?} was not resolved into a host and API key \
+                 before this step ran"
+            ),
+            None => format!(
+                "{NAME}: config has no `host`/`api_key`. Name a Meilisearch `connection` \
+                 on this step, or send the tenant context (MeiliContext) with the request; \
+                 this plugin never reads MEILI_URL/MEILI_API_KEY from the environment \
+                 (SPEC §7.4)"
+            ),
+        };
+        return Err(PluginError::InvalidConfig(why));
+    };
     if cfg.batch_size == 0 {
         return Err(PluginError::InvalidConfig(format!(
             "{NAME}: `batch_size` must be at least 1"
+        )));
+    }
+    if cfg.max_batch_bytes == 0 {
+        return Err(PluginError::InvalidConfig(format!(
+            "{NAME}: `max_batch_bytes` must be at least 1"
         )));
     }
     if cfg.primary_key.trim().is_empty() {
@@ -94,7 +147,63 @@ fn parse_config(config: Value) -> Result<(IndexerConfig, String), PluginError> {
                  X-Meili-Index header, the `?index=` query or MEILI_INDEX on the gateway (SPEC §3.4)"
             ))
         })?;
-    Ok((cfg, index))
+    Ok(ParsedConfig {
+        cfg,
+        index,
+        host,
+        api_key,
+    })
+}
+
+/// A single document whose serialized size exceeds `max_batch_bytes` on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OversizedDoc {
+    /// Position of the document in the input.
+    index: usize,
+    /// Its serialized size in bytes.
+    bytes: usize,
+}
+
+/// Split documents into consecutive batches, given each document's serialized size.
+///
+/// A batch is cut at whichever of `max_docs` and `max_bytes` is reached first. Bytes are
+/// counted as the JSON array Meilisearch actually receives: the documents, the commas
+/// between them, and the enclosing brackets.
+///
+/// Pure and I/O-free so the splitting is testable without a Meilisearch. A document that
+/// does not fit even alone is an error rather than a batch of one: sending it would earn
+/// a `413` that the retry policy would repeat forever.
+fn plan_batches(
+    sizes: &[usize],
+    max_docs: usize,
+    max_bytes: u64,
+) -> Result<Vec<std::ops::Range<usize>>, OversizedDoc> {
+    const BRACKETS: u64 = 2;
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = BRACKETS;
+    for (i, &size) in sizes.iter().enumerate() {
+        let size64 = size as u64;
+        if BRACKETS + size64 > max_bytes {
+            return Err(OversizedDoc {
+                index: i,
+                bytes: size,
+            });
+        }
+        let in_batch = i - start;
+        let comma = u64::from(in_batch > 0);
+        if in_batch > 0 && (in_batch >= max_docs || bytes + comma + size64 > max_bytes) {
+            batches.push(start..i);
+            start = i;
+            bytes = BRACKETS + size64;
+        } else {
+            bytes += comma + size64;
+        }
+    }
+    if start < sizes.len() {
+        batches.push(start..sizes.len());
+    }
+    Ok(batches)
 }
 
 /// Whether an SDK error means "the index does not exist".
@@ -159,12 +268,13 @@ fn task_failed(uid: u32, what: &str, err: &MeilisearchError) -> PluginError {
 }
 
 /// Poll a task until it finishes. `Ok(None)` = succeeded, `Ok(Some(err))` = failed.
-/// Heartbeats between polling slices; gives up (retryable) after [`TASK_TIMEOUT`].
+/// Heartbeats between polling slices; gives up (retryable) after `timeout`.
 async fn wait_for_task(
     client: &Client,
     ctx: &ActivityContext,
     task: &TaskInfo,
     what: &str,
+    timeout: Duration,
 ) -> Result<Option<MeilisearchError>, PluginError> {
     let uid = task.task_uid;
     let mut waited = Duration::ZERO;
@@ -182,38 +292,100 @@ async fn wait_for_task(
             Err(e) => return Err(map_error(e, &format!("polling task {uid} ({what})"))),
         }
         waited += WAIT_SLICE;
-        if waited >= TASK_TIMEOUT {
+        if waited >= timeout {
             return Err(PluginError::Retryable(format!(
-                "{NAME}: task {uid} ({what}) did not finish within {}s",
-                TASK_TIMEOUT.as_secs()
+                "{NAME}: task {uid} ({what}) did not finish within {}s; Meilisearch may \
+                 be busy with other tasks (raise task_timeout_secs or {TASK_TIMEOUT_ENV})",
+                timeout.as_secs()
             )));
         }
     }
 }
 
-/// Create the index (with `primary_key`) when it does not exist yet.
-async fn ensure_index(
-    client: &Client,
-    ctx: &ActivityContext,
-    uid: &str,
-    primary_key: &str,
-) -> Result<(), PluginError> {
-    match client.get_index(uid).await {
-        Ok(_) => Ok(()),
-        Err(e) if is_index_not_found(&e) => {
-            tracing::info!(plugin = NAME, index = %uid, primary_key = %primary_key, "creating index");
-            let info = client
-                .create_index(uid, Some(primary_key))
-                .await
-                .map_err(|e| map_error(e, &format!("creating index {uid:?}")))?;
-            match wait_for_task(client, ctx, &info, "index creation").await? {
-                None => Ok(()),
-                // Another job created it concurrently: fine.
-                Some(err) if matches!(err.error_code, ErrorCode::IndexAlreadyExists) => Ok(()),
-                Some(err) => Err(task_failed(info.task_uid, "index creation", &err)),
+/// What [`ensure_index`] found (or did) for the target index.
+#[derive(Debug)]
+enum IndexState {
+    /// The index did not exist and `auto_create_index` is off: nothing was enqueued.
+    Missing,
+    /// The index did not exist; its creation (with the configured key) was enqueued.
+    Creating(TaskInfo),
+    /// The index exists, with its own primary key or none yet.
+    Existing { primary_key: Option<String> },
+}
+
+impl IndexState {
+    /// The `?primaryKey` to send on document additions. An index that already has a
+    /// primary key gets none: Meilisearch rejects any other key with
+    /// `index_primary_key_already_exists`, and without the parameter it uses its own.
+    fn addition_primary_key<'a>(&self, configured: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Existing {
+                primary_key: Some(_),
+            } => None,
+            Self::Missing | Self::Creating(_) | Self::Existing { primary_key: None } => {
+                Some(configured)
             }
         }
+    }
+
+    fn creation(&self) -> Option<&TaskInfo> {
+        match self {
+            Self::Creating(task) => Some(task),
+            Self::Missing | Self::Existing { .. } => None,
+        }
+    }
+}
+
+/// Look the index up. When it does not exist and `create` is set, enqueue its creation
+/// (with `primary_key`) without waiting for it.
+async fn ensure_index(
+    client: &Client,
+    uid: &str,
+    primary_key: &str,
+    create: bool,
+) -> Result<IndexState, PluginError> {
+    match client.get_index(uid).await {
+        Ok(index) => {
+            if let Some(existing) = index.primary_key.as_deref()
+                && existing != primary_key
+            {
+                tracing::info!(
+                    plugin = NAME,
+                    index = %uid,
+                    primary_key = %existing,
+                    configured_primary_key = %primary_key,
+                    "index already has a primary key; using it instead of the configured one"
+                );
+            }
+            Ok(IndexState::Existing {
+                primary_key: index.primary_key,
+            })
+        }
+        Err(e) if is_index_not_found(&e) && !create => Ok(IndexState::Missing),
+        Err(e) if is_index_not_found(&e) => {
+            tracing::info!(plugin = NAME, index = %uid, primary_key = %primary_key, "creating index");
+            client
+                .create_index(uid, Some(primary_key))
+                .await
+                .map(IndexState::Creating)
+                .map_err(|e| map_error(e, &format!("creating index {uid:?}")))
+        }
         Err(e) => Err(map_error(e, &format!("fetching index {uid:?}"))),
+    }
+}
+
+/// Wait for the index creation and fail on anything but success or "already exists"
+/// (another job, or an earlier attempt of this one, created it first).
+async fn check_creation(
+    client: &Client,
+    ctx: &ActivityContext,
+    task: &TaskInfo,
+    timeout: Duration,
+) -> Result<(), PluginError> {
+    match wait_for_task(client, ctx, task, "index creation", timeout).await? {
+        None => Ok(()),
+        Some(err) if matches!(err.error_code, ErrorCode::IndexAlreadyExists) => Ok(()),
+        Some(err) => Err(task_failed(task.task_uid, "index creation", &err)),
     }
 }
 
@@ -222,40 +394,46 @@ impl Plugin for MeiliIndexerPlugin {
     fn manifest(&self) -> PluginManifest {
         PluginManifest::new(NAME, env!("CARGO_PKG_VERSION"))
             .description(
-                "Pushes documents into Meilisearch using the tenant MeiliContext injected into \
-                 the step config (host, api_key, index). Creates the index when missing, batches \
-                 addOrReplace calls and waits for the tasks.",
+                "Pushes documents into Meilisearch. The destination is the named `connection` \
+                 when the step sets one, otherwise the tenant MeiliContext sent with the \
+                 request. Creates the index when missing, batches addOrReplace calls by \
+                 document count and serialized size, and waits for the tasks.",
             )
             .accepts([InputKind::Documents, InputKind::Many, InputKind::Empty])
             .produces(OutputKind::Indexed)
             .config_schema(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                // `host`, `api_key`, `index`, `project_id` and `region` are NOT listed
-                // as required and are marked `readOnly`: the workflow injects them from
-                // the tenant's MeiliContext just before the step runs. A pipeline author
-                // must never type them, least of all the API key, and a schema-driven
-                // editor is expected to skip `readOnly` properties rather than render an
-                // empty required field for a secret.
+                // `host`, `api_key`, `tenant_id` and `region` are NOT listed as
+                // required and are marked `readOnly`: they are injected just before the
+                // step runs, from the named `connection` or from the tenant's
+                // MeiliContext. A pipeline author must never type them, least of all the
+                // API key, and a schema-driven editor is expected to skip `readOnly`
+                // properties rather than render an empty required field for a secret.
+                // To pin a destination, name a `connection` instead.
                 "required": [],
                 "properties": {
+                    "connection": {
+                        "type": "string",
+                        "format": "meili-connection",
+                        "description": "Optional: name of a Meilisearch connection. When set it is the destination, and it wins over any Meilisearch context sent with the request. Required for pipelines run by a scheduled source, which have no request."
+                    },
                     "host": {
                         "type": "string",
                         "readOnly": true,
-                        "description": "Injected: Meilisearch base URL from the tenant MeiliContext. Never set this by hand."
+                        "description": "Injected: Meilisearch base URL from the connection or the tenant MeiliContext. Never set this by hand."
                     },
                     "api_key": {
                         "type": "string",
                         "readOnly": true,
                         "writeOnly": true,
-                        "description": "Injected: Meilisearch API key from the tenant MeiliContext. Never set this by hand."
+                        "description": "Injected: Meilisearch API key from the connection or the tenant MeiliContext. Never set this by hand."
                     },
                     "index": {
                         "type": "string",
-                        "readOnly": true,
-                        "description": "Injected: target index uid, resolved by the gateway (SPEC §3.4). Set `trigger.index_pattern` on the pipeline instead."
+                        "description": "Optional: pin the target index uid. When unset it is resolved from the pipeline's `trigger.index_pattern`, then the request, then the deployment default (SPEC §3.4)."
                     },
-                    "project_id": {
+                    "tenant_id": {
                         "type": ["string", "null"],
                         "default": null,
                         "readOnly": true,
@@ -270,23 +448,34 @@ impl Plugin for MeiliIndexerPlugin {
                     "primary_key": {
                         "type": "string",
                         "default": "id",
-                        "description": "Primary key declared when creating the index and sent as ?primaryKey on document additions."
+                        "description": "Primary key declared when creating the index, and sent as ?primaryKey on document additions while the index has none. An index that already has a primary key keeps its own: additions then carry no ?primaryKey."
                     },
                     "auto_create_index": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Create the index when GET /indexes/{uid} returns 404."
+                        "description": "Create the index when GET /indexes/{uid} returns 404. The lookup runs either way, so an existing primary key is respected."
                     },
                     "batch_size": {
                         "type": "integer",
                         "minimum": 1,
                         "default": 1000,
-                        "description": "Documents per addOrReplace request."
+                        "description": "Maximum documents per addOrReplace request."
+                    },
+                    "max_batch_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": DEFAULT_MAX_BATCH_BYTES,
+                        "description": "Maximum serialized bytes per addOrReplace request. A batch is cut at whichever of this and batch_size is reached first. Keep it under Meilisearch's http_payload_size_limit (100 MB by default)."
                     },
                     "wait_for_completion": {
                         "type": "boolean",
                         "default": true,
                         "description": "Poll every task until it succeeds; a failed task fails the step (non-retryable)."
+                    },
+                    "task_timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How long to wait for one Meilisearch task before retrying the step. Defaults to the worker's INDEXER_TASK_TIMEOUT_SECS, else 120. Keep it below the step's timeout_secs."
                     }
                 }
             }))
@@ -298,7 +487,12 @@ impl Plugin for MeiliIndexerPlugin {
         input: PluginInput,
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
-        let (cfg, index_uid) = parse_config(config)?;
+        let ParsedConfig {
+            cfg,
+            index: index_uid,
+            host,
+            api_key,
+        } = parse_config(config)?;
         let docs = input.into_documents()?;
         tracing::info!(
             plugin = NAME,
@@ -310,15 +504,22 @@ impl Plugin for MeiliIndexerPlugin {
             "indexing documents"
         );
 
-        let host = cfg.meili.host.trim().trim_end_matches('/').to_owned();
-        let client = Client::new(host, Some(cfg.meili.api_key.as_str()))
+        let host = host.trim_end_matches('/').to_owned();
+        let client = Client::new(host, Some(api_key.as_str()))
             .map_err(|e| map_error(e, "building the Meilisearch client"))?;
 
-        if cfg.auto_create_index {
-            ensure_index(&client, ctx, &index_uid, &cfg.primary_key).await?;
-        }
+        let timeout = task_timeout(cfg.task_timeout_secs);
+        let state =
+            ensure_index(&client, &index_uid, &cfg.primary_key, cfg.auto_create_index).await?;
+        let creation = state.creation();
+        let addition_primary_key = state.addition_primary_key(&cfg.primary_key);
 
         if docs.is_empty() {
+            if let Some(task) = creation
+                && cfg.wait_for_completion
+            {
+                check_creation(&client, ctx, task, timeout).await?;
+            }
             return Ok(PluginOutput::Indexed(IndexReport {
                 index: index_uid,
                 document_count: 0,
@@ -327,18 +528,33 @@ impl Plugin for MeiliIndexerPlugin {
         }
 
         let index = client.index(index_uid.clone());
-        let batch_total = docs.len().div_ceil(cfg.batch_size);
+        let payloads: Vec<Value> = docs.iter().map(Document::to_index_json).collect();
+        let sizes: Vec<usize> = payloads
+            .iter()
+            .map(|p| serde_json::to_vec(p).map(|b| b.len()).unwrap_or(usize::MAX))
+            .collect();
+        let batches = plan_batches(&sizes, cfg.batch_size, cfg.max_batch_bytes).map_err(
+            |OversizedDoc { index, bytes }| {
+                PluginError::NonRetryable(format!(
+                    "{NAME}: document {:?} is {bytes} bytes serialized, over \
+                     `max_batch_bytes` ({}); it cannot be sent in any batch. Raise \
+                     `max_batch_bytes` or chunk the document upstream",
+                    docs[index].id, cfg.max_batch_bytes
+                ))
+            },
+        )?;
+        let batch_total = batches.len();
         let mut tasks: Vec<TaskInfo> = Vec::with_capacity(batch_total);
-        for (batch_no, batch) in docs.chunks(cfg.batch_size).enumerate() {
+        for (batch_no, range) in batches.into_iter().enumerate() {
             ctx.check_cancelled()?;
+            let payload = &payloads[range];
             ctx.heartbeat(format!(
                 "{NAME}: sending batch {}/{batch_total} ({} documents)",
                 batch_no + 1,
-                batch.len()
+                payload.len()
             ));
-            let payload: Vec<Value> = batch.iter().map(Document::to_index_json).collect();
             let info = index
-                .add_or_replace(&payload, Some(&cfg.primary_key))
+                .add_or_replace(payload, addition_primary_key)
                 .await
                 .map_err(|e| map_error(e, &format!("adding documents (batch {})", batch_no + 1)))?;
             tracing::debug!(
@@ -346,7 +562,7 @@ impl Plugin for MeiliIndexerPlugin {
                 index = %index_uid,
                 task_uid = info.task_uid,
                 batch = batch_no + 1,
-                documents = batch.len(),
+                documents = payload.len(),
                 "batch enqueued"
             );
             tasks.push(info);
@@ -354,9 +570,15 @@ impl Plugin for MeiliIndexerPlugin {
 
         if cfg.wait_for_completion {
             for info in &tasks {
-                if let Some(err) = wait_for_task(&client, ctx, info, "document addition").await? {
+                if let Some(err) =
+                    wait_for_task(&client, ctx, info, "document addition", timeout).await?
+                {
                     return Err(task_failed(info.task_uid, "document addition", &err));
                 }
+            }
+            // Enqueued before the additions, so it finished before them: no extra wait.
+            if let Some(task) = creation {
+                check_creation(&client, ctx, task, timeout).await?;
             }
         }
 
@@ -372,7 +594,9 @@ impl Plugin for MeiliIndexerPlugin {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const INDEX: &str = "documents";
@@ -382,7 +606,7 @@ mod tests {
             "host": host,
             "api_key": "test-key",
             "index": INDEX,
-            "project_id": "proj-1",
+            "tenant_id": "proj-1",
             "region": "eu"
         })
     }
@@ -477,18 +701,28 @@ mod tests {
             .await;
     }
 
-    async fn mount_documents_add(server: &MockServer, task_uid: u32, expected_calls: u64) {
-        Mock::given(method("POST"))
+    /// Accept document additions sent with `?primaryKey=<primary_key>`, or without the
+    /// parameter at all when `primary_key` is `None`.
+    async fn mount_documents_add(
+        server: &MockServer,
+        task_uid: u32,
+        expected_calls: u64,
+        primary_key: Option<&str>,
+    ) {
+        let mock = Mock::given(method("POST"))
             .and(path(format!("/indexes/{INDEX}/documents")))
-            .and(query_param("primaryKey", "id"))
-            .and(header("authorization", "Bearer test-key"))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .set_body_json(task_info(task_uid, "documentAdditionOrUpdate")),
-            )
-            .expect(expected_calls)
-            .mount(server)
-            .await;
+            .and(header("authorization", "Bearer test-key"));
+        let mock = match primary_key {
+            Some(pk) => mock.and(query_param("primaryKey", pk)),
+            None => mock.and(query_param_is_missing("primaryKey")),
+        };
+        mock.respond_with(
+            ResponseTemplate::new(202)
+                .set_body_json(task_info(task_uid, "documentAdditionOrUpdate")),
+        )
+        .expect(expected_calls)
+        .mount(server)
+        .await;
     }
 
     async fn run(
@@ -528,7 +762,7 @@ mod tests {
     async fn creates_index_then_adds_documents_and_waits() {
         let server = MockServer::start().await;
         mount_index_creation(&server).await;
-        mount_documents_add(&server, 2, 1).await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
         Mock::given(method("GET"))
             .and(path("/tasks/2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -577,6 +811,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn documents_are_sent_before_the_index_creation_is_awaited() {
+        // On a busy Meilisearch the creation can sit behind other tasks for minutes.
+        // Tasks run in enqueue order, so the additions must be enqueued right away,
+        // not after the creation finished.
+        let server = MockServer::start().await;
+        mount_index_creation(&server).await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
+        Mock::given(method("GET"))
+            .and(path("/tasks/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                2,
+                "succeeded",
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 2, "indexedDocuments": 2}),
+                None,
+            )))
+            .mount(&server)
+            .await;
+        run(
+            &server,
+            PluginInput::Documents(docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        let order: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        let add = order
+            .iter()
+            .position(|r| r == &format!("POST /indexes/{INDEX}/documents"))
+            .expect("documents sent");
+        let first_creation_poll = order
+            .iter()
+            .position(|r| r == "GET /tasks/1")
+            .expect("creation checked");
+        assert!(
+            add < first_creation_poll,
+            "documents must not wait for the creation: {order:?}"
+        );
+    }
+
+    #[test]
+    fn task_timeout_prefers_the_step_config() {
+        assert_eq!(task_timeout(Some(900)), Duration::from_secs(900));
+        // 0 is not a usable budget: fall back rather than time out instantly.
+        if std::env::var(TASK_TIMEOUT_ENV).is_err() {
+            assert_eq!(task_timeout(Some(0)), DEFAULT_TASK_TIMEOUT);
+            assert_eq!(task_timeout(None), DEFAULT_TASK_TIMEOUT);
+        }
+    }
+
+    #[tokio::test]
     async fn failed_task_is_non_retryable_with_meilisearch_message() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -584,7 +875,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
             .mount(&server)
             .await;
-        mount_documents_add(&server, 7, 1).await;
+        mount_documents_add(&server, 7, 1, None).await;
         Mock::given(method("GET"))
             .and(path("/tasks/7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -672,7 +963,7 @@ mod tests {
     async fn empty_input_only_ensures_the_index() {
         let server = MockServer::start().await;
         mount_index_creation(&server).await;
-        mount_documents_add(&server, 2, 0).await;
+        mount_documents_add(&server, 2, 0, Some("id")).await;
 
         let out = run(
             &server,
@@ -713,7 +1004,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        mount_documents_add(&server, 9, 3).await;
+        mount_documents_add(&server, 9, 3, None).await;
         Mock::given(method("GET"))
             .and(path("/tasks/9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(task(
@@ -758,19 +1049,206 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_create_index_false_skips_the_lookup() {
+    async fn auto_create_index_false_does_not_create_a_missing_index() {
+        // The index is still looked up (to learn its primary key), but a missing one is
+        // not created: the additions go out with the configured key, as before.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/indexes/{INDEX}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
+            .respond_with(ResponseTemplate::new(404).set_body_json(index_not_found()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")))
             .expect(0)
             .mount(&server)
             .await;
-        mount_documents_add(&server, 3, 1).await;
+        mount_documents_add(&server, 3, 1, Some("id")).await;
         let mut cfg = config(&server.uri());
         cfg["auto_create_index"] = json!(false);
         cfg["wait_for_completion"] = json!(false);
         let out = run(&server, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap();
+        assert_eq!(out.document_count(), 2);
+    }
+
+    fn index_with_primary_key(primary_key: Value) -> Value {
+        json!({
+            "uid": INDEX,
+            "primaryKey": primary_key,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        })
+    }
+
+    async fn mount_succeeded_addition(server: &MockServer, task_uid: u32) {
+        Mock::given(method("GET"))
+            .and(path(format!("/tasks/{task_uid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                task_uid,
+                "succeeded",
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 2, "indexedDocuments": 2}),
+                None,
+            )))
+            .mount(server)
+            .await;
+    }
+
+    /// Documents as a Scrapix crawl writes them: the index key is `uid`, not `id`.
+    fn docs_with_uid() -> Vec<Document> {
+        docs()
+            .into_iter()
+            .map(|mut d| {
+                d.fields.insert("uid".into(), json!(format!("u-{}", d.id)));
+                d
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_existing_index_keeps_its_own_primary_key() {
+        // An index created elsewhere (a Scrapix crawl) with `uid` as its key. Sending
+        // `?primaryKey=id` makes Meilisearch reject every addition with
+        // `index_primary_key_already_exists`, so the parameter must be left out.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(json!("uid"))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param("primaryKey", "id"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(8, "documentAdditionOrUpdate")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tasks/8"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                8,
+                "failed",
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 2, "indexedDocuments": 0}),
+                Some(meili_error(
+                    "index_primary_key_already_exists",
+                    "invalid_request",
+                    "Index already has a primary key: `uid`.",
+                )),
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param_is_missing("primaryKey"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(2, "documentAdditionOrUpdate")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_succeeded_addition(&server, 2).await;
+
+        let input_docs = docs_with_uid();
+        let out = run(
+            &server,
+            PluginInput::Documents(input_docs.clone()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            PluginOutput::Indexed(IndexReport {
+                index: INDEX.into(),
+                document_count: 2,
+                task_uids: vec![2],
+            })
+        );
+        // The documents themselves are unchanged.
+        let requests = server.received_requests().await.unwrap();
+        let add = requests
+            .iter()
+            .find(|r| r.method == "POST")
+            .expect("documents request");
+        let sent: Vec<Value> = add.body_json().unwrap();
+        let expected: Vec<Value> = input_docs.iter().map(Document::to_index_json).collect();
+        assert_eq!(sent, expected);
+        assert_eq!(sent[0]["uid"], "u-a");
+    }
+
+    #[tokio::test]
+    async fn an_existing_index_without_a_primary_key_gets_the_configured_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(Value::Null)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param_is_missing("primaryKey"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(5, "documentAdditionOrUpdate")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
+        mount_succeeded_addition(&server, 2).await;
+
+        let out = run(
+            &server,
+            PluginInput::Documents(docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.document_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_create_index_false_still_respects_an_existing_primary_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(json!("uid"))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .and(query_param_is_missing("primaryKey"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(3, "documentAdditionOrUpdate")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut cfg = config(&server.uri());
+        cfg["auto_create_index"] = json!(false);
+        cfg["wait_for_completion"] = json!(false);
+        let out = run(&server, PluginInput::Documents(docs_with_uid()), cfg)
             .await
             .unwrap();
         assert_eq!(out.document_count(), 2);
@@ -927,19 +1405,138 @@ mod tests {
         let props = m.config_schema["properties"]
             .as_object()
             .expect("properties");
-        for key in ["host", "api_key", "index", "project_id", "region"] {
+        // Destination credentials and tenant tags are injected, never typed.
+        for key in ["host", "api_key", "tenant_id", "region"] {
             assert_eq!(
                 props[key]["readOnly"],
                 serde_json::json!(true),
                 "{key} must be marked readOnly"
             );
         }
-        // Author-controlled knobs stay editable.
-        for key in ["primary_key", "batch_size"] {
+        // Author-controlled knobs stay editable, including the connection that pins the
+        // destination and the index that may be pinned next to it.
+        for key in [
+            "connection",
+            "index",
+            "primary_key",
+            "batch_size",
+            "max_batch_bytes",
+        ] {
             assert!(
                 props[key].get("readOnly").is_none(),
                 "{key} should remain editable"
             );
         }
+    }
+
+    // ----- batch planning (max_batch_bytes) -----
+
+    #[test]
+    fn plan_batches_splits_on_count() {
+        let got = plan_batches(&[10; 5], 2, u64::MAX).expect("fits");
+        assert_eq!(got, vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn plan_batches_splits_on_bytes() {
+        // Each batch is "[" + docs joined by "," + "]". Two 10-byte docs = 2 + 10 + 1 + 10
+        // = 23 bytes, so a 23-byte cap fits exactly two and a 22-byte cap only one.
+        assert_eq!(
+            plan_batches(&[10; 4], 1000, 23).expect("fits"),
+            vec![0..2, 2..4]
+        );
+        assert_eq!(
+            plan_batches(&[10; 3], 1000, 22).expect("fits"),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn plan_batches_cuts_at_whichever_limit_comes_first() {
+        // Bytes bind first: a 25-byte cap fits two 10-byte docs, count would allow 3.
+        assert_eq!(
+            plan_batches(&[10; 4], 3, 25).expect("fits"),
+            vec![0..2, 2..4]
+        );
+        // Count binds first: bytes would allow many, count caps at 2.
+        assert_eq!(
+            plan_batches(&[1; 5], 2, 10_000).expect("fits"),
+            vec![0..2, 2..4, 4..5]
+        );
+    }
+
+    #[test]
+    fn plan_batches_rejects_a_document_that_fits_no_batch() {
+        let err = plan_batches(&[10, 500, 10], 1000, 100).expect_err("oversized");
+        assert_eq!(
+            err,
+            OversizedDoc {
+                index: 1,
+                bytes: 500
+            }
+        );
+    }
+
+    #[test]
+    fn plan_batches_of_nothing_is_no_batches() {
+        assert!(plan_batches(&[], 1000, 100).expect("fits").is_empty());
+    }
+
+    #[test]
+    fn plan_batches_covers_every_document_exactly_once() {
+        let sizes: Vec<usize> = (1..=97).map(|i| (i * 37) % 200 + 1).collect();
+        let batches = plan_batches(&sizes, 7, 600).expect("fits");
+        let mut next = 0;
+        for r in &batches {
+            assert_eq!(r.start, next, "batches are contiguous");
+            assert!(!r.is_empty(), "no empty batch");
+            assert!(r.len() <= 7, "count cap respected");
+            let bytes = 2 + r.len() - 1 + sizes[r.clone()].iter().sum::<usize>();
+            assert!(bytes <= 600, "byte cap respected: {bytes}");
+            next = r.end;
+        }
+        assert_eq!(next, sizes.len(), "every document is sent");
+    }
+
+    #[test]
+    fn max_batch_bytes_defaults_and_rejects_zero() {
+        let cfg: IndexerConfig = serde_json::from_value(serde_json::json!({
+            "host": "http://m", "api_key": "k", "index": "i"
+        }))
+        .expect("config");
+        assert_eq!(cfg.max_batch_bytes, DEFAULT_MAX_BATCH_BYTES);
+
+        let zero = serde_json::json!({
+            "host": "http://m", "api_key": "k", "index": "i", "max_batch_bytes": 0
+        });
+        assert!(parse_config(zero).is_err());
+    }
+
+    #[test]
+    fn an_unresolved_connection_is_named_in_the_error() {
+        // The worker activity resolves `connection` into host/api_key before the plugin
+        // runs; if that did not happen, the error must say which connection, not just
+        // "no host".
+        let Err(PluginError::InvalidConfig(msg)) = parse_config(serde_json::json!({
+            "connection": "prod-movies", "index": "movies"
+        })) else {
+            panic!("an unresolved connection must be rejected");
+        };
+        assert!(msg.contains("prod-movies"), "{msg}");
+        assert!(msg.contains("not resolved"), "{msg}");
+    }
+
+    #[test]
+    fn a_resolved_connection_parses_to_its_host_and_key() {
+        let parsed = parse_config(serde_json::json!({
+            "connection": "prod-movies",
+            "host": " https://movies.example ",
+            "api_key": "k",
+            "index": "movies"
+        }))
+        .unwrap_or_else(|e| panic!("resolved config must parse: {e}"));
+        assert_eq!(parsed.host, "https://movies.example", "trimmed");
+        assert_eq!(parsed.api_key, "k");
+        assert_eq!(parsed.cfg.connection.as_deref(), Some("prod-movies"));
     }
 }

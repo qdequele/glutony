@@ -1,25 +1,28 @@
 //! Control-plane binary: reads its configuration from the environment, connects to
 //! Postgres, applies migrations and serves the internal HTTP API.
 
-use std::net::SocketAddr;
-
 use anyhow::Context;
+use meili_ingest_control_plane::boot::BootConfig;
 use meili_ingest_control_plane::{AppState, app, db};
 use tracing_subscriber::EnvFilter;
-
-/// Default listen address (SPEC §13).
-const DEFAULT_BIND: &str = "0.0.0.0:9000";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
-    let bind = std::env::var("BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    let addr: SocketAddr = bind
-        .parse()
-        .with_context(|| format!("BIND {bind:?} is not a valid socket address"))?;
+    // Validate the whole configuration BEFORE touching Postgres: a binary that
+    // migrates and then refuses its configuration leaves the database ahead of the
+    // image still running (sqlx refuses a migration it does not know).
+    let BootConfig {
+        database_url,
+        addr,
+        internal_token,
+        lab: lab_config,
+    } = BootConfig::from_env()?;
+    if let Some(config) = &lab_config {
+        // Also before Postgres: wrong credentials abort boot (spec §3.6).
+        meili_ingest_control_plane::boot::confirm_lab_identity(config).await?;
+    }
 
     tracing::info!("connecting to Postgres");
     let pool = db::connect(&database_url)
@@ -28,15 +31,66 @@ async fn main() -> anyhow::Result<()> {
     db::migrate(&pool).await.context("applying migrations")?;
     tracing::info!("migrations applied");
 
+    if internal_token.is_none() && lab_config.is_some() {
+        tracing::warn!(
+            "CONTROL_PLANE_TOKEN_DISABLED=true with Lab credentials: GET /internal/lab/ai \
+             answers 403 token_required, so LAB_AI_GATEWAY workers cannot run Lab AI steps"
+        );
+    }
+    let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
+    if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
+        // Workers ask `GET /internal/lab/credits/{account}` before a source run and
+        // `GET /internal/lab/ai/{account}` before an AI step. This client is on that
+        // path: short timeouts, and no redirects so the bearer secret is never
+        // replayed to another host.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("cannot build the Lab HTTP client")?;
+        state = state
+            .with_lab_credits(std::sync::Arc::new(
+                meili_ingest_lab::AccountCreditCache::new(creds.clone(), http.clone()),
+            ))
+            .with_lab_ai(std::sync::Arc::new(meili_ingest_lab::AiTargetCache::new(
+                creds.clone(),
+                http,
+            )));
+        tracing::info!("credit pre-check and AI target lookup enabled");
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let sender = match lab_config {
+        Some(config) => {
+            tracing::info!(url = %config.url(), "lab events sender enabled");
+            let sender = meili_ingest_control_plane::lab_sender::LabSender::new(
+                meili_ingest_control_plane::lab_events::LabEventRepo::new(pool.clone()),
+                config,
+                state.metrics.clone(),
+                state.lab_notify.clone(),
+            )?;
+            Some(tokio::spawn(sender.run(cancel.clone())))
+        }
+        None => {
+            tracing::info!("LAB_URL is unset: lab events are kept in the outbox, not sent");
+            None
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "control plane listening");
 
-    axum::serve(listener, app(AppState::new(pool.clone())))
+    axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("http server")?;
+
+    cancel.cancel();
+    if let Some(handle) = sender {
+        let _ = handle.await;
+    }
 
     tracing::info!("shutting down");
     pool.close().await;

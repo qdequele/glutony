@@ -8,11 +8,29 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
-use meili_ingest_plugin_sdk::PipelineDefinition;
+use meili_ingest_plugin_sdk::{PipelineDefinition, RowScope};
+use serde::Serialize;
 
-use crate::context::resolve_project_id;
+use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::AppState;
+
+/// A pipeline as the API returns it: the definition plus whose it is.
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineView {
+    /// The definition, flattened into the response object.
+    #[serde(flatten)]
+    pub pipeline: PipelineDefinition,
+    /// Whose it is.
+    pub scope: RowScope,
+}
+
+impl From<PipelineDefinition> for PipelineView {
+    fn from(pipeline: PipelineDefinition) -> Self {
+        let scope = RowScope::of(pipeline.builtin, pipeline.tenant_id.as_deref());
+        Self { pipeline, scope }
+    }
+}
 
 /// Whether a content type denotes YAML.
 pub fn is_yaml(content_type: Option<&str>) -> bool {
@@ -60,12 +78,30 @@ pub fn parse_pipeline(
     Ok(def)
 }
 
+/// Stamp the caller's tenant on the definition. A caller with a tenant always wins over
+/// the body; a global caller (an Admin, or open mode without an edge tenant) keeps the
+/// body's `tenant_id` so operators can create a tenant's pipeline, but it is validated
+/// like every tenant id that enters the system (spec §3.1).
+fn apply_scope(scope: &Scope, def: &mut PipelineDefinition) -> Result<(), GatewayError> {
+    match &scope.tenant_id {
+        Some(tenant_id) => def.tenant_id = Some(tenant_id.clone()),
+        None => {
+            if let Some(tenant_id) = &def.tenant_id {
+                meili_ingest_plugin_sdk::validate_tenant_id(tenant_id)
+                    .map_err(GatewayError::InvalidTenant)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `POST /pipelines` — create or update.
 pub async fn create_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<PipelineDefinition>), GatewayError> {
+) -> Result<(StatusCode, Json<PipelineView>), GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
     def.validate()
@@ -75,26 +111,23 @@ pub async fn create_pipeline(
             "user pipelines cannot be marked builtin".into(),
         ));
     }
-    if let Some(project_id) = resolve_project_id(&headers, &state.config) {
-        def.project_id = Some(project_id);
-    }
+    apply_scope(&scope, &mut def)?;
     let stored = state.control_plane.upsert_pipeline(&def).await?;
-    tracing::info!(pipeline = %stored.uid, project_id = ?stored.project_id, version = stored.version, "pipeline upserted");
-    Ok((StatusCode::CREATED, Json(stored)))
+    tracing::info!(pipeline = %stored.uid, tenant_id = ?stored.tenant_id, version = stored.version, "pipeline upserted");
+    Ok((StatusCode::CREATED, Json(stored.into())))
 }
 
 /// `GET /pipelines`.
 pub async fn list_pipelines(
     State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<PipelineDefinition>>, GatewayError> {
-    let project_id = resolve_project_id(&headers, &state.config);
-    Ok(Json(
-        state
-            .control_plane
-            .list_pipelines(project_id.as_deref())
-            .await?,
-    ))
+    scope: Scope,
+) -> Result<Json<Vec<PipelineView>>, GatewayError> {
+    let tenant_id = scope.tenant_id.clone();
+    let rows = state
+        .control_plane
+        .list_pipelines(tenant_id.as_deref())
+        .await?;
+    Ok(Json(rows.into_iter().map(PipelineView::from).collect()))
 }
 
 /// `POST /pipelines/validate` — check a definition without saving it.
@@ -104,44 +137,60 @@ pub async fn list_pipelines(
 /// while the author is still typing.
 pub async fn validate_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
-    if let Some(project_id) = resolve_project_id(&headers, &state.config) {
-        def.project_id = Some(project_id);
-    }
+    apply_scope(&scope, &mut def)?;
     Ok(Json(state.control_plane.validate_pipeline(&def).await?))
 }
 
 /// `GET /pipelines/{name}`.
 pub async fn get_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<PipelineDefinition>, GatewayError> {
-    let project_id = resolve_project_id(&headers, &state.config);
-    Ok(Json(
-        state
-            .control_plane
-            .get_pipeline(&name, project_id.as_deref())
-            .await?,
-    ))
+) -> Result<Json<PipelineView>, GatewayError> {
+    let tenant_id = scope.tenant_id.clone();
+    let row = state
+        .control_plane
+        .get_pipeline(&name, tenant_id.as_deref())
+        .await?;
+    Ok(Json(row.into()))
 }
 
 /// `DELETE /pipelines/{name}` → 204.
 pub async fn delete_pipeline(
     State(state): State<AppState>,
+    scope: Scope,
     Path(name): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, GatewayError> {
-    let project_id = resolve_project_id(&headers, &state.config);
-    state
+    let tenant_id = scope.tenant_id.clone();
+    let archived = state
         .control_plane
-        .delete_pipeline(&name, project_id.as_deref())
+        .delete_pipeline(&name, tenant_id.as_deref())
         .await?;
-    tracing::info!(pipeline = %name, project_id = ?project_id, "pipeline deleted");
+    // The control plane archived the sources feeding this pipeline; stop their
+    // schedules so they do not keep firing into a source that can no longer run. The
+    // pipeline is already gone, so a failure here is logged rather than returned.
+    for source_id in &archived {
+        let schedule_id = meili_ingest_source::SourceRunInput::schedule_id(*source_id);
+        if let Err(e) = state.schedules.delete(&schedule_id).await {
+            tracing::error!(
+                pipeline = %name,
+                schedule = %schedule_id,
+                "could not delete the schedule of an archived source: {e}"
+            );
+        }
+    }
+    tracing::info!(
+        pipeline = %name,
+        tenant_id = ?tenant_id,
+        archived_sources = archived.len(),
+        "pipeline deleted"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -214,15 +263,53 @@ steps:
     }
 
     #[tokio::test]
+    async fn management_routes_need_the_token_when_auth_is_on() {
+        let server = MockServer::start().await;
+        let config = GatewayConfig {
+            lab_service_token: Some("lab-secret".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, config).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/pipelines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer");
+
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .and(wq("tenant_id", "acct-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let resp = app
+            .oneshot(
+                Request::get("/pipelines")
+                    .header("authorization", "Bearer lab-secret")
+                    .header("x-glutony-tenant-id", "acct-1")
+                    // A trusted edge header for another tenant must not win.
+                    .header("x-meili-project-id", "someone-else")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn post_yaml_is_validated_forwarded_with_tenant_and_returns_201() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/pipelines"))
             .and(body_partial_json(
-                json!({"uid": "my-pdf", "project_id": "xxx"}),
+                json!({"uid": "my-pdf", "tenant_id": "xxx"}),
             ))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-                "uid": "my-pdf", "name": "PDF", "version": 2, "project_id": "xxx",
+                "uid": "my-pdf", "name": "PDF", "version": 2, "tenant_id": "xxx",
                 "steps": [{"id": "extract", "plugin": "pdf_extractor"}]
             })))
             .mount(&server)
@@ -237,7 +324,92 @@ steps:
         assert_eq!(resp.status(), StatusCode::CREATED);
         let json = json_body(resp).await;
         assert_eq!(json["version"], 2);
-        assert_eq!(json["project_id"], "xxx");
+        assert_eq!(json["tenant_id"], "xxx");
+    }
+
+    #[tokio::test]
+    async fn a_global_caller_body_tenant_id_is_validated() {
+        let server = MockServer::start().await;
+        let body = |tenant: &str| {
+            json!({"uid": "t", "tenant_id": tenant,
+                   "steps": [{"id": "a", "plugin": "chunker"}]})
+            .to_string()
+        };
+
+        // Admin with no tenant header: the body's tenant is honored but must be valid.
+        let admin = GatewayConfig {
+            admin_api_key: Some("admin-key".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, admin).await;
+        for uri in ["/pipelines", "/pipelines/validate"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post(uri)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("authorization", "Bearer admin-key")
+                        .body(Body::from(body("a/b")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(json_body(resp).await["code"], "invalid_tenant", "{uri}");
+        }
+
+        // Open mode with no edge tenant behaves the same.
+        let (open, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = open
+            .oneshot(
+                Request::post("/pipelines")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body("a/b")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_may_still_create_a_pipeline_for_a_valid_body_tenant() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines"))
+            .and(body_partial_json(
+                json!({"uid": "t", "tenant_id": "acct-9"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "uid": "t", "name": "t", "version": 1, "tenant_id": "acct-9",
+                "steps": [{"id": "a", "plugin": "chunker"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let admin = GatewayConfig {
+            admin_api_key: Some("admin-key".into()),
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, admin).await;
+        let body = json!({"uid": "t", "tenant_id": "acct-9",
+                          "steps": [{"id": "a", "plugin": "chunker"}]})
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::post("/pipelines")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer admin-key")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -262,7 +434,7 @@ steps:
         assert_eq!(resp.status(), StatusCode::CREATED);
         let sent = server.received_requests().await.unwrap().remove(0);
         let sent: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
-        assert!(sent.get("project_id").is_none());
+        assert!(sent.get("tenant_id").is_none());
     }
 
     #[tokio::test]
@@ -387,7 +559,7 @@ steps:
         let def = sample_pipeline("builtin.pdf", None);
         Mock::given(method("GET"))
             .and(path("/pipelines"))
-            .and(wq("project_id", "xxx"))
+            .and(wq("tenant_id", "xxx"))
             .respond_with(ResponseTemplate::new(200).set_body_json(vec![def.clone()]))
             .mount(&server)
             .await;
@@ -471,5 +643,38 @@ steps:
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn pipelines_say_whose_they_are() {
+        let server = MockServer::start().await;
+        let mut own = sample_pipeline("mine", None);
+        own.tenant_id = Some("t1".into());
+        let global = sample_pipeline("shared", None);
+        let mut builtin = sample_pipeline("builtin.pdf", None);
+        builtin.builtin = true;
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![own, global, builtin]))
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(
+                Request::get("/pipelines")
+                    .header("x-meili-project-id", "t1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = json_body(resp).await;
+        assert_eq!(json[0]["scope"], "tenant");
+        assert_eq!(json[1]["scope"], "global");
+        assert_eq!(json[2]["scope"], "builtin");
+        assert_eq!(
+            json[0]["uid"], "mine",
+            "the definition is flattened, not nested"
+        );
     }
 }

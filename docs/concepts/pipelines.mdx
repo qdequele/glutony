@@ -59,7 +59,7 @@ steps:
 | `steps[].plugin` | yes | A registered plugin name; unknown → `422`. |
 | `steps[].depends_on` | no | Steps to wait for. |
 | `steps[].fan_out` | no | `$.documents`, `$.many` or `$`. Requires exactly one dependency. |
-| `steps[].config` | no | Plugin config block (object). |
+| `steps[].config` | no | Plugin config block (object), checked against the plugin's `config_schema`; a mismatch → `422`. |
 | `steps[].timeout_secs` | no | Activity start-to-close timeout. |
 | `steps[].retry` | no | Retry policy. |
 
@@ -80,16 +80,21 @@ steps:
   collected into a `Many` output; the next step receives it as its input
   (fan-in). Plugins that accept `documents` flatten `Many` automatically.
 - **Routing.** Each activity is scheduled on the task queue of its plugin
-  (`workers-general` / `workers-llm` / `workers-gpu` / `workers-io`), so GPU
-  and LLM work never blocks parsing.
+  (`workers-general` / `workers-io`). AI steps call hosted APIs, so they run
+  on `workers-general` with parsing; downloads run on `workers-io`.
 - **Failure.** A step that exhausts its retries, or returns a non-retryable
   error, fails the job with `status: failed` and the message in `error`.
   Already-completed steps are not rolled back (documents indexed by an
   earlier indexer step stay indexed).
 - **Cancellation.** `POST /jobs/:id/cancel` sets `cancel_requested`; running
   activities are cancelled, no new step starts, status becomes `cancelled`.
-- **Validation** at creation time: unique ids, known dependencies, no cycles
-  (Kahn's algorithm), `fan_out` arity/path, known plugins.
+- **Validation** at creation time (and by `POST /pipelines/validate`, which
+  saves nothing): unique ids, known dependencies, no cycles (Kahn's algorithm),
+  `fan_out` arity/path, known plugins, each step's `config` against its plugin's
+  `config_schema` from `GET /plugins` (unknown keys and wrong types are `422`),
+  and each `meili_indexer` `connection` against the tenant's connections (its
+  own, else a global one). A plugin that no worker has registered yet has no
+  schema to check against, so its config is accepted as is.
 
 ## Payload sizes
 
@@ -124,10 +129,10 @@ Default retry: `max_attempts: 3, backoff: exponential`.
 <Note>
 Every plugin these pipelines reference is compiled into the worker, including
 `pptx_extractor`, `video_audio_extractor` and `whisper_transcriber`. The audio
-and video pipelines run on the `workers-gpu` queue, and `whisper_transcriber`
+and video pipelines run on the `workers-general` queue, and `whisper_transcriber`
 needs `TRANSCRIBE_API_KEY` (or `LLM_API_KEY`) pointing at an OpenAI-compatible
 `/audio/transcriptions` endpoint; without it that step fails with a clear
-message. `ocr` is the one routed name still expecting a
+message. `ocr` is the one referenced name still expecting a
 [gRPC plugin](/plugins/authoring-grpc).
 </Note>
 
@@ -142,8 +147,8 @@ curl $INGEST/pipelines/my-pdf-with-enrichment
 curl -X DELETE $INGEST/pipelines/my-pdf-with-enrichment     # 403 for builtin.*
 ```
 
-Upserts are keyed by `(uid, project_id)`. Behind Meilisearch Cloud the project
-id comes from Envoy, so each tenant has its own namespace of uids and can shadow
+Upserts are keyed by `(uid, tenant_id)`. Behind Meilisearch Cloud the tenant id
+comes from Envoy, so each tenant has its own namespace of uids and can shadow
 a global pipeline (or a built-in's trigger) without affecting others.
 
 Examples: [`config/pipelines/`](https://github.com/meilisearch/meili-ingest/tree/main/config/pipelines).

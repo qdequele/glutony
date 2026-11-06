@@ -8,7 +8,9 @@ members = [
     "crates/blob",
     "crates/plugin-sdk",
     "crates/usage",
+    "crates/lab",
     "crates/plugin-runtime",
+    "crates/source",
     "crates/plugins/pdf",
     "crates/plugins/docx",
     "crates/plugins/xlsx",
@@ -20,6 +22,7 @@ members = [
     "crates/plugins/script",
     "crates/plugins/meili-indexer",
     "crates/plugins/llm-enricher",
+    "crates/plugins/jev-enricher",
     "crates/plugins/image-captioner",
     "crates/plugins/pptx",
     "crates/plugins/audio-transcriber",
@@ -42,6 +45,7 @@ meili-ingest-plugin-sdk = { path = "crates/plugin-sdk", version = "0.1.0" }
 meili-ingest-router = { path = "crates/router" }
 meili-ingest-blob = { path = "crates/blob" }
 meili-ingest-usage = { path = "crates/usage" }
+meili-ingest-lab = { path = "crates/lab" }
 meili-ingest-plugin-runtime = { path = "crates/plugin-runtime" }
 meili-ingest-plugin-pdf = { path = "crates/plugins/pdf" }
 meili-ingest-plugin-docx = { path = "crates/plugins/docx" }
@@ -54,6 +58,7 @@ meili-ingest-plugin-chunker = { path = "crates/plugins/chunker" }
 meili-ingest-plugin-script = { path = "crates/plugins/script" }
 meili-ingest-plugin-meili-indexer = { path = "crates/plugins/meili-indexer" }
 meili-ingest-plugin-llm-enricher = { path = "crates/plugins/llm-enricher" }
+meili-ingest-plugin-jev-enricher = { path = "crates/plugins/jev-enricher" }
 meili-ingest-plugin-image-captioner = { path = "crates/plugins/image-captioner" }
 meili-ingest-plugin-pptx = { path = "crates/plugins/pptx" }
 meili-ingest-plugin-audio-transcriber = { path = "crates/plugins/audio-transcriber" }
@@ -61,6 +66,7 @@ meili-ingest-plugin-video-audio = { path = "crates/plugins/video-audio" }
 meili-ingest-plugin-msgpack = { path = "crates/plugins/msgpack" }
 meili-ingest-plugin-avro = { path = "crates/plugins/avro" }
 meili-ingest-plugin-parquet = { path = "crates/plugins/parquet" }
+meili-ingest-source = { path = "crates/source" }
 
 # async / runtime
 tokio = { version = "1.47", features = ["full"] }
@@ -81,8 +87,16 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+toml = "0.9"
 base64 = "0.23"
 bytes = "1"
+
+# scheduled sources: sealed secrets, change detection, transparent gzip, cron timezones
+chacha20poly1305 = "0.10"
+rand = "0.9"
+blake3 = "1"
+flate2 = "1"
+chrono-tz = "0.10"
 
 # temporal
 temporalio-sdk = "1.0"
@@ -106,8 +120,6 @@ meilisearch-sdk = "0.33"
 # detection / parsing
 infer = "0.22"
 mime_guess = "2"
-# Compiles the exported admin UI into the gateway binary (feature `ui`).
-rust-embed = { version = "8", features = ["mime-guess"] }
 globset = "0.4"
 regex = "1"
 serde_json_path = "0.7"
@@ -159,9 +171,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # misc
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+subtle = "2.6"
+
+# Lab events: HMAC-signed delivery and Prometheus metrics
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+prometheus = { version = "0.14", default-features = false }
 
 # testing
 tempfile = "3"

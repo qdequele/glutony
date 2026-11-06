@@ -25,8 +25,8 @@
 # - All Rust services share one `target-cache` volume so dependencies are built
 #   once. Cargo serialises concurrent builds with a file lock, so the very first
 #   `watch` can take several minutes.
-# - LLM_API_KEY is read from your shell environment (or a .env file) and is only
-#   needed by worker-llm.
+# - LLM_API_KEY, TYPESAFE_API_KEY and TRANSCRIBE_API_KEY are read from your shell
+#   environment (or a .env file) and are only needed by worker-general.
 
 name: meili-ingest
 
@@ -54,11 +54,26 @@ x-rust-dev: &rust-dev
       - action: rebuild
         path: ./Cargo.lock
 
+# Meilisearch connections, shared by the gateway (which seals keys) and every worker
+# (which opens them). They must use the same SOURCE_SECRET_KEY. The default below is a
+# well-known dev-only value ("dev-only-source-secret-key-32byt"): never deploy it.
+# The dev Meilisearch is a private address, which the default `public` host policy would
+# refuse, hence the allowlist.
+x-connections-env: &connections-env
+  SOURCE_SECRET_KEY: ${SOURCE_SECRET_KEY:-ZGV2LW9ubHktc291cmNlLXNlY3JldC1rZXktMzJieXQ=}
+  MEILI_CONNECTION_HOSTS: ${MEILI_CONNECTION_HOSTS:-meilisearch:7700}
+  # Where scheduled sources may fetch from. `public` (https, public addresses only) is
+  # the safe default; list hosts here to fetch from an internal file server.
+  SOURCE_FETCH_HOSTS: ${SOURCE_FETCH_HOSTS:-public}
+
 x-worker-env: &worker-env
+  <<: *connections-env
   RUST_LOG: info,meili_ingest=debug
   TEMPORAL_URL: http://temporal:7233
   TEMPORAL_NAMESPACE: default
   CONTROL_PLANE_URL: http://control-plane:9000
+  # Shared by the three services. The default is a well-known dev-only value: never deploy it.
+  CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}
   BLOB_STORE_URL: file:///data/blobs
   PAYLOAD_SPILL_BYTES: "1048576"
   MAX_CONCURRENT_ACTIVITIES: "20"
@@ -74,7 +89,10 @@ services:
   postgres:
     image: postgres:17-alpine
     ports:
-      - "5432:5432"
+      # Host side is overridable because 5432 is the port every other local
+      # Postgres wants too; the stack itself reaches this over the compose network
+      # (postgres:5432), so only host tools care. POSTGRES_HOST_PORT=55433 to dodge.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: dev-password
@@ -138,6 +156,7 @@ services:
       RUST_LOG: info,meili_ingest=debug
       BIND: 0.0.0.0:9000
       DATABASE_URL: postgres://postgres:dev-password@postgres:5432/postgres
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}
     depends_on:
       postgres:
         condition: service_healthy
@@ -154,11 +173,13 @@ services:
     ports:
       - "8080:8080"
     environment:
+      <<: *connections-env
       RUST_LOG: info,meili_ingest=debug
       BIND: 0.0.0.0:8080
       TEMPORAL_URL: http://temporal:7233
       TEMPORAL_NAMESPACE: default
       CONTROL_PLANE_URL: http://control-plane:9000
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-dev-only-control-plane-token}
       # Standalone-mode fallback (SPEC §3.3): every request without X-Meili-*
       # headers targets the local Meilisearch.
       MEILI_URL: http://meilisearch:7700
@@ -195,51 +216,20 @@ services:
     environment:
       <<: *worker-env
       TASK_QUEUE: workers-general
-    volumes:
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-git:/usr/local/cargo/git
-      - target-cache:/app/target
-      - blobs:/data/blobs
-    depends_on:
-      temporal:
-        condition: service_healthy
-      control-plane:
-        condition: service_started
-
-  worker-llm:
-    <<: *rust-dev
-    command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]
-    environment:
-      <<: *worker-env
-      TASK_QUEUE: workers-llm
+      # AI steps call hosted APIs from this pool. Without a key the matching
+      # plugins register as unavailable; everything else still runs.
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
-    volumes:
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-git:/usr/local/cargo/git
-      - target-cache:/app/target
-      - blobs:/data/blobs
-    depends_on:
-      temporal:
-        condition: service_healthy
-      control-plane:
-        condition: service_started
-
-  # Media pool. The task queue is named workers-gpu because SPEC 8.3 routes
-  # whisper_transcriber, video_audio_extractor and ocr there; the in-repo media
-  # plugins are pure Rust and need no GPU, so this service runs the same image as
-  # every other worker. A production GPU pool (see k8s/workers.yaml) adds gRPC
-  # plugin sidecars for local inference.
-  worker-gpu:
-    <<: *rust-dev
-    command: ["cargo", "watch", "-x", "run --bin meili-ingest-worker", "-w", "crates", "-w", "proto"]
-    environment:
-      <<: *worker-env
-      TASK_QUEUE: workers-gpu
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      TYPESAFE_BASE_URL: ${TYPESAFE_BASE_URL:-https://api.typesafe.ai/v1}
+      JEV_MODEL: ${JEV_MODEL:-jev-latest}
+      # whisper_transcriber: falls back to the LLM key and endpoint.
       TRANSCRIBE_API_KEY: ${TRANSCRIBE_API_KEY:-${LLM_API_KEY:-}}
       TRANSCRIBE_BASE_URL: ${TRANSCRIBE_BASE_URL:-${LLM_BASE_URL:-https://api.openai.com/v1}}
       TRANSCRIBE_MODEL: ${TRANSCRIBE_MODEL:-whisper-1}
+      # true behind the Lab: Lab accounts' AI steps use the team's Gateway.
+      LAB_AI_GATEWAY: ${LAB_AI_GATEWAY:-}
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git

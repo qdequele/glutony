@@ -49,7 +49,7 @@ The **gateway** (axum) receives the request, resolves a `MeiliContext`
 (which Meilisearch host / key / index this is for), detects the MIME type,
 asks the **control plane** (axum + Postgres) which pipeline applies, and starts
 a `PipelineWorkflow` on **Temporal**. **Workers** poll typed task queues
-(`workers-general`, `workers-llm`, `workers-gpu`, `workers-io`) and run one
+(`workers-general`, `workers-io`) and run one
 activity per step through a plugin registry. The last step, `meili_indexer`,
 is the only code that talks to Meilisearch.
 

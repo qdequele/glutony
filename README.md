@@ -11,7 +11,7 @@ orchestrated by [Temporal](https://temporal.io), and pushes the result into a
 Meilisearch index.
 
 - **100% Rust** — axum gateway, Temporal workers, sqlx control plane.
-- **Kubernetes-native** — Deployments, KEDA autoscaling per task queue, GPU pools.
+- **Kubernetes-native** — Deployments, KEDA autoscaling per task queue.
 - **Multi-tenant** — one deployment serves every Meilisearch Cloud project via Envoy-injected headers; also runs standalone.
 - **Extensible** — built-in, WASM (extism) and gRPC plugins share one `Plugin` trait (`meili-ingest-plugin-sdk`).
 
@@ -43,13 +43,14 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                     ┌─────────────────┼──────────────────┐
-                     ▼                 ▼                  ▼
-              workers-general    workers-llm        workers-gpu
-              (pdf,docx,xlsx,    (llm_enricher)     (whisper,ocr)
-               chunker,indexer)
-                     │                 │                  │
-                     └─────────────────┼──────────────────┘
+                         ┌─────────────┴─────────────┐
+                         ▼                           ▼
+                  workers-general               workers-io
+                  (pdf,docx,xlsx,               (s3_downloader)
+                   chunker,indexer,
+                   AI steps, ocr)
+                         │                           │
+                         └─────────────┬─────────────┘
                                        │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
@@ -58,7 +59,7 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         └──────────────────────────────────────────────┘
 ```
 
-Three binaries, one image (`ghcr.io/meilisearch/meili-ingest`):
+Three binaries, one image (`ghcr.io/qdequele/glutony`):
 
 | Binary | Role |
 |---|---|
@@ -168,7 +169,7 @@ steps:
   - id: enrich
     plugin: llm_enricher
     fan_out: "$.documents"
-    config: { model: gpt-4o-mini, prompt: "Extract as JSON: title, summary, keywords, language." }
+    config: { model: openai/gpt-4o-mini, prompt: "Extract as JSON: title, summary, keywords, language." }
   - id: index
     plugin: meili_indexer
 ```
@@ -179,24 +180,56 @@ curl -X POST --data-binary @config/pipelines/pdf-with-enrichment.yaml \
 ```
 
 Other endpoints: `GET /jobs/:id`, `POST /jobs/:id/cancel`, `GET|POST /pipelines`,
-`GET|DELETE /pipelines/:uid`, `GET /plugins`, `GET /health`. Full OpenAPI spec in
+`GET|DELETE /pipelines/:uid`, `/connections`, `/sources`, `GET /plugins`,
+`GET /health`. Full OpenAPI spec in
 [`docs/openapi.yaml`](docs/openapi.yaml).
 
 ## Multi-tenancy
 
-Every request is scoped to a `MeiliContext` (`project_id`, `host`, `api_key`,
+Every request is scoped to a `MeiliContext` (`tenant_id`, `host`, `api_key`,
 `index`, `region`) resolved **once** at the gateway and carried immutably
 through the Temporal workflow. Workers never read Meilisearch credentials from
 the environment; only the `meili_indexer` plugin touches Meilisearch, using the
 context the workflow injects into its config.
 
-Resolution order: `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Project-Id` /
-`X-Meili-Index` headers (injected by Meilisearch Cloud's Envoy, trusted only when
+Resolution order: `X-Meili-Host` / `X-Meili-Api-Key` / `X-Meili-Tenant-Id` (or the older
+`X-Meili-Project-Id`) / `X-Meili-Index` headers (injected by Meilisearch Cloud's
+Envoy or the Lab's edge, trusted only when
 `X-Meili-Envoy-Secret` matches `ENVOY_TRUSTED_HEADER`) → `?index=` →
 `Authorization: Bearer` → `MEILI_URL` / `MEILI_API_KEY` env vars → `400`.
 
-User pipelines can be global or scoped to a `project_id`; tenant pipelines
+User pipelines can be global or scoped to a `tenant_id`; tenant pipelines
 shadow global ones, which shadow built-ins.
+
+A pipeline can instead **pin** its destination: a `meili_indexer` step with
+`connection: <uid>` writes to a named [Meilisearch connection](docs/concepts/connections.mdx)
+(host + sealed key, `POST /connections`), which wins over the request's context.
+A pinned pipeline needs no `X-Meili-*` headers, and its key never enters Temporal
+history.
+
+## Scheduled sources
+
+A **source** fetches a URL on a cron schedule and runs it through a pinned
+pipeline. It skips unchanged content (ETag / Last-Modified / content hash),
+gunzips transparently, and renders the URL against the scheduled time. For
+example, the TMDB daily export:
+
+```bash
+curl -X POST localhost:8080/sources -H 'Content-Type: application/json' -d '{
+  "uid": "tmdb",
+  "pipeline": "tmdb-movies",
+  "location": { "kind": "url",
+    "url": "https://files.tmdb.org/p/exports/movie_ids_{{ date:%m_%d_%Y }}.json.gz" },
+  "cron": "0 9 * * *"
+}'
+curl -X POST localhost:8080/sources/tmdb/run        # run now
+curl localhost:8080/sources/tmdb/runs               # ingested / unchanged / failed
+```
+
+Schedules are Temporal Schedules; each tick runs a `SourceRunWorkflow` that starts
+ordinary ingest jobs. Fetches are restricted by `SOURCE_FETCH_HOSTS` (public https
+only by default), and credentials are sealed with `SOURCE_SECRET_KEY`. See
+[`docs/concepts/sources.mdx`](docs/concepts/sources.mdx).
 
 ## Plugins
 
@@ -220,31 +253,24 @@ pub trait Plugin: Send + Sync + 'static {
 `crates/plugins/llm-enricher` is the canonical example. See
 `docs/plugins/authoring-builtin.mdx`, `authoring-wasm.mdx`, `authoring-grpc.mdx`.
 
-## Admin UI
+## Meilisearch Lab
 
-The gateway can serve a built-in admin UI at `/ui`: a pipeline editor whose config
-forms are generated from each plugin's JSON Schema, job monitoring with a per-step
-timeline and cancellation, an ingest playground that shows which pipeline auto-routed
-a file, and a per-tenant usage dashboard.
-
-It is a Next.js static export compiled into the binary, so production stays one
-container with no Node runtime and the browser talks to the API same-origin. The
-feature is off by default; `cargo build` needs no Node toolchain.
-
-```bash
-cd ui && NEXT_PUBLIC_BASE_PATH=/ui pnpm install && pnpm build
-cd .. && cargo run --features meili-ingest-gateway/ui --bin meili-ingest-gateway
-```
-
-The published image builds it automatically.
+glutony plugs into the Meilisearch Lab through three seams: an opaque tenant on every
+owned row, a token-protected management API, and signed usage events from a durable
+outbox. All three are off by default, so a deployment that sets none of the `LAB_*`
+variables behaves as a standalone one. See
+[docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx).
 
 ## Usage & metering
 
 Every job records per-tenant usage — documents, bytes, LLM tokens, transcription
-seconds, pages — into Tinybird (managed ClickHouse). Reporting runs as a Temporal
-activity, so it is retried until it lands and survives worker crashes, and rows carry
-deterministic ids so a redelivery replaces rather than double-counts. Bill from
-`usage_daily_billing`; see [docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
+seconds, pages — into Tinybird (managed ClickHouse) for analytics (dashboards,
+`GET /usage`, reconciliation). Billing is the Meilisearch Lab's: see
+[docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx). Reporting
+runs as a Temporal activity, so it is retried until it lands and survives worker
+crashes, and rows carry deterministic ids so a redelivery replaces rather than
+double-counts. Read `usage_daily_billing` for deduplicated daily totals; see
+[docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
 [tinybird/README.md](tinybird/README.md).
 
 Without `TINYBIRD_TOKEN` the reporting step is a no-op, so self-hosted deployments need

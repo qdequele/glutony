@@ -13,7 +13,9 @@ in `crates/plugin-sdk/src/types.rs`:
 | `steps[]` | The DAG. `id`, `plugin`, optional `depends_on`, `fan_out` (`$.documents`, `$.many` or `$`), `config`, `timeout_secs`, `retry {max_attempts, backoff: exponential\|linear\|none, initial_interval_secs}`. |
 
 Steps without `depends_on` run after the previous step (implicit sequential
-mode). Cycles and unknown plugins are rejected with `422`.
+mode). Cycles, unknown plugins, a step `config` that breaks its plugin's
+`config_schema` (see `GET /plugins`) and a `meili_indexer` `connection` the tenant
+does not have are rejected with `422`.
 
 ## Register a pipeline
 

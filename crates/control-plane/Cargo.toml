@@ -19,6 +19,7 @@ path = "src/main.rs"
 meili-ingest-plugin-sdk.workspace = true
 meili-ingest-plugin-script.workspace = true
 meili-ingest-router.workspace = true
+meili-ingest-lab.workspace = true
 
 axum.workspace = true
 tokio.workspace = true
@@ -29,6 +30,13 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+meili-ingest-source.workspace = true
+reqwest.workspace = true
+url.workspace = true
+tokio-util.workspace = true
+subtle.workspace = true
+prometheus.workspace = true
+jsonschema = { version = "0.45", default-features = false }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -37,3 +45,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+wiremock.workspace = true

@@ -6,6 +6,15 @@
 #
 # Cargo caches (registry, git, target) are mounted as named volumes by
 # compose.yaml so rebuilds are incremental.
+#
+# There is deliberately no `cargo build` in this image. compose.yaml mounts the
+# shared `target-cache` volume over /app/target, and Docker only seeds a named
+# volume from the image while it is still empty. So a pre-build helped at most on
+# the very first run on a fresh machine, where it merely moved the same compile
+# from build time to run time. After that it was pure cost: ~12 GB of debug
+# artefacts baked into every service's image and re-written on every source change,
+# all hidden by the volume. Now the first `cargo watch` compiles into the volume
+# once and every service reuses it.
 
 FROM rust:1.94-bookworm
 
@@ -16,10 +25,6 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY . .
-
-# Pre-build so the first `cargo watch` cycle is fast. Allowed to fail while the
-# workspace is still being written; the watch loop reports real errors.
-RUN cargo build --workspace --bins || true
 
 EXPOSE 8080 9000
 ENV RUST_LOG=info,meili_ingest=debug \

@@ -28,7 +28,8 @@ xxx.us-west.meilisearch.com/ingest
 
 | Header | Value |
 |---|---|
-| `X-Meili-Project-Id` | tenant identifier (`xxx`) |
+| `X-Meili-Tenant-Id` | tenant identifier (`xxx`) |
+| `X-Meili-Project-Id` | same value, the older name. Still works; `X-Meili-Tenant-Id` wins when both are present |
 | `X-Meili-Host` | full Meilisearch URL, `https://xxx.us-west.meilisearch.io` |
 | `X-Meili-Api-Key` | a key with documents write permission (master or a dedicated ingest key) |
 | `X-Meili-Index` | optional, when the path or query names an index |
@@ -70,6 +71,7 @@ routes:
       cluster: meili-ingest-gateway
       timeout: 600s                     # large uploads
     request_headers_to_remove:
+      - x-meili-tenant-id
       - x-meili-project-id
       - x-meili-host
       - x-meili-api-key
@@ -78,7 +80,7 @@ routes:
       - x-meili-envoy-secret
     request_headers_to_add:
       - header: { key: x-meili-envoy-secret, value: "%ENVIRONMENT(MEILI_INGEST_SECRET)%" }
-      # x-meili-project-id / host / api-key / index / region are added by the
+      # x-meili-project-id (or x-meili-tenant-id) / host / api-key / index / region are added by the
       # glutony Lua/ext_authz filter after looking the project up.
   - match: { prefix: /jobs }
     route: { cluster: meili-ingest-gateway }
@@ -90,12 +92,40 @@ routes:
 
 Set Envoy's per-route body limits at or above the gateway's `MAX_UPLOAD_MB`.
 
+## Index-scoped routes and the caller's own key
+
+The gateway also answers Meilisearch-style URLs, so ingestion can sit next to a
+project's own routes without clashing:
+
+| Route | Same as |
+|---|---|
+| `POST /indexes/{index_uid}/ingest` | `POST /ingest` |
+| `POST /indexes/{index_uid}/ingest/batch` | `POST /ingest/batch` |
+| `POST /indexes/{index_uid}/ingest/pipeline/{name}` | `POST /ingest/pipeline/{name}` |
+
+The path's index wins over `?index=`, the `index` field, `X-Meili-Index` and the
+pipeline trigger's `index_pattern`. It does not override an `index` that a pipeline's
+`meili_indexer` step sets in its own config: such a request is a `422` unless the two
+match (send it to `/ingest/pipeline/{name}` instead).
+
+Instead of injecting a project key, the edge can leave the caller's
+`Authorization: Bearer <key>` untouched and inject only `X-Meili-Host`,
+`X-Meili-Project-Id`, `X-Meili-Region` and the secret. The job then writes with the
+caller's key, so Meilisearch's own key permissions decide what may be written: a key
+limited to `movies` cannot land documents in any other index. With
+`WRITE_PREFLIGHT=true` that refusal is a `403` at request time rather than a failed
+job. The key needs `documents.add`, `indexes.get` and `tasks.get` on the index (plus
+`indexes.create` when the indexer should create it).
+
+Leave `MEILI_API_KEY` unset in this mode, or a request without a key would silently
+write with it.
+
 ## Tenant-scoped resources
 
 - **Pipelines** created through `POST /pipelines` are stored with the
   project's id and only visible to that project. They shadow global pipelines
   and built-in triggers for that tenant only.
-- **Jobs** record `project_id`. Status URLs use unguessable UUIDs; Envoy should
+- **Jobs** record `tenant_id`. Status URLs use unguessable UUIDs; Envoy should
   still only route `/jobs/*` for authenticated project traffic.
 - **Credentials** live only in the workflow input for the duration of the job
   and in Temporal's history (encrypt payloads with a Temporal data converter /

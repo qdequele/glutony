@@ -6,10 +6,11 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 
 use super::ingest::{
-    BatchResponse, IngestResponse, PipelineSelection, context_for, submit_batch, submit_one,
+    BatchResponse, IngestResponse, PipelineSelection, context_for, path_index, submit_batch,
+    submit_one,
 };
 use super::{QueryParams, query_param, read_payload};
-use crate::context::resolve_context;
+use crate::context::resolve_request_context;
 use crate::error::GatewayError;
 use crate::extract::IngestPayload;
 use crate::state::AppState;
@@ -33,11 +34,37 @@ pub async fn ingest_with_pipeline(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
-    let pre = resolve_context(&headers, query_param(&query, "index"), &state.config)?;
+    ingest_with_pipeline_inner(state, name, query, headers, req, None).await
+}
+
+/// `POST /indexes/{index_uid}/ingest/pipeline/{name}` — explicit pipeline, and the path's
+/// index wins over the pipeline trigger's `index_pattern`.
+pub async fn ingest_into_index_with_pipeline(
+    State(state): State<AppState>,
+    Path((index_uid, name)): Path<(String, String)>,
+    Query(query): Query<QueryParams>,
+    headers: HeaderMap,
+    req: Request,
+) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
+    let index = path_index(&index_uid)?;
+    ingest_with_pipeline_inner(state, name, query, headers, req, Some(index)).await
+}
+
+async fn ingest_with_pipeline_inner(
+    state: AppState,
+    name: String,
+    query: QueryParams,
+    headers: HeaderMap,
+    req: Request,
+    locked_index: Option<&str>,
+) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
+    // Only the tenant scope is needed here; the destination is checked once the
+    // pipeline is known, since one pinned to a connection needs none.
+    let pre = resolve_request_context(&headers, query_param(&query, "index"), &state.config)?;
     // 404 before reading the body when the pipeline does not exist.
     let pipeline = state
         .control_plane
-        .get_pipeline(&name, pre.project_id.as_deref())
+        .get_pipeline(&name, pre.tenant_id.as_deref())
         .await?;
     let extracted = read_payload(&headers, &query, req).await?;
     let ctx = context_for(&state, &headers, &query, &extracted)?;
@@ -47,11 +74,13 @@ pub async fn ingest_with_pipeline(
             if items.is_empty() {
                 return Err(GatewayError::BadRequest("`items` must not be empty".into()));
             }
-            PipelineIngestResponse::Batch(submit_batch(&state, items, &ctx, &selection).await)
+            PipelineIngestResponse::Batch(
+                submit_batch(&state, items, &ctx, &selection, locked_index).await,
+            )
         }
-        single => {
-            PipelineIngestResponse::Single(submit_one(&state, single, ctx, &selection).await?)
-        }
+        single => PipelineIngestResponse::Single(
+            submit_one(&state, single, ctx, &selection, locked_index).await?,
+        ),
     };
     Ok((StatusCode::ACCEPTED, Json(resp)))
 }
@@ -65,6 +94,52 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::matchers::{method, path, query_param as wq};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn an_explicit_pinned_pipeline_needs_no_context_and_an_unpinned_one_does() {
+        let server = MockServer::start().await;
+        let mut pinned = sample_pipeline("movies", None);
+        pinned.steps[0].config = json!({ "connection": "prod-movies" });
+        Mock::given(method("GET"))
+            .and(path("/pipelines/movies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pinned))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines/plain"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_pipeline("plain", None)))
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let headerless = |uri: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"documents":[{"id":"1","content":"x"}]}"#,
+                ))
+                .unwrap()
+        };
+
+        let resp = app
+            .clone()
+            .oneshot(headerless("/ingest/pipeline/movies"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(starter.inputs().len(), 1);
+
+        let resp = app
+            .oneshot(headerless("/ingest/pipeline/plain"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["code"], "missing_context");
+        assert_eq!(starter.inputs().len(), 1, "no second workflow");
+    }
 
     #[tokio::test]
     async fn explicit_pipeline_skips_routing_and_applies_index_pattern() {
@@ -151,7 +226,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/pipelines/ghost"))
-            .and(wq("project_id", "xxx"))
+            .and(wq("tenant_id", "xxx"))
             .respond_with(
                 ResponseTemplate::new(404)
                     .set_body_json(json!({"error": "pipeline ghost not found"})),

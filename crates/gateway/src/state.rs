@@ -66,6 +66,8 @@ pub struct GatewayConfig {
     pub temporal_namespace: String,
     /// Internal control plane base URL (`CONTROL_PLANE_URL`).
     pub control_plane_url: String,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Standalone fallback Meilisearch host (`MEILI_URL`).
     pub meili_url: Option<String>,
     /// Standalone fallback Meilisearch API key (`MEILI_API_KEY`).
@@ -85,6 +87,20 @@ pub struct GatewayConfig {
     /// Read-side usage analytics API, when configured. Absent means `GET /usage`
     /// answers 501 rather than failing.
     pub usage_api: Option<UsageApiConfig>,
+    /// Browser origins allowed to call the API cross-origin
+    /// (`CORS_ALLOW_ORIGINS`, comma-separated). Empty means no `CorsLayer` is
+    /// mounted at all, which is what a server-to-server deployment (the Lab, an
+    /// edge proxy) wants. Set it only for a browser app that calls the API
+    /// directly from another origin.
+    pub cors_allow_origins: Vec<String>,
+    /// Check the request's Meilisearch key against the target index before queueing a
+    /// job (`WRITE_PREFLIGHT`, default off). See [`crate::preflight`].
+    pub write_preflight: bool,
+    /// Bearer token the Meilisearch Lab uses on management routes (`LAB_SERVICE_TOKEN`).
+    /// Setting it (or `admin_api_key`) closes open mode. See [`crate::auth`].
+    pub lab_service_token: Option<String>,
+    /// Bearer token an operator uses on management routes (`ADMIN_API_KEY`).
+    pub admin_api_key: Option<String>,
 }
 
 impl std::fmt::Debug for GatewayConfig {
@@ -95,6 +111,10 @@ impl std::fmt::Debug for GatewayConfig {
             .field("temporal_url", &self.temporal_url)
             .field("temporal_namespace", &self.temporal_namespace)
             .field("control_plane_url", &self.control_plane_url)
+            .field(
+                "control_plane_token",
+                &self.control_plane_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("meili_url", &self.meili_url)
             .field(
                 "meili_api_key",
@@ -109,6 +129,16 @@ impl std::fmt::Debug for GatewayConfig {
             .field("blob_store_url", &self.blob_store_url)
             .field("inline_max_bytes", &self.inline_max_bytes)
             .field("usage_api", &self.usage_api)
+            .field("cors_allow_origins", &self.cors_allow_origins)
+            .field("write_preflight", &self.write_preflight)
+            .field(
+                "lab_service_token",
+                &self.lab_service_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -120,6 +150,7 @@ impl Default for GatewayConfig {
             temporal_url: "http://temporal-frontend:7233".into(),
             temporal_namespace: "default".into(),
             control_plane_url: "http://meili-control-plane:9000".into(),
+            control_plane_token: None,
             meili_url: None,
             meili_api_key: None,
             default_index: "documents".into(),
@@ -128,6 +159,10 @@ impl Default for GatewayConfig {
             blob_store_url: "file://./blobs".into(),
             inline_max_bytes: 1_048_576,
             usage_api: None,
+            cors_allow_origins: Vec::new(),
+            write_preflight: false,
+            lab_service_token: None,
+            admin_api_key: None,
         }
     }
 }
@@ -141,6 +176,7 @@ impl GatewayConfig {
             temporal_url: env_or("TEMPORAL_URL", &d.temporal_url),
             temporal_namespace: env_or("TEMPORAL_NAMESPACE", &d.temporal_namespace),
             control_plane_url: env_or("CONTROL_PLANE_URL", &d.control_plane_url),
+            control_plane_token: env_opt("CONTROL_PLANE_TOKEN"),
             meili_url: env_opt("MEILI_URL"),
             meili_api_key: env_opt("MEILI_API_KEY"),
             default_index: env_or("DEFAULT_INDEX", &d.default_index),
@@ -157,7 +193,52 @@ impl GatewayConfig {
                 token,
                 pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
             }),
+            cors_allow_origins: env_opt("CORS_ALLOW_ORIGINS")
+                .map(|v| split_list(&v))
+                .unwrap_or_default(),
+            write_preflight: env_parse("WRITE_PREFLIGHT", d.write_preflight)?,
+            lab_service_token: env_opt("LAB_SERVICE_TOKEN"),
+            admin_api_key: env_opt("ADMIN_API_KEY"),
         })
+    }
+
+    /// Checks that must stop the process at boot.
+    ///
+    /// - The example Secret's `CHANGE_ME` placeholder is refused for every secret: once
+    ///   published, it would let anyone through.
+    /// - A Lab service token, or Lab instance credentials (`lab`), without the edge
+    ///   secret would let any client claim a tenant with a bare `X-Meili-Tenant-Id`
+    ///   header (Lab account ids are not secrets) and, on a Lab engine, bill any account.
+    ///   Both combinations are refused.
+    ///
+    /// `ADMIN_API_KEY` alone stays allowed: operator mode may run without an edge.
+    pub fn validate(&self, lab: Option<&meili_ingest_lab::LabCredentials>) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("CONTROL_PLANE_TOKEN", &self.control_plane_token),
+            ("ADMIN_API_KEY", &self.admin_api_key),
+            ("ENVOY_TRUSTED_HEADER", &self.envoy_trusted_header),
+        ] {
+            if value.as_deref().is_some_and(is_placeholder) {
+                anyhow::bail!(
+                    "{name} is the example placeholder CHANGE_ME; set a real secret \
+                     (openssl rand -hex 32) or leave it unset"
+                );
+            }
+        }
+        if lab.is_some() && self.envoy_trusted_header.is_none() {
+            anyhow::bail!(
+                "LAB_INSTANCE_ID / LAB_INSTANCE_SECRET are set but ENVOY_TRUSTED_HEADER is not: \
+                 without the edge secret any client could bill any Lab account with \
+                 X-Meili-Tenant-Id; set both"
+            );
+        }
+        if self.lab_service_token.is_some() && self.envoy_trusted_header.is_none() {
+            anyhow::bail!(
+                "LAB_SERVICE_TOKEN is set but ENVOY_TRUSTED_HEADER is not: without the edge \
+                 secret any client could claim a tenant with X-Meili-Tenant-Id; set both"
+            );
+        }
+        Ok(())
     }
 
     /// Maximum request body size in bytes.
@@ -166,11 +247,30 @@ impl GatewayConfig {
     }
 }
 
+/// The value the example Secret ships for every secret (`k8s/secrets.example.yaml`).
+pub const PLACEHOLDER: &str = "CHANGE_ME";
+
+/// Whether `value` is the example placeholder (trimmed, exact match).
+fn is_placeholder(value: &str) -> bool {
+    value.trim() == PLACEHOLDER
+}
+
 fn env_opt(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Split a comma-separated env value, trimming each entry and dropping empty ones
+/// (`"a, b,,"` → `["a", "b"]`), so the spacing people naturally type is harmless.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -381,8 +481,8 @@ pub struct JobRecord {
     /// Pipeline that was run.
     pub pipeline_uid: String,
     /// Tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Target index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_name: Option<String>,
@@ -427,8 +527,8 @@ pub struct ResolveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     /// Tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
+    pub tenant_id: Option<String>,
     /// Explicit pipeline uid (skips MIME routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
@@ -458,12 +558,24 @@ struct UpstreamErrorBody {
 }
 
 /// Thin HTTP client for the control plane's internal API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlPlaneClient {
     /// Base URL without trailing slash.
     pub base_url: String,
     /// Shared HTTP client.
     pub http: reqwest::Client,
+    /// `CONTROL_PLANE_TOKEN`, presented as a bearer on every request.
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for ControlPlaneClient {
+    /// Redacts the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl ControlPlaneClient {
@@ -473,16 +585,30 @@ impl ControlPlaneClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            token: None,
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    /// Present `CONTROL_PLANE_TOKEN` on every request.
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
+    }
+
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
 
-    fn project_query(project_id: Option<&str>) -> Vec<(&'static str, String)> {
-        project_id
-            .map(|p| vec![("project_id", p.to_string())])
+    pub(crate) fn tenant_query(tenant_id: Option<&str>) -> Vec<(&'static str, String)> {
+        tenant_id
+            .map(|p| vec![("tenant_id", p.to_string())])
             .unwrap_or_default()
     }
 
@@ -519,12 +645,12 @@ impl ControlPlaneClient {
         }
     }
 
-    async fn send_json<T: DeserializeOwned>(
+    pub(crate) async fn send_json<T: DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<T, GatewayError> {
-        let resp = req.send().await?;
+        let resp = self.authed(req).send().await?;
         if !resp.status().is_success() {
             return Err(Self::error_from(resp, what).await);
         }
@@ -533,12 +659,12 @@ impl ControlPlaneClient {
         })
     }
 
-    async fn send_empty(
+    pub(crate) async fn send_empty(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<(), GatewayError> {
-        let resp = req.send().await?;
+        let resp = self.authed(req).send().await?;
         if !resp.status().is_success() {
             return Err(Self::error_from(resp, what).await);
         }
@@ -551,13 +677,13 @@ impl ControlPlaneClient {
         &self,
         mime: &str,
         filename: Option<&str>,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
         pipeline: Option<&str>,
     ) -> Result<ResolveResponse, GatewayError> {
         let body = ResolveRequest {
             mime: mime.to_string(),
             filename: filename.map(str::to_string),
-            project_id: project_id.map(str::to_string),
+            tenant_id: tenant_id.map(str::to_string),
             pipeline: pipeline.map(str::to_string),
         };
         self.send_json(
@@ -567,30 +693,30 @@ impl ControlPlaneClient {
         .await
     }
 
-    /// `GET /pipelines/{uid}?project_id=`.
+    /// `GET /pipelines/{uid}?tenant_id=`.
     pub async fn get_pipeline(
         &self,
         uid: &str,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<PipelineDefinition, GatewayError> {
         self.send_json(
             self.http
                 .get(self.url(&format!("/pipelines/{uid}")))
-                .query(&Self::project_query(project_id)),
+                .query(&Self::tenant_query(tenant_id)),
             "get pipeline",
         )
         .await
     }
 
-    /// `GET /pipelines?project_id=`.
+    /// `GET /pipelines?tenant_id=`.
     pub async fn list_pipelines(
         &self,
-        project_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Vec<PipelineDefinition>, GatewayError> {
         self.send_json(
             self.http
                 .get(self.url("/pipelines"))
-                .query(&Self::project_query(project_id)),
+                .query(&Self::tenant_query(tenant_id)),
             "list pipelines",
         )
         .await
@@ -629,19 +755,40 @@ impl ControlPlaneClient {
             .await
     }
 
-    /// `DELETE /pipelines/{uid}?project_id=`.
+    /// `DELETE /pipelines/{uid}?tenant_id=`.
+    ///
+    /// Returns the ids of the sources the delete archived, whose Temporal schedules the
+    /// caller must delete. An older control plane answering `204` reports none.
     pub async fn delete_pipeline(
         &self,
         uid: &str,
-        project_id: Option<&str>,
-    ) -> Result<(), GatewayError> {
-        self.send_empty(
-            self.http
-                .delete(self.url(&format!("/pipelines/{uid}")))
-                .query(&Self::project_query(project_id)),
-            "delete pipeline",
-        )
-        .await
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<Uuid>, GatewayError> {
+        let resp = self
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/pipelines/{uid}")))
+                    .query(&Self::tenant_query(tenant_id)),
+            )
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Self::error_from(resp, "delete pipeline").await);
+        }
+        if resp.status() == StatusCode::NO_CONTENT {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct Deleted {
+            #[serde(default)]
+            archived_sources: Vec<Uuid>,
+        }
+        let deleted: Deleted = resp.json().await.map_err(|e| {
+            GatewayError::Upstream(format!(
+                "control plane delete pipeline: invalid response: {e}"
+            ))
+        })?;
+        Ok(deleted.archived_sources)
     }
 
     /// `GET /plugins`.
@@ -701,6 +848,14 @@ pub struct AppState {
     pub blob: BlobStore,
     /// Shared HTTP client.
     pub http: reqwest::Client,
+    /// Meilisearch connection settings: sealing key, host policy, probe client.
+    pub connections: crate::connections::ConnectionConfig,
+    /// Temporal Schedules for scheduled sources.
+    pub schedules: Arc<dyn crate::schedules::ScheduleClient>,
+    /// Which hosts a source may fetch from (`SOURCE_FETCH_HOSTS`), checked on save.
+    pub fetch_policy: meili_ingest_source::HostPolicy,
+    /// The Lab, when this deployment reports to one (`LAB_URL` + `LAB_INSTANCE_*`).
+    pub lab: Option<Arc<crate::lab::LabClient>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -709,6 +864,8 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("control_plane", &self.control_plane)
             .field("blob", &self.blob)
+            .field("connections", &self.connections)
+            .field("lab", &self.lab)
             .finish_non_exhaustive()
     }
 }
@@ -721,14 +878,44 @@ impl AppState {
         blob: BlobStore,
         http: reqwest::Client,
     ) -> Self {
-        let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone());
+        let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone())
+            .with_token(config.control_plane_token.clone());
         Self {
             config: Arc::new(config),
             temporal,
             control_plane,
             blob,
             http,
+            connections: crate::connections::ConnectionConfig::default(),
+            schedules: Arc::new(crate::schedules::DisabledSchedules),
+            fetch_policy: meili_ingest_source::HostPolicy::default(),
+            lab: None,
         }
+    }
+
+    /// Enable scheduled sources: the Temporal Schedule client and the fetch policy.
+    /// Without it the `/sources` routes answer 501.
+    pub fn with_sources(
+        mut self,
+        schedules: Arc<dyn crate::schedules::ScheduleClient>,
+        fetch_policy: meili_ingest_source::HostPolicy,
+    ) -> Self {
+        self.schedules = schedules;
+        self.fetch_policy = fetch_policy;
+        self
+    }
+
+    /// Enable the `/connections` routes with a sealing key and host policy. Without it
+    /// they answer 501, so a key is never stored unsealed by accident.
+    pub fn with_connections(mut self, connections: crate::connections::ConnectionConfig) -> Self {
+        self.connections = connections;
+        self
+    }
+
+    /// Attach the Lab client: hosted deployments then pre-check credits before each job.
+    pub fn with_lab(mut self, lab: Arc<crate::lab::LabClient>) -> Self {
+        self.lab = Some(lab);
+        self
     }
 }
 
@@ -737,6 +924,17 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn split_list_trims_and_drops_empty_entries() {
+        // The exact shape compose passes: a space after the comma must not leak into
+        // an origin, where it would never match the browser's `Origin` header.
+        assert_eq!(
+            split_list("http://localhost:3000, http://ui.local:3000,,"),
+            vec!["http://localhost:3000", "http://ui.local:3000"]
+        );
+        assert!(split_list(" , ").is_empty());
+    }
 
     fn sample_pipeline() -> PipelineDefinition {
         PipelineDefinition {
@@ -750,7 +948,7 @@ mod tests {
                 "meili_indexer",
             )],
             builtin: true,
-            project_id: None,
+            tenant_id: None,
         }
     }
 
@@ -823,12 +1021,93 @@ mod tests {
         let cfg = GatewayConfig {
             meili_api_key: Some("SUPERSECRET".into()),
             envoy_trusted_header: Some("ENVOYSECRET".into()),
+            lab_service_token: Some("lab-secret-value".into()),
+            admin_api_key: Some("admin-secret-value".into()),
             ..Default::default()
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("SUPERSECRET"));
         assert!(!dbg.contains("ENVOYSECRET"));
+        assert!(!dbg.contains("lab-secret-value"));
+        assert!(!dbg.contains("admin-secret-value"));
         assert_eq!(cfg.max_upload_bytes(), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn validate_requires_the_edge_secret_with_a_lab_token() {
+        let lab_only = GatewayConfig {
+            lab_service_token: Some("lab".into()),
+            ..Default::default()
+        };
+        let err = lab_only.validate(None).unwrap_err().to_string();
+        assert!(err.contains("LAB_SERVICE_TOKEN"), "{err}");
+        assert!(err.contains("ENVOY_TRUSTED_HEADER"), "{err}");
+
+        let both = GatewayConfig {
+            lab_service_token: Some("lab".into()),
+            envoy_trusted_header: Some("edge".into()),
+            ..Default::default()
+        };
+        assert!(both.validate(None).is_ok());
+
+        // Operator mode may run without an edge.
+        let admin_only = GatewayConfig {
+            admin_api_key: Some("admin".into()),
+            ..Default::default()
+        };
+        assert!(admin_only.validate(None).is_ok());
+        assert!(GatewayConfig::default().validate(None).is_ok());
+    }
+
+    #[test]
+    fn validate_refuses_the_change_me_placeholder() {
+        // The example Secret ships CHANGE_ME; booting on it would make these public.
+        type Set = fn(&mut GatewayConfig, String);
+        let cases: [(&str, Set); 3] = [
+            ("CONTROL_PLANE_TOKEN", |c, v| {
+                c.control_plane_token = Some(v)
+            }),
+            ("ADMIN_API_KEY", |c, v| c.admin_api_key = Some(v)),
+            ("ENVOY_TRUSTED_HEADER", |c, v| {
+                c.envoy_trusted_header = Some(v)
+            }),
+        ];
+        for (name, set) in cases {
+            for value in ["CHANGE_ME", " CHANGE_ME\n"] {
+                let mut cfg = GatewayConfig::default();
+                set(&mut cfg, value.to_string());
+                let err = cfg.validate(None).unwrap_err().to_string();
+                assert!(err.contains(name), "{name}: {err}");
+                assert!(err.contains("CHANGE_ME"), "{name}: {err}");
+            }
+            // Only the exact placeholder is refused.
+            let mut cfg = GatewayConfig::default();
+            set(&mut cfg, "change_me_not".to_string());
+            assert!(cfg.validate(None).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn validate_requires_the_edge_secret_on_a_lab_engine() {
+        // With Lab credentials every Lab-account job is billed: without the edge secret
+        // any client could bill any account with X-Meili-Tenant-Id.
+        let creds = meili_ingest_lab::LabCredentials::new(
+            "https://lab.example",
+            "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d",
+            "s",
+        )
+        .unwrap();
+        let err = GatewayConfig::default()
+            .validate(Some(&creds))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LAB_INSTANCE_ID"), "{err}");
+        assert!(err.contains("ENVOY_TRUSTED_HEADER"), "{err}");
+        let with_edge = GatewayConfig {
+            envoy_trusted_header: Some("edge".into()),
+            ..Default::default()
+        };
+        assert!(with_edge.validate(Some(&creds)).is_ok());
     }
 
     #[tokio::test]
@@ -876,7 +1155,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/pipelines/builtin.pdf"))
-            .and(query_param("project_id", "tenant-a"))
+            .and(query_param("tenant_id", "tenant-a"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&def))
             .mount(&server)
             .await;
@@ -936,7 +1215,7 @@ mod tests {
             job_id,
             workflow_id: format!("ingest-{job_id}"),
             pipeline_uid: "builtin.pdf".into(),
-            project_id: None,
+            tenant_id: None,
             index_name: Some("documents".into()),
             status: JobStatus::Queued,
             current_step: None,
@@ -979,5 +1258,43 @@ mod tests {
             cp.get_job(job_id).await,
             Err(GatewayError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_token_is_sent_as_a_bearer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/jobs"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer cp-token",
+            ))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new())
+            .with_token(Some("cp-token".into()));
+        let job_id = Uuid::new_v4();
+        cp.create_job(&JobRecord {
+            job_id,
+            workflow_id: format!("ingest-{job_id}"),
+            pipeline_uid: "builtin.pdf".into(),
+            tenant_id: None,
+            index_name: None,
+            status: JobStatus::Queued,
+            current_step: None,
+            error: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+        assert!(!format!("{cp:?}").contains("cp-token"), "{cp:?}");
+        let cfg = GatewayConfig {
+            control_plane_token: Some("cp-token-value".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{cfg:?}").contains("cp-token-value"));
     }
 }

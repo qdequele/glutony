@@ -26,9 +26,9 @@ use temporalio_common::protos::temporal::api::failure::v1::Failure;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::workflows::join_all;
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, ApplicationFailure, SyncWorkflowContext,
-    WorkflowCancellationToken, WorkflowContext, WorkflowContextView, WorkflowResult,
-    WorkflowTermination,
+    ActivityCloseTimeouts, ActivityExecutionError, ActivityOptions, ApplicationFailure,
+    SyncWorkflowContext, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
+    WorkflowResult, WorkflowTermination,
 };
 
 use crate::activity::{FanOutActivityInput, JobStartedInput, StepActivities};
@@ -38,9 +38,10 @@ use crate::dag::{FanOut, fan_out_branches, ready_steps, resolve_input, retry_par
 /// workflow history well under Temporal's event limits).
 pub const MAX_FAN_OUT_BRANCHES: usize = 500;
 
-/// Attempts allowed for the usage-reporting activity before the job gives up on it.
-/// Generous, because these rows are billed from; the job still succeeds either way.
-const USAGE_MAX_ATTEMPTS: u32 = 10;
+/// How long the usage activity keeps retrying. Its rows are what the Lab bills from,
+/// so a control-plane or analytics outage must not lose them; the job's own status is
+/// written first and does not wait on this (spec §5.3).
+const USAGE_RETRY_WINDOW: Duration = Duration::from_secs(7 * 24 * 3_600);
 
 /// Heartbeat timeout for every step activity. The activity keeps itself alive every
 /// 20 s independently of the plugin.
@@ -225,14 +226,14 @@ impl PipelineWorkflow {
 /// Temporal's own `Display` is always "Activity task failed"; the message a plugin
 /// produced sits in the failure's cause chain. Walk it and return the deepest
 /// non-empty message so `GET /jobs/{id}` shows something actionable.
-fn describe_activity_failure(err: &ActivityExecutionError) -> String {
+pub(crate) fn describe_activity_failure(err: &ActivityExecutionError) -> String {
     err.failure()
         .and_then(deepest_failure_message)
         .unwrap_or_else(|| err.to_string())
 }
 
 /// Deepest non-generic message in a failure's cause chain.
-fn deepest_failure_message(failure: &Failure) -> Option<String> {
+pub(crate) fn deepest_failure_message(failure: &Failure) -> Option<String> {
     {
         fn deepest(failure: &Failure) -> Option<String> {
             let mut best = non_empty(&failure.message);
@@ -262,7 +263,7 @@ fn describe_failure_for_test(failure: &Failure) -> String {
 ///
 /// Uses `WorkflowContext::workflow_time`, which replays identically, rather than the
 /// wall clock, which would make the workflow non-deterministic.
-fn to_utc(time: Option<SystemTime>) -> DateTime<Utc> {
+pub(crate) fn to_utc(time: Option<SystemTime>) -> DateTime<Utc> {
     time.map(DateTime::<Utc>::from)
         .unwrap_or_else(|| DateTime::<Utc>::from(UNIX_EPOCH))
 }
@@ -331,7 +332,7 @@ impl PipelineWorkflow {
             workflow_id: PipelineWorkflowInput::workflow_id(input.job_id),
             pipeline_uid: input.pipeline.uid.clone(),
             pipeline_builtin: input.pipeline.builtin,
-            project_id: input.context.project_id.clone().unwrap_or_default(),
+            tenant_id: input.context.tenant_id.clone().unwrap_or_default(),
             region: input.context.region.clone().unwrap_or_default(),
             index_name: input.context.index.clone().unwrap_or_default(),
             task_queue: "workers-general".to_string(),
@@ -343,7 +344,11 @@ impl PipelineWorkflow {
             steps,
             error,
         };
-        let opts = ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
+        let opts =
+            ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::ScheduleAndStartToClose {
+                schedule_to_close: USAGE_RETRY_WINDOW,
+                start_to_close: Duration::from_secs(60),
+            })
             .task_queue("workers-general".to_string())
             // Detached from the workflow's cancellation token. Activities inherit
             // workflow cancellation, so on a cancelled job this one would be killed
@@ -352,9 +357,9 @@ impl PipelineWorkflow {
             .cancellation_token(WorkflowCancellationToken::new())
             .retry_policy(
                 RetryPolicy::builder()
-                    .maximum_attempts(USAGE_MAX_ATTEMPTS)
                     .initial_interval(Duration::from_secs(2))
                     .backoff_coefficient(2.0)
+                    .maximum_interval(Duration::from_secs(300))
                     .build(),
             )
             .build();
@@ -416,7 +421,7 @@ impl PipelineWorkflow {
                 input: branch_input,
                 branch,
                 branch_total: total,
-                project_id: input.context.project_id.clone(),
+                tenant_id: input.context.tenant_id.clone(),
             }
         };
 

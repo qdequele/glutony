@@ -2,8 +2,9 @@
 //!
 //! Every handler returns `Result<_, GatewayError>`; the [`IntoResponse`] impl turns the
 //! error into `{"error": "<message>", "code": "<snake_case>"}` with the status code from
-//! the plan (400 missing context / bad request, 403 forbidden, 404 not found, 413 too
-//! large, 415 no pipeline for the MIME type, 422 invalid pipeline, 502 upstream, 500
+//! the plan (400 missing context / bad request, 401 unauthorized, 402 insufficient credits,
+//! 403 forbidden, 404 not found, 409 job already finished, 413 too large, 415 no pipeline
+//! for the MIME type, 422 invalid pipeline, 502 upstream, 503 lab unavailable, 500
 //! internal). Messages never contain API keys: they are built from our own strings, from
 //! control-plane error bodies, or from transport errors that carry URLs but no
 //! credentials.
@@ -22,12 +23,30 @@ pub enum GatewayError {
     /// Malformed request (400).
     #[error("{0}")]
     BadRequest(String),
-    /// The control plane refused the operation, e.g. deleting a built-in pipeline (403).
+    /// A tenant id failed validation (400).
+    #[error("invalid tenant id: {0}")]
+    InvalidTenant(String),
+    /// The caller's Meilisearch key is missing (401), from the write preflight.
+    #[error("{0}")]
+    Unauthorized(String),
+    /// The control plane refused the operation, e.g. deleting a built-in pipeline, or the
+    /// caller's Meilisearch key may not write the target index (403).
     #[error("{0}")]
     Forbidden(String),
+    /// A hosted Lab engine refused work for an account out of credits (402).
+    #[error("{0}")]
+    PaymentRequired(String),
+    /// A hosted Lab engine could not check an account's credits: the Lab has been
+    /// unreachable for longer than the stale window (503, retry later).
+    #[error("{0}")]
+    LabUnavailable(String),
     /// Unknown pipeline, job or resource (404).
     #[error("{0}")]
     NotFound(String),
+    /// The job exists but has already reached a terminal status, so it cannot be
+    /// cancelled (409).
+    #[error("{0}")]
+    AlreadyFinished(String),
     /// Upload larger than the configured limit (413).
     #[error("{0}")]
     TooLarge(String),
@@ -44,6 +63,10 @@ pub enum GatewayError {
         message: String,
         diagnostics: serde_json::Value,
     },
+    /// Any other request that is well-formed but cannot be accepted (422), e.g. a
+    /// Meilisearch connection whose host is forbidden or whose key is rejected.
+    #[error("{0}")]
+    Unprocessable(String),
     /// A feature is not configured on this deployment (501).
     #[error("{0}")]
     NotImplemented(String),
@@ -59,15 +82,20 @@ impl GatewayError {
     /// HTTP status for this error.
     pub fn status(&self) -> StatusCode {
         match self {
-            GatewayError::MissingContext(_) | GatewayError::BadRequest(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            GatewayError::MissingContext(_)
+            | GatewayError::BadRequest(_)
+            | GatewayError::InvalidTenant(_) => StatusCode::BAD_REQUEST,
+            GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
+            GatewayError::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
+            GatewayError::LabUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
+            GatewayError::AlreadyFinished(_) => StatusCode::CONFLICT,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             GatewayError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            GatewayError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            GatewayError::InvalidStepConfig { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            GatewayError::Invalid(_)
+            | GatewayError::InvalidStepConfig { .. }
+            | GatewayError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             GatewayError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             GatewayError::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -79,12 +107,18 @@ impl GatewayError {
         match self {
             GatewayError::MissingContext(_) => "missing_context",
             GatewayError::BadRequest(_) => "bad_request",
+            GatewayError::InvalidTenant(_) => "invalid_tenant",
+            GatewayError::Unauthorized(_) => "unauthorized",
             GatewayError::Forbidden(_) => "forbidden",
+            GatewayError::PaymentRequired(_) => "insufficient_credits",
+            GatewayError::LabUnavailable(_) => "lab_unavailable",
             GatewayError::NotFound(_) => "not_found",
+            GatewayError::AlreadyFinished(_) => "already_finished",
             GatewayError::TooLarge(_) => "payload_too_large",
             GatewayError::Unsupported(_) => "unsupported_media_type",
             GatewayError::Invalid(_) => "invalid_pipeline",
             GatewayError::InvalidStepConfig { .. } => "invalid_step_config",
+            GatewayError::Unprocessable(_) => "validation",
             GatewayError::NotImplemented(_) => "not_configured",
             GatewayError::Upstream(_) => "upstream_error",
             GatewayError::Internal(_) => "internal_error",
@@ -136,7 +170,15 @@ impl IntoResponse for GatewayError {
             })
             .unwrap_or_default(),
         };
-        (status, Json(body)).into_response()
+        let is_unauthorized = status == StatusCode::UNAUTHORIZED;
+        let mut response = (status, Json(body)).into_response();
+        if is_unauthorized {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
@@ -193,12 +235,24 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
+            GatewayError::InvalidTenant("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            GatewayError::InvalidTenant("x".into()).code(),
+            "invalid_tenant"
+        );
+        assert_eq!(
             GatewayError::Forbidden("x".into()).status(),
             StatusCode::FORBIDDEN
         );
         assert_eq!(
             GatewayError::NotFound("x".into()).status(),
             StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            GatewayError::AlreadyFinished("x".into()).status(),
+            StatusCode::CONFLICT
         );
         assert_eq!(
             GatewayError::TooLarge("x".into()).status(),
@@ -220,6 +274,22 @@ mod tests {
             GatewayError::Internal("x".into()).status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+        assert_eq!(
+            GatewayError::PaymentRequired("x".into()).status(),
+            StatusCode::PAYMENT_REQUIRED
+        );
+        assert_eq!(
+            GatewayError::PaymentRequired("x".into()).code(),
+            "insufficient_credits"
+        );
+        assert_eq!(
+            GatewayError::LabUnavailable("x".into()).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            GatewayError::LabUnavailable("x".into()).code(),
+            "lab_unavailable"
+        );
     }
 
     #[test]
@@ -227,11 +297,17 @@ mod tests {
         let all = [
             GatewayError::MissingContext("x".into()),
             GatewayError::BadRequest("x".into()),
+            GatewayError::InvalidTenant("x".into()),
             GatewayError::Forbidden("x".into()),
+            GatewayError::PaymentRequired("x".into()),
+            GatewayError::LabUnavailable("x".into()),
             GatewayError::NotFound("x".into()),
+            GatewayError::AlreadyFinished("x".into()),
             GatewayError::TooLarge("x".into()),
             GatewayError::Unsupported("x".into()),
             GatewayError::Invalid("x".into()),
+            GatewayError::Unprocessable("x".into()),
+            GatewayError::NotImplemented("x".into()),
             GatewayError::Upstream("x".into()),
             GatewayError::Internal("x".into()),
         ];
@@ -243,6 +319,15 @@ mod tests {
                 "{c}"
             );
         }
+    }
+
+    #[test]
+    fn unprocessable_is_422_without_the_pipeline_wording() {
+        // `Invalid` reads "invalid pipeline: …", which is wrong for a rejected connection.
+        let e = GatewayError::Unprocessable("the API key was rejected".into());
+        assert_eq!(e.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(e.code(), "validation");
+        assert_eq!(e.to_string(), "the API key was rejected");
     }
 
     #[tokio::test]

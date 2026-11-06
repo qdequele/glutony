@@ -1,15 +1,12 @@
-//! Every example in the editor's reference must run and produce what it claims — in
-//! Code mode (`snippet`) and, where there is one, in Builder mode (`op`). Read at test
-//! time, never with `include_str!`, so building the plugin never needs `ui/`.
+//! Every example in the document_script reference (`tests/reference.json`, the data a
+//! script editor shows) must run and produce what it claims — as a script (`snippet`)
+//! and, where there is one, as an `ops` entry (`op`).
 
 use meili_ingest_plugin_script::DocumentScriptPlugin;
 use meili_ingest_plugin_sdk::prelude::*;
 use serde_json::{Value, json};
 
-const REFERENCE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../ui/src/app/pipelines/_components/document-script/reference.json"
-);
+const REFERENCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reference.json");
 
 async fn run(example: &Value, config: Value) -> Vec<Document> {
     let mut doc = Document::with_id("example", example["content"].as_str().unwrap_or(""));

@@ -5,12 +5,14 @@ use axum::Json;
 use axum::extract::State;
 use meili_ingest_plugin_sdk::PluginManifest;
 
+use crate::auth::Scope;
 use crate::error::GatewayError;
 use crate::state::AppState;
 
 /// `GET /plugins`.
 pub async fn list_plugins(
     State(state): State<AppState>,
+    _scope: Scope,
 ) -> Result<Json<Vec<PluginManifest>>, GatewayError> {
     Ok(Json(state.control_plane.list_plugins().await?))
 }
