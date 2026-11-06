@@ -40,6 +40,9 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   team. With the flag on, the AI plugins register without `LLM_API_KEY` /
   `TYPESAFE_API_KEY`. The route refuses (`403 token_required`) while the control
   plane runs with `CONTROL_PLANE_TOKEN_DISABLED=true`.
+- `POST /pipelines/validate` returns `warnings` naming every key of the body that the
+  definition does not know and a save would drop silently (a `match:` block instead of
+  `trigger:`, a misspelled step or `retry` field). Saving is unchanged.
 
 ### Changed
 - **Breaking default:** tenant object refs (`{"s3": "s3://…"}`, `gs://`, `az://`)
@@ -60,6 +63,15 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   runners; CI builds both.
 
 ### Fixed
+- `docs/openapi.yaml` matches the gateway again: `POST /ingest/batch` takes
+  `index` and `pipeline` once for the batch (per-item ones were never read, yet the
+  example showed one), the JSON ingest body documents `pipeline` and no longer lists a
+  `content_type` it never read, inline documents need no `id` (one is generated), and
+  `POST /jobs/{job_id}/cancel` answers `{job_id, status: "cancelling"}`, not a job.
+- The pipelines docs: only the first step runs on the job's initial input
+  (`depends_on: []` is the same as leaving it out; "list root steps first" did not make
+  two roots possible), and the built-in audio and video pipelines also take
+  `audio/flac` and `video/x-matroska`.
 - `meili_indexer` no longer sends `?primaryKey=<primary_key>` on document additions
   to an index that already has a primary key. An index created elsewhere with another
   key (`uid`, as Scrapix crawls create them) rejected every addition with

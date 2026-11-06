@@ -144,7 +144,87 @@ pub async fn validate_pipeline(
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
     apply_scope(&scope, &mut def)?;
-    Ok(Json(state.control_plane.validate_pipeline(&def).await?))
+    let mut verdict = state.control_plane.validate_pipeline(&def).await?;
+    let ignored = ignored_keys(&body);
+    if !ignored.is_empty()
+        && let serde_json::Value::Object(map) = &mut verdict
+    {
+        let warnings = ignored
+            .iter()
+            .map(|key| serde_json::Value::String(format!("unknown key `{key}` is ignored")))
+            .collect();
+        map.insert("warnings".into(), serde_json::Value::Array(warnings));
+    }
+    Ok(Json(verdict))
+}
+
+/// Keys of a pipeline body that the definition does not know, so parsing drops them
+/// silently (a `match:` block instead of `trigger:`, a misspelled step field). Saving
+/// keeps accepting them, since clients round-trip what `GET /pipelines/{name}` returns;
+/// `POST /pipelines/validate` reports them as `warnings`. Plugin `config` blocks are
+/// checked against their own schema, so they are not walked here.
+pub fn ignored_keys(body: &[u8]) -> Vec<String> {
+    const TOP: &[&str] = &[
+        "uid",
+        "name",
+        "description",
+        "version",
+        "trigger",
+        "steps",
+        "builtin",
+        "tenant_id",
+        "project_id",
+        // Returned by GET /pipelines/{name}; dropped on the way back in.
+        "scope",
+    ];
+    const TRIGGER: &[&str] = &["content_types", "filename_pattern", "index_pattern"];
+    const STEP: &[&str] = &[
+        "id",
+        "plugin",
+        "depends_on",
+        "fan_out",
+        "config",
+        "timeout_secs",
+        "retry",
+    ];
+    const RETRY: &[&str] = &["max_attempts", "backoff", "initial_interval_secs"];
+
+    fn unknown(value: &serde_yaml::Value, known: &[&str], prefix: &str, out: &mut Vec<String>) {
+        let Some(map) = value.as_mapping() else {
+            return;
+        };
+        for key in map.keys() {
+            let name = match key.as_str() {
+                Some(name) => name.to_string(),
+                None => format!("{key:?}"),
+            };
+            if !known.contains(&name.as_str()) {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+    }
+
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    // YAML is a superset of JSON, so one parser covers both body formats.
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    unknown(&root, TOP, "", &mut out);
+    if let Some(trigger) = root.get("trigger") {
+        unknown(trigger, TRIGGER, "trigger.", &mut out);
+    }
+    if let Some(steps) = root.get("steps").and_then(serde_yaml::Value::as_sequence) {
+        for (i, step) in steps.iter().enumerate() {
+            unknown(step, STEP, &format!("steps[{i}]."), &mut out);
+            if let Some(retry) = step.get("retry") {
+                unknown(retry, RETRY, &format!("steps[{i}].retry."), &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// `GET /pipelines/{name}`.
@@ -235,6 +315,39 @@ steps:
     }
 
     #[test]
+    fn ignored_keys_names_what_parsing_drops() {
+        let yaml = r#"
+uid: p
+scope: tenant
+match:
+  content_types: [application/pdf]
+trigger:
+  content_type: application/pdf
+steps:
+  - id: a
+    plugin: pdf_extractor
+    timeout: 60
+    retry: { max_attempts: 2, delay: 5 }
+  - id: b
+    plugin: meili_indexer
+    config: { anything: goes }
+"#;
+        assert_eq!(
+            ignored_keys(yaml.as_bytes()),
+            vec![
+                "match",
+                "trigger.content_type",
+                "steps[0].timeout",
+                "steps[0].retry.delay"
+            ]
+        );
+        assert!(ignored_keys(YAML.as_bytes()).is_empty());
+        let json = r#"{"uid":"p","steps":[{"id":"a","plugin":"chunker","dependsOn":["x"]}]}"#;
+        assert_eq!(ignored_keys(json.as_bytes()), vec!["steps[0].dependsOn"]);
+        assert!(ignored_keys(b"not: [valid").is_empty());
+    }
+
+    #[test]
     fn parse_yaml_json_and_fallback() {
         let def = parse_pipeline(YAML.as_bytes(), Some("application/x-yaml")).unwrap();
         assert_eq!(def.uid, "my-pdf");
@@ -298,6 +411,37 @@ steps:
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn validate_warns_about_ignored_keys() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines/validate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "valid": true, "order": ["extract", "chunk", "index"]
+            })))
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let send = |body: String| {
+            app.clone().oneshot(
+                Request::post("/pipelines/validate")
+                    .header(CONTENT_TYPE, "application/x-yaml")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        let resp = send(YAML.replace("trigger:", "match:")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_body(resp).await;
+        assert_eq!(json["valid"], true);
+        assert_eq!(json["warnings"], json!(["unknown key `match` is ignored"]));
+
+        // A clean definition gets no `warnings` key at all.
+        let json = json_body(send(YAML.to_string()).await.unwrap()).await;
+        assert!(json.get("warnings").is_none(), "{json}");
     }
 
     #[tokio::test]
