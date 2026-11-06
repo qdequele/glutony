@@ -77,4 +77,42 @@ Control-plane DB tests skip without `DATABASE_URL`. No `protoc` needed (`protox`
 - Every behaviour change gets a test, plus a `CHANGELOG.md` entry under `Unreleased` when users can see it.
 - Docs are Mintlify in `docs/` (`mint.json`). Update them with the feature; env vars go in `docs/deployment/environment-variables.mdx`.
 - Conventional commits (`feat(scope): …`, `fix(scope): …`, `docs: …`, `ci: …`). No AI co-author trailers.
-- Release: move `Unreleased` under the version in `CHANGELOG.md`, bump `Cargo.toml`, push tag `vX.Y.Z`.
+
+## Versioning, releases and deployment
+
+One version, kept in sync by `scripts/prepare-release.sh` and enforced by
+CI's `version sync` job: `[workspace.package] version` and the pinned
+`meili-ingest-plugin-sdk` version in `Cargo.toml`, the workspace crates in
+`Cargo.lock`, `info.version` in `docs/openapi.yaml` (the Pipelines contract
+the Lab vendors), and the newest `CHANGELOG.md` section.
+
+- **Every PR**: add its entries under `Unreleased` in `CHANGELOG.md`, in the
+  same PR. Leave every version alone: only the release script writes them.
+- **Release**: run the "Prepare release" workflow, then merge the
+  `chore(release): vX.Y.Z` PR it opens. The merge tags `vX.Y.Z`, pushes
+  `ghcr.io/qdequele/glutony:X.Y.Z`, publishes the GitHub release and sends
+  `glutony-released` to the Lab. Tags come only from that merge: never push
+  or move one by hand. Steps: CONTRIBUTING.md, "Releasing".
+- **Contract change** (`docs/openapi.yaml`): merge and release it here, then
+  the Lab's Contracts sync PR re-vendors it (or re-vendor in the Lab in the
+  same cross-repo task, same branch name, linked PRs). The Lab ships code
+  that uses it after. A Lab-owned contract (`contracts/vendor/lab/`) goes the
+  other way: the Lab changes it first, backward compatible, then copy it here.
+- **Deploy**: production (the Lab's hosted Pipelines on hackersearch) is not
+  the release. qdq-server's `glutony-autodeploy` builds every `main` commit
+  whose `rustfmt`, `clippy`, `test`, `docker build (amd64)` and
+  `docker build (arm64)` checks are green, so merging to `main` deploys.
+  Renaming one of those jobs stalls the autodeploy until
+  `GLUTONY_REQUIRED_CHECKS` in qdq-server follows. It `pg_dump`s the `glutony`
+  database first; the control plane applies `migrations/` (sqlx) at boot,
+  forward-only, and a rollback restores the dump when `migrations/` changed.
+  Kubernetes: pin `newTag` in `k8s/kustomization.yaml` to the release, then
+  `kubectl apply -k k8s/` (`docs/deployment/kubernetes.mdx`, "Upgrades").
+- **Before merging a change that needs config**: a new required env var or
+  secret goes into `/etc/glutony/glutony.env` on the box (and
+  `docs/deployment/environment-variables.mdx`) first; an auth change that the
+  gateway, workers and control plane must agree on follows the rollout order
+  in `docs/deployment/kubernetes.mdx`. Keep migrations additive: a failed
+  deploy restores the pre-deploy dump and loses the writes made meanwhile.
+- **PR description**: a "Deploy notes" section listing env and config
+  changes, migrations and the rollout order, or "none".

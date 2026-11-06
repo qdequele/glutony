@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # prepare-release.yml dispatches CI on the release branch: a PR opened with
+  # GITHUB_TOKEN gets no pull_request run of its own.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +17,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The release invariant: the crate version (Cargo.toml package and pinned
+  # path dependencies, Cargo.lock) and docs/openapi.yaml info.version agree.
+  version-sync:
+    name: version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/prepare-release.sh --check
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

@@ -1,8 +1,24 @@
 name: Release
 
+# Runs on a `vX.Y.Z` tag: release-on-merge.yml calls it when a
+# `chore(release): vX.Y.Z` PR merges (see CONTRIBUTING.md, "Releasing"); a tag
+# pushed by hand runs it too (recovery only). Builds and pushes the multi-arch
+# image, creates the GitHub release with the tag's CHANGELOG section as notes,
+# then notifies meilisearch/lab (`glutony-released`) so its Contracts sync
+# re-vendors docs/openapi.yaml (only with the LAB_DISPATCH_TOKEN secret).
+#
+# Production on the Lab's box does not deploy these images: it builds every
+# green `main` commit from source (qdq-server glutony/autodeploy.sh).
+
 on:
   push:
     tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: "The vX.Y.Z tag to release (already pushed)"
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -10,6 +26,8 @@ permissions:
 
 env:
   IMAGE: ghcr.io/qdequele/glutony
+  # The tag being released: the pushed tag, or the caller's input.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # One native build per architecture (no QEMU: an emulated release build of this
@@ -28,6 +46,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - id: arch
         run: echo "name=${PLATFORM#linux/}" >> "$GITHUB_OUTPUT"
         env:
@@ -82,10 +102,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # `value`: under workflow_call github.ref is the PR's, not the tag.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
       - name: Create the manifest list
         working-directory: /tmp/digests
         run: |
@@ -112,9 +133,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Release notes from the CHANGELOG
+        env:
+          VERSION: ${{ needs.image.outputs.version }}
+          LATEST: ${{ !contains(env.RELEASE_TAG, '-') && ' (also `latest`)' || '' }}
+        run: |
+          {
+            scripts/prepare-release.sh --notes "$RELEASE_TAG"
+            echo
+            echo "Image: \`$IMAGE:$VERSION\`$LATEST."
+          } > "$RUNNER_TEMP/notes.md"
       - uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          body: |
-            Image: `ghcr.io/qdequele/glutony:${{ needs.image.outputs.version }}`${{ !contains(github.ref_name, '-') && ' (also `latest`)' || '' }}.
-            Changes: see CHANGELOG.md.
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: ${{ runner.temp }}/notes.md
+
+  # A failed dispatch never fails a published release: the Lab's daily
+  # Contracts sync catches up anyway.
+  notify-lab:
+    name: notify the Lab
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Send repository_dispatch glutony-released to meilisearch/lab
+        env:
+          LAB_DISPATCH_TOKEN: ${{ secrets.LAB_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$LAB_DISPATCH_TOKEN" ]; then
+            echo "::notice::LAB_DISPATCH_TOKEN is not set; skipping the Lab notification (its daily contracts run will pick up $RELEASE_TAG)"
+            exit 0
+          fi
+          payload=$(printf '{"event_type":"glutony-released","client_payload":{"tag":"%s","version":"%s"}}' "$RELEASE_TAG" "${RELEASE_TAG#v}")
+          code=$(curl -sS -o "$RUNNER_TEMP/dispatch.out" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $LAB_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/meilisearch/lab/dispatches -d "$payload" || true)
+          if [ "$code" = "204" ]; then
+            echo "notified meilisearch/lab of $RELEASE_TAG"
+          else
+            echo "::warning::could not notify meilisearch/lab (HTTP ${code:-none}): $(head -c 300 "$RUNNER_TEMP/dispatch.out" 2>/dev/null)"
+          fi
