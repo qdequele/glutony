@@ -333,3 +333,396 @@ async fn metrics_are_served_in_the_prometheus_text_format() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn internal_routes_need_the_control_plane_token() {
+    let app = app(state().with_internal_token(Some("cp-token".into())));
+    for req in [
+        post_json("/internal/lab-events", r#"{"events":[]}"#),
+        Request::post("/internal/lab-events")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer nope")
+            .body(Body::from(r#"{"events":[]}"#))
+            .unwrap(),
+        Request::post("/internal/lab-events")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Basic cp-token")
+            .body(Body::from(r#"{"events":[]}"#))
+            .unwrap(),
+        Request::get("/internal/connections/x")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let (status, body) = call(app.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "unauthorized");
+    }
+    // The right token reaches the handler. With the lazy pool that handler fails on
+    // the database (500 `db`), which is exactly "past the auth gate".
+    let (status, _) = call(
+        app.clone(),
+        Request::get("/internal/connections/x")
+            .header(header::AUTHORIZATION, "Bearer cp-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    // Non-internal routes are untouched: /metrics never needs the token.
+    let (status, _) = call(app, Request::get("/metrics").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn without_a_configured_token_internal_routes_stay_open() {
+    let (status, _) = call(
+        app(state()),
+        Request::get("/metrics").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        app(state()),
+        Request::get("/internal/connections/x")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn control_plane_token_policy() {
+    use meili_ingest_control_plane::control_plane_token_policy as policy;
+    assert_eq!(
+        policy(Some("t".into()), false).unwrap().as_deref(),
+        Some("t")
+    );
+    assert_eq!(
+        policy(Some("t".into()), true).unwrap().as_deref(),
+        Some("t")
+    );
+    assert_eq!(policy(None, true).unwrap(), None);
+    let err = policy(None, false).unwrap_err().to_string();
+    assert!(
+        err.contains("CONTROL_PLANE_TOKEN") && err.contains("CONTROL_PLANE_TOKEN_DISABLED=true"),
+        "{err}"
+    );
+    assert!(policy(Some("  ".into()), false).is_err(), "blank is unset");
+    // The example Secret's placeholder is refused even with the escape hatch on.
+    for placeholder in ["CHANGE_ME", " CHANGE_ME\n"] {
+        for disabled in [false, true] {
+            let err = policy(Some(placeholder.into()), disabled)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("CONTROL_PLANE_TOKEN") && err.contains("CHANGE_ME"),
+                "{err}"
+            );
+        }
+    }
+}
+
+// --- `GET /internal/lab/credits/{account_id}`: the workers' credit pre-check ---
+
+const LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+const LAB_INSTANCE: &str = "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d";
+
+fn with_lab(lab_url: &str) -> AppState {
+    let creds = meili_ingest_lab::LabCredentials::new(lab_url, LAB_INSTANCE, "s").unwrap();
+    state().with_lab_credits(std::sync::Arc::new(
+        meili_ingest_lab::AccountCreditCache::new(creds, reqwest::Client::new()),
+    ))
+}
+
+async fn mount_lab_balance(lab: &wiremock::MockServer, balance: i64, expect: u64) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "account_id": LAB_ACCOUNT, "tier": "pro",
+                "credits": {"balance": balance}, "cache_ttl": 30
+            })),
+        )
+        .expect(expect)
+        .mount(lab)
+        .await;
+}
+
+async fn credit_check(state: AppState, account: &str) -> (StatusCode, serde_json::Value) {
+    let (status, body) = call(
+        app(state),
+        Request::get(format!("/internal/lab/credits/{account}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    (status, json(&body))
+}
+
+#[tokio::test]
+async fn credit_checks_without_lab_credentials_are_not_checked() {
+    let (status, body) = credit_check(state(), LAB_ACCOUNT).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"checked": false}));
+}
+
+#[tokio::test]
+async fn credit_checks_of_a_non_lab_account_never_call_the_lab() {
+    let lab = wiremock::MockServer::start().await;
+    mount_lab_balance(&lab, 0, 0).await;
+    for account in ["hackersearch", "0192F3C1-7C2E-7B1A-9F00-3C9D2E4A5B61"] {
+        let (status, body) = credit_check(with_lab(&lab.uri()), account).await;
+        assert_eq!(status, StatusCode::OK, "{account}");
+        assert_eq!(body, serde_json::json!({"checked": false}), "{account}");
+    }
+    // `expect(0)` is verified when `lab` drops.
+}
+
+#[tokio::test]
+async fn credit_checks_of_an_account_with_credits_pass() {
+    let lab = wiremock::MockServer::start().await;
+    mount_lab_balance(&lab, 10, 1).await;
+    let (status, body) = credit_check(with_lab(&lab.uri()), LAB_ACCOUNT).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"checked": true}));
+}
+
+#[tokio::test]
+async fn credit_checks_of_an_account_without_credits_are_402() {
+    let lab = wiremock::MockServer::start().await;
+    mount_lab_balance(&lab, 0, 1).await;
+    let (status, body) = credit_check(with_lab(&lab.uri()), LAB_ACCOUNT).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(body["code"], "insufficient_credits");
+    assert!(
+        body["error"].as_str().unwrap().contains(LAB_ACCOUNT),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn credit_checks_fail_closed_when_the_lab_cannot_answer() {
+    // Nothing listens on port 1, and nothing is cached yet.
+    let (status, body) = credit_check(with_lab("http://127.0.0.1:1"), LAB_ACCOUNT).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "lab_unavailable");
+}
+
+#[tokio::test]
+async fn credit_checks_need_the_control_plane_token() {
+    let (status, body) = credit_check(
+        state().with_internal_token(Some("cp-token".into())),
+        LAB_ACCOUNT,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "unauthorized");
+}
+
+// --- `GET /internal/lab/ai/{account_id}`: the workers' Gateway target ---
+
+const TEAM_KEY: &str = "sk-team-key-do-not-leak";
+
+/// A state serving AI targets from `lab_url`, with the control plane token `cp-token`
+/// (the route refuses without one).
+fn with_lab_ai(lab_url: &str) -> AppState {
+    let creds = meili_ingest_lab::LabCredentials::new(lab_url, LAB_INSTANCE, "s").unwrap();
+    state()
+        .with_internal_token(Some("cp-token".into()))
+        .with_lab_ai(std::sync::Arc::new(meili_ingest_lab::AiTargetCache::new(
+            creds,
+            reqwest::Client::new(),
+        )))
+}
+
+fn ai_body(key_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "base_url": "https://gateway.example/v1",
+        "api_key": TEAM_KEY,
+        "key_id": key_id,
+        "default_model": "openai/gpt-4o-mini",
+        "vision_model": "openai/gpt-4o",
+        "cache_ttl": 60,
+    })
+}
+
+/// `GET uri` with the `cp-token` bearer.
+async fn ai_target(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::get(uri)
+        .header(header::AUTHORIZATION, "Bearer cp-token")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(app(state), req).await;
+    (status, json(&body))
+}
+
+fn ai_uri() -> String {
+    format!("/internal/lab/ai/{LAB_ACCOUNT}")
+}
+
+#[tokio::test]
+async fn ai_target_without_lab_credentials_is_null() {
+    let state = state().with_internal_token(Some("cp-token".into()));
+    let (status, body) = ai_target(state, &ai_uri()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"target": null}));
+}
+
+#[tokio::test]
+async fn ai_target_of_a_non_lab_account_is_null_and_never_calls_the_lab() {
+    let lab = wiremock::MockServer::start().await;
+    let (status, body) = ai_target(with_lab_ai(&lab.uri()), "/internal/lab/ai/hackersearch").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"target": null}));
+    assert!(lab.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ai_target_is_served_from_the_lab() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
+        .expect(1)
+        .mount(&lab)
+        .await;
+    let (status, body) = ai_target(with_lab_ai(&lab.uri()), &ai_uri()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["target"]["key_id"], "k1");
+    // Workers need the key; the route is behind the control plane token.
+    assert_eq!(body["target"]["api_key"], TEAM_KEY);
+    assert_eq!(body["target"]["base_url"], "https://gateway.example/v1");
+    assert_eq!(body["target"]["default_model"], "openai/gpt-4o-mini");
+}
+
+#[tokio::test]
+async fn ai_target_passes_rejected_key_id() {
+    use wiremock::matchers::{method, path, query_param};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .and(query_param("rejected_key_id", "k1"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k2")))
+        .expect(1)
+        .mount(&lab)
+        .await;
+    let (status, body) = ai_target(
+        with_lab_ai(&lab.uri()),
+        &format!("{}?rejected_key_id=k1", ai_uri()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["target"]["key_id"], "k2");
+}
+
+#[tokio::test]
+async fn ai_target_refresh_asks_the_lab_past_a_fresh_entry() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
+        .mount(&lab)
+        .await;
+    let state = with_lab_ai(&lab.uri());
+    let lab_calls = || async { lab.received_requests().await.unwrap().len() };
+    ai_target(state.clone(), &ai_uri()).await;
+    // Cached (cache_ttl 60 s): no second Lab call.
+    ai_target(state.clone(), &ai_uri()).await;
+    assert_eq!(lab_calls().await, 1);
+    // `refresh=true` (a retried step) skips the fresh entry.
+    let (status, body) = ai_target(state.clone(), &format!("{}?refresh=true", ai_uri())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["target"]["key_id"], "k1");
+    assert_eq!(lab_calls().await, 2);
+    // `refresh=false` is the default.
+    ai_target(state, &format!("{}?refresh=false", ai_uri())).await;
+    assert_eq!(lab_calls().await, 2);
+}
+
+#[tokio::test]
+async fn ai_target_is_refused_when_the_token_is_disabled() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
+        .mount(&lab)
+        .await;
+    // CONTROL_PLANE_TOKEN_DISABLED=true: no token on the state.
+    let state = with_lab_ai(&lab.uri()).with_internal_token(None);
+    let (status, body) = call(
+        app(state),
+        Request::get(ai_uri()).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json::<serde_json::Value>(&body)["code"], "token_required");
+    assert!(!String::from_utf8_lossy(&body).contains(TEAM_KEY));
+    assert!(lab.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ai_target_lab_404_is_no_gateway() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(404))
+        .mount(&lab)
+        .await;
+    let (status, body) = ai_target(with_lab_ai(&lab.uri()), &ai_uri()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "no_gateway");
+}
+
+#[tokio::test]
+async fn ai_target_lab_503_is_lab_unavailable() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .mount(&lab)
+        .await;
+    let (status, body) = ai_target(with_lab_ai(&lab.uri()), &ai_uri()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "lab_unavailable");
+    assert!(!body.to_string().contains(TEAM_KEY));
+}
+
+#[tokio::test]
+async fn ai_target_needs_the_control_plane_token() {
+    use wiremock::matchers::{method, path};
+    let lab = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/internal/accounts/{LAB_ACCOUNT}/ai")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(ai_body("k1")))
+        .mount(&lab)
+        .await;
+    let state = with_lab_ai(&lab.uri());
+    let (status, body) = call(
+        app(state.clone()),
+        Request::get(ai_uri()).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json::<serde_json::Value>(&body)["code"], "unauthorized");
+    assert!(!String::from_utf8_lossy(&body).contains(TEAM_KEY));
+    // The refused request never reached the Lab.
+    assert!(lab.received_requests().await.unwrap().is_empty());
+    // With the bearer it goes through.
+    let (status, _) = call(
+        app(state),
+        Request::get(ai_uri())
+            .header(header::AUTHORIZATION, "Bearer cp-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

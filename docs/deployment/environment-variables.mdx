@@ -15,20 +15,23 @@ inside plugins or workflow code.
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
 | `CONTROL_PLANE_URL` | `http://meili-control-plane:9000` | Internal control plane. |
-| `MEILI_URL` | — | Standalone fallback Meilisearch host (used when no `X-Meili-Host`). |
-| `MEILI_API_KEY` | — | Standalone fallback API key (used when no `X-Meili-Api-Key` / bearer). |
+| `MEILI_URL` | — | Standalone fallback Meilisearch host (used when no `X-Meili-Host` and the request carries no tenant). |
+| `MEILI_API_KEY` | — | Standalone fallback API key (used when no `X-Meili-Api-Key` / bearer and the request carries no tenant). |
 | `DEFAULT_INDEX` | `documents` | Last resort of the index resolution chain. |
 | `MAX_UPLOAD_MB` | `500` | Maximum request body; larger → `413`. |
-| `ENVOY_TRUSTED_HEADER` | — | Shared secret. When set, `X-Meili-*` headers are honoured only if `X-Meili-Envoy-Secret` matches. Unset = trust headers (dev mode, warned at startup). |
+| `ENVOY_TRUSTED_HEADER` | — | Shared secret. When set, `X-Meili-*` headers are honoured only if `X-Meili-Envoy-Secret` matches. Unset = trust headers (dev mode, warned at startup). Required with `LAB_SERVICE_TOKEN` or `LAB_INSTANCE_*`. `CHANGE_ME` is refused at boot. |
 | `WRITE_PREFLIGHT` | `false` | Before queueing a job, check the request's Meilisearch key can add documents to (and read) the target index; answer `401`/`403` instead of a job that fails at `meili_indexer`. Skipped for pipelines pinned to a connection. Side-effect free: see `crates/gateway/src/preflight.rs`. |
 | `BLOB_STORE_URL` | `file://./blobs` | Where uploads above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
 | `INLINE_MAX_BYTES` | `1048576` | Uploads up to this size travel inside the Temporal payload; larger ones are staged. |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
 | `SOURCE_SECRET_KEY` | — | 32 bytes, base64 (`openssl rand -base64 32`). Seals [connection](/concepts/connections) keys and [source](/concepts/sources) credentials. Unset = `/connections` and `/sources` answer `501`. Must match the workers'. Rotating it makes stored secrets unreadable. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Where connections may point: `public` (https, public addresses only), `any`, or a comma list of `host[:port]`. |
-| `LAB_SERVICE_TOKEN` | — | Bearer token the Meilisearch Lab console sends to the management routes, together with a required `X-Glutony-Tenant-Id`. Setting it closes open mode, and the gateway refuses to start unless `ENVOY_TRUSTED_HEADER` is also set. See [Meilisearch Lab](/deployment/meilisearch-lab). |
-| `ADMIN_API_KEY` | — | Operator bearer key for the management routes; `X-Glutony-Tenant-Id` is optional (without it the caller acts on the global scope). Setting it closes open mode. Turning it on also requires a management token or a trusted edge tenant on `GET /jobs/{id}`; ingest clients that poll with only a Meilisearch key get 401. |
+| `LAB_SERVICE_TOKEN` | — | Bearer token the Meilisearch Lab console sends to the management routes, together with a required `X-Glutony-Tenant-Id`: the `CREDENTIAL=` given to `bin/rails lab:hosted_engine:create` (`openssl rand -hex 32`). Setting it closes open mode, and the gateway refuses to start unless `ENVOY_TRUSTED_HEADER` is also set. See [Meilisearch Lab](/deployment/meilisearch-lab). |
+| `ADMIN_API_KEY` | — | Operator bearer key for the management routes; `X-Glutony-Tenant-Id` is optional (without it the caller acts on the global scope). Setting it closes open mode. Turning it on also requires a management token or a trusted edge tenant on `GET /jobs/{id}`; ingest clients that poll with only a Meilisearch key get 401. Never reuse it as the Lab credential. `CHANGE_ME` is refused at boot. |
 | `SOURCE_FETCH_HOSTS` | `public` | Where sources **and `{"url": …}` ingest bodies** may fetch from; same syntax. Checked when a source is saved, and on every ingest URL (a forbidden one is a `422`, no job queued). `public` means `https` and public addresses only, so plain-`http` URLs need an allowlist entry or `any`. |
+| `OBJECT_REF_BUCKETS` | unset (any) | Comma-separated bucket (Azure: container) names `{"s3": …}` ingest bodies may name; any other is a `422`. A ref to the blob store's own bucket is always a `422`. Keep it equal to the workers'. See [object refs](#object-refs). |
+| `CONTROL_PLANE_TOKEN` | — | Bearer token presented on every control-plane call. Required when the control plane enforces it (production). `CHANGE_ME` is refused at boot. |
+| `LAB_URL` / `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | — | All three or none, and only with `ENVOY_TRUSTED_HEADER`. `LAB_URL` is a base URL (no path or query). Enables the identity check at boot (a 401, or credentials of another product, aborts boot) and the credit pre-check on ingest and manual source runs (`402` out of credits, `503` when the Lab cannot be asked). See [Meilisearch Lab](/deployment/meilisearch-lab). |
 
 ## Worker (`meili-ingest-worker`)
 
@@ -36,28 +39,33 @@ inside plugins or workflow code.
 |---|---|---|
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
-| `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general`, `workers-llm`, `workers-gpu`, `workers-io`. |
+| `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general` or `workers-io`. AI steps run on `workers-general`. |
 | `CONTROL_PLANE_URL` | — | Plugin manifests are published there at boot (`POST /internal/plugins`). Required for Meilisearch connections and scheduled sources, which the worker loads from it. |
+| `CONTROL_PLANE_TOKEN` | — | Bearer token presented on every control-plane call. Required when the control plane enforces it (production). `CHANGE_ME` is refused at boot. |
 | `BLOB_STORE_URL` | `file://./blobs` | Same store as the gateway. |
 | `PAYLOAD_SPILL_BYTES` | `1048576` | Step outputs larger than this are spilled to the blob store. |
 | `MAX_CONCURRENT_ACTIVITIES` | `20` | Activities executed concurrently by this process. |
 | `EXTERNAL_PLUGINS` | — | Comma-separated external plugins: `wasm:/path/plugin.wasm`, `grpc:http://host:50051`. |
-| `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-llm` pool). Without it those plugins register as unavailable. |
+| `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-general` pool). Without it those plugins register as unavailable. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
 | `LLM_MODEL` | `gpt-4o-mini` | Default model when a step's `config.model` is absent. |
-| `TYPESAFE_API_KEY` | — | Required for `jev_enricher` (the `workers-llm` pool). Without it the plugin registers as unavailable. |
+| `TYPESAFE_API_KEY` | — | Required for `jev_enricher` (the `workers-general` pool). Without it the plugin registers as unavailable. |
 | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai/v1` | TypeSafe API endpoint exposing `/systemone`. |
 | `JEV_MODEL` | `jev-latest` | Default Jev model when a step's `config.model` is absent. |
-| `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-gpu` pool). |
+| `TRANSCRIBE_API_KEY` | falls back to `LLM_API_KEY` | Required for `whisper_transcriber` (the `workers-general` pool). Without it (and without `LLM_API_KEY`) the plugin registers as unavailable. |
 | `TRANSCRIBE_BASE_URL` | falls back to `LLM_BASE_URL`, then `https://api.openai.com/v1` | OpenAI-compatible endpoint exposing `/audio/transcriptions`. |
 | `TRANSCRIBE_MODEL` | `whisper-1` | Default transcription model. |
 | `INDEXER_TASK_TIMEOUT_SECS` | `120` | How long `meili_indexer` waits for one Meilisearch task before retrying the step; a step's `task_timeout_secs` overrides it. Raise it when Meilisearch is shared with a busy writer (tasks run one at a time), and keep it below the index step's `timeout_secs` (built-in pipelines: 1800). |
 | `SOURCE_SECRET_KEY` | — | Same key as the gateway. Opens connection keys in the indexer activity and source credentials in the fetch activity. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Same policy as the gateway, re-applied every time a connection is used. |
-| `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect hop (at most 5) — for scheduled sources and for URL refs in step inputs alike. A refused URL fails the step as non-retryable. `s3://`/`gs://`/`az://` refs are **not** covered (other object-store schemes such as `file://` are refused outright): they are read with the worker's ambient cloud credentials, so scope those to what tenants may read (never the blob store's bucket in a shared deployment). |
+| `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect hop (at most 5), for scheduled sources and for URL refs in step inputs alike. A refused URL fails the step as non-retryable. `s3://`/`gs://`/`az://` refs are **not** covered (other object-store schemes such as `file://` are refused outright): `OBJECT_REF_*` governs them. |
+| `OBJECT_REF_AMBIENT_CREDENTIALS` | `false` | `true` signs `s3://`/`gs://`/`az://` refs with the worker's ambient cloud credentials (task role, instance profile, `AWS_*` keys, ...). Off, they are read anonymously: public objects only. Only turn it on when every tenant may read everything those credentials reach, or with `OBJECT_REF_BUCKETS`. Any value other than `true`/`false`/`1`/`0` stops the worker. See [object refs](#object-refs). |
+| `OBJECT_REF_BUCKETS` | unset (any) | Comma-separated bucket (Azure: container) names object refs may name; a ref to any other fails the step as non-retryable. The blob store's own bucket is refused whatever this says. |
+| `SHUTDOWN_GRACE_SECS` | `60` | On `SIGTERM`/`SIGINT` the worker stops polling at once and lets running activities finish for this long; then they are cancelled and reported to Temporal as retryable `WorkerShutdown` failures, so another worker retries them right away. A plugin that ignores the cancellation is abandoned 10 s later, and the process exits at the latest 30 s after the grace (90 s with the default, inside ECS's and the Kubernetes manifests' 120 s). |
 | `DEFAULT_INDEX` | `documents` | Index for a source's documents when nothing more specific resolves. Keep it equal to the gateway's. |
-| `LAB_EVENTS_ENABLED` | `false` | `true` makes the usage step write one billing event per Lab job to the control plane's outbox. Needs `CONTROL_PLANE_URL` (the worker refuses to start without it). See [Meilisearch Lab](/deployment/meilisearch-lab). |
-| `PROVIDER_COSTS_FILE` | bundled `config/provider-costs.toml` | Provider cost table (micro-USD) used to price each job. A call it cannot price costs 0 and sets `cost_complete: false`. A missing or invalid file stops the worker at boot. |
+| `LAB_EVENTS_ENABLED` | `false` | `true` makes the usage step write one `usage.recorded` and one `job.completed`/`job.failed` event per Lab job to the control plane's outbox. Needs `CONTROL_PLANE_URL` (the worker refuses to start without it). See [Meilisearch Lab](/deployment/meilisearch-lab). |
+| `LAB_AI_GATEWAY` | `false` | `true` behind the Lab: the AI steps of Lab accounts (`llm_enricher`, `image_captioner`, `jev_enricher`) run on the team's Gateway, with the target the control plane gets from the Lab with its `LAB_INSTANCE_*` credentials. Those plugins then register even without `LLM_API_KEY` / `TYPESAFE_API_KEY`; other tenants' AI steps still need them. Needs `CONTROL_PLANE_URL` (the worker refuses to start without it). See [Meilisearch Lab](/deployment/meilisearch-lab#ai-steps-on-the-teams-gateway). |
+| `PROVIDER_COSTS_FILE` | bundled `config/provider-costs.toml` | Provider cost table (micro-USD) used to price each job. A call it cannot price costs 0 and marks the job's cost incomplete (the Lab event reports the priced calls' cost and counts the others in `unpriced_provider_calls`). A missing or invalid file stops the worker at boot. |
 | `TINYBIRD_TOKEN` | — | Append token for per-tenant [usage analytics](/concepts/usage). Absent disables reporting entirely. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
 | `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |
@@ -71,9 +79,10 @@ arrive in the workflow input as `MeiliContext`.
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | — (required) | Postgres connection string. Migrations run at boot. |
-| `BIND` | `0.0.0.0:9000` | Internal listen address. Do not expose publicly. |
-| `LAB_URL` | — | Meilisearch Lab base URL. Enables the sender that posts lab events to `{LAB_URL}/internal/events`. Must be `https` unless the host is loopback or private. |
-| `LAB_EVENTS_SECRET` | — | HMAC key that signs each batch (`X-Lab-Signature`). Required with `LAB_URL` and the reverse is a boot error. Never logged. |
+| `BIND` | `0.0.0.0:9000` | Internal listen address. Never expose it publicly: `CONTROL_PLANE_TOKEN` guards `/internal/*` only, and `/pipelines`, `/jobs`, `/plugins` are open. |
+| `LAB_URL` | — | Meilisearch Lab base URL (no path or query). Enables the sender that posts Lab events to `{LAB_URL}/internal/events`. Must be `https` unless the host is loopback or private. |
+| `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | — | This deployment's Lab credentials; sign each batch (`X-Lab-Signature` over `"<timestamp>.<body>"`) and answer the workers' credit pre-check of source runs (`GET /internal/lab/credits/{account}`). Required with `LAB_URL`. Credentials of another product's engine abort boot. Never logged. |
+| `CONTROL_PLANE_TOKEN` | — (required) | Bearer token callers of `/internal/*` must present (the other routes on this port are not covered). `CONTROL_PLANE_TOKEN_DISABLED=true` runs without it (dev, and step 2 of the [rollout order](/deployment/meilisearch-lab#rollout-order)); a set token is enforced whatever the flag. `CHANGE_ME` is refused at boot. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 ## Object store credentials
@@ -83,9 +92,37 @@ variables read by `object_store`:
 
 | Scheme | Variables |
 |---|---|
-| `s3://bucket/prefix` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, optional `AWS_ENDPOINT` (MinIO), or IRSA / instance profile |
+| `s3://bucket/prefix` | `AWS_REGION` (or `AWS_DEFAULT_REGION`; without either requests go to `us-east-1`), then the first credentials found: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`), web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`: IRSA), the ECS task role (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, set by ECS and Fargate), EKS Pod Identity, or the EC2 instance profile. Optional `AWS_ENDPOINT` (MinIO) with `AWS_ALLOW_HTTP=true` for plain http. |
 | `gs://bucket/prefix` | `GOOGLE_SERVICE_ACCOUNT` / `GOOGLE_APPLICATION_CREDENTIALS`, or Workload Identity |
 | `az://container/prefix` | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY` or SAS / managed identity |
+
+ECS sets `AWS_REGION` in every task; an EC2 instance does not, so set it on a
+gateway or worker running directly on EC2. Gateway and workers must use the same
+`BLOB_STORE_URL`: the gateway stages uploads there and the workers read them back.
+Give each role only what it needs on that bucket and prefix: `s3:PutObject` for
+the gateway, `s3:GetObject` and `s3:PutObject` for the workers (they spill large
+step outputs there too).
+
+### Object refs
+
+An ingest body `{"s3": "s3://bucket/key"}` (or `gs://`, `az://`, ...) is read by
+the worker, not the gateway, under these rules:
+
+- A ref to the blob store's own bucket is always refused (`422` at the gateway,
+  a non-retryable step failure at the worker): other tenants' uploads are staged
+  there.
+- With `OBJECT_REF_BUCKETS` set, a ref to any bucket outside the list is refused
+  the same way.
+- By default the object is read **anonymously** (unsigned requests), so only
+  public objects can be ingested this way. For S3 the bucket's region is looked
+  up first (an unsigned `HEAD` to `<bucket>.s3.amazonaws.com`), unless
+  `AWS_ENDPOINT` points elsewhere.
+- `OBJECT_REF_AMBIENT_CREDENTIALS=true` signs the read with the worker's own
+  credentials instead. Anyone who can submit an ingest can then read whatever
+  those credentials reach, so pair it with `OBJECT_REF_BUCKETS`.
+
+Private tenant data is better passed as a presigned `https://` URL in a
+`{"url": …}` body, which `SOURCE_FETCH_HOSTS` governs.
 
 ## Temporal Cloud
 
@@ -99,5 +136,7 @@ client configuration in `crates/gateway/src/main.rs` and
 ## Where they are set
 
 - **Compose**: inline in `compose.yaml`; secrets via `.env`.
-- **Kubernetes**: `ConfigMap meili-ingest-config` and `Secret meili-ingest-secrets`
-  in `k8s/control-plane.yaml`, mounted with `envFrom` / `secretKeyRef`.
+- **Kubernetes**: `ConfigMap meili-ingest-config` in `k8s/control-plane.yaml` and
+  `Secret meili-ingest-secrets`, created once outside the kustomization (every key is
+  listed in `k8s/secrets.example.yaml`), mounted with `envFrom` / `secretKeyRef`.
+  Restart the pods after changing either: env is read at pod start.

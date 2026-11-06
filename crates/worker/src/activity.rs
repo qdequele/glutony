@@ -23,11 +23,43 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::connection::{ConnectionSettings, ControlPlane, resolve_connection};
+use crate::ai_target::{LAB_AI_PLUGINS, fetch_ai_target};
+use crate::connection::{ConnectionSettings, ControlPlane, authed, resolve_connection};
 use crate::registry::PluginRegistry;
 
 /// Interval at which the activity heartbeats on its own, independent of the plugin.
 const KEEPALIVE_HEARTBEAT: Duration = Duration::from_secs(20);
+
+/// How long a plugin may keep running after its activity is cancelled (a job cancel,
+/// or the worker shutting down) before it is abandoned and the activity reports the
+/// cancellation. Plugins that poll the cancellation flag stop well within it.
+const CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// Run `work`, but once `cancelled` resolves give it only `grace` more before giving up
+/// with [`PluginError::Cancelled`]. Without this a plugin that never polls the flag
+/// would keep a shutting-down worker alive until it is killed, and Temporal would only
+/// retry the step after its heartbeat timeout.
+async fn abandon_after_cancel<T>(
+    work: impl std::future::Future<Output = Result<T, PluginError>>,
+    cancelled: impl std::future::Future<Output = ()>,
+    grace: Duration,
+) -> Result<T, PluginError> {
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => return result,
+        () = cancelled => {}
+    }
+    match tokio::time::timeout(grace, work).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "plugin ignored cancellation, abandoning it"
+            );
+            Err(PluginError::Cancelled)
+        }
+    }
+}
 
 /// Input of the `expand_fan_out` activity: split a (possibly spilled) upstream output
 /// into branch inputs.
@@ -101,10 +133,14 @@ pub struct StepActivities {
     /// Control plane base URL, used to keep the job row's status honest and to resolve
     /// Meilisearch connections.
     pub control_plane_url: Option<String>,
+    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    pub control_plane_token: Option<String>,
     /// Key and host policy for resolving an indexer step's Meilisearch connection.
     pub connections: ConnectionSettings,
     /// Post Lab billing events to the control plane (spec §5.3).
     pub lab_events: bool,
+    /// Run the AI steps of Lab accounts on the team's Gateway (`LAB_AI_GATEWAY`).
+    pub lab_ai_gateway: bool,
 }
 
 impl StepActivities {
@@ -117,8 +153,10 @@ impl StepActivities {
             spill_threshold,
             usage: None,
             control_plane_url: None,
+            control_plane_token: None,
             connections: ConnectionSettings::default(),
             lab_events: false,
+            lab_ai_gateway: false,
         }
     }
 
@@ -141,13 +179,104 @@ impl StepActivities {
         self
     }
 
-    /// Post each finished Lab job's billing event to the control plane's outbox.
+    /// Present `CONTROL_PLANE_TOKEN` on every control plane request.
+    pub fn with_control_plane_token(mut self, token: Option<String>) -> Self {
+        self.control_plane_token = token;
+        self
+    }
+
+    /// Post each finished Lab job's usage and lifecycle events to the control plane's outbox.
     pub fn with_lab_events(mut self, enabled: bool) -> Self {
         self.lab_events = enabled;
         self
     }
 
-    /// Record a finished job: status write-back, then the Lab billing event, then
+    /// Run the AI steps ([`LAB_AI_PLUGINS`]) of Lab accounts on the team's Gateway,
+    /// with the target the control plane serves (`GET /internal/lab/ai/{account}`).
+    pub fn with_lab_ai_gateway(mut self, enabled: bool) -> Self {
+        self.lab_ai_gateway = enabled;
+        self
+    }
+
+    fn control_plane(&self) -> ControlPlane<'_> {
+        ControlPlane {
+            http: &self.http,
+            base_url: self.control_plane_url.as_deref(),
+            token: self.control_plane_token.as_deref(),
+        }
+    }
+
+    /// Attach the step's Lab Gateway target to `plugin_ctx` when this worker runs AI
+    /// steps on the Lab, the plugin is one of [`LAB_AI_PLUGINS`] and `tenant` is a Lab
+    /// account. Returns whether one was attached. The key stays in memory: it is not
+    /// part of the activity input, so it never reaches Temporal history.
+    ///
+    /// A retried attempt asks the control plane to refresh its cached target: the
+    /// replica answering may still hold a key another one saw rotated.
+    async fn attach_ai_target(
+        &self,
+        plugin_ctx: &PluginContext,
+        plugin: &str,
+        tenant: Option<&str>,
+    ) -> Result<bool, PluginError> {
+        if !self.lab_ai_gateway || !LAB_AI_PLUGINS.contains(&plugin) {
+            return Ok(false);
+        }
+        let Some(tenant) = tenant.filter(|t| meili_ingest_lab::is_lab_account(t)) else {
+            return Ok(false);
+        };
+        let refresh = plugin_ctx.attempt() > 1;
+        match fetch_ai_target(&self.control_plane(), tenant, None, refresh).await? {
+            Some(target) => {
+                plugin_ctx.set_ai_target(target);
+                Ok(true)
+            }
+            None => {
+                tracing::warn!(
+                    tenant,
+                    plugin,
+                    "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target \
+                     for this Lab account (it has no LAB_INSTANCE_* credentials?); the step \
+                     falls back to this worker's own provider key"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// After a failed step: when the Gateway refused the Lab key, report it once so the
+    /// Lab replaces it before Temporal retries the step. The answer only matters to the
+    /// next attempt (which fetches again), so it is logged, never returned.
+    async fn report_rejected_key(&self, plugin_ctx: &PluginContext, tenant: Option<&str>) {
+        let (Some(target), Some(tenant)) = (plugin_ctx.ai_target(), tenant) else {
+            return;
+        };
+        if !target.is_rejected() {
+            return;
+        }
+        let rejected = target.key_id.as_str();
+        match fetch_ai_target(&self.control_plane(), tenant, Some(rejected), false).await {
+            Ok(Some(next)) => tracing::warn!(
+                tenant,
+                rejected_key_id = rejected,
+                key_id = %next.key_id,
+                "the Gateway refused the Lab key; reported it, the retry uses the Lab's answer"
+            ),
+            Ok(None) => tracing::warn!(
+                tenant,
+                rejected_key_id = rejected,
+                "the Gateway refused the Lab key; reported it, the Lab served no target"
+            ),
+            Err(e) => tracing::warn!(
+                tenant,
+                rejected_key_id = rejected,
+                error = %e,
+                "the Gateway refused the Lab key and reporting it failed"
+            ),
+        }
+    }
+
+    /// Record a finished job: status write-back, then the Lab events, then
     /// analytics. The bill goes first so an analytics outage cannot hold it back;
     /// every step is idempotent, so a retry repeats them harmlessly.
     pub async fn report_usage(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
@@ -161,7 +290,7 @@ impl StepActivities {
             .map_err(|e| UsageReportError::Retryable(e.to_string()))?;
 
         if self.lab_events {
-            self.post_lab_event(input).await?;
+            self.post_lab_events(input).await?;
         }
 
         let Some(client) = &self.usage else {
@@ -181,14 +310,14 @@ impl StepActivities {
         }
     }
 
-    async fn post_lab_event(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
-        let event = match meili_ingest_usage::lab::lab_event_for_job(input) {
+    async fn post_lab_events(&self, input: &JobUsageInput) -> Result<(), UsageReportError> {
+        let events = match meili_ingest_usage::lab::lab_events_for_job(input) {
             Ok(e) => e,
             Err(reason) => {
                 tracing::debug!(
                     job_id = %input.job_id,
                     reason = reason.as_str(),
-                    "no Lab event for this job"
+                    "no Lab events for this job"
                 );
                 return Ok(());
             }
@@ -198,20 +327,30 @@ impl StepActivities {
                 "LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL".into(),
             ));
         };
-        let resp = self
-            .http
-            .post(format!("{base}/internal/lab-events"))
-            .json(&serde_json::json!({ "events": [event] }))
-            .send()
-            .await
-            .map_err(|e| UsageReportError::Retryable(format!("control plane unreachable: {e}")))?;
+        let resp = authed(
+            self.http.post(format!("{base}/internal/lab-events")),
+            self.control_plane_token.as_deref(),
+        )
+        .json(&serde_json::json!({ "events": events }))
+        .send()
+        .await
+        .map_err(|e| UsageReportError::Retryable(format!("control plane unreachable: {e}")))?;
         if !resp.status().is_success() {
             return Err(UsageReportError::Retryable(format!(
-                "control plane refused the lab event: {}",
+                "control plane refused the lab events: {}",
                 resp.status()
             )));
         }
-        tracing::info!(job_id = %input.job_id, "lab event recorded");
+        tracing::info!(job_id = %input.job_id, events = events.len(), "lab events recorded");
+        let unpriced = meili_ingest_usage::lab::unpriced_provider_calls(input);
+        if unpriced > 0 {
+            tracing::warn!(
+                job_id = %input.job_id,
+                pipeline = %input.pipeline_uid,
+                unpriced_provider_calls = unpriced,
+                "Lab usage event under-reports provider cost: some calls had no price"
+            );
+        }
         Ok(())
     }
 
@@ -238,9 +377,7 @@ impl StepActivities {
             let truncated: String = err.chars().take(1000).collect();
             body.insert("error".into(), serde_json::json!(truncated));
         }
-        let resp = self
-            .http
-            .patch(&url)
+        let resp = authed(self.http.patch(&url), self.control_plane_token.as_deref())
             .json(&serde_json::Value::Object(body))
             .send()
             .await
@@ -279,6 +416,10 @@ impl StepActivities {
                 BlobError::Blocked(_) => {
                     PluginError::NonRetryable(format!("refusing to fetch the step input: {e}"))
                 }
+                // A 404 / 403 / 410 ... answers the same way on every attempt.
+                BlobError::Rejected(_) => {
+                    PluginError::NonRetryable(format!("failed to resolve step input: {e}"))
+                }
                 other => PluginError::Retryable(format!("failed to resolve step input: {other}")),
             })?;
         if !manifest.accepts.is_empty() && !manifest.accepts_kind(resolved.kind()) {
@@ -310,17 +451,25 @@ impl StepActivities {
         // Resolved here, in memory, rather than in the workflow: the activity input only
         // ever names the connection, so its key never reaches Temporal history.
         let config = resolve_connection(
-            &ControlPlane {
-                http: &self.http,
-                base_url: self.control_plane_url.as_deref(),
-            },
+            &self.control_plane(),
             &self.connections,
             &input.plugin,
             input.config,
             input.tenant_id.as_deref(),
         )
         .await?;
-        let output = plugin.execute(plugin_ctx, resolved, config).await?;
+        // Same rule for a Lab tenant's Gateway key: fetched here, held by the context.
+        let lab_target = self
+            .attach_ai_target(plugin_ctx, &input.plugin, input.tenant_id.as_deref())
+            .await?;
+        let output = match plugin.execute(plugin_ctx, resolved, config).await {
+            Ok(output) => output,
+            Err(e) => {
+                self.report_rejected_key(plugin_ctx, input.tenant_id.as_deref())
+                    .await;
+                return Err(e);
+            }
+        };
         let doc_count = output.document_count();
         let output = self
             .blob
@@ -335,7 +484,12 @@ impl StepActivities {
             .map_err(|e| PluginError::Retryable(format!("failed to spill step output: {e}")))?;
         let duration_ms = started.elapsed().as_millis() as u64;
         // Whatever the plugin spent on external services during `execute`.
-        let usage = plugin_ctx.usage();
+        let mut usage = plugin_ctx.usage();
+        if lab_target {
+            // The team's Gateway bills these calls to the team; glutony paid no provider.
+            usage.cost_micro_usd = 0;
+            usage.unpriced_calls = 0;
+        }
         tracing::info!(
             job_id = %input.job_id,
             step = %input.step_id,
@@ -481,7 +635,12 @@ impl StepActivities {
         input: StepActivityInput,
     ) -> Result<StepActivityOutput, ActivityError> {
         let (plugin_ctx, forwarder) = bridge_context(&ctx, input.job_id, &input.step_id);
-        let result = self.run_step(&plugin_ctx, input).await;
+        let result = abandon_after_cancel(
+            self.run_step(&plugin_ctx, input),
+            ctx.cancelled(),
+            CANCEL_GRACE,
+        )
+        .await;
         forwarder.abort();
         result.map_err(to_activity_error)
     }
@@ -535,6 +694,31 @@ mod tests {
     use super::*;
     use meili_ingest_plugin_sdk::Document;
     use meili_ingest_plugin_sdk::prelude::*;
+
+    #[tokio::test]
+    async fn a_plugin_ignoring_cancellation_is_abandoned_after_the_grace() {
+        let never = std::future::pending::<Result<(), PluginError>>();
+        let result = abandon_after_cancel(never, async {}, Duration::from_millis(10)).await;
+        assert!(matches!(result, Err(PluginError::Cancelled)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_finishing_within_the_grace_keeps_its_result() {
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, PluginError>(7)
+        };
+        let result = abandon_after_cancel(work, async {}, Duration::from_secs(5)).await;
+        assert_eq!(result.unwrap(), 7);
+        // Not cancelled: the work runs as long as it needs.
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok::<_, PluginError>(8)
+        };
+        let result =
+            abandon_after_cancel(work, std::future::pending(), Duration::from_millis(1)).await;
+        assert_eq!(result.unwrap(), 8);
+    }
 
     struct Upper;
     #[async_trait]
@@ -635,7 +819,7 @@ mod tests {
 
         let control_plane = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/internal/connections/prod-movies/resolve"))
+            .and(path("/internal/connections/prod-movies"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "tenant_id": "tenant-1",
                 "host": "http://meilisearch:7700",
@@ -674,6 +858,314 @@ mod tests {
         );
         assert_eq!(received["host"], "http://meilisearch:7700");
         assert_eq!(received["connection"], "prod-movies");
+    }
+
+    /// A Lab account id (canonical UUID), so its AI steps go through the Lab.
+    const LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+    const OTHER_LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62";
+    const LAB_KEY: &str = "sk-lab-NEVER-IN-HISTORY";
+
+    /// Stands in for an AI plugin: answers with the `key_id` of the target it saw
+    /// (`"none"` without one), records priced usage, and can refuse the key.
+    struct Probe {
+        name: &'static str,
+        reject: bool,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Probe {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                reject: false,
+                runs: Arc::default(),
+            }
+        }
+
+        fn rejecting(mut self) -> Self {
+            self.reject = true;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for Probe {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new(self.name, "0")
+        }
+        async fn execute(
+            &self,
+            ctx: &PluginContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            ctx.record_usage(UsageUnits {
+                llm_input_tokens: 10,
+                cost_micro_usd: 50,
+                unpriced_calls: 1,
+                ..Default::default()
+            });
+            let target = ctx.ai_target();
+            if self.reject
+                && let Some(t) = target
+            {
+                t.mark_rejected();
+                return Err(PluginError::Retryable("the Gateway refused the key".into()));
+            }
+            let seen = target.map_or_else(|| "none".to_string(), |t| t.key_id.clone());
+            Ok(PluginOutput::Documents(vec![Document::with_id(
+                "seen", seen,
+            )]))
+        }
+    }
+
+    fn seen_key(out: &StepActivityOutput) -> String {
+        match &out.output {
+            PluginOutput::Documents(d) => d[0].content.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn lab_target(key_id: &str) -> serde_json::Value {
+        serde_json::json!({ "target": {
+            "base_url": "http://lumen:8080/v1",
+            "api_key": LAB_KEY,
+            "key_id": key_id,
+            "default_model": "openai/gpt-4o-mini",
+            "vision_model": "openai/gpt-4o-mini",
+            "cache_ttl": 300,
+        }})
+    }
+
+    /// A control plane answering `GET /internal/lab/ai/{account}` with `answer`.
+    async fn ai_control_plane(answer: ResponseTemplate) -> MockServer {
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/internal/lab/ai/[^/]+$"))
+            .respond_with(answer)
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    async fn ai_requests(cp: &MockServer) -> Vec<wiremock::Request> {
+        cp.received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().starts_with("/internal/lab/ai/"))
+            .collect()
+    }
+
+    fn ai_acts(cp: &MockServer, plugin: Probe, lab_ai_gateway: bool) -> StepActivities {
+        acts(vec![Arc::new(plugin)])
+            .with_control_plane(Some(cp.uri()))
+            .with_control_plane_token(Some("cp-token".into()))
+            .with_lab_ai_gateway(lab_ai_gateway)
+    }
+
+    fn ai_step(plugin: &str, tenant: &str) -> StepActivityInput {
+        let mut input = step_input(plugin, PluginInput::Empty);
+        input.tenant_id = Some(tenant.into());
+        input
+    }
+
+    #[tokio::test]
+    async fn a_lab_tenant_ai_step_gets_its_target() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let input = ai_step("llm_enricher", LAB_ACCOUNT);
+
+        // What Temporal records for this activity.
+        let recorded = serde_json::to_string(&input).expect("serialize");
+        assert!(
+            !recorded.contains("api_key") && !recorded.contains(LAB_KEY),
+            "the activity input must not carry the Gateway key: {recorded}"
+        );
+
+        let out = a
+            .run_step(&PluginContext::noop(), input)
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "k1");
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].url.path(),
+            format!("/internal/lab/ai/{LAB_ACCOUNT}")
+        );
+        assert_eq!(
+            reqs[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer cp-token")
+        );
+        let shown = format!("{out:?}");
+        assert!(!shown.contains(LAB_KEY), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_non_lab_tenant_gets_no_target_and_no_call() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", "tenant-1"))
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+
+        let no_tenant = step_input("llm_enricher", PluginInput::Empty);
+        let out = a
+            .run_step(&PluginContext::noop(), no_tenant)
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_flag_off_makes_no_call() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), false);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_non_ai_plugin_makes_no_call() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("chunker"), true);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("chunker", LAB_ACCOUNT))
+            .await
+            .expect("step runs");
+        assert_eq!(seen_key(&out), "none");
+        assert!(ai_requests(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_is_reported_once() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let probe = Probe::new("llm_enricher").rejecting();
+        let runs = probe.runs.clone();
+        let a = ai_acts(&cp, probe, true);
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("the Gateway refused the key");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(!err.to_string().contains(LAB_KEY), "{err}");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 2, "the lookup, then one report: {reqs:?}");
+        assert!(reqs[0].url.query().is_none(), "{:?}", reqs[0].url);
+        let reported = reqs
+            .iter()
+            .filter(|r| {
+                r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "rejected_key_id" && v == "k1")
+            })
+            .count();
+        assert_eq!(reported, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retried_step_asks_for_a_refreshed_target() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let ctx_at = |attempt| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            PluginContext::new(
+                uuid::Uuid::nil(),
+                "s",
+                attempt,
+                tx,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        };
+        a.run_step(&ctx_at(1), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("attempt 1 runs");
+        a.run_step(&ctx_at(2), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("attempt 2 runs");
+        let reqs = ai_requests(&cp).await;
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].url.query(), None, "attempt 1 uses the cache");
+        assert_eq!(reqs[1].url.query(), Some("refresh=true"));
+    }
+
+    #[tokio::test]
+    async fn a_lab_target_step_reports_no_provider_cost() {
+        let cp = ai_control_plane(ResponseTemplate::new(200).set_body_json(lab_target("k1"))).await;
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect("step runs");
+        assert_eq!(out.usage.cost_micro_usd, 0, "the Gateway bills the team");
+        assert_eq!(out.usage.unpriced_calls, 0);
+        assert_eq!(out.usage.llm_input_tokens, 10, "units are still metered");
+
+        // Without a Lab target the provider cost is ours and stays.
+        let out = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", "tenant-1"))
+            .await
+            .expect("step runs");
+        assert_eq!(out.usage.cost_micro_usd, 50);
+        assert_eq!(out.usage.unpriced_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn two_tenants_get_their_own_keys() {
+        let cp = MockServer::start().await;
+        for (account, key_id) in [(LAB_ACCOUNT, "k-a"), (OTHER_LAB_ACCOUNT, "k-b")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/internal/lab/ai/{account}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(lab_target(key_id))
+                        .set_delay(Duration::from_millis(20)),
+                )
+                .mount(&cp)
+                .await;
+        }
+        let a = ai_acts(&cp, Probe::new("llm_enricher"), true);
+        let (ctx_a, ctx_b) = (PluginContext::noop(), PluginContext::noop());
+        let (out_a, out_b) = tokio::join!(
+            a.run_step(&ctx_a, ai_step("llm_enricher", LAB_ACCOUNT)),
+            a.run_step(&ctx_b, ai_step("llm_enricher", OTHER_LAB_ACCOUNT)),
+        );
+        assert_eq!(seen_key(&out_a.expect("a runs")), "k-a");
+        assert_eq!(seen_key(&out_b.expect("b runs")), "k-b");
+    }
+
+    #[tokio::test]
+    async fn no_gateway_is_final() {
+        let cp = ai_control_plane(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": format!("account {LAB_ACCOUNT} has no Gateway"),
+            "code": "no_gateway",
+        })))
+        .await;
+        let probe = Probe::new("llm_enricher");
+        let runs = probe.runs.clone();
+        let a = ai_acts(&cp, probe, true);
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("no Gateway");
+        assert!(!err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("no Gateway"), "{err}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the plugin never runs");
     }
 
     #[tokio::test]
@@ -907,6 +1399,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permanent_client_error_on_the_input_url_is_non_retryable() {
+        // A 404 stays a 404: retrying only delays the failed job.
+        for (status, permanent) in [
+            (404, true),
+            (403, true),
+            (410, true),
+            (408, false),
+            (429, false),
+            (503, false),
+        ] {
+            let files = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .mount(&files)
+                .await;
+            let err = guarded_acts(files.uri().trim_start_matches("http://"))
+                .run_step(
+                    &PluginContext::noop(),
+                    step_input("echo", url_input(format!("{}/doc.txt", files.uri()))),
+                )
+                .await
+                .unwrap_err();
+            if permanent {
+                assert!(
+                    matches!(err, PluginError::NonRetryable(_)),
+                    "{status}: {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, PluginError::Retryable(_)),
+                    "{status}: {err:?}"
+                );
+            }
+            assert!(err.to_string().contains(&status.to_string()), "{err}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_public_address_passes_the_public_policy() {
         // The check only: no request leaves the test. An IP literal needs no DNS.
         use meili_ingest_blob::UrlCheck as _;
@@ -974,7 +1504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lab_job_posts_its_event_to_the_outbox() {
+    async fn a_lab_job_posts_its_usage_and_lifecycle_events_to_the_outbox() {
         let cp = control_plane_with_lab_events(202, 1).await;
         let input = lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61");
         acts_with(&cp, true).report_usage(&input).await.unwrap();
@@ -986,10 +1516,18 @@ mod tests {
             .find(|r| r.url.path() == "/internal/lab-events")
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&posted.body).unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2, "one batch carries both events of the job");
         assert_eq!(
-            body["events"][0]["id"],
+            events[0]["id"],
             meili_ingest_usage::lab::lab_event_id(input.job_id).to_string()
         );
+        assert_eq!(events[0]["type"], "usage.recorded");
+        assert_eq!(
+            events[1]["id"],
+            meili_ingest_usage::lab::lab_job_event_id(input.job_id).to_string()
+        );
+        assert_eq!(events[1]["type"], "job.completed");
     }
 
     #[tokio::test]

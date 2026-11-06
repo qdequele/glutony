@@ -40,9 +40,19 @@
 //!
 //! | var | required | default |
 //! |---|---|---|
-//! | `LLM_API_KEY` | yes | — |
+//! | `LLM_API_KEY` | yes (unless the Lab provides a target, see below) | — |
 //! | `LLM_BASE_URL` | no | `https://api.openai.com/v1` |
 //! | `LLM_MODEL` | no | `gpt-4o-mini` |
+//!
+//! ## Behind the Lab
+//!
+//! Behind the Meilisearch Lab the worker attaches the team's [`AiTarget`] (its hosted
+//! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
+//! plugin calls it instead of the env-configured API, with the target's `default_model`
+//! (a step's `config.model` still wins), and even a [`LlmEnricherPlugin::disabled`]
+//! instance works. A Gateway 401 marks the target rejected and is retried with a fresh
+//! key; a 402 means the team's budget is spent and is final; a 403 is final. Without a target
+//! nothing changes: the env client is used, and `LLM_API_KEY not set` is the error.
 //!
 //! ## Reply mapping
 //!
@@ -60,8 +70,10 @@
 use std::time::Duration;
 
 use futures::StreamExt;
+use meili_ingest_plugin_sdk::ai::gateway_failure;
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
 /// Plugin name referenced by `steps[].plugin`.
@@ -176,6 +188,9 @@ struct LlmClient {
     api_key: String,
     default_model: String,
     http: reqwest::Client,
+    /// Set when this client was built from the Lab's target: Gateway failures then map
+    /// through [`gateway_failure`], and a rejected key is flagged on the shared target.
+    lab: Option<AiTarget>,
 }
 
 /// The `llm_enricher` plugin. See the crate docs.
@@ -256,6 +271,7 @@ impl LlmEnricherPlugin {
                 api_key: api_key.into(),
                 default_model: default_model.into(),
                 http,
+                lab: None,
             }),
         }
     }
@@ -265,9 +281,29 @@ impl LlmEnricherPlugin {
         self.client.is_some()
     }
 
-    fn client(&self) -> Result<&LlmClient, PluginError> {
+    /// The client for one step: the Lab's target when the context carries one, else the
+    /// env client, else `InvalidConfig("LLM_API_KEY not set")`.
+    fn client_for(&self, ctx: &ActivityContext) -> Result<LlmClient, PluginError> {
+        if let Some(target) = ctx.ai_target() {
+            let http = match &self.client {
+                Some(c) => c.http.clone(),
+                None => reqwest::Client::builder()
+                    .timeout(DEFAULT_TIMEOUT)
+                    .build()
+                    .map_err(|e| {
+                        PluginError::non_retryable(format!("cannot build HTTP client: {e}"))
+                    })?,
+            };
+            return Ok(LlmClient {
+                base_url: target.base_url.trim_end_matches('/').to_string(),
+                api_key: target.api_key.clone(),
+                default_model: target.default_model.clone(),
+                http,
+                lab: Some(target.clone()),
+            });
+        }
         self.client
-            .as_ref()
+            .clone()
             .ok_or_else(|| PluginError::invalid_config("LLM_API_KEY not set"))
     }
 }
@@ -307,7 +343,7 @@ impl Plugin for LlmEnricherPlugin {
         let cfg: LlmEnricherConfig = serde_json::from_value(config)
             .map_err(|e| PluginError::invalid_config(e.to_string()))?;
         cfg.validate()?;
-        let client = self.client()?;
+        let client = self.client_for(ctx)?;
 
         // 2. Input: Documents or Many, flattened.
         let docs = input.into_documents()?;
@@ -322,7 +358,7 @@ impl Plugin for LlmEnricherPlugin {
             std::iter::repeat_with(|| None).take(total).collect();
         let mut stream = futures::stream::iter(docs.into_iter().enumerate())
             .map(|(i, doc)| {
-                let cfg = &cfg;
+                let (cfg, client) = (&cfg, &client);
                 async move { (i, client.enrich(ctx, cfg, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
@@ -401,6 +437,16 @@ fn request_without_token_counts() -> UsageUnits {
 }
 
 impl LlmClient {
+    /// The id to send for `model`: as written to the Lab's Gateway, else without the
+    /// `<provider>/` prefix of the vendor called directly (see [`direct_model`]).
+    fn wire_model<'a>(&self, model: &'a str) -> &'a str {
+        if self.lab.is_some() {
+            model
+        } else {
+            direct_model(&self.base_url, model)
+        }
+    }
+
     /// Ask the model about one document and merge the reply into it.
     ///
     /// Records the call's usage on `ctx` before returning. This runs inside the
@@ -420,7 +466,7 @@ impl LlmClient {
             .unwrap_or(DEFAULT_SYSTEM_PROMPT);
         let model = cfg.model.as_deref().unwrap_or(&self.default_model);
         let mut body = serde_json::json!({
-            "model": model,
+            "model": self.wire_model(model),
             "temperature": cfg.temperature,
             "response_format": { "type": "json_object" },
             "messages": [
@@ -433,8 +479,14 @@ impl LlmClient {
         }
 
         // A failed call records nothing: `?` returns before `record_usage`.
-        let completion =
-            chat_completion_with_usage(&self.http, &self.base_url, &self.api_key, &body).await?;
+        let completion = complete(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &body,
+            self.lab.as_ref(),
+        )
+        .await?;
         let mut usage = completion.usage;
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
@@ -472,6 +524,19 @@ pub async fn chat_completion_with_usage(
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<Completion, PluginError> {
+    complete(http, base_url, api_key, body, None).await
+}
+
+/// The one chat-completions call behind [`chat_completion_with_usage`] and the plugin.
+/// When `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say: 401
+/// marks the target rejected and is `Retryable`, 402 is a final "budget exhausted".
+async fn complete(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    lab: Option<&AiTarget>,
+) -> Result<Completion, PluginError> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = http
         .post(&url)
@@ -487,7 +552,7 @@ pub async fn chat_completion_with_usage(
         .await
         .map_err(|e| PluginError::retryable(format!("LLM response body unreadable: {e}")))?;
     if !status.is_success() {
-        return Err(map_http_failure(status.as_u16(), &text));
+        return Err(map_http_failure(status.as_u16(), &text, lab));
     }
 
     let parsed: ChatCompletion = serde_json::from_str(&text).map_err(|e| {
@@ -511,7 +576,10 @@ pub async fn chat_completion_with_usage(
     Ok(Completion { content, usage })
 }
 
-fn map_http_failure(code: u16, body: &str) -> PluginError {
+fn map_http_failure(code: u16, body: &str, lab: Option<&AiTarget>) -> PluginError {
+    if let Some(err) = lab.and_then(|t| gateway_failure(t, code, body)) {
+        return err;
+    }
     let snippet = truncate_chars(body, 512);
     match code {
         429 | 500..=599 => {
@@ -1117,6 +1185,190 @@ mod tests {
         assert!(ctx.usage().is_empty());
     }
 
+    // -- Behind the Lab: the target on the context wins over the env client --------------
+
+    fn lab_target(server: &MockServer) -> AiTarget {
+        AiTarget::new(
+            format!("{}/v1", server.uri()),
+            "lab-key",
+            "key-1",
+            "lab-model",
+            "lab-vision",
+            Some("lab-decision".to_string()),
+        )
+    }
+
+    fn ctx_with_target(target: AiTarget) -> ActivityContext {
+        let ctx = ActivityContext::noop();
+        ctx.set_ai_target(target);
+        ctx
+    }
+
+    async fn run_with(
+        p: &LlmEnricherPlugin,
+        ctx: &ActivityContext,
+        cfg: serde_json::Value,
+    ) -> Result<Vec<Document>, PluginError> {
+        p.execute(
+            ctx,
+            PluginInput::Documents(vec![Document::with_id("d1", "hello")]),
+            cfg,
+        )
+        .await?
+        .into_documents()
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_uses_the_lab_target_over_env() {
+        let env = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(0)
+            .mount(&env)
+            .await;
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer lab-key"))
+            .and(body_partial_json(serde_json::json!({"model": "lab-model"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"summary":"s"}"#)),
+            )
+            .expect(1)
+            .mount(&lab)
+            .await;
+
+        let ctx = ctx_with_target(lab_target(&lab));
+        let out = run_with(&plugin(&env), &ctx, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out[0].fields["summary"], "s");
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_step_model_wins_over_the_lab_default() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "step-model"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        run_with(
+            &LlmEnricherPlugin::disabled(),
+            &ctx,
+            serde_json::json!({"model": "step-model"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_disabled_works_with_a_lab_target() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer lab-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let p = LlmEnricherPlugin::disabled();
+        assert!(!p.is_enabled());
+        run_with(&p, &ctx, serde_json::json!({})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_disabled_without_target_names_the_env_key() {
+        let ctx = ActivityContext::noop();
+        let err = run_with(&LlmEnricherPlugin::disabled(), &ctx, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("LLM_API_KEY")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_lab_401_marks_the_target_rejected() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
+            )
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let err = run_with(&LlmEnricherPlugin::disabled(), &ctx, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(ctx.ai_target().unwrap().is_rejected());
+        assert!(!err.to_string().contains("lab-key"));
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_lab_403_is_final_and_keeps_the_key() {
+        // Lumen's 403s are filtered content (LM-2013) or platform-only routes, not a
+        // refused key.
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_string(r#"{"error":{"code":"LM-2013"}}"#),
+            )
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let err = run_with(&LlmEnricherPlugin::disabled(), &ctx, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("403")),
+            "{err:?}"
+        );
+        assert!(!ctx.ai_target().unwrap().is_rejected());
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_lab_402_is_final() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("no budget"))
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let err = run_with(&LlmEnricherPlugin::disabled(), &ctx, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("budget is exhausted")),
+            "{err:?}"
+        );
+        assert!(!ctx.ai_target().unwrap().is_rejected());
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_env_401_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        let err = run_with(&plugin(&server), &ctx, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("LLM_API_KEY")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn manifest_and_helpers() {
         let m = LlmEnricherPlugin::disabled().manifest();
@@ -1136,5 +1388,95 @@ mod tests {
         assert!(parse_json_object("[1,2]").is_none());
         let cfg: LlmEnricherConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(cfg, LlmEnricherConfig::default());
+    }
+
+    /// A plugin whose env client calls `host` (a vendor's public API host) but reaches
+    /// `server`: the HTTP client resolves `host` to the mock, and the base URL keeps its port.
+    fn plugin_on_host(server: &MockServer, host: &str, model: &str) -> LlmEnricherPlugin {
+        let http = reqwest::Client::builder()
+            .resolve(host, *server.address())
+            .build()
+            .unwrap();
+        let base = format!("http://{host}:{}/v1", server.address().port());
+        LlmEnricherPlugin::with_client(base, "test-key", model, http)
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_to_the_vendor_drops_its_gateway_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "gpt-4o-mini"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(2)
+            .mount(&server)
+            .await;
+        // From the step's config and from the plugin default (`LLM_MODEL`).
+        let p = plugin_on_host(&server, "api.openai.com", "openai/gpt-4o-mini");
+        run(
+            &p,
+            vec![Document::with_id("d1", "x")],
+            serde_json::json!({"model": "openai/gpt-4o-mini"}),
+        )
+        .await
+        .unwrap();
+        run(
+            &p,
+            vec![Document::with_id("d2", "y")],
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_elsewhere_keeps_the_id_as_written() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "openai/gpt-4o-mini"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // An unknown host (a proxy, vLLM, a self-hosted Gateway) gets the id unchanged.
+        run(
+            &plugin(&server),
+            vec![Document::with_id("d1", "x")],
+            serde_json::json!({"model": "openai/gpt-4o-mini"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_gets_the_prefixed_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer lab-key"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "openai/gpt-4o-mini"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Even on a vendor's host, the Gateway target is never stripped.
+        let p = plugin_on_host(&server, "api.openai.com", "unused");
+        let target = AiTarget::new(
+            format!("http://api.openai.com:{}/v1", server.address().port()),
+            "lab-key",
+            "key-1",
+            "openai/gpt-4o-mini",
+            "openai/gpt-4o",
+            None,
+        );
+        run_with(&p, &ctx_with_target(target), serde_json::json!({}))
+            .await
+            .unwrap();
     }
 }

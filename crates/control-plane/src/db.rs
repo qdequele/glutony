@@ -15,7 +15,7 @@ pub const MAX_CONNECTIONS: u32 = 10;
 ///
 /// sqlx defaults to 30 s, which is far too long for a request an operator is
 /// watching: when Postgres is unreachable or failing over, every call to the
-/// gateway hangs for half a minute and the admin UI simply appears frozen. Failing
+/// gateway hangs for half a minute and its clients simply appear frozen. Failing
 /// in a few seconds with a clear 500 is the better behaviour, and the gateway
 /// surfaces it as an upstream error.
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);

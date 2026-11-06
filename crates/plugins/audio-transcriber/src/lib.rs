@@ -65,6 +65,7 @@ use std::time::Duration;
 
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
 /// Plugin name referenced by `steps[].plugin`.
@@ -345,7 +346,8 @@ impl Plugin for WhisperTranscriberPlugin {
         ctx.heartbeat(format!("{NAME}: uploading {} bytes", blob.data.len()));
 
         let model = cfg.model.as_deref().unwrap_or(&client.default_model);
-        let form = build_form(&blob, &mime, model, &cfg)?;
+        // Always a direct call: a `<provider>/` prefix naming the vendor is stripped.
+        let form = build_form(&blob, &mime, direct_model(&client.base_url, model), &cfg)?;
         let body = post_transcription(client, form, Duration::from_secs(cfg.timeout_secs)).await?;
         let parsed = parse_transcription(&body)?;
 
@@ -1289,5 +1291,66 @@ mod tests {
             WhisperTranscriberConfig::default().response_format(),
             "json"
         );
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_to_the_vendor_drops_its_gateway_prefix() {
+        for (host, base_path, prefixed, bare) in [
+            ("api.openai.com", "/v1", "openai/whisper-1", "whisper-1"),
+            (
+                "api.groq.com",
+                "/openai/v1",
+                "groq/whisper-large-v3",
+                "whisper-large-v3",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("{base_path}/audio/transcriptions")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "hi" })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let http = reqwest::Client::builder()
+                .resolve(host, *server.address())
+                .build()
+                .unwrap();
+            let base = format!("http://{host}:{}{base_path}", server.address().port());
+            WhisperTranscriberPlugin::with_client(base, "test-key", "whisper-1", http)
+                .execute(
+                    &ActivityContext::noop(),
+                    audio(),
+                    serde_json::json!({ "model": prefixed }),
+                )
+                .await
+                .unwrap();
+            let reqs = server.received_requests().await.unwrap();
+            assert_eq!(part_value(&reqs[0].body, "model"), bare, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_elsewhere_keeps_the_id_as_written() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "hi" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        plugin(&server)
+            .execute(
+                &ActivityContext::noop(),
+                audio(),
+                serde_json::json!({ "model": "openai/whisper-1" }),
+            )
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(part_value(&reqs[0].body, "model"), "openai/whisper-1");
     }
 }

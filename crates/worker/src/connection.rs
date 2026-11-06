@@ -7,8 +7,8 @@
 //! this process. The key is therefore never part of the activity input, and never
 //! recorded in Temporal history.
 //!
-//! A job with a tenant only ever resolves a connection that tenant owns: the control
-//! plane's `/resolve` lookup never falls back to a global row for a tenant, and this
+//! A job with a tenant only ever resolves a connection that tenant owns: it asks the
+//! control plane with `scope=tenant`, which never falls back to a global row, and this
 //! module re-checks the owner of whatever comes back, so a tenant's pipeline naming a
 //! global connection uid can never write with the operator's key. A job without a
 //! tenant resolves global connections, as before.
@@ -36,8 +36,8 @@ pub struct ConnectionSettings {
     pub policy: HostPolicy,
 }
 
-/// The fields of `GET /internal/connections/{uid}/resolve` this worker reads. Declared
-/// here rather than imported so the worker does not link the control plane.
+/// The fields of `GET /internal/connections/{uid}` this worker reads. Declared here
+/// rather than imported so the worker does not link the control plane.
 #[derive(Deserialize)]
 struct ConnectionRow {
     /// Owner; absent for a global connection.
@@ -53,6 +53,16 @@ pub struct ControlPlane<'a> {
     pub http: &'a reqwest::Client,
     /// Base URL, trailing slash trimmed. `None` when not configured.
     pub base_url: Option<&'a str>,
+    /// `CONTROL_PLANE_TOKEN`, presented as a bearer.
+    pub token: Option<&'a str>,
+}
+
+/// Present the control plane token, when there is one.
+pub fn authed(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
 }
 
 /// Return `config` with `host`/`api_key` resolved from the step's connection.
@@ -82,8 +92,15 @@ pub async fn resolve_connection(
         .base_url
         .ok_or_else(|| fail("no control plane is configured on this worker".into()))?;
 
-    let row = fetch(control_plane.http, base, &name, tenant_id).await?;
-    // The control plane already scopes `/resolve`; this holds even against one that
+    let row = fetch(
+        control_plane.http,
+        base,
+        control_plane.token,
+        &name,
+        tenant_id,
+    )
+    .await?;
+    // The control plane already scopes the lookup; this holds even against one that
     // falls back (an older binary, or a bug), and before the key is ever opened.
     if row.tenant_id.as_deref() != tenant_id {
         return Err(fail(match (tenant_id, row.tenant_id.as_deref()) {
@@ -123,6 +140,7 @@ pub async fn resolve_connection(
 async fn fetch(
     http: &reqwest::Client,
     base: &str,
+    token: Option<&str>,
     name: &str,
     tenant_id: Option<&str>,
 ) -> Result<ConnectionRow, PluginError> {
@@ -132,30 +150,25 @@ async fn fetch(
     url.path_segments_mut()
         .map_err(|()| PluginError::NonRetryable("control plane url cannot be a base".into()))?
         .pop_if_empty()
-        .push(name)
-        .push("resolve");
+        .push(name);
     if let Some(p) = tenant_id {
-        url.query_pairs_mut().append_pair("tenant_id", p);
+        // A tenant job may only write with its own connection (spec v2 isolation).
+        url.query_pairs_mut()
+            .append_pair("tenant_id", p)
+            .append_pair("scope", "tenant");
     }
 
-    let resp = http
-        .get(url)
+    let resp = authed(http.get(url), token)
         .send()
         .await
         .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(PluginError::NonRetryable(match tenant_id {
-            Some(t) => format!(
-                "connection {name:?} not found for tenant {t:?}; a tenant's job can only \
-                 use a connection that tenant owns, never a global one, and it may also \
-                 have been deleted while this pipeline still names it"
-            ),
-            None => format!(
-                "connection {name:?} not found (no tenant); it may have been deleted \
-                 while this pipeline still names it"
-            ),
-        }));
+        return Err(PluginError::NonRetryable(format!(
+            "connection {name:?} not found (tenant_id={tenant_id:?}); a tenant job may only \
+             use its own connections (global ones are templates), or it was deleted while \
+             this pipeline still names it"
+        )));
     }
     if !status.is_success() {
         return Err(PluginError::Retryable(format!(
@@ -186,32 +199,26 @@ mod tests {
         }
     }
 
-    fn row(tenant_id: Option<&str>, host: &str, sealed: Vec<u8>) -> serde_json::Value {
-        let mut row = serde_json::json!({
-            "id": "11111111-1111-1111-1111-111111111111",
-            "uid": "prod-movies",
-            "name": "Movies",
-            "host": host,
-            "api_key": sealed,
-            "created_at": "2026-09-23T00:00:00Z",
-            "updated_at": "2026-09-23T00:00:00Z",
-        });
-        if let Some(t) = tenant_id {
-            row["tenant_id"] = t.into();
-        }
-        row
-    }
-
     async fn control_plane_with(host: &str, sealed: Vec<u8>) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/internal/connections/prod-movies/resolve"))
+            .and(path("/internal/connections/prod-movies"))
             .and(query_param("tenant_id", "tenant-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(row(
-                Some("tenant-1"),
-                host,
-                sealed,
-            )))
+            .and(query_param("scope", "tenant"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer cp-token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "11111111-1111-1111-1111-111111111111",
+                "uid": "prod-movies",
+                "name": "Movies",
+                "tenant_id": "tenant-1",
+                "host": host,
+                "api_key": sealed,
+                "created_at": "2026-09-23T00:00:00Z",
+                "updated_at": "2026-09-23T00:00:00Z",
+            })))
             .mount(&server)
             .await;
         server
@@ -227,6 +234,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some("http://unused.invalid"),
+            token: Some("cp-token"),
         };
         let s = settings(HostPolicy::Any);
         let cfg = serde_json::json!({ "connection": "prod-movies" });
@@ -251,6 +259,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let out = resolve_connection(
             &cp,
@@ -267,111 +276,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tenant_job_never_uses_a_global_connection() {
-        // A control plane that still falls back to the global row (an older one, or a
-        // bug) must not be enough to hand a tenant the operator's key.
-        let server = MockServer::start().await;
-        for p in [
-            "/internal/connections/prod-movies",
-            "/internal/connections/prod-movies/resolve",
-        ] {
-            Mock::given(method("GET"))
-                .and(path(p))
-                .respond_with(ResponseTemplate::new(200).set_body_json(row(
-                    None,
-                    "http://meilisearch:7700",
-                    sealed_key(),
-                )))
-                .mount(&server)
-                .await;
-        }
-        let http = reqwest::Client::new();
-        let base = server.uri();
-        let cp = ControlPlane {
-            http: &http,
-            base_url: Some(&base),
-        };
-        let err = resolve_connection(
-            &cp,
-            &settings(HostPolicy::Any),
-            INDEXER_PLUGIN,
-            serde_json::json!({ "connection": "prod-movies" }),
-            Some("tenant-1"),
-        )
-        .await
-        .expect_err("a global connection is not the tenant's");
-        let PluginError::NonRetryable(msg) = err else {
-            panic!("retrying cannot make the connection the tenant's: {err:?}");
-        };
-        assert!(
-            msg.contains("prod-movies") && msg.contains("global"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains(PLAINTEXT_KEY),
-            "an error must never carry the key"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_job_without_a_tenant_still_uses_a_global_connection() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/internal/connections/prod-movies/resolve"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(row(
-                None,
-                "http://meilisearch:7700",
-                sealed_key(),
-            )))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let http = reqwest::Client::new();
-        let base = server.uri();
-        let cp = ControlPlane {
-            http: &http,
-            base_url: Some(&base),
-        };
-        let out = resolve_connection(
-            &cp,
-            &settings(HostPolicy::Any),
-            INDEXER_PLUGIN,
-            serde_json::json!({ "connection": "prod-movies" }),
-            None,
-        )
-        .await
-        .expect("a standalone job keeps the global fallback");
-        assert_eq!(out["api_key"], PLAINTEXT_KEY);
-    }
-
-    #[tokio::test]
-    async fn a_tenant_without_its_own_connection_is_told_why() {
-        let server = MockServer::start().await; // every path 404s
-        let http = reqwest::Client::new();
-        let base = server.uri();
-        let cp = ControlPlane {
-            http: &http,
-            base_url: Some(&base),
-        };
-        let err = resolve_connection(
-            &cp,
-            &settings(HostPolicy::Any),
-            INDEXER_PLUGIN,
-            serde_json::json!({ "connection": "prod-movies" }),
-            Some("tenant-1"),
-        )
-        .await
-        .expect_err("missing for this tenant");
-        let PluginError::NonRetryable(msg) = err else {
-            panic!("{err:?}");
-        };
-        assert!(
-            msg.contains("tenant-1") && msg.contains("global"),
-            "a tenant whose pipeline names a global uid must learn why it fails: {msg}"
-        );
-    }
-
-    #[tokio::test]
     async fn a_missing_connection_is_non_retryable_and_named() {
         let server = MockServer::start().await; // every path 404s
         let http = reqwest::Client::new();
@@ -379,6 +283,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -404,6 +309,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some("http://unused.invalid"),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -430,6 +336,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -459,6 +366,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let err = resolve_connection(
             &cp,
@@ -480,7 +388,7 @@ mod tests {
         let server = MockServer::start().await;
         // Only this exact, encoded path answers; a traversal would hit something else.
         Mock::given(method("GET"))
-            .and(path("/internal/connections/..%2Fjobs/resolve"))
+            .and(path("/internal/connections/..%2Fjobs"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
@@ -490,6 +398,7 @@ mod tests {
         let cp = ControlPlane {
             http: &http,
             base_url: Some(&base),
+            token: Some("cp-token"),
         };
         let _ = resolve_connection(
             &cp,
@@ -500,5 +409,113 @@ mod tests {
         )
         .await;
         // `expect(1)` is verified when the server drops.
+    }
+
+    #[tokio::test]
+    async fn a_tenant_job_never_uses_a_global_connection() {
+        // A control plane that still falls back to the global row (an older one, or a
+        // bug) must not be enough to hand a tenant the operator's key.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "11111111-1111-1111-1111-111111111111",
+                "uid": "prod-movies",
+                "name": "Movies",
+                "host": "http://meilisearch:7700",
+                "api_key": sealed_key(),
+                "created_at": "2026-09-23T00:00:00Z",
+                "updated_at": "2026-09-23T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: None,
+        };
+        let err = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            Some("tenant-1"),
+        )
+        .await
+        .expect_err("a global connection is not the tenant's");
+        let PluginError::NonRetryable(msg) = err else {
+            panic!("retrying cannot make the connection the tenant's: {err:?}");
+        };
+        assert!(
+            msg.contains("prod-movies") && msg.contains("global"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(PLAINTEXT_KEY),
+            "an error must never carry the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_lookup_asks_for_the_tenants_row_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .and(query_param("tenant_id", "tenant-1"))
+            .and(query_param("scope", "tenant"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: Some("cp-token"),
+        };
+        let err = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            Some("tenant-1"),
+        )
+        .await
+        .expect_err("global rows are not the tenant's");
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("prod-movies") && m.contains("own connections")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_global_lookup_has_no_scope() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: None,
+        };
+        let _ = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            None,
+        )
+        .await;
+        let req = &server.received_requests().await.unwrap()[0];
+        assert!(req.url.query().is_none(), "{:?}", req.url);
     }
 }

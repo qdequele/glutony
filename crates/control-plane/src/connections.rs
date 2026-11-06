@@ -12,7 +12,7 @@
 //! when it exists and fall back to the global one, while writes touch exactly the
 //! caller's scope — a tenant must never be able to repoint or delete a global
 //! connection. **Use** is stricter than reads: a job resolves a connection in exactly
-//! its own scope ([`ConnectionRepo::resolve`]), so a tenant's job can never write with
+//! its own scope ([`ConnectionRepo::get_owned`]), so a tenant's job can never write with
 //! a global connection's key.
 
 use axum::Json;
@@ -116,8 +116,8 @@ impl ConnectionRepo {
     /// Fetch one connection by uid: the tenant's row when `tenant_id` is given and it
     /// exists, otherwise the global row.
     ///
-    /// This is a **read**: a tenant may see a global connection. What a job may use is
-    /// [`ConnectionRepo::resolve`], which never falls back.
+    /// This is the lookup management reads use (a tenant sees its row, else the global
+    /// template). Jobs use [`ConnectionRepo::get_owned`].
     pub async fn get(
         &self,
         uid: &str,
@@ -136,21 +136,18 @@ impl ConnectionRepo {
         .await?)
     }
 
-    /// Fetch the connection a job may **use**: the row in exactly `tenant_id`'s scope.
-    ///
-    /// Unlike [`ConnectionRepo::get`], a tenant never falls back to a global row: a
-    /// tenant's job writing with the operator's global key would cross tenants. A job
-    /// without a tenant (standalone, or a global pipeline run untagged) gets the global
-    /// row, as before.
-    pub async fn resolve(
+    /// The tenant's own row only. This is the lookup a tenant job uses: a global
+    /// connection is a template an operator may copy, never a key a tenant can write
+    /// with (spec v2, tenant isolation).
+    pub async fn get_owned(
         &self,
         uid: &str,
-        tenant_id: Option<&str>,
+        tenant_id: &str,
     ) -> Result<Option<ConnectionRecord>, CpError> {
         Ok(sqlx::query_as(
             "SELECT id, uid, name, tenant_id, host, api_key, created_at, updated_at \
              FROM meili_connections \
-             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
+             WHERE uid = $1 AND tenant_id = $2",
         )
         .bind(uid)
         .bind(tenant_id)
@@ -238,7 +235,7 @@ impl ConnectionRepo {
     /// For a tenant connection that is the tenant's pipelines plus global ones (a global
     /// pipeline run for that tenant resolves the name in its scope). For a global
     /// connection it is the global pipelines only: a tenant's job never resolves a
-    /// global connection ([`ConnectionRepo::resolve`]), so only runs without a tenant
+    /// global connection ([`ConnectionRepo::get_owned`]), so only runs without a tenant
     /// use it.
     pub async fn used_by(
         &self,
@@ -267,7 +264,7 @@ impl ConnectionRepo {
 // ---------------------------------------------------------------------------
 // `/internal/connections` handlers. Internal only: the gateway owns validation, sealing
 // and redaction, and the worker resolves an indexer step's connection through
-// `resolve`.
+// `get_owned` (`scope=tenant`) for a tenant job, `get` for a global one.
 // ---------------------------------------------------------------------------
 
 /// `GET /internal/connections?tenant_id=` → the tenant's plus global connections.
@@ -290,44 +287,40 @@ pub async fn create_connection(
     Ok((StatusCode::CREATED, Json(stored)).into_response())
 }
 
-/// `GET /internal/connections/{uid}?tenant_id=` → tenant row, else global, else 404.
+/// Query of `GET /internal/connections/{uid}`.
+#[derive(Debug, Deserialize)]
+pub struct ConnectionQuery {
+    /// Tenant scope; falls back to the `X-Meili-Project-Id` header.
+    #[serde(default, alias = "project_id")]
+    pub tenant_id: Option<String>,
+    /// `tenant`: only the tenant's own row, what a tenant job may use.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// `GET /internal/connections/{uid}?tenant_id=[&scope=tenant]`.
+///
+/// Without `scope`: the tenant's row, else the global one (management reads). With
+/// `scope=tenant`: the tenant's own row only (job lookups); it needs a tenant.
 pub async fn get_connection(
     State(state): State<AppState>,
     Path(uid): Path<String>,
-    Query(q): Query<TenantQuery>,
+    Query(q): Query<ConnectionQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ConnectionRecord>, CpError> {
     let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
-    state
-        .connections()
-        .get(&uid, tenant_id.as_deref())
-        .await?
-        .map(Json)
+    let row = match (q.scope.as_deref(), tenant_id.as_deref()) {
+        (Some("tenant"), Some(t)) => state.connections().get_owned(&uid, t).await?,
+        (Some("tenant"), None) => {
+            return Err(CpError::Validation("scope=tenant needs a tenant_id".into()));
+        }
+        (Some(other), _) => {
+            return Err(CpError::Validation(format!("unknown scope {other:?}")));
+        }
+        (None, t) => state.connections().get(&uid, t).await?,
+    };
+    row.map(Json)
         .ok_or_else(|| not_found(&uid, tenant_id.as_deref()))
-}
-
-/// `GET /internal/connections/{uid}/resolve?tenant_id=` → the row in exactly that
-/// scope, else 404. The lookup the worker uses for an indexer step: a tenant's job
-/// never gets a global connection.
-pub async fn resolve_connection(
-    State(state): State<AppState>,
-    Path(uid): Path<String>,
-    Query(q): Query<TenantQuery>,
-    headers: HeaderMap,
-) -> Result<Json<ConnectionRecord>, CpError> {
-    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
-    state
-        .connections()
-        .resolve(&uid, tenant_id.as_deref())
-        .await?
-        .map(Json)
-        .ok_or_else(|| match tenant_id.as_deref() {
-            Some(t) => CpError::NotFound(format!(
-                "connection {uid:?} not found for tenant {t:?}; a tenant's job can only \
-                 use a connection that tenant owns, never a global one"
-            )),
-            None => not_found(&uid, None),
-        })
 }
 
 /// `PATCH /internal/connections/{uid}?tenant_id=` body [`ConnectionPatch`].

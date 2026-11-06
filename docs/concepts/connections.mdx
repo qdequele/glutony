@@ -91,7 +91,8 @@ the document, rather than looping on `413`.
   tightening the policy takes effect immediately.
 - Connections are tenant-scoped like pipelines: a tenant sees its own
   connections first, then global ones, and can only modify its own.
-- A tenant can **see** a global connection but never **use** it. See
+- A tenant pipeline may only name its **own** connections. Global connections are
+  templates: a tenant can **see** one but never **use** it. See
   [Tenants and global connections](#tenants-and-global-connections).
 
 `MEILI_CONNECTION_HOSTS` controls where connections may point:
@@ -116,29 +117,26 @@ A job only writes through a connection its own tenant owns:
 | has no tenant (standalone, untagged ingest, a global source) | the global `prod` |
 
 A tenant's job never falls back to a global connection: it would write with the
-operator's key. Where the gateway can see the problem, it refuses it with
-`422` before anything runs:
+operator's key. It is refused with `422` before anything runs:
 
 - `POST /pipelines` and `POST /pipelines/validate` for a tenant's pipeline
   (the caller's tenant, or a body `tenant_id` from a global caller) whose
-  indexer names a global connection;
+  indexer names anything but one of the tenant's own connections;
 - `POST /sources` and a `PATCH /sources/{uid}` that changes `pipeline`, when
   the source's tenant cannot use the pipeline's connections. This includes a
   global pipeline pinned to a global connection;
 - `POST /ingest…` with a tenant, when the chosen pipeline names a global
   connection.
 
-Anything that slips past (a global connection created after the pipeline, a
+Anything that slips past (a connection deleted after the pipeline was saved, a
 pipeline saved before this rule existed) fails the indexer step at run time,
-without retrying, with an error that says the connection is global.
+without retrying: the worker asks only for the tenant's own row, and refuses a
+global row even from a control plane that would still fall back.
 
 A global pipeline pinned to a global connection keeps working for jobs without
 a tenant. To let a tenant use it, create a connection **with the same uid** for
 that tenant. The tenant's row shadows the global one, so the same pipeline then
 writes through the tenant's own connection.
-
-A connection that does not exist yet is not refused at save time; a job using it
-fails at run time, as described below.
 
 ## Deleting
 

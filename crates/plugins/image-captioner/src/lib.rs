@@ -21,9 +21,19 @@
 //!
 //! | var | required | default |
 //! |---|---|---|
-//! | `LLM_API_KEY` | yes | — |
+//! | `LLM_API_KEY` | yes (unless the Lab provides a target, see below) | — |
 //! | `LLM_BASE_URL` | no | `https://api.openai.com/v1` |
 //! | `LLM_MODEL` | no | `gpt-4o-mini` |
+//!
+//! ## Behind the Lab
+//!
+//! Behind the Meilisearch Lab the worker attaches the team's [`AiTarget`] (its hosted
+//! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
+//! plugin calls it instead of the env-configured API, with the target's `vision_model`
+//! (a step's `config.model` still wins), and even a [`ImageCaptionerPlugin::disabled`]
+//! instance works. A Gateway 401 marks the target rejected and is retried with a fresh
+//! key; a 402 means the team's budget is spent and is final; a 403 is final. Without a target
+//! nothing changes: the env client is used, and `LLM_API_KEY not set` is the error.
 //!
 //! ## Output
 //!
@@ -39,8 +49,10 @@
 use std::time::Duration;
 
 use base64::Engine;
+use meili_ingest_plugin_sdk::ai::gateway_failure;
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
 /// Plugin name referenced by `steps[].plugin`.
@@ -125,6 +137,9 @@ struct LlmClient {
     api_key: String,
     default_model: String,
     http: reqwest::Client,
+    /// Set when this client was built from the Lab's target: Gateway failures then map
+    /// through [`gateway_failure`], and a rejected key is flagged on the shared target.
+    lab: Option<AiTarget>,
 }
 
 /// The `image_captioner` plugin. See the crate docs.
@@ -202,6 +217,7 @@ impl ImageCaptionerPlugin {
                 api_key: api_key.into(),
                 default_model: default_model.into(),
                 http,
+                lab: None,
             }),
         }
     }
@@ -209,6 +225,32 @@ impl ImageCaptionerPlugin {
     /// Whether credentials are configured.
     pub fn is_enabled(&self) -> bool {
         self.client.is_some()
+    }
+
+    /// The client for one step: the Lab's target when the context carries one, else the
+    /// env client, else `InvalidConfig("LLM_API_KEY not set")`.
+    fn client_for(&self, ctx: &ActivityContext) -> Result<LlmClient, PluginError> {
+        if let Some(target) = ctx.ai_target() {
+            let http = match &self.client {
+                Some(c) => c.http.clone(),
+                None => reqwest::Client::builder()
+                    .timeout(DEFAULT_TIMEOUT)
+                    .build()
+                    .map_err(|e| {
+                        PluginError::non_retryable(format!("cannot build HTTP client: {e}"))
+                    })?,
+            };
+            return Ok(LlmClient {
+                base_url: target.base_url.trim_end_matches('/').to_string(),
+                api_key: target.api_key.clone(),
+                default_model: target.vision_model.clone(),
+                http,
+                lab: Some(target.clone()),
+            });
+        }
+        self.client
+            .clone()
+            .ok_or_else(|| PluginError::invalid_config("LLM_API_KEY not set"))
     }
 }
 
@@ -244,10 +286,7 @@ impl Plugin for ImageCaptionerPlugin {
         if cfg.max_tokens == 0 {
             return Err(PluginError::invalid_config("max_tokens must be >= 1"));
         }
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| PluginError::invalid_config("LLM_API_KEY not set"))?;
+        let client = self.client_for(ctx)?;
 
         let blob = input.into_bytes()?;
         let mime = blob
@@ -277,8 +316,15 @@ impl Plugin for ImageCaptionerPlugin {
             base64::engine::general_purpose::STANDARD.encode(&blob.data)
         );
         let model = cfg.model.as_deref().unwrap_or(&client.default_model);
+        // The Lab's Gateway takes the id as written; a vendor called directly gets it
+        // without its own `<provider>/` prefix.
+        let wire_model = if client.lab.is_some() {
+            model
+        } else {
+            direct_model(&client.base_url, model)
+        };
         let mut body = serde_json::json!({
-            "model": model,
+            "model": wire_model,
             "max_tokens": cfg.max_tokens,
             "messages": [{
                 "role": "user",
@@ -293,8 +339,14 @@ impl Plugin for ImageCaptionerPlugin {
         }
 
         // A failed call records nothing: `?` returns before `record_usage`.
-        let (raw, mut units) =
-            chat_completion(&client.http, &client.base_url, &client.api_key, &body).await?;
+        let (raw, mut units) = chat_completion(
+            &client.http,
+            &client.base_url,
+            &client.api_key,
+            &body,
+            client.lab.as_ref(),
+        )
+        .await?;
         // One image went to the vision model, and its tokens are billed on top.
         units.images = 1;
         ProviderCosts::global().apply(NAME, model, &mut units);
@@ -385,12 +437,15 @@ struct ApiUsage {
 /// returned units still count one request, with the token counts left at zero rather
 /// than estimated.
 ///
-/// 429 / 5xx / transport → `Retryable`; 401 / 403 / 400 / others → `NonRetryable`.
+/// 429 / 5xx / transport → `Retryable`; 401 / 403 / 400 / others → `NonRetryable`. When
+/// `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say (see
+/// [`map_http_failure`]).
 async fn chat_completion(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
+    lab: Option<&AiTarget>,
 ) -> Result<(String, UsageUnits), PluginError> {
     let url = format!("{base_url}/chat/completions");
     let resp = http
@@ -406,21 +461,7 @@ async fn chat_completion(
         .await
         .map_err(|e| PluginError::retryable(format!("vision response body unreadable: {e}")))?;
     if !status.is_success() {
-        let snippet = truncate_chars(&text, 512);
-        return Err(match status.as_u16() {
-            429 | 500..=599 => {
-                PluginError::Retryable(format!("vision API returned HTTP {status}: {snippet}"))
-            }
-            401 | 403 => PluginError::NonRetryable(format!(
-                "vision API rejected the credentials (HTTP {status}); check LLM_API_KEY: {snippet}"
-            )),
-            400 => PluginError::NonRetryable(format!(
-                "vision API rejected the request (HTTP 400): {snippet}"
-            )),
-            _ => PluginError::NonRetryable(format!(
-                "vision API returned unexpected HTTP {status}: {snippet}"
-            )),
-        });
+        return Err(map_http_failure(status, &text, lab));
     }
     let parsed: ChatCompletion = serde_json::from_str(&text).map_err(|e| {
         PluginError::non_retryable(format!(
@@ -444,6 +485,33 @@ async fn chat_completion(
             PluginError::non_retryable("vision response has no choices[0].message.content")
         })?;
     Ok((content, usage))
+}
+
+/// Map a non-2xx reply to a [`PluginError`]. With the Lab's target, a Gateway refusal
+/// (401 / 402) is mapped by [`gateway_failure`] first.
+fn map_http_failure(
+    status: reqwest::StatusCode,
+    body: &str,
+    lab: Option<&AiTarget>,
+) -> PluginError {
+    if let Some(err) = lab.and_then(|t| gateway_failure(t, status.as_u16(), body)) {
+        return err;
+    }
+    let snippet = truncate_chars(body, 512);
+    match status.as_u16() {
+        429 | 500..=599 => {
+            PluginError::Retryable(format!("vision API returned HTTP {status}: {snippet}"))
+        }
+        401 | 403 => PluginError::NonRetryable(format!(
+            "vision API rejected the credentials (HTTP {status}); check LLM_API_KEY: {snippet}"
+        )),
+        400 => PluginError::NonRetryable(format!(
+            "vision API rejected the request (HTTP 400): {snippet}"
+        )),
+        _ => PluginError::NonRetryable(format!(
+            "vision API returned unexpected HTTP {status}: {snippet}"
+        )),
+    }
 }
 
 fn parse_json_object(raw: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -790,5 +858,206 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidConfig(_)));
         assert!(!format!("{p:?}").contains("test-key"));
+    }
+
+    // -- Behind the Lab: the target on the context wins over the env client --------------
+
+    fn lab_target(server: &MockServer) -> AiTarget {
+        AiTarget::new(
+            format!("{}/v1", server.uri()),
+            "lab-key",
+            "key-1",
+            "lab-model",
+            "lab-vision",
+            Some("lab-decision".to_string()),
+        )
+    }
+
+    fn ctx_with_target(target: AiTarget) -> ActivityContext {
+        let ctx = ActivityContext::noop();
+        ctx.set_ai_target(target);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn image_captioner_uses_the_lab_target_over_env() {
+        let env = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(0)
+            .mount(&env)
+            .await;
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer lab-key"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "lab-vision"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A cat"}"#)),
+            )
+            .expect(1)
+            .mount(&lab)
+            .await;
+
+        let ctx = ctx_with_target(lab_target(&lab));
+        let docs = plugin(&env)
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(docs[0].content, "A cat");
+    }
+
+    #[tokio::test]
+    async fn image_captioner_step_model_wins_over_the_lab_vision_model() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "step-model"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        ImageCaptionerPlugin::disabled()
+            .execute(&ctx, image(), serde_json::json!({"model": "step-model"}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_captioner_disabled_works_with_a_lab_target() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer lab-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        ImageCaptionerPlugin::disabled()
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_captioner_disabled_without_target_names_the_env_key() {
+        let err = ImageCaptionerPlugin::disabled()
+            .execute(&ActivityContext::noop(), image(), serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("LLM_API_KEY")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_captioner_lab_401_marks_the_target_rejected() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
+            )
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let err = ImageCaptionerPlugin::disabled()
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(ctx.ai_target().unwrap().is_rejected());
+        assert!(!err.to_string().contains("lab-key"));
+    }
+
+    #[tokio::test]
+    async fn image_captioner_lab_402_is_final() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("no budget"))
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let err = ImageCaptionerPlugin::disabled()
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("budget is exhausted")),
+            "{err:?}"
+        );
+        assert!(!ctx.ai_target().unwrap().is_rejected());
+    }
+
+    #[tokio::test]
+    async fn image_captioner_env_401_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .mount(&server)
+            .await;
+        let err = plugin(&server)
+            .execute(&ActivityContext::noop(), image(), serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("LLM_API_KEY")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_to_the_vendor_drops_its_gateway_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"model": "gpt-4o"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A cat"}"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .resolve("api.openai.com", *server.address())
+            .build()
+            .unwrap();
+        let base = format!("http://api.openai.com:{}/v1", server.address().port());
+        ImageCaptionerPlugin::with_client(base, "test-key", "vision-model", http)
+            .execute(
+                &ActivityContext::noop(),
+                image(),
+                serde_json::json!({"model": "openai/gpt-4o"}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_gets_the_prefixed_id() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "openai/gpt-4o"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A cat"}"#)),
+            )
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        ImageCaptionerPlugin::disabled()
+            .execute(&ctx, image(), serde_json::json!({"model": "openai/gpt-4o"}))
+            .await
+            .unwrap();
     }
 }

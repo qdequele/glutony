@@ -158,7 +158,36 @@ pub async fn get_job(
     }
 }
 
-/// `POST /jobs/{id}/cancel`.
+/// Why Temporal refused to cancel `job_id`. It answers `NotFound` both for a workflow
+/// that never existed and for one that already closed, so tell them apart: a job
+/// Temporal still describes, or one with a control-plane row (kept past Temporal's
+/// retention), has finished — `409 already_finished`; anything else is `404`.
+async fn not_cancellable(state: &AppState, job_id: Uuid) -> GatewayError {
+    let status = match state.temporal.progress(job_id).await {
+        Ok(Some(snapshot)) => Some(snapshot.status),
+        _ => state
+            .control_plane
+            .get_job(job_id)
+            .await
+            .ok()
+            .map(|r| r.status),
+    };
+    match status {
+        Some(status) if status.is_terminal() => GatewayError::AlreadyFinished(format!(
+            "job {job_id} already finished ({}); there is nothing to cancel",
+            status.as_str()
+        )),
+        // A row whose cached status never reached a terminal one, for a workflow
+        // Temporal no longer knows: it is over all the same.
+        Some(_) => GatewayError::AlreadyFinished(format!(
+            "job {job_id} is no longer running; there is nothing to cancel"
+        )),
+        None => GatewayError::NotFound(format!("job {job_id} not found")),
+    }
+}
+
+/// `POST /jobs/{id}/cancel` → `202`, `409 already_finished` when the job is over,
+/// `404` when it does not exist or belongs to another tenant.
 pub async fn cancel_job(
     State(state): State<AppState>,
     scope: Scope,
@@ -166,7 +195,11 @@ pub async fn cancel_job(
 ) -> Result<(StatusCode, Json<CancelResponse>), GatewayError> {
     let job_id = parse_job_id(&id)?;
     ensure_job_visible(&state, job_id, scope.tenant()).await?;
-    state.temporal.cancel(job_id).await?;
+    match state.temporal.cancel(job_id).await {
+        Ok(()) => {}
+        Err(GatewayError::NotFound(_)) => return Err(not_cancellable(&state, job_id).await),
+        Err(e) => return Err(e),
+    }
     tracing::info!(job_id = %job_id, "cancel requested");
     Ok((
         StatusCode::ACCEPTED,
@@ -372,6 +405,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_finished_job_is_409_not_404() {
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        let mut r = record(job_id);
+        r.status = JobStatus::Failed;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/jobs/{job_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&r))
+            .mount(&server)
+            .await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        starter.set_snapshot(
+            job_id,
+            JobSnapshot {
+                status: JobStatus::Failed,
+                progress: None,
+            },
+        );
+        let resp = app
+            .oneshot(
+                Request::post(format!("/jobs/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = json_body(resp).await;
+        assert_eq!(json["code"], "already_finished");
+        assert!(json["error"].as_str().unwrap().contains("failed"), "{json}");
+        assert!(starter.cancelled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_job_temporal_forgot_is_409_when_the_row_exists() {
+        // Past Temporal's retention the workflow is gone, but the job row remains.
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        let mut r = record(job_id);
+        r.status = JobStatus::Succeeded;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/jobs/{job_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&r))
+            .mount(&server)
+            .await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        starter.forget(job_id);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/jobs/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(resp).await["code"], "already_finished");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_job_is_still_404() {
+        let server = MockServer::start().await; // every control-plane path 404s
+        let job_id = Uuid::new_v4();
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        starter.forget(job_id);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/jobs/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(resp).await["code"], "not_found");
     }
 
     fn lab_config() -> GatewayConfig {

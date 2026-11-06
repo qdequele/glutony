@@ -6,6 +6,29 @@ use std::sync::Arc;
 
 use meili_ingest_plugin_sdk::{Plugin, PluginError, PluginManifest};
 
+use crate::ai_target::LAB_AI_PLUGINS;
+
+/// What the env-backed AI plugins' `from_env` returned.
+struct AiPlugins {
+    llm_enricher: Result<meili_ingest_plugin_llm_enricher::LlmEnricherPlugin, PluginError>,
+    jev_enricher: Result<meili_ingest_plugin_jev_enricher::JevEnricherPlugin, PluginError>,
+    image_captioner: Result<meili_ingest_plugin_image_captioner::ImageCaptionerPlugin, PluginError>,
+    whisper_transcriber:
+        Result<meili_ingest_plugin_audio_transcriber::WhisperTranscriberPlugin, PluginError>,
+}
+
+impl AiPlugins {
+    fn from_env() -> Self {
+        Self {
+            llm_enricher: meili_ingest_plugin_llm_enricher::LlmEnricherPlugin::from_env(),
+            jev_enricher: meili_ingest_plugin_jev_enricher::JevEnricherPlugin::from_env(),
+            image_captioner: meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::from_env(),
+            whisper_transcriber:
+                meili_ingest_plugin_audio_transcriber::WhisperTranscriberPlugin::from_env(),
+        }
+    }
+}
+
 /// Registry of plugins available on this worker.
 #[derive(Default)]
 pub struct PluginRegistry {
@@ -34,6 +57,22 @@ impl PluginRegistry {
     /// fail to construct are recorded as unavailable instead of aborting startup, so a
     /// `workers-general` pool without `LLM_API_KEY` still boots.
     pub fn builtin() -> Self {
+        Self::builtin_with(false)
+    }
+
+    /// [`Self::builtin`], for a worker whose Lab tenants' AI steps may run on the
+    /// team's Gateway (`LAB_AI_GATEWAY`). With `lab_ai_gateway`, an AI plugin of
+    /// [`LAB_AI_PLUGINS`] without its env key is registered disabled rather than
+    /// unavailable: a step with a Lab target runs, any other fails with
+    /// `InvalidConfig` naming the missing key. `whisper_transcriber` takes no target
+    /// and is unchanged.
+    pub fn builtin_with(lab_ai_gateway: bool) -> Self {
+        Self::builtin_from(lab_ai_gateway, AiPlugins::from_env())
+    }
+
+    /// [`Self::builtin_with`] from already-built AI plugins (tests pass them without
+    /// touching the process environment).
+    fn builtin_from(lab_ai_gateway: bool, ai: AiPlugins) -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(meili_ingest_plugin_pdf::PdfExtractorPlugin::new()));
         reg.register(Arc::new(
@@ -72,27 +111,49 @@ impl PluginRegistry {
         reg.register(Arc::new(
             meili_ingest_plugin_video_audio::VideoAudioExtractorPlugin::new(),
         ));
-        match meili_ingest_plugin_llm_enricher::LlmEnricherPlugin::from_env() {
-            Ok(p) => reg.register(Arc::new(p)),
-            Err(e) => reg.mark_unavailable(meili_ingest_plugin_llm_enricher::NAME, e.to_string()),
-        }
-        match meili_ingest_plugin_jev_enricher::JevEnricherPlugin::from_env() {
-            Ok(p) => reg.register(Arc::new(p)),
-            Err(e) => reg.mark_unavailable(meili_ingest_plugin_jev_enricher::NAME, e.to_string()),
-        }
-        match meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::from_env() {
-            Ok(p) => reg.register(Arc::new(p)),
-            Err(e) => {
-                reg.mark_unavailable(meili_ingest_plugin_image_captioner::NAME, e.to_string())
-            }
-        }
-        match meili_ingest_plugin_audio_transcriber::WhisperTranscriberPlugin::from_env() {
+        reg.register_ai(
+            meili_ingest_plugin_llm_enricher::NAME,
+            ai.llm_enricher,
+            meili_ingest_plugin_llm_enricher::LlmEnricherPlugin::disabled,
+            lab_ai_gateway,
+        );
+        reg.register_ai(
+            meili_ingest_plugin_jev_enricher::NAME,
+            ai.jev_enricher,
+            meili_ingest_plugin_jev_enricher::JevEnricherPlugin::disabled,
+            lab_ai_gateway,
+        );
+        reg.register_ai(
+            meili_ingest_plugin_image_captioner::NAME,
+            ai.image_captioner,
+            meili_ingest_plugin_image_captioner::ImageCaptionerPlugin::disabled,
+            lab_ai_gateway,
+        );
+        match ai.whisper_transcriber {
             Ok(p) => reg.register(Arc::new(p)),
             Err(e) => {
                 reg.mark_unavailable(meili_ingest_plugin_audio_transcriber::NAME, e.to_string())
             }
         }
         reg
+    }
+
+    /// Register an env-backed AI plugin: built, disabled (it can still run on a Lab
+    /// target) or unavailable.
+    fn register_ai<P: Plugin + 'static>(
+        &mut self,
+        name: &str,
+        built: Result<P, PluginError>,
+        disabled: fn() -> P,
+        lab_ai_gateway: bool,
+    ) {
+        match built {
+            Ok(p) => self.register(Arc::new(p)),
+            Err(_) if lab_ai_gateway && LAB_AI_PLUGINS.contains(&name) => {
+                self.register(Arc::new(disabled()))
+            }
+            Err(e) => self.mark_unavailable(name, e.to_string()),
+        }
     }
 
     /// Load external plugins from an `EXTERNAL_PLUGINS` spec string and add them.
@@ -238,6 +299,62 @@ mod tests {
             assert!(r.get(name).is_some() || r.unavailable().contains_key(name));
         }
     }
+    /// What the env-backed AI plugins' `from_env` returns on a worker with none of
+    /// their keys, without touching this process's environment.
+    fn no_ai_keys() -> AiPlugins {
+        fn missing<P>(key: &str) -> Result<P, PluginError> {
+            Err(PluginError::invalid_config(format!("{key} not set")))
+        }
+        AiPlugins {
+            llm_enricher: missing("LLM_API_KEY"),
+            jev_enricher: missing("TYPESAFE_API_KEY"),
+            image_captioner: missing("LLM_API_KEY"),
+            whisper_transcriber: missing("TRANSCRIBE_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn builtin_with_lab_gateway_registers_ai_plugins_without_keys() {
+        let r = PluginRegistry::builtin_from(true, no_ai_keys());
+        for name in ["llm_enricher", "image_captioner", "jev_enricher"] {
+            assert!(r.get(name).is_some(), "{name} runs on the Lab's Gateway");
+            assert!(!r.unavailable().contains_key(name), "{name}");
+        }
+        assert!(r.get("whisper_transcriber").is_none());
+        assert!(r.unavailable().contains_key("whisper_transcriber"));
+        for name in crate::ai_target::LAB_AI_PLUGINS {
+            assert!(r.get(name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn builtin_without_lab_gateway_marks_keyless_ai_plugins_unavailable() {
+        let r = PluginRegistry::builtin_from(false, no_ai_keys());
+        for name in [
+            "llm_enricher",
+            "image_captioner",
+            "jev_enricher",
+            "whisper_transcriber",
+        ] {
+            assert!(r.get(name).is_none(), "{name}");
+            assert!(r.unavailable().contains_key(name), "{name}");
+        }
+        assert!(
+            matches!(r.resolve("llm_enricher"), Err(PluginError::NonRetryable(m)) if m.contains("LLM_API_KEY"))
+        );
+    }
+
+    #[test]
+    fn lab_ai_plugins_are_the_plugins_that_take_a_target() {
+        assert_eq!(
+            crate::ai_target::LAB_AI_PLUGINS,
+            [
+                meili_ingest_plugin_llm_enricher::NAME,
+                meili_ingest_plugin_image_captioner::NAME,
+                meili_ingest_plugin_jev_enricher::NAME,
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +466,62 @@ mod builtin_pipeline_compat {
         }
     }
 
+    /// Every pipeline glutony ships: the built-ins, the catalog templates with an
+    /// inline definition and the examples under `config/pipelines/`.
+    fn shipped_pipelines() -> Vec<meili_ingest_plugin_sdk::PipelineDefinition> {
+        let mut out = builtin_pipelines();
+        out.extend(
+            meili_ingest_router::catalog::catalog()
+                .workflows
+                .into_iter()
+                .filter_map(|w| w.definition),
+        );
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/pipelines");
+        for entry in std::fs::read_dir(dir).expect("config/pipelines") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "yaml") {
+                let text = std::fs::read_to_string(&path).expect("read example");
+                out.push(
+                    serde_yaml::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+                );
+            }
+        }
+        out
+    }
+
+    /// The control plane checks every step config against its plugin's schema on save
+    /// (`POST /pipelines`). A shipped pipeline that failed that check could not be
+    /// duplicated and saved, which is how the Lab edits a built-in.
+    #[test]
+    fn every_shipped_pipeline_step_config_satisfies_its_plugin_schema() {
+        let reg = registry_with_all_manifests();
+        let mut failures = Vec::new();
+        for pipeline in shipped_pipelines() {
+            for step in &pipeline.steps {
+                let Some(plugin) = reg.get(&step.plugin) else {
+                    assert!(
+                        EXTERNAL.contains(&step.plugin.as_str()),
+                        "{}: plugin {} not registered",
+                        pipeline.uid,
+                        step.plugin
+                    );
+                    continue;
+                };
+                let schema = plugin.manifest().config_schema;
+                let validator = jsonschema::validator_for(&schema)
+                    .unwrap_or_else(|e| panic!("{}: schema does not compile: {e}", step.plugin));
+                for e in validator.iter_errors(&step.config) {
+                    failures.push(format!(
+                        "{}: step {:?} ({}): {e}",
+                        pipeline.uid, step.id, step.plugin
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     #[test]
     fn every_builtin_pipeline_ends_in_the_indexer() {
         for pipeline in builtin_pipelines() {
@@ -360,5 +533,24 @@ mod builtin_pipeline_compat {
                 pipeline.uid
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod priced_plugins {
+    #[test]
+    fn priced_plugins_are_the_plugins_that_call_providers() {
+        // Every plugin that calls `ProviderCosts::apply`, by its own NAME: a rename
+        // must not silently drop it from the boot check for missing prices.
+        let mut callers = vec![
+            meili_ingest_plugin_llm_enricher::NAME,
+            meili_ingest_plugin_jev_enricher::NAME,
+            meili_ingest_plugin_image_captioner::NAME,
+            meili_ingest_plugin_audio_transcriber::NAME,
+        ];
+        callers.sort_unstable();
+        let mut priced = meili_ingest_plugin_sdk::cost::PRICED_PLUGINS.to_vec();
+        priced.sort_unstable();
+        assert_eq!(priced, callers);
     }
 }

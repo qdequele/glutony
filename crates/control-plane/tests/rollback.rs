@@ -1,4 +1,4 @@
-//! Rollback script for migrations 0003 and 0004. Needs DATABASE_URL (skips otherwise), e.g.
+//! Rollback script for migrations 0003, 0004 and 0005. Needs DATABASE_URL (skips otherwise), e.g.
 //! `DATABASE_URL=postgres://postgres:dev@localhost:55433/postgres cargo test -p meili-ingest-control-plane --test rollback`.
 
 use std::str::FromStr;

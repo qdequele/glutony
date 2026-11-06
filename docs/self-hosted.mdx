@@ -61,9 +61,7 @@ X-Meili-Index header
 |---|---|---|
 | Gateway | 2+ | stateless; put a load balancer in front |
 | Control plane | 1–2 | needs Postgres (`DATABASE_URL`) |
-| Worker `workers-general` | 1+ | CPU-bound parsing |
-| Worker `workers-llm` | 0+ | only if pipelines use `llm_enricher` / `jev_enricher` / `image_captioner` |
-| Worker `workers-gpu` | 0+ | only for gRPC media plugins |
+| Worker `workers-general` | 1+ | every plugin, including AI steps (hosted APIs) and `EXTERNAL_PLUGINS` |
 | Temporal | — | dev server for tests; Temporal Cloud or the Helm chart in prod |
 | Blob store | — | `file://` for a single node, `s3://` / `gs://` / `az://` otherwise |
 

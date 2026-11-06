@@ -21,7 +21,8 @@ info:
     headers (injected by Meilisearch Cloud's Envoy and trusted only when
     `X-Meili-Envoy-Secret` matches the gateway's `ENVOY_TRUSTED_HEADER`), the
     `?index=` query parameter, an `Authorization: Bearer <key>` header, and
-    finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables.
+    finally the gateway's `MEILI_URL` / `MEILI_API_KEY` environment variables
+    (only for a request without a tenant: a tenant request never falls back to them).
     When none of these yields a host and API key the request fails with `400` —
     unless the pipeline is **pinned**: every `meili_indexer` step names a
     [Meilisearch connection](/concepts/connections), which then supplies the host
@@ -145,6 +146,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "422":
@@ -155,6 +158,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /ingest/batch:
     post:
@@ -183,7 +188,7 @@ paths:
                 - { "s3": "s3://my-bucket/b.mp4", "index": "videos" }
       responses:
         "202":
-          description: One job per item, in input order.
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
           content:
             application/json:
               schema:
@@ -244,6 +249,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -254,6 +261,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /indexes/{index_uid}/ingest:
     post:
@@ -297,6 +306,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "422":
@@ -307,6 +318,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /indexes/{index_uid}/ingest/batch:
     post:
@@ -331,7 +344,7 @@ paths:
               $ref: "#/components/schemas/BatchIngestRequest"
       responses:
         "202":
-          description: One job per item, in input order.
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
           content:
             application/json:
               schema:
@@ -385,6 +398,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
         "404":
@@ -395,6 +410,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /jobs:
     get:
@@ -500,7 +517,11 @@ paths:
       operationId: cancelJob
       summary: Cancel a running job
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Sends the `cancel` signal to the workflow. Steps already running finish; no new step is scheduled.
+      description: |
+        Sends the `cancel` signal to the workflow. Steps already running finish; no
+        new step is scheduled. A job that already reached a terminal status
+        (`succeeded`, `failed`, `cancelled`) is `409 already_finished`; an unknown id,
+        or another tenant's job, is `404`.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/JobId"
@@ -517,6 +538,13 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
+        "409":
+          description: The job exists but has already finished, so there is nothing to cancel.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { "error": "job 550e8400-e29b-41d4-a716-446655440000 already finished (failed); there is nothing to cancel", "code": "already_finished" }
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
@@ -552,7 +580,10 @@ paths:
       description: |
         Accepts YAML (`application/x-yaml`, `text/yaml`) or JSON. The definition
         is normalised (implicit sequential `depends_on`), validated (unknown
-        plugin, cycle, bad `fan_out` → `422`) and upserted by `(uid, tenant_id)`;
+        plugin, cycle, bad `fan_out`, a step `config` that does not satisfy its
+        plugin's `config_schema` from `GET /plugins`, a `meili_indexer`
+        `config.connection` that is not one of the tenant's own connections, or
+        for a global pipeline not a global connection → `422`) and upserted by `(uid, tenant_id)`;
         `version` is bumped on update. `uid`s starting with `builtin.` are
         rejected with `403`. Behind Envoy the pipeline is scoped to the calling
         project.
@@ -587,7 +618,7 @@ paths:
                   plugin: llm_enricher
                   depends_on: [chunk]
                   fan_out: "$.documents"
-                  config: { model: gpt-4o-mini }
+                  config: { model: openai/gpt-4o-mini }
                 - id: index
                   plugin: meili_indexer
                   depends_on: [enrich]
@@ -612,12 +643,7 @@ paths:
                 $ref: "#/components/schemas/Error"
               example: { "error": "builtin pipelines are read-only", "code": "forbidden" }
         "422":
-          description: Invalid pipeline (unknown plugin, cycle, duplicate step, unsupported `fan_out`), or a tenant's pipeline whose `meili_indexer` names a global connection (`code` `validation`).
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-              example: { "error": "step \"enrich\" references unknown plugin \"llm_enrichr\"", "code": "invalid_pipeline" }
+          $ref: "#/components/responses/InvalidPipeline"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
 
@@ -626,7 +652,15 @@ paths:
       tags: [Pipelines]
       operationId: validatePipeline
       summary: Dry-run a pipeline definition
-      description: Runs the same checks as a create and persists nothing.
+      description: |
+        Runs the same checks as a create and persists nothing: structure (cycle,
+        duplicate step, bad `fan_out`), unknown plugins, every step's `config`
+        against its plugin's `config_schema` (JSON Schema draft 2020-12, as served by
+        `GET /plugins`; `format` is not asserted) and every `meili_indexer`
+        `config.connection` against the caller's own connections (a tenant pipeline
+        may not name a global connection; global ones are templates). A plugin no worker has registered yet has no schema, so its config is
+        not checked. All config and connection problems are reported in one message,
+        `; `-separated.
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
@@ -644,7 +678,12 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ValidationResult" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "422": { $ref: "#/components/responses/Unprocessable" }
+        "403":
+          description: The `uid` is in the reserved `builtin.` namespace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/InvalidPipeline" }
 
   /pipelines/{uid}:
     get:
@@ -935,8 +974,13 @@ paths:
       description: |
         Validates the URL template and its host (`SOURCE_FETCH_HOSTS`), checks that
         the pipeline is pinned (every `meili_indexer` step names a connection), then
-        creates a Temporal schedule. A cron Temporal rejects is `422`. The source
-        starts active.
+        creates a Temporal schedule. `cron` must have exactly 5 fields; a 6- or
+        7-field expression (seconds, years) or an `@` descriptor is `422`, and so is
+        a 5-field cron Temporal rejects. The source starts active.
+
+        A run whose fetch gets a client error other than `408`/`429` (e.g. `404`,
+        `403`) fails at once; transport errors, `408`, `429` and `5xx` are retried
+        (3 attempts) before the run is recorded as `failed`.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -1005,7 +1049,11 @@ paths:
       operationId: updateSource
       summary: Update a source
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Any subset of the create fields except `uid`. `auth` omitted keeps it, `null` clears it.
+      description: |
+        Any subset of the create fields except `uid`. `auth` omitted keeps it, `null`
+        clears it. `index` omitted keeps it; `null` or a blank string clears the
+        override (the pipeline's `index_pattern`, then the MIME default, apply
+        again). `cron` follows the create rules (exactly 5 fields).
       requestBody:
         required: true
         content:
@@ -1088,7 +1136,11 @@ paths:
       operationId: runSource
       summary: Run a source now
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+      description: >-
+        Starts one run off-schedule. Skipped by Temporal when a run is already in flight.
+        On a Lab engine the tenant's credits are checked first, as for ingest. Every
+        run of a Lab account, scheduled or manual, is checked again by the worker before
+        it fetches anything; a run refused there is recorded as failed with the reason.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/SourceUid"
@@ -1108,6 +1160,8 @@ paths:
                     type: string
                     const: triggered
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -1118,6 +1172,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "501":
           $ref: "#/components/responses/NotEnabled"
+        "503":
+          $ref: "#/components/responses/LabUnavailable"
 
   /sources/{uid}/runs:
     get:
@@ -1380,18 +1436,48 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "source \"tmdb\" not found", "code": "not_found" }
     Unprocessable:
-      description: Validation failed (bad cron or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline, or a tenant's job whose pipeline names a global connection).
+      description: Validation failed (bad cron — including one without exactly 5 fields — or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline, or a tenant's job whose pipeline names a global connection).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example: { "error": "pipeline \"movies\" cannot run on a schedule: its meili_indexer step names no Meilisearch `connection`", "code": "validation" }
+    InvalidPipeline:
+      description: |
+        The pipeline definition is invalid: unknown plugin, cycle, duplicate step,
+        unsupported `fan_out`, a step `config` that breaks its plugin's
+        `config_schema`, or a `meili_indexer` connection the tenant does not have.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            config:
+              value: { "error": "invalid pipeline: step \"c\" (chunker): invalid config at /chunk_size: \"big\" is not of type \"integer\"", "code": "invalid_pipeline" }
+            connection:
+              value: { "error": "invalid pipeline: step \"index\" (meili_indexer): connection \"does-not-exist\" does not exist for this tenant", "code": "invalid_pipeline" }
+            plugin:
+              value: { "error": "invalid pipeline: unknown plugin \"llm_enrichr\": not built in and not registered by any worker", "code": "invalid_pipeline" }
     NotEnabled:
       description: "`SOURCE_SECRET_KEY` is not set on this deployment, so connections and sources are disabled."
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    InsufficientCredits:
+      description: "Hosted Lab engine only. The Lab account has no credits left (`code: insufficient_credits`); nothing was queued."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61 has no credits left; top up in the Lab console", "code": "insufficient_credits" }
+    LabUnavailable:
+      description: "Hosted Lab engine only. The account's credits could not be checked (`code: lab_unavailable`): the Lab has not yet confirmed this deployment's credentials, or it cannot answer and there is no answer for the account from the last 300 s. Nothing was queued or started; retry later."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the Lab has been unreachable for more than 300s; cannot check account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61's credits", "code": "lab_unavailable" }
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
@@ -1460,7 +1546,7 @@ components:
         code:
           type: string
           description: Stable snake_case error code.
-          examples: [missing_context, bad_request, forbidden, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, internal_error]
+          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, internal_error]
 
     JobStatus:
       type: string
@@ -1492,10 +1578,14 @@ components:
           description: |
             HTTP(S) URL fetched by the worker. Must satisfy `SOURCE_FETCH_HOSTS` (default
             `public`: `https`, public addresses only), checked here — a forbidden URL is a
-            `422` — and again at fetch time on every redirect hop.
+            `422` — and again at fetch time on every redirect hop. The fetch happens in
+            the job, not in this request: a `4xx` other than `408`/`429` (e.g. `404`,
+            `403`, `410`, also after a redirect) fails the job's first step at once,
+            while transport errors, `408`, `429` and `5xx` are retried per the step's
+            retry policy.
         s3:
           type: string
-          description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. Streamed by the worker with its ambient cloud credentials: not subject to `SOURCE_FETCH_HOSTS`, so scope those credentials to what callers may read."
+          description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. The blob store's own bucket, and any bucket outside the deployment's `OBJECT_REF_BUCKETS` when set, is a `422` too. Streamed by the worker anonymously (public objects only) unless the deployment sets `OBJECT_REF_AMBIENT_CREDENTIALS=true`; not subject to `SOURCE_FETCH_HOSTS`."
         documents:
           type: array
           description: Inline documents, indexed directly (no extraction). Must be JSON objects with an `id`.
@@ -1948,7 +2038,12 @@ components:
           $ref: "#/components/schemas/SourceLocation"
         cron:
           type: string
-          description: 5-field cron, validated by Temporal.
+          description: |
+            Standard 5-field cron: minute, hour, day of month, month, day of week.
+            Temporal's 6/7-field forms (leading seconds, trailing years) and `@`
+            descriptors are rejected with `422`; the field values are validated by
+            Temporal.
+          pattern: "^\\s*\\S+(\\s+\\S+){4}\\s*$"
           example: "0 9 * * *"
         timezone:
           type: string
@@ -1956,7 +2051,7 @@ components:
           description: IANA timezone for the cron and URL templates.
         index:
           type: string
-          description: Index override (in the place of a request's `?index=`).
+          description: Index override (in the place of a request's `?index=`). A blank string means no override.
         auth:
           $ref: "#/components/schemas/FetchAuth"
     UpdateSource:
@@ -1968,9 +2063,14 @@ components:
         pipeline: { type: string }
         location:
           $ref: "#/components/schemas/SourceLocation"
-        cron: { type: string }
+        cron:
+          type: string
+          description: Standard 5-field cron, as on create.
+          pattern: "^\\s*\\S+(\\s+\\S+){4}\\s*$"
         timezone: { type: string }
-        index: { type: string }
+        index:
+          type: [string, "null"]
+          description: Omit to keep, `null` or a blank string to clear the override, a name to replace it.
         auth:
           description: Omit to keep, `null` to clear, an object to replace.
           oneOf:

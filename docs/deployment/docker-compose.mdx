@@ -22,8 +22,7 @@ docker compose down -v        # stop and wipe volumes
 | `meilisearch` | `getmeili/meilisearch:v1.15` | 7700 | master key `masterKey` |
 | `control-plane` | `Dockerfile.dev` | 9000 | `cargo watch -x "run --bin meili-ingest-control-plane"` |
 | `gateway` | `Dockerfile.dev` | 8080 | standalone mode → local Meilisearch |
-| `worker-general` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-general` |
-| `worker-llm` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-llm`, needs `LLM_API_KEY` |
+| `worker-general` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-general`; runs AI steps too, so it takes the API keys |
 | `worker-io` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-io` |
 
 With OrbStack every container also answers on
@@ -62,10 +61,11 @@ to change:
 
 | Variable | Service | Default | Purpose |
 |---|---|---|---|
-| `LLM_API_KEY` | worker-llm | `${LLM_API_KEY:-}` from your shell / `.env` | required for `llm_enricher` / `image_captioner` |
-| `LLM_BASE_URL` | worker-llm | `https://api.openai.com/v1` | any OpenAI-compatible endpoint (Ollama, vLLM, …) |
-| `LLM_MODEL` | worker-llm | `gpt-4o-mini` | default model |
-| `TYPESAFE_API_KEY` | worker-llm | `${TYPESAFE_API_KEY:-}` from your shell / `.env` | required for `jev_enricher` |
+| `LLM_API_KEY` | worker-general | `${LLM_API_KEY:-}` from your shell / `.env` | required for `llm_enricher` / `image_captioner` |
+| `LLM_BASE_URL` | worker-general | `https://api.openai.com/v1` | any OpenAI-compatible endpoint (Ollama, vLLM, …) |
+| `LLM_MODEL` | worker-general | `gpt-4o-mini` | default model |
+| `TYPESAFE_API_KEY` | worker-general | `${TYPESAFE_API_KEY:-}` from your shell / `.env` | required for `jev_enricher` |
+| `TRANSCRIBE_API_KEY` | worker-general | falls back to `LLM_API_KEY` | required for `whisper_transcriber` |
 | `MEILI_URL` / `MEILI_API_KEY` | gateway | local Meilisearch | standalone fallback |
 | `INLINE_MAX_BYTES` | gateway | 1 MiB | above this, uploads are staged in the blob store |
 | `PAYLOAD_SPILL_BYTES` | workers | 1 MiB | above this, step outputs are spilled |
@@ -105,7 +105,7 @@ under `/usr/local/bin/`.
   compiling. `docker compose logs -f control-plane`.
 - **Uploads fail with 413** — raise `MAX_UPLOAD_MB` on the gateway.
 - **LLM steps fail with `plugin llm_enricher unavailable`** — `LLM_API_KEY`
-  is not set in the `worker-llm` environment.
+  is not set in the `worker-general` environment.
 - **Reset everything** — `docker compose down -v` also deletes the Postgres,
   Temporal, Meilisearch and blob volumes (not the cargo caches unless you
   `docker volume rm meili-ingest_target-cache`).

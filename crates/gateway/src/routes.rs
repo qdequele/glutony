@@ -49,7 +49,7 @@ const fn mgmt(method: &'static str, path: &'static str) -> RouteSpec {
     }
 }
 
-/// Every route `router()` mounts, except the admin UI's.
+/// Every route `router()` mounts.
 pub const ROUTES: &[RouteSpec] = &[
     data("GET", "/health"),
     data("POST", "/ingest"),

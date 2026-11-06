@@ -78,6 +78,10 @@ observe it through `ctx.check_cancelled()`), no new step is scheduled and the
 job ends as `cancelled`. Documents already written by an earlier indexer step
 remain in the index.
 
+Cancelling a job that has already finished (`succeeded`, `failed` or
+`cancelled`) changes nothing and returns `409` with code `already_finished`. An
+unknown id, or another tenant's job, is `404`.
+
 ## Retries and timeouts
 
 Per step, from the pipeline definition:
@@ -93,6 +97,19 @@ Per step, from the pipeline definition:
 Retryable errors (network, rate limits, transient upstream failures) go through
 this policy. Non-retryable ones (`InvalidInput`, `InvalidConfig`,
 `NonRetryable`) fail the step at once.
+
+When a step's input is a URL (`POST /ingest {"url": ...}`), the worker fetches it
+before the plugin runs. A transport error, `408`, `429` or `5xx` goes through the
+step's retry policy; any other `4xx` (`404`, `403`, `410`…), including one returned
+after a redirect, fails the step at once, since the same request gets the same
+answer. A URL refused by `SOURCE_FETCH_HOSTS` is non-retryable too, and so is an
+object ref (`{"s3": ...}`) the deployment refuses (the blob store's own bucket, or a
+bucket outside `OBJECT_REF_BUCKETS`; see
+[object refs](/deployment/environment-variables#object-refs)).
+
+A step cut short because its worker shut down (scale-in, Spot interruption,
+deploy) fails as a retryable `WorkerShutdown` error and is retried at once on
+another worker. It counts as one attempt of the step's retry policy.
 
 ## Observability
 

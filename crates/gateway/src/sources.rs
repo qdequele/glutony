@@ -125,9 +125,9 @@ pub struct SourcePatch {
     /// New timezone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
-    /// New index override.
+    /// Replace (`Some(Some)`), clear (`Some(None)`) or keep (`None`) the index override.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_name: Option<String>,
+    pub index_name: Option<Option<String>>,
     /// Replace (`Some(Some)`), clear (`Some(None)`) or keep (`None`) the credential.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetch_auth: Option<Option<Vec<u8>>>,
@@ -195,9 +195,10 @@ pub struct UpdateSource {
     /// New timezone.
     #[serde(default)]
     pub timezone: Option<String>,
-    /// New index override.
-    #[serde(default)]
-    pub index: Option<String>,
+    /// Replace the index override, clear it (`null` or a blank string: the pipeline's
+    /// `index_pattern`, then the MIME default, apply again) or keep it (absent).
+    #[serde(default, deserialize_with = "double_option")]
+    pub index: Option<Option<String>>,
     /// Replace, clear (`null`) or keep (absent) the credential.
     #[serde(default, deserialize_with = "double_option")]
     pub auth: Option<Option<FetchAuth>>,

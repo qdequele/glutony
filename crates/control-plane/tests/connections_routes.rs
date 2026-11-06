@@ -223,39 +223,67 @@ async fn used_by_and_list_are_exposed() {
 }
 
 #[tokio::test]
-async fn resolve_never_hands_a_global_connection_to_a_tenant() {
-    let Some(app) = setup("cr-res").await else {
+async fn scope_tenant_returns_only_the_tenants_own_row() {
+    let Some(app) = setup("cr-scope").await else {
         return;
     };
-    let mut global = new_connection("cr-res-1", "unused");
+    let mut global = new_connection("cr-scope-1", "unused");
     global.tenant_id = None;
     let (status, _) = call(&app, with_json("POST", "/internal/connections", &global)).await;
     assert_eq!(status, StatusCode::CREATED);
-
-    // The read route still falls back to the global row ...
     let (status, _) = call(
         &app,
-        bare("GET", "/internal/connections/cr-res-1?tenant_id=rp-9"),
+        with_json(
+            "POST",
+            "/internal/connections",
+            &new_connection("cr-scope-1", "rp-6"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Management reads still fall back to the global template.
+    let (status, body) = call(
+        &app,
+        bare("GET", "/internal/connections/cr-scope-1?tenant_id=rp-7"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(json::<ConnectionRecord>(&body).tenant_id, None);
 
-    // ... but the lookup a job uses does not.
+    // A job's lookup never does.
     let (status, body) = call(
         &app,
         bare(
             "GET",
-            "/internal/connections/cr-res-1/resolve?tenant_id=rp-9",
+            "/internal/connections/cr-scope-1?tenant_id=rp-7&scope=tenant",
         ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let err: ErrorBody = json(&body);
-    assert!(err.error.contains("cr-res-1"), "{}", err.error);
+    assert_eq!(json::<ErrorBody>(&body).code, "not_found");
 
-    // Without a tenant, the global row is the answer.
-    let (status, body) = call(&app, bare("GET", "/internal/connections/cr-res-1/resolve")).await;
+    let (status, body) = call(
+        &app,
+        bare(
+            "GET",
+            "/internal/connections/cr-scope-1?tenant_id=rp-6&scope=tenant",
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let row: ConnectionRecord = json(&body);
-    assert_eq!(row.tenant_id, None);
+    assert_eq!(
+        json::<ConnectionRecord>(&body).tenant_id.as_deref(),
+        Some("rp-6")
+    );
+
+    // `scope=tenant` without a tenant, or an unknown scope, is a validation error.
+    for uri in [
+        "/internal/connections/cr-scope-1?scope=tenant",
+        "/internal/connections/cr-scope-1?tenant_id=rp-6&scope=everything",
+    ] {
+        let (status, body) = call(&app, bare("GET", uri)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        assert_eq!(json::<ErrorBody>(&body).code, "validation", "{uri}");
+    }
 }

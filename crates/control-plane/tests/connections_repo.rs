@@ -316,56 +316,83 @@ async fn used_by_ignores_a_connection_key_on_a_non_indexer_step() {
 }
 
 #[tokio::test]
-async fn a_tenant_job_resolves_only_the_tenants_own_connection() {
-    let Some(pool) = pool("cn-own").await else {
+async fn get_owned_never_returns_the_global_row() {
+    let Some(pool) = pool("cn-owned").await else {
         return;
     };
     let repo = ConnectionRepo::new(pool);
-    let mut global = new_connection("cn-own-1", None);
-    global.host = "https://global.example".into();
-    repo.insert(&global).await.expect("global");
-
-    // Readable by the tenant, but never usable by its jobs.
+    repo.insert(&new_connection("cn-owned-1", None))
+        .await
+        .expect("global");
+    repo.insert(&new_connection("cn-owned-1", Some("cp-2")))
+        .await
+        .expect("tenant");
     assert!(
-        repo.get("cn-own-1", Some("cp-own"))
+        repo.get_owned("cn-owned-1", "cp-2")
             .await
             .expect("get")
             .is_some()
     );
     assert!(
-        repo.resolve("cn-own-1", Some("cp-own"))
+        repo.get_owned("cn-owned-1", "cp-3")
             .await
-            .expect("resolve")
+            .expect("get")
             .is_none(),
-        "a tenant job must not fall back to the operator's global connection"
+        "a global connection is a template, never a tenant's key"
     );
+}
 
-    // A job without a tenant keeps using the global row.
-    let standalone = repo
-        .resolve("cn-own-1", None)
-        .await
-        .expect("resolve")
-        .expect("global row");
-    assert_eq!(standalone.host, "https://global.example");
+#[tokio::test]
+async fn a_tenant_pipeline_cannot_name_a_global_connection() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use meili_ingest_plugin_sdk::PluginManifest;
+    use tower::ServiceExt;
 
-    // Once the tenant has its own row of that name, its jobs use it.
-    let mut tenant = new_connection("cn-own-1", Some("cp-own"));
-    tenant.host = "https://tenant.example".into();
-    repo.insert(&tenant).await.expect("tenant");
-    let own = repo
-        .resolve("cn-own-1", Some("cp-own"))
+    let Some(pool) = pool("cn-tpl").await else {
+        return;
+    };
+    let connections = ConnectionRepo::new(pool.clone());
+    connections
+        .insert(&new_connection("cn-tpl-global", None))
         .await
-        .expect("resolve")
-        .expect("tenant row");
-    assert_eq!(own.host, "https://tenant.example");
-    assert_eq!(own.tenant_id.as_deref(), Some("cp-own"));
+        .expect("global");
+    connections
+        .insert(&new_connection("cn-tpl-own", Some("cp-9")))
+        .await
+        .expect("own");
+    let app = meili_ingest_control_plane::app(meili_ingest_control_plane::AppState::new(pool));
+
+    // `POST /internal/plugins` takes full manifests (`produces` is required).
+    let manifests = vec![
+        PluginManifest::new("json_parser", "0"),
+        PluginManifest::new("meili_indexer", "0"),
+    ];
+    let reg = Request::post("/internal/plugins")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&manifests).unwrap()))
+        .unwrap();
     assert!(
-        repo.resolve("cn-own-1", Some("cp-own-other"))
+        app.clone()
+            .oneshot(reg)
             .await
-            .expect("resolve")
-            .is_none(),
-        "another tenant's row is never reachable"
+            .unwrap()
+            .status()
+            .is_success()
     );
+
+    for (connection, expected) in [
+        ("cn-tpl-global", StatusCode::UNPROCESSABLE_ENTITY),
+        ("cn-tpl-own", StatusCode::OK),
+    ] {
+        let def = pipeline_using("cn-tpl-p", Some("cp-9"), connection);
+        let req = Request::post("/pipelines/validate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&def).unwrap()))
+            .unwrap();
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        assert_eq!(status, expected, "{connection}");
+    }
 }
 
 #[tokio::test]

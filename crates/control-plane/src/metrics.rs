@@ -14,6 +14,8 @@ pub struct LabMetrics {
     pub delivered_total: IntCounter,
     /// `glutony_lab_events_failed_total{reason}`.
     pub failed_total: IntCounterVec,
+    /// `glutony_lab_events_dropped_total`.
+    pub dropped_total: IntCounter,
 }
 
 impl Default for LabMetrics {
@@ -37,11 +39,17 @@ impl Default for LabMetrics {
             &["reason"],
         )
         .expect("valid metric");
+        let dropped_total = IntCounter::new(
+            "glutony_lab_events_dropped_total",
+            "Lab events dropped after 24 h without acknowledgement",
+        )
+        .expect("valid metric");
         for m in [
             Box::new(pending.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(oldest_pending_seconds.clone()),
             Box::new(delivered_total.clone()),
             Box::new(failed_total.clone()),
+            Box::new(dropped_total.clone()),
         ] {
             registry.register(m).expect("unique metric");
         }
@@ -51,6 +59,7 @@ impl Default for LabMetrics {
             oldest_pending_seconds,
             delivered_total,
             failed_total,
+            dropped_total,
         }
     }
 }
@@ -82,6 +91,7 @@ mod tests {
             "glutony_lab_events_oldest_pending_seconds",
             "glutony_lab_events_delivered_total",
             "glutony_lab_events_failed_total{reason=\"auth\"} 1",
+            "glutony_lab_events_dropped_total",
         ] {
             assert!(text.contains(name), "{name} missing from\n{text}");
         }

@@ -50,6 +50,22 @@ fn non_blank(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
+/// A source's cron must be the standard 5 fields (minute hour day-of-month month
+/// day-of-week). Temporal also takes a leading seconds field and a trailing years field
+/// (6 or 7 fields) and `@`-descriptors; those are refused so a source cannot fire every
+/// second and so the API matches what the docs and the Lab console offer. This only
+/// counts fields: whether each one is valid is still Temporal's call (Decision 10).
+fn check_cron(cron: &str) -> Result<(), GatewayError> {
+    let fields = cron.split_whitespace().count();
+    if fields == 5 {
+        return Ok(());
+    }
+    Err(GatewayError::Unprocessable(format!(
+        "invalid cron {cron:?}: expected 5 fields (minute hour day-of-month month \
+         day-of-week), got {fields}"
+    )))
+}
+
 /// Seal a fetch credential.
 fn seal(key: &SecretKey, auth: &meili_ingest_source::FetchAuth) -> Result<Vec<u8>, GatewayError> {
     seal_json(key, auth).map_err(|e| GatewayError::Internal(e.to_string()))
@@ -141,6 +157,7 @@ pub async fn create_source(
     check_uid(&uid)?;
     let tenant_id = scope.tenant_id.clone();
 
+    check_cron(&req.cron)?;
     validate_location(&req.location, &req.timezone, &state.fetch_policy).await?;
     schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
     let fetch_auth = req.auth.as_ref().map(|a| seal(key, a)).transpose()?;
@@ -267,6 +284,9 @@ pub async fn patch_source(
     check_uid(&uid)?;
     let req: UpdateSource = parse_body(&body)?;
     let tenant_id = scope.tenant_id.clone();
+    if let Some(cron) = &req.cron {
+        check_cron(cron)?;
+    }
     let stored = owned(&state, &uid, tenant_id.as_deref()).await?;
     let d = &stored.definition;
 
@@ -302,7 +322,7 @@ pub async fn patch_source(
         location: req.location,
         cron: req.cron,
         timezone: req.timezone,
-        index_name: req.index,
+        index_name: req.index.map(non_blank),
         fetch_auth,
         paused: None,
     };
@@ -367,6 +387,12 @@ pub async fn run_source(
         return Err(GatewayError::Unprocessable(format!(
             "source {uid:?} is archived: its pipeline was deleted"
         )));
+    }
+    // A manual run starts billable work for the tenant: the same credit pre-check as
+    // POST /ingest (spec v2 §8.1). Every run, scheduled or manual, is checked again at
+    // its start by the worker, through the control plane.
+    if let (Some(lab), Some(account)) = (&state.lab, tenant_id.as_deref()) {
+        lab.check_credits(account).await?;
     }
     state
         .schedules
@@ -836,6 +862,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_or_null_index_clears_the_override() {
+        let cp = MockServer::start().await;
+        mount_source(&cp).await;
+        Mock::given(method("PATCH"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record(false)))
+            .mount(&cp)
+            .await;
+        let app = app(&cp, Arc::new(FakeSchedules::default()), true);
+
+        for body in [
+            serde_json::json!({ "index": "" }),
+            serde_json::json!({ "index": "   " }),
+            serde_json::json!({ "index": null }),
+            serde_json::json!({ "index": " movies " }),
+            serde_json::json!({ "name": "TMDB" }),
+        ] {
+            let (status, _) = call(&app, req("PATCH", "/sources/tmdb", body.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let sent: Vec<serde_json::Value> = cp
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| serde_json::from_slice(&r.body).expect("json"))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                serde_json::json!({ "index_name": null }),
+                serde_json::json!({ "index_name": null }),
+                serde_json::json!({ "index_name": null }),
+                serde_json::json!({ "index_name": "movies" }),
+                serde_json::json!({ "name": "TMDB" }),
+            ],
+            "blank and null clear the override; absent keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cron_without_exactly_five_fields_is_422() {
+        let cp = MockServer::start().await;
+        mount_pipeline(&cp, true).await;
+        mount_source(&cp).await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sources"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(record(true)))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let app = app(&cp, schedules.clone(), true);
+
+        for cron in ["* * * * * *", "0 0 9 * * * 2026", "0 9 * *", "@daily", ""] {
+            let mut body = create_body();
+            body["cron"] = serde_json::json!(cron);
+            let (status, err) = call(&app, req("POST", "/sources", body)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "create {cron:?}");
+            assert!(
+                err["error"].as_str().unwrap_or("").contains("5 fields"),
+                "{err}"
+            );
+            let (status, _) = call(
+                &app,
+                req(
+                    "PATCH",
+                    "/sources/tmdb",
+                    serde_json::json!({ "cron": cron }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "patch {cron:?}");
+        }
+        assert!(schedules.calls().is_empty(), "{:?}", schedules.calls());
+    }
+
+    #[tokio::test]
     async fn run_triggers_and_delete_removes_the_schedule_first() {
         let cp = MockServer::start().await;
         mount_source(&cp).await;
@@ -870,6 +975,69 @@ mod tests {
                 "delete source-11111111-1111-1111-1111-111111111111".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_manual_run_for_a_lab_account_without_credits_is_402_and_nothing_runs() {
+        // A manual run starts billable work for the tenant, so it gets the same credit
+        // pre-check as POST /ingest (spec v2 §8.1).
+        const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+        const INSTANCE: &str = "7b4a2c1e-5d6f-4a8b-9c0d-1e2f3a4b5c6d";
+        let cp = MockServer::start().await;
+        let mut owned = record(false);
+        owned["tenant_id"] = serde_json::json!(ACCOUNT);
+        Mock::given(method("GET"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(owned))
+            .mount(&cp)
+            .await;
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{ACCOUNT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "account_id": ACCOUNT, "tier": "free",
+                "credits": {"balance": 0}, "cache_ttl": 30
+            })))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let client = Arc::new(crate::lab::LabClient::new(
+            meili_ingest_lab::LabCredentials::new(&lab.uri(), INSTANCE, "s").expect("creds"),
+            reqwest::Client::new(),
+        ));
+        client.set_identity(meili_ingest_lab::InstanceInfo {
+            instance_id: INSTANCE.into(),
+            kind: meili_ingest_lab::InstanceKind::Hosted,
+            product: "glutony".into(),
+            region: None,
+            lab_url: None,
+        });
+        let schedules = Arc::new(FakeSchedules::default());
+        let config = GatewayConfig {
+            control_plane_url: cp.uri(),
+            ..GatewayConfig::default()
+        };
+        let state = AppState::new(
+            config,
+            Arc::new(FakeStarter::default()),
+            BlobStore::memory(),
+            reqwest::Client::new(),
+        )
+        .with_connections(ConnectionConfig::new(Some(key()), HostPolicy::Any))
+        .with_sources(schedules.clone(), HostPolicy::Any)
+        .with_lab(client);
+        let app = crate::router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sources/tmdb/run")
+            .header("x-meili-tenant-id", ACCOUNT)
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(body["code"], "insufficient_credits");
+        assert!(schedules.calls().is_empty(), "nothing was triggered");
     }
 
     #[tokio::test]

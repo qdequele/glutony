@@ -4,6 +4,7 @@
 //! The binary in `main.rs` wires these to a Temporal worker polling one task queue.
 
 pub mod activity;
+pub mod ai_target;
 pub mod config;
 pub mod connection;
 pub mod dag;

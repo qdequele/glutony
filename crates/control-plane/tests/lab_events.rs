@@ -236,11 +236,12 @@ async fn purge_only_touches_old_delivered_rows() {
 #[tokio::test]
 async fn the_internal_route_inserts_and_is_idempotent() {
     let Some(t) = setup().await else { return };
-    let app = app(AppState::new(t.pool.clone()));
+    let app = app(AppState::new(t.pool.clone()).with_internal_token(Some("cp-token".into())));
     let id = Uuid::new_v4();
     let body = serde_json::json!({"events": [event(id)]});
     for expected in [1, 0] {
         let req = Request::post("/internal/lab-events")
+            .header(header::AUTHORIZATION, "Bearer cp-token")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
@@ -251,6 +252,7 @@ async fn the_internal_route_inserts_and_is_idempotent() {
         assert_eq!(v["inserted"], expected);
     }
     let bad = Request::post("/internal/lab-events")
+        .header(header::AUTHORIZATION, "Bearer cp-token")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"events":[{"id":"x"}]}"#))
         .unwrap();
@@ -276,5 +278,33 @@ async fn metrics_reflect_the_outbox_without_a_sender() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("glutony_lab_events_pending 2"), "{text}");
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn drop_stale_only_removes_old_undelivered_rows() {
+    let Some(t) = setup().await else { return };
+    let repo = LabEventRepo::new(t.pool.clone());
+    let (old_pending, old_delivered, recent) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    repo.insert_many(&[event(old_pending), event(old_delivered), event(recent)])
+        .await
+        .unwrap();
+    repo.mark_delivered(&[old_delivered]).await.unwrap();
+    sqlx::query("UPDATE lab_events SET created_at = now() - interval '2 days' WHERE id = ANY($1)")
+        .bind(vec![old_pending, old_delivered])
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    let dropped = repo
+        .drop_stale(Duration::from_secs(24 * 3_600))
+        .await
+        .unwrap();
+    assert_eq!(dropped, vec![old_pending]);
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM lab_events ORDER BY created_at")
+        .fetch_all(&t.pool)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 2);
+    assert!(left.contains(&old_delivered) && left.contains(&recent));
     t.drop_schema().await;
 }

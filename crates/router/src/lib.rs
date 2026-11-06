@@ -252,10 +252,11 @@ pub fn mime_to_default_index(mime: &str) -> &'static str {
 }
 
 /// Temporal task queue that runs a plugin (SPEC §8.3).
+///
+/// No model runs inside a worker: AI steps call a hosted API, so they share
+/// `workers-general` with every other plugin instead of needing their own pool.
 pub fn plugin_task_queue(plugin: &str) -> &'static str {
     match plugin {
-        "whisper_transcriber" | "ocr" | "video_audio_extractor" => "workers-gpu",
-        "llm_enricher" | "jev_enricher" | "image_captioner" => "workers-llm",
         "s3_downloader" => "workers-io",
         _ => "workers-general",
     }
@@ -1159,12 +1160,15 @@ mod tests {
 
     #[test]
     fn task_queue_table() {
-        assert_eq!(plugin_task_queue("whisper_transcriber"), "workers-gpu");
-        assert_eq!(plugin_task_queue("ocr"), "workers-gpu");
-        assert_eq!(plugin_task_queue("video_audio_extractor"), "workers-gpu");
-        assert_eq!(plugin_task_queue("llm_enricher"), "workers-llm");
-        assert_eq!(plugin_task_queue("jev_enricher"), "workers-llm");
-        assert_eq!(plugin_task_queue("image_captioner"), "workers-llm");
+        assert_eq!(plugin_task_queue("whisper_transcriber"), "workers-general");
+        assert_eq!(plugin_task_queue("ocr"), "workers-general");
+        assert_eq!(
+            plugin_task_queue("video_audio_extractor"),
+            "workers-general"
+        );
+        assert_eq!(plugin_task_queue("llm_enricher"), "workers-general");
+        assert_eq!(plugin_task_queue("jev_enricher"), "workers-general");
+        assert_eq!(plugin_task_queue("image_captioner"), "workers-general");
         assert_eq!(plugin_task_queue("s3_downloader"), "workers-io");
         assert_eq!(plugin_task_queue("pdf_extractor"), "workers-general");
         assert_eq!(plugin_task_queue("chunker"), "workers-general");

@@ -42,14 +42,17 @@
 //! }
 //! ```
 
+pub mod ai;
 pub mod context;
 pub mod cost;
 pub mod error;
 pub mod tenant;
 pub mod types;
+pub mod vendor;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+pub use ai::AiTarget;
 pub use async_trait::async_trait;
 pub use context::ActivityContext;
 pub use error::PluginError;
@@ -101,6 +104,7 @@ where
 
 /// Convenience re-exports for plugin authors.
 pub mod prelude {
+    pub use crate::ai::AiTarget;
     pub use crate::context::ActivityContext;
     pub use crate::error::PluginError;
     pub use crate::types::*;

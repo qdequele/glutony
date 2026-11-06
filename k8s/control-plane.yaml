@@ -1,14 +1,14 @@
 # Control plane: pipeline registry + routing API (internal, port 9000).
 #
-# This file also carries the ConfigMap and Secret shared by every meili-ingest
-# component (gateway, workers). Replace the Secret placeholders before applying:
+# This file also carries the ConfigMap shared by every meili-ingest component
+# (gateway, workers). The Secret `meili-ingest-secrets` is NOT part of this
+# kustomization: create it once before the first `kubectl apply -k k8s/` (see
+# secrets.example.yaml and docs/deployment/kubernetes.mdx), so re-applying the
+# kustomization never overwrites real values.
 #
-#   kubectl -n meili-ingest create secret generic meili-ingest-secrets \
-#     --from-literal=DATABASE_URL='postgres://user:pass@postgres:5432/meili_ingest' \
-#     --from-literal=LLM_API_KEY='sk-...' \
-#     --from-literal=TINYBIRD_TOKEN='p.ey...' \
-#     --from-literal=ENVOY_TRUSTED_HEADER='<shared secret agreed with the Envoy team>' \
-#     --dry-run=client -o yaml | kubectl apply -f -
+# Port 9000 must never be reachable from outside the cluster network:
+# CONTROL_PLANE_TOKEN only guards /internal/*; /pipelines, /jobs and /plugins
+# on this port are open.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -39,29 +39,14 @@ data:
   # region: api.tinybird.co, api.eu-central-1.aws.tinybird.co, and so on.
   TINYBIRD_BASE_URL: "https://api.tinybird.co"
   TINYBIRD_DATASOURCE: "meili_ingest_usage"
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: meili-ingest-secrets
-  namespace: meili-ingest
-  labels:
-    app.kubernetes.io/name: meili-ingest
-type: Opaque
-stringData:
-  # --- placeholders: override with your own values ---
-  DATABASE_URL: "postgres://postgres:CHANGE_ME@postgres:5432/meili_ingest"
-  LLM_API_KEY: "CHANGE_ME"
-  # Tinybird append token for the usage data source. Omit the key entirely to run
-  # without usage analytics: the worker logs it once and the reporting step no-ops.
-  TINYBIRD_TOKEN: "CHANGE_ME"
-  # TypeSafe key for jev_enricher. Optional: omit it to run without the plugin.
-  TYPESAFE_API_KEY: "CHANGE_ME"
-  # Speech-to-text endpoint key for whisper_transcriber; falls back to LLM_API_KEY.
-  TRANSCRIBE_API_KEY: "CHANGE_ME"
-  # Shared secret Envoy must send in `X-Meili-Envoy-Secret` for X-Meili-*
-  # headers to be honoured. Leave empty to trust headers unconditionally (dev only).
-  ENVOY_TRUSTED_HEADER: "CHANGE_ME"
+  # Meilisearch Lab (platform contract v2). Leave LAB_URL empty to run without a Lab.
+  # Edit here and re-apply (`kubectl apply -k k8s/`), then `kubectl rollout restart`
+  # the control plane, gateway and workers: env is read at pod start.
+  LAB_URL: ""
+  # Workers write one usage and one lifecycle event per Lab job to the outbox.
+  LAB_EVENTS_ENABLED: "false"
+  # Provider cost table mounted from the meili-ingest-provider-costs ConfigMap.
+  PROVIDER_COSTS_FILE: "/etc/meili-ingest/provider-costs.toml"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -72,7 +57,8 @@ metadata:
     app.kubernetes.io/name: meili-control-plane
     app.kubernetes.io/component: control-plane
 spec:
-  replicas: 1
+  # Two replicas: the Lab events sender leases rows with FOR UPDATE SKIP LOCKED, so both can run it.
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: meili-control-plane
@@ -89,7 +75,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: control-plane
-          image: ghcr.io/meilisearch/meili-ingest:latest
+          image: ghcr.io/qdequele/glutony:latest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/meili-ingest-control-plane"]
           ports:
@@ -108,6 +94,29 @@ spec:
                 secretKeyRef:
                   name: meili-ingest-secrets
                   key: DATABASE_URL
+            - name: CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: CONTROL_PLANE_TOKEN
+            - name: LAB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: meili-ingest-config
+                  key: LAB_URL
+                  optional: true
+            - name: LAB_INSTANCE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_INSTANCE_ID
+                  optional: true
+            - name: LAB_INSTANCE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: LAB_INSTANCE_SECRET
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

@@ -551,18 +551,19 @@ Recorded in the final review:
    owns. Before this, a tenant's pipeline naming a global connection uid resolved to
    the global row and wrote with the operator's key, so the interim rule was "no
    global connections in a Lab deployment".
-   - **Run time:** the worker resolves through `GET /internal/connections/{uid}/resolve`
-     (`ConnectionRepo::resolve`), which returns the row in exactly the job's scope: the
-     tenant's row for a tenant job, the global row for a job without a tenant. The
-     worker also refuses a row whose owner is not the job's tenant, so an older control
+   - **Run time:** the worker resolves through
+     `GET /internal/connections/{uid}?tenant_id=&scope=tenant` (`ConnectionRepo::get_owned`,
+     added on main in ae11a36), which returns only the tenant's row for a tenant job; a
+     job without a tenant gets the global row. The worker also refuses a row whose owner is not the job's tenant, so an older control
      plane that falls back cannot undo it. Either way the step fails non-retryably,
      saying the connection is global. Reads (`GET /internal/connections/{uid}`) still
      fall back, so a tenant can see global connections.
-   - **Submit time:** the gateway answers `422` (`validation`) when a tenant's pipeline
-     names a global connection: `POST /pipelines` and `/pipelines/validate` (caller's
-     tenant or a body `tenant_id`), `POST /sources` and a `PATCH /sources/{uid}` that
-     changes `pipeline` (source's tenant), and tenant-tagged ingest. A connection uid
-     that does not exist yet is not refused; it fails at run time (Decision 15).
+   - **Submit time:** `POST /pipelines` and `/pipelines/validate` are refused (`422`)
+     by the control plane's save-time check when a tenant pipeline names anything but
+     its own connection. The gateway also answers `422` when a tenant's source or
+     ingest would run a pipeline (including a global one) whose indexer names a global
+     connection: `POST /sources`, a `PATCH /sources/{uid}` that changes `pipeline`
+     (source's tenant), and tenant-tagged ingest.
    - **A tenant job on a global pipeline pinned to a global connection** is refused
      at submit time and fails at run time. The same pipeline keeps working without a
      tenant. A tenant can use it by creating its own connection with the same uid,
