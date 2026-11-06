@@ -67,8 +67,13 @@ steps:
 
 - **Implicit sequencing.** A step without `depends_on` (other than the first)
   depends on the step listed right before it. Linear pipelines therefore never
-  need `depends_on`. In a DAG, write `depends_on` on every non-root step and
-  list root steps first.
+  need `depends_on`. `depends_on: []` counts as no `depends_on`, so **only the
+  first step runs on the job's initial input**: two steps cannot both start from
+  it. To branch, have several steps depend on the same step
+  (`depends_on: [extract]`); write `depends_on` on every step after a branch.
+- **Unknown keys are dropped.** A key the definition does not know (a `match:`
+  block instead of `trigger:`, a misspelled step field) is ignored when the
+  pipeline is saved. `POST /pipelines/validate` lists them in `warnings`.
 - **Parallelism.** Steps whose dependencies are all satisfied and that do not
   depend on each other run concurrently.
 - **Input resolution.** No dependency → the job's initial input (bytes, a
@@ -120,8 +125,8 @@ invisible to plugins and to pipeline authors.
 | `builtin.avro` | `application/vnd.apache.avro` | avro_parser → meili_indexer |
 | `builtin.msgpack` | `application/vnd.msgpack` | msgpack_parser → meili_indexer |
 | `builtin.image` | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | image_captioner → meili_indexer |
-| `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4` | whisper_transcriber → meili_indexer |
-| `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm` | video_audio_extractor → whisper_transcriber → meili_indexer |
+| `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4`, `audio/flac` | whisper_transcriber → meili_indexer |
+| `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm`, `video/x-matroska` | video_audio_extractor → whisper_transcriber → meili_indexer |
 
 Default chunker config: `strategy: sentence, chunk_size: 512, overlap: 64`.
 Default retry: `max_attempts: 3, backoff: exponential`.

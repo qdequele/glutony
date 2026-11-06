@@ -183,9 +183,10 @@ paths:
             schema:
               $ref: "#/components/schemas/BatchIngestRequest"
             example:
+              index: documents
               items:
                 - { "url": "https://example.com/a.pdf" }
-                - { "s3": "s3://my-bucket/b.mp4", "index": "videos" }
+                - { "s3": "s3://my-bucket/b.pdf", "filename": "b.pdf" }
       responses:
         "202":
           description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
@@ -530,11 +531,11 @@ paths:
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "202":
-          description: Cancellation requested.
+          description: Cancellation requested. Read the job with `GET /jobs/{job_id}` to see it reach `cancelled`.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JobStatusResponse"
+                $ref: "#/components/schemas/CancelJobResponse"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
@@ -1521,6 +1522,15 @@ components:
         valid: { type: boolean, const: true }
         order: { type: array, items: { type: string }, description: "Topological step order." }
         normalized: { $ref: "#/components/schemas/PipelineDefinition" }
+        warnings:
+          type: array
+          items: { type: string }
+          description: |
+            Present only when the body has keys the definition does not know, which a
+            save drops without an error: a top-level `match:` instead of `trigger:`, a
+            misspelled step or `retry` field. One entry per key, for example
+            ``"unknown key `match` is ignored"``. Plugin `config` blocks are checked by
+            their schema instead.
     UsageRow:
       type: object
       required: [day, pipeline_uid, plugin]
@@ -1588,19 +1598,45 @@ components:
           description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. The blob store's own bucket, and any bucket outside the deployment's `OBJECT_REF_BUCKETS` when set, is a `422` too. Streamed by the worker anonymously (public objects only) unless the deployment sets `OBJECT_REF_AMBIENT_CREDENTIALS=true`; not subject to `SOURCE_FETCH_HOSTS`."
         documents:
           type: array
-          description: Inline documents, indexed directly (no extraction). Must be JSON objects with an `id`.
+          description: |
+            Inline documents, routed as `application/json` (to `builtin.json` unless a
+            pipeline is named). Each must be a JSON object. `id` is optional: a missing
+            or `null` id gets a UUID, and ids are sanitised to `[A-Za-z0-9_-]`. The
+            content is taken from `content`, else `text`, else `body`, else every string
+            value joined.
           items:
             type: object
             additionalProperties: true
         filename:
           type: string
           description: Filename hint used for MIME detection and `_meta.filename`.
-        content_type:
-          type: string
-          description: MIME hint, used only when magic bytes and extension are inconclusive.
         index:
           type: string
           description: Target index (same as `?index=`).
+        pipeline:
+          type: string
+          description: Pipeline `uid` to run instead of routing by content type (same as `?pipeline=`).
+      oneOf:
+        - required: [url]
+        - required: [s3]
+        - required: [documents]
+
+    BatchIngestItem:
+      type: object
+      description: |
+        One item of a batch: exactly one of `url`, `s3` or `documents`, as in
+        `JsonIngest`. `index` and `pipeline` are not read per item: set them once on
+        the batch.
+      properties:
+        url: { type: string, format: uri, description: "As `JsonIngest.url`." }
+        s3: { type: string, description: "As `JsonIngest.s3`." }
+        documents:
+          type: array
+          description: As `JsonIngest.documents`.
+          items: { type: object, additionalProperties: true }
+        filename:
+          type: string
+          description: Filename hint used for MIME detection and `_meta.filename`.
       oneOf:
         - required: [url]
         - required: [s3]
@@ -1614,7 +1650,13 @@ components:
           type: array
           minItems: 1
           items:
-            $ref: "#/components/schemas/JsonIngest"
+            $ref: "#/components/schemas/BatchIngestItem"
+        index:
+          type: string
+          description: Target index for every item (same as `?index=`).
+        pipeline:
+          type: string
+          description: Pipeline `uid` for every item (same as `?pipeline=`).
 
     IngestResponse:
       type: object
@@ -1696,6 +1738,16 @@ components:
           type: boolean
           default: false
 
+    CancelJobResponse:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: cancelling
     JobStatusResponse:
       type: object
       required: [job_id, status, progress, pipeline_used]
