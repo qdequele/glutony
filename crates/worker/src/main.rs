@@ -103,12 +103,27 @@ async fn main() -> anyhow::Result<()> {
         ClientOptions::new(config.temporal_namespace.clone()).build(),
     )?;
 
-    // Usage reporting is optional: without TINYBIRD_TOKEN the activity is a no-op.
+    // Usage reporting is optional: without TINYBIRD_TOKEN or USAGE_CLICKHOUSE_URL the
+    // activity is a no-op.
     let usage = meili_ingest_usage::UsageClient::from_env()
         .context("invalid usage analytics configuration")?;
     match &usage {
-        Some(c) => tracing::info!(datasource = c.datasource(), "usage analytics enabled"),
-        None => tracing::warn!("usage analytics disabled (TINYBIRD_TOKEN is not set)"),
+        Some(c) => {
+            tracing::info!(
+                backend = c.backend(),
+                datasource = c.datasource(),
+                "usage analytics enabled"
+            );
+            // Create the ClickHouse table now, so bad grants show up at boot. Not
+            // fatal: an analytics outage must not stop ingestion, and the reporting
+            // step retries the creation.
+            if let Err(e) = c.prepare().await {
+                tracing::error!(error = %e, "usage store not ready; reporting will retry");
+            }
+        }
+        None => tracing::warn!(
+            "usage analytics disabled (neither TINYBIRD_TOKEN nor USAGE_CLICKHOUSE_URL is set)"
+        ),
     }
 
     // Meilisearch connections: optional, so a worker without SOURCE_SECRET_KEY still

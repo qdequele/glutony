@@ -34,24 +34,59 @@ pub const WORKFLOW_TYPE: &str = "PipelineWorkflow";
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration of the read-side usage analytics API.
+/// Where the read-side usage analytics API (`GET /usage`) reads from.
 #[derive(Clone)]
-pub struct UsageApiConfig {
-    /// Tinybird API base URL for the workspace's region.
-    pub base_url: String,
-    /// Read token. Held server-side only; never sent to a browser.
-    pub token: String,
-    /// Endpoint pipe name backing the dashboard.
-    pub pipe: String,
+pub enum UsageApiConfig {
+    /// A Tinybird endpoint pipe.
+    Tinybird {
+        /// Tinybird API base URL for the workspace's region.
+        base_url: String,
+        /// Read token. Held server-side only; never sent to a browser.
+        token: String,
+        /// Endpoint pipe name backing the dashboard.
+        pipe: String,
+    },
+    /// The usage table in a self-hosted ClickHouse (`USAGE_CLICKHOUSE_*`).
+    ClickHouse(meili_ingest_usage::clickhouse::ClickHouseConfig),
 }
 
 impl std::fmt::Debug for UsageApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UsageApiConfig")
-            .field("base_url", &self.base_url)
-            .field("pipe", &self.pipe)
-            .field("token", &"<redacted>")
-            .finish()
+        match self {
+            Self::Tinybird { base_url, pipe, .. } => f
+                .debug_struct("Tinybird")
+                .field("base_url", base_url)
+                .field("pipe", pipe)
+                .field("token", &"<redacted>")
+                .finish(),
+            // ClickHouseConfig redacts its own password.
+            Self::ClickHouse(c) => f.debug_tuple("ClickHouse").field(c).finish(),
+        }
+    }
+}
+
+impl UsageApiConfig {
+    /// `TINYBIRD_READ_TOKEN` (Tinybird) or `USAGE_CLICKHOUSE_URL` (ClickHouse); neither
+    /// is `None` (`GET /usage` answers 501), both is an error.
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let clickhouse = meili_ingest_usage::clickhouse::ClickHouseConfig::from_env()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match (env_opt("TINYBIRD_READ_TOKEN"), clickhouse) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "both TINYBIRD_READ_TOKEN and USAGE_CLICKHOUSE_URL are set: pick one usage store"
+            ),
+            // The dashboard proxy needs a READ token, which is a different token from
+            // the append token the workers use to write usage events.
+            (Some(token), None) => Ok(Some(Self::Tinybird {
+                base_url: env_or("TINYBIRD_BASE_URL", "https://api.tinybird.co")
+                    .trim_end_matches('/')
+                    .to_string(),
+                token,
+                pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
+            })),
+            (None, Some(c)) => Ok(Some(Self::ClickHouse(c))),
+            (None, None) => Ok(None),
+        }
     }
 }
 
@@ -184,15 +219,7 @@ impl GatewayConfig {
             envoy_trusted_header: env_opt("ENVOY_TRUSTED_HEADER"),
             blob_store_url: env_or("BLOB_STORE_URL", &d.blob_store_url),
             inline_max_bytes: env_parse("INLINE_MAX_BYTES", d.inline_max_bytes)?,
-            // The dashboard proxy needs a READ token, which is a different token from
-            // the append token the workers use to write usage events.
-            usage_api: env_opt("TINYBIRD_READ_TOKEN").map(|token| UsageApiConfig {
-                base_url: env_or("TINYBIRD_BASE_URL", "https://api.tinybird.co")
-                    .trim_end_matches('/')
-                    .to_string(),
-                token,
-                pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
-            }),
+            usage_api: UsageApiConfig::from_env()?,
             cors_allow_origins: env_opt("CORS_ALLOW_ORIGINS")
                 .map(|v| split_list(&v))
                 .unwrap_or_default(),

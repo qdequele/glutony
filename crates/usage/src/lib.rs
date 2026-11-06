@@ -1,4 +1,4 @@
-//! # `meili-ingest-usage` — per-tenant usage metering into Tinybird
+//! # `meili-ingest-usage` — per-tenant usage metering into Tinybird or ClickHouse
 //!
 //! Postgres only holds the *mutable* status of a job, so nothing durable records how
 //! much work a tenant actually consumed. This crate produces that record: one flat row
@@ -48,9 +48,11 @@
 //!
 //! ## Configuration
 //!
-//! [`UsageClient::from_env`] returns `Ok(None)` when `TINYBIRD_TOKEN` is unset: usage
-//! reporting is optional, and a deployment without it simply logs once that metering
-//! is off.
+//! Two stores, one row format. [`UsageClient::from_env`] picks Tinybird when
+//! `TINYBIRD_TOKEN` is set, a self-hosted ClickHouse when `USAGE_CLICKHOUSE_URL` is set
+//! (see [`clickhouse`]), refuses both at once, and returns `Ok(None)` with neither:
+//! usage reporting is optional, and a deployment without it simply logs once that
+//! metering is off.
 //!
 //! | var | default | notes |
 //! |---|---|---|
@@ -81,9 +83,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod clickhouse;
 pub mod lab;
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -141,11 +145,12 @@ pub enum UsageError {
     Config(String),
 
     /// Network failure, DNS failure, TLS failure or timeout. Retryable.
-    #[error("usage transport failure talking to Tinybird: {0}")]
+    #[error("usage transport failure talking to the usage store: {0}")]
     Transport(String),
 
-    /// Tinybird is unhappy but might not be next time: HTTP 429 or 5xx. Retryable.
-    #[error("Tinybird returned HTTP {status} (retryable): {body}")]
+    /// The store is unhappy but might not be next time: HTTP 429 or 5xx (for
+    /// ClickHouse, any error that is not about credentials or the request). Retryable.
+    #[error("the usage store returned HTTP {status} (retryable): {body}")]
     Upstream {
         /// HTTP status code.
         status: u16,
@@ -157,8 +162,8 @@ pub enum UsageError {
     /// on the data source. Permanent, and deliberately carries no response body so a
     /// token echoed back by the API can never reach a log.
     #[error(
-        "Tinybird rejected the credentials (HTTP {status}); check {ENV_TOKEN} and its \
-         scope on the data source"
+        "the usage store rejected the credentials (HTTP {status}); check {ENV_TOKEN} and \
+         its scope on the data source, or the USAGE_CLICKHOUSE_USER grants"
     )]
     Auth {
         /// HTTP status code (401 or 403).
@@ -167,7 +172,7 @@ pub enum UsageError {
 
     /// Any other 4xx: the request itself is wrong (unknown data source, malformed
     /// NDJSON, payload too large). Permanent.
-    #[error("Tinybird rejected the request (HTTP {status}): {body}")]
+    #[error("the usage store rejected the request (HTTP {status}): {body}")]
     Rejected {
         /// HTTP status code.
         status: u16,
@@ -608,34 +613,60 @@ fn truncate_chars(s: &str, max: usize) -> String {
 // Client
 // ---------------------------------------------------------------------------
 
-/// Tinybird Events API client.
+/// Usage store client: the Tinybird Events API, or a self-hosted ClickHouse.
 ///
 /// Cheap to clone (the inner [`reqwest::Client`] is an `Arc`), so the worker builds one
 /// at startup and shares it with every activity.
 #[derive(Clone)]
 pub struct UsageClient {
-    base_url: String,
-    token: String,
-    datasource: String,
+    sink: Sink,
     http: reqwest::Client,
 }
 
-/// Redacts the token: a usage client is routinely printed in worker startup logs.
+#[derive(Clone)]
+enum Sink {
+    Tinybird {
+        base_url: String,
+        token: String,
+        datasource: String,
+    },
+    ClickHouse {
+        config: clickhouse::ClickHouseConfig,
+        /// Set once `CREATE TABLE IF NOT EXISTS` succeeded; shared by every clone.
+        table_ready: Arc<tokio::sync::OnceCell<()>>,
+    },
+}
+
+/// Redacts the token and password: a usage client is printed in worker startup logs.
 impl fmt::Debug for UsageClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UsageClient")
-            .field("base_url", &self.base_url)
-            .field("datasource", &self.datasource)
-            .field("token", &"<redacted>")
-            .finish()
+        match &self.sink {
+            Sink::Tinybird {
+                base_url,
+                datasource,
+                ..
+            } => f
+                .debug_struct("UsageClient")
+                .field("backend", &"tinybird")
+                .field("base_url", base_url)
+                .field("datasource", datasource)
+                .field("token", &"<redacted>")
+                .finish(),
+            Sink::ClickHouse { config, .. } => f
+                .debug_struct("UsageClient")
+                .field("backend", &"clickhouse")
+                .field("config", config)
+                .finish(),
+        }
     }
 }
 
 impl UsageClient {
     /// Build a client from the environment.
     ///
-    /// Returns `Ok(None)` when `TINYBIRD_TOKEN` is absent or empty: usage reporting is
-    /// optional and the worker just logs once that metering is off. Returns
+    /// Tinybird with `TINYBIRD_TOKEN`, ClickHouse with `USAGE_CLICKHOUSE_URL`, and
+    /// [`UsageError::Config`] with both. Returns `Ok(None)` with neither: usage
+    /// reporting is optional and the worker just logs once that metering is off. Returns
     /// [`UsageError::Config`] when a variable is present but unusable — a typo in
     /// `TINYBIRD_TIMEOUT_SECS` should not silently disable billing data.
     ///
@@ -652,20 +683,33 @@ impl UsageClient {
                 .filter(|v| !v.is_empty())
         };
 
-        let Some(token) = non_empty(ENV_TOKEN) else {
-            return Ok(None);
+        let timeout = |var: &str| match non_empty(var) {
+            Some(raw) => raw
+                .parse::<u64>()
+                .map_err(|e| UsageError::Config(format!("{var} must be a number of seconds: {e}"))),
+            None => Ok(DEFAULT_TIMEOUT_SECS),
         };
+        let clickhouse = clickhouse::ClickHouseConfig::from_lookup(&get)?;
+        let Some(token) = non_empty(ENV_TOKEN) else {
+            let Some(config) = clickhouse else {
+                return Ok(None);
+            };
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout(clickhouse::ENV_TIMEOUT_SECS)?))
+                .build()
+                .map_err(|e| UsageError::Config(format!("cannot build the HTTP client: {e}")))?;
+            return Ok(Some(Self::clickhouse(config, http)));
+        };
+        if clickhouse.is_some() {
+            return Err(UsageError::Config(format!(
+                "both {ENV_TOKEN} and {} are set: pick one usage store",
+                clickhouse::ENV_URL
+            )));
+        }
         let base_url = non_empty(ENV_BASE_URL).unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let datasource =
             non_empty(ENV_DATASOURCE).unwrap_or_else(|| DEFAULT_DATASOURCE.to_string());
-        let timeout_secs = match non_empty(ENV_TIMEOUT_SECS) {
-            Some(raw) => raw.parse::<u64>().map_err(|e| {
-                UsageError::Config(format!(
-                    "{ENV_TIMEOUT_SECS} must be a number of seconds: {e}"
-                ))
-            })?,
-            None => DEFAULT_TIMEOUT_SECS,
-        };
+        let timeout_secs = timeout(ENV_TIMEOUT_SECS)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -685,25 +729,75 @@ impl UsageClient {
         http: reqwest::Client,
     ) -> Self {
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            token: token.into(),
-            datasource: datasource.into(),
+            sink: Sink::Tinybird {
+                base_url: base_url.into().trim_end_matches('/').to_string(),
+                token: token.into(),
+                datasource: datasource.into(),
+            },
             http,
         }
     }
 
-    /// Target data source name.
-    pub fn datasource(&self) -> &str {
-        &self.datasource
+    /// A client writing to a self-hosted ClickHouse. The table is created on the first
+    /// [`Self::send`] (or [`Self::prepare`]).
+    pub fn clickhouse(config: clickhouse::ClickHouseConfig, http: reqwest::Client) -> Self {
+        Self {
+            sink: Sink::ClickHouse {
+                config,
+                table_ready: Arc::new(tokio::sync::OnceCell::new()),
+            },
+            http,
+        }
     }
 
-    /// Regional API host this client posts to.
+    /// `"tinybird"` or `"clickhouse"`.
+    pub fn backend(&self) -> &'static str {
+        match self.sink {
+            Sink::Tinybird { .. } => "tinybird",
+            Sink::ClickHouse { .. } => "clickhouse",
+        }
+    }
+
+    /// Target data source (Tinybird) or table (ClickHouse) name.
+    pub fn datasource(&self) -> &str {
+        match &self.sink {
+            Sink::Tinybird { datasource, .. } => datasource,
+            Sink::ClickHouse { config, .. } => config.table(),
+        }
+    }
+
+    /// Regional API host (Tinybird) or HTTP interface (ClickHouse) this client posts to.
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        match &self.sink {
+            Sink::Tinybird { base_url, .. } => base_url,
+            Sink::ClickHouse { config, .. } => config.url(),
+        }
+    }
+
+    /// Create the ClickHouse table now if it is missing, so a worker can report a
+    /// misconfigured store at boot. A no-op for Tinybird, whose data source is deployed
+    /// with the `tb` CLI. Optional: [`Self::send`] does it on first use.
+    pub async fn prepare(&self) -> Result<(), UsageError> {
+        match &self.sink {
+            Sink::Tinybird { .. } => Ok(()),
+            Sink::ClickHouse {
+                config,
+                table_ready,
+            } => table_ready
+                .get_or_try_init(|| async {
+                    config
+                        .ensure_table(&self.http)
+                        .await
+                        .map_err(UsageError::from)
+                })
+                .await
+                .map(|_| ()),
+        }
     }
 
     /// Append `events` to the data source through
-    /// `POST {base_url}/v0/events?name={datasource}&wait=true`.
+    /// `POST {base_url}/v0/events?name={datasource}&wait=true`, or to the ClickHouse
+    /// table through `INSERT … FORMAT JSONEachRow` (creating it on first use).
     ///
     /// The body is newline-delimited JSON, one event per line — the Events API format.
     /// `wait=true` makes Tinybird acknowledge the actual write rather than the receipt,
@@ -737,13 +831,31 @@ impl UsageClient {
             body.push('\n');
         }
 
-        let url = format!(
-            "{}/v0/events?name={}&wait=true",
-            self.base_url, self.datasource
-        );
+        let (base_url, token, datasource) = match &self.sink {
+            Sink::Tinybird {
+                base_url,
+                token,
+                datasource,
+            } => (base_url, token, datasource),
+            Sink::ClickHouse { config, .. } => {
+                self.prepare().await?;
+                tracing::debug!(
+                    table = %config.table(),
+                    events = events.len(),
+                    bytes = body.len(),
+                    "sending usage events to ClickHouse"
+                );
+                // `INSERT` is synchronous: a 200 means the rows are written.
+                return config
+                    .insert(&self.http, body)
+                    .await
+                    .map_err(UsageError::from);
+            }
+        };
+        let url = format!("{base_url}/v0/events?name={datasource}&wait=true");
         tracing::debug!(
-            datasource = %self.datasource,
-            base_url = %self.base_url,
+            datasource = %datasource,
+            base_url = %base_url,
             events = events.len(),
             bytes = body.len(),
             "sending usage events to Tinybird"
@@ -752,15 +864,14 @@ impl UsageClient {
         let response = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
             .header("content-type", "application/x-ndjson")
             .body(body)
             .send()
             .await
             .map_err(|e| {
                 UsageError::Transport(format!(
-                    "POST {}/v0/events (name={}) failed: {e}",
-                    self.base_url, self.datasource
+                    "POST {base_url}/v0/events (name={datasource}) failed: {e}"
                 ))
             })?;
 
@@ -778,13 +889,13 @@ impl UsageClient {
         let ack: EventsAck = serde_json::from_str(&text).unwrap_or_default();
         if ack.quarantined_rows > 0 {
             tracing::error!(
-                datasource = %self.datasource,
+                datasource = %datasource,
                 quarantined_rows = ack.quarantined_rows,
                 "Tinybird quarantined usage rows: schema drift"
             );
             return Err(UsageError::Quarantined {
                 count: ack.quarantined_rows,
-                datasource: self.datasource.clone(),
+                datasource: datasource.clone(),
             });
         }
         tracing::debug!(

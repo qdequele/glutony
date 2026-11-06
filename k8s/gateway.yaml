@@ -107,6 +107,13 @@ spec:
                   name: meili-ingest-secrets
                   key: TINYBIRD_READ_TOKEN
                   optional: true
+            # Password of USAGE_CLICKHOUSE_USER when usage lives in ClickHouse.
+            - name: USAGE_CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: USAGE_CLICKHOUSE_PASSWORD
+                  optional: true
             # Uncomment for a standalone (non-Envoy) deployment:
             # - name: MEILI_URL
             #   value: "http://meilisearch:7700"

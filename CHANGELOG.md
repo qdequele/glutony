@@ -6,6 +6,14 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+- Usage analytics can live in a self-hosted ClickHouse instead of Tinybird: set
+  `USAGE_CLICKHOUSE_URL` (plus `_DATABASE`, `_TABLE`, `_USER`, `_PASSWORD`) on the
+  workers and the gateway. The workers create the table (same columns, engine and TTL
+  as the Tinybird data source) and insert the same rows; `GET /usage` reads them back
+  deduplicated, with the columns of `tenant_usage` and no hourly lag. Setting both
+  stores is refused at boot.
+
 ### Fixed
 - The gateway's `TINYBIRD_READ_TOKEN` (and `TINYBIRD_USAGE_PIPE`), which `GET /usage`
   needs, is now documented in the environment variables reference and the usage page,

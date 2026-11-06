@@ -1,11 +1,12 @@
 ---
 title: "Usage & metering"
-description: "Per-tenant usage data: what is recorded, how it reaches Tinybird, and which table to read."
+description: "Per-tenant usage data: what is recorded, how it reaches Tinybird or ClickHouse, and which table to read."
 ---
 
 Every job records what it consumed, per tenant, so you can chart it and reconcile it.
-The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse) and is
-written by the worker, never by the gateway. Tinybird holds the analytics. Behind the
+The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse), or in a
+ClickHouse you run yourself ([ClickHouse instead of Tinybird](#clickhouse-instead-of-tinybird)),
+and is written by the worker, never by the gateway. Tinybird holds the analytics. Behind the
 Meilisearch Lab, billing is the Lab's, from a separate stream of events described in
 [Analytics and the Lab](#analytics-and-the-lab).
 
@@ -141,6 +142,32 @@ the gateway:
 Set both tokens: with only the read token the page is empty because nothing is recorded,
 and with only the append token usage is recorded but `GET /usage` still answers `501`.
 Only jobs that run after `TINYBIRD_TOKEN` is set are counted.
+
+### ClickHouse instead of Tinybird
+
+Tinybird is managed ClickHouse, so a ClickHouse server you already run can hold the same
+rows. Set `USAGE_CLICKHOUSE_URL` on the workers **and** the gateway instead of the
+Tinybird tokens; setting both is refused at boot.
+
+| Variable | Default | Description |
+|---|---|---|
+| `USAGE_CLICKHOUSE_URL` | — | ClickHouse HTTP interface, e.g. `http://127.0.0.1:8123`. Absent: not this store. |
+| `USAGE_CLICKHOUSE_DATABASE` | `default` | Must exist. |
+| `USAGE_CLICKHOUSE_TABLE` | `meili_ingest_usage` | Created by the workers if missing. |
+| `USAGE_CLICKHOUSE_USER` | `default` | Workers need `INSERT`, `SELECT` and `CREATE TABLE` on the database; the gateway `SELECT`. |
+| `USAGE_CLICKHOUSE_PASSWORD` | empty | Sent in `X-ClickHouse-Key`, never logged. |
+| `USAGE_CLICKHOUSE_TIMEOUT_SECS` | `20` | Worker HTTP timeout. |
+
+The workers create the table on boot (and retry on the first report if that failed): the
+Tinybird data source's columns, `ReplacingMergeTree` engine, `(project_id, ts, event_id)`
+sorting key, monthly partitions and 180-day TTL. Rows go in with `INSERT … FORMAT
+JSONEachRow`, which rejects an unknown field, so schema drift fails loudly as it does
+in Tinybird.
+
+`GET /usage` returns the same columns as `tenant_usage`, from one query over the raw
+table with `FINAL`: redelivered rows are collapsed before they are counted, and there is
+no hourly lag. The tenant and dates are bound as typed query parameters. Before the
+first row is written (no table yet) it answers an empty list.
 
 ## Usage data is not monitoring
 

@@ -81,6 +81,11 @@ x-worker-env: &worker-env
   TINYBIRD_TOKEN: ${TINYBIRD_TOKEN:-}
   TINYBIRD_BASE_URL: ${TINYBIRD_BASE_URL:-https://api.tinybird.co}
   TINYBIRD_DATASOURCE: ${TINYBIRD_DATASOURCE:-meili_ingest_usage}
+  # Or a self-hosted ClickHouse (empty URL = off). Set the same values on the gateway.
+  USAGE_CLICKHOUSE_URL: ${USAGE_CLICKHOUSE_URL:-}
+  USAGE_CLICKHOUSE_DATABASE: ${USAGE_CLICKHOUSE_DATABASE:-}
+  USAGE_CLICKHOUSE_USER: ${USAGE_CLICKHOUSE_USER:-}
+  USAGE_CLICKHOUSE_PASSWORD: ${USAGE_CLICKHOUSE_PASSWORD:-}
 
 services:
   # ---------------------------------------------------------------------------
@@ -193,6 +198,10 @@ services:
       # Usage analytics read side (GET /usage). Empty = 501, like the append side.
       TINYBIRD_READ_TOKEN: ${TINYBIRD_READ_TOKEN:-}
       TINYBIRD_BASE_URL: ${TINYBIRD_BASE_URL:-https://api.tinybird.co}
+      USAGE_CLICKHOUSE_URL: ${USAGE_CLICKHOUSE_URL:-}
+      USAGE_CLICKHOUSE_DATABASE: ${USAGE_CLICKHOUSE_DATABASE:-}
+      USAGE_CLICKHOUSE_USER: ${USAGE_CLICKHOUSE_USER:-}
+      USAGE_CLICKHOUSE_PASSWORD: ${USAGE_CLICKHOUSE_PASSWORD:-}
       # ENVOY_TRUSTED_HEADER is intentionally unset: X-Meili-* headers are trusted (dev mode).
     volumes:
       - cargo-registry:/usr/local/cargo/registry
