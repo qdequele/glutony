@@ -318,6 +318,61 @@ async fn health_reports_503_when_db_unreachable() {
     assert_eq!(v["status"], "unavailable");
 }
 
+fn script_step(id: &str, config: serde_json::Value) -> StepDefinition {
+    let mut step = StepDefinition::new(id, "document_script");
+    step.config = config;
+    step
+}
+
+fn script_pipeline(steps: Vec<StepDefinition>) -> PipelineDefinition {
+    let mut def = pipeline("scripts", &[]);
+    def.steps = steps;
+    def
+}
+
+#[tokio::test]
+async fn validate_reports_every_broken_document_script_step() {
+    let def = script_pipeline(vec![
+        script_step("a", serde_json::json!({"script": "doc.fields.x = ;"})),
+        script_step(
+            "b",
+            serde_json::json!({"ops": [{"set": {"field": "t", "expr": "1 +"}}]}),
+        ),
+    ]);
+    let (status, body) = call(
+        app(state()),
+        post_json("/pipelines/validate", serde_json::to_vec(&def).unwrap()),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = json(&body);
+    assert_eq!(body["code"], "invalid_step_config");
+    assert_eq!(body["error"], "2 steps have invalid configuration");
+    let diagnostics = body["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0]["step"], "a");
+    assert_eq!(diagnostics[0]["path"], "script");
+    assert_eq!(diagnostics[0]["line"], 1);
+    assert_eq!(diagnostics[1]["step"], "b");
+    assert_eq!(diagnostics[1]["path"], "ops[0].expr");
+}
+
+#[tokio::test]
+async fn saving_a_broken_script_is_rejected_before_the_database() {
+    let def = script_pipeline(vec![script_step("a", serde_json::json!({"script": "1 +"}))]);
+    let (status, body) = call(
+        app(state()),
+        post_json("/pipelines", serde_json::to_vec(&def).unwrap()),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = json(&body);
+    assert_eq!(body["code"], "invalid_step_config");
+    assert_eq!(body["error"], "step `a` has invalid configuration");
+}
+
 #[tokio::test]
 async fn metrics_are_served_in_the_prometheus_text_format() {
     let (status, body) = call(

@@ -151,7 +151,8 @@ rubato = "5.0"
 # Send + Sync (the `Plugin` trait requires it), `serde` converts documents to and
 # from `Dynamic`, and `no_module` / `no_custom_syntax` / `no_time` strip the parts
 # of the language a tenant-authored script has no business reaching.
-rhai = { version = "1.26", features = ["sync", "serde", "no_module", "no_custom_syntax", "no_time"] }
+# Pinned exactly: the field resolver relies on Engine::on_var, which rhai marks volatile.
+rhai = { version = "=1.26.1", features = ["sync", "serde", "no_module", "no_custom_syntax", "no_time"] }
 
 # plugin runtime
 extism = "1.30"

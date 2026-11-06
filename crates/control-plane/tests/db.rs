@@ -826,3 +826,42 @@ async fn an_indexer_connection_must_exist_for_the_tenant() {
 
     t.drop_schema().await;
 }
+
+#[tokio::test]
+async fn validate_returns_generated_scripts_for_builder_steps_only() {
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let script_step = |id: &str, config: serde_json::Value| {
+        StepDefinition::new(id, "document_script").config(config)
+    };
+    let def = PipelineDefinition {
+        uid: "scripts".into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            script_step(
+                "shape",
+                serde_json::json!({"ops": [{"rename": {"from": "a", "to": "b"}}]}),
+            ),
+            script_step("raw", serde_json::json!({"script": "1"})),
+        ],
+        builtin: false,
+        tenant_id: Some("t1".into()),
+    };
+    let (status, body) = call(
+        app(state.clone()),
+        req_json("POST", "/pipelines/validate", &def),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let body: serde_json::Value = json(&body);
+    assert_eq!(
+        body["generated_scripts"]["shape"],
+        "doc.rename_field(\"a\", \"b\");\n"
+    );
+    assert!(body["generated_scripts"].get("raw").is_none());
+
+    t.drop_schema().await;
+}

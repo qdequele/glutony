@@ -56,6 +56,13 @@ pub enum GatewayError {
     /// A pipeline definition failed validation (422).
     #[error("invalid pipeline: {0}")]
     Invalid(String),
+    /// A step's config failed its plugin's check (422). Carries the control plane's
+    /// per-step diagnostics through unchanged.
+    #[error("{message}")]
+    InvalidStepConfig {
+        message: String,
+        diagnostics: serde_json::Value,
+    },
     /// Any other request that is well-formed but cannot be accepted (422), e.g. a
     /// Meilisearch connection whose host is forbidden or whose key is rejected.
     #[error("{0}")]
@@ -86,9 +93,9 @@ impl GatewayError {
             GatewayError::AlreadyFinished(_) => StatusCode::CONFLICT,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             GatewayError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            GatewayError::Invalid(_) | GatewayError::Unprocessable(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            GatewayError::Invalid(_)
+            | GatewayError::InvalidStepConfig { .. }
+            | GatewayError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             GatewayError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             GatewayError::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -110,6 +117,7 @@ impl GatewayError {
             GatewayError::TooLarge(_) => "payload_too_large",
             GatewayError::Unsupported(_) => "unsupported_media_type",
             GatewayError::Invalid(_) => "invalid_pipeline",
+            GatewayError::InvalidStepConfig { .. } => "invalid_step_config",
             GatewayError::Unprocessable(_) => "validation",
             GatewayError::NotImplemented(_) => "not_configured",
             GatewayError::Upstream(_) => "upstream_error",
@@ -150,9 +158,17 @@ impl IntoResponse for GatewayError {
         } else {
             tracing::debug!(code = self.code(), "{self}");
         }
-        let body = ErrorBody {
-            error: self.to_string(),
-            code: self.code().to_string(),
+        let body = match &self {
+            GatewayError::InvalidStepConfig { diagnostics, .. } => serde_json::json!({
+                "error": self.to_string(),
+                "code": self.code(),
+                "diagnostics": diagnostics,
+            }),
+            _ => serde_json::to_value(ErrorBody {
+                error: self.to_string(),
+                code: self.code().to_string(),
+            })
+            .unwrap_or_default(),
         };
         let is_unauthorized = status == StatusCode::UNAUTHORIZED;
         let mut response = (status, Json(body)).into_response();

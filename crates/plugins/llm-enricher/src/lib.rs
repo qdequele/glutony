@@ -322,13 +322,13 @@ impl Plugin for LlmEnricherPlugin {
                 "additionalProperties": false,
                 "properties": {
                     "model": { "type": "string", "description": "Model name; defaults to LLM_MODEL" },
-                    "prompt": { "type": "string", "default": DEFAULT_PROMPT },
+                    "prompt": { "type": "string", "x-widget": "textarea", "default": DEFAULT_PROMPT },
                     "max_concurrent": { "type": "integer", "minimum": 1, "default": 8 },
                     "temperature": { "type": "number", "minimum": 0.0, "maximum": 2.0, "default": 0.0 },
                     "max_tokens": { "type": "integer", "minimum": 1 },
                     "max_input_chars": { "type": "integer", "minimum": 1, "default": 12000 },
                     "merge_strategy": { "type": "string", "enum": ["merge", "replace"], "default": "merge" },
-                    "system_prompt": { "type": "string", "default": DEFAULT_SYSTEM_PROMPT }
+                    "system_prompt": { "type": "string", "x-widget": "textarea", "default": DEFAULT_SYSTEM_PROMPT }
                 }
             }))
     }

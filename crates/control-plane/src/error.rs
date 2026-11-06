@@ -26,6 +26,9 @@ pub enum CpError {
     /// Pipeline references a plugin nobody knows about (422, `unknown_plugin`).
     #[error("{0}")]
     UnknownPlugin(String),
+    /// One or more steps carry a config their plugin rejects (422, `invalid_step_config`).
+    #[error("{}", step_config_summary(.0))]
+    StepConfig(Vec<StepDiagnostic>),
     /// Missing or wrong `CONTROL_PLANE_TOKEN` on an internal route (401, `unauthorized`).
     #[error("missing or invalid control plane token")]
     Unauthorized,
@@ -60,6 +63,24 @@ pub struct ErrorBody {
     pub code: String,
 }
 
+/// A step-config diagnostic, tagged with the step it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepDiagnostic {
+    pub step: String,
+    #[serde(flatten)]
+    pub diagnostic: meili_ingest_plugin_script::Diagnostic,
+}
+
+fn step_config_summary(diagnostics: &[StepDiagnostic]) -> String {
+    let mut steps: Vec<&str> = diagnostics.iter().map(|d| d.step.as_str()).collect();
+    steps.sort_unstable();
+    steps.dedup();
+    match steps.as_slice() {
+        [one] => format!("step `{one}` has invalid configuration"),
+        many => format!("{} steps have invalid configuration", many.len()),
+    }
+}
+
 impl CpError {
     /// HTTP status for this error.
     pub fn status(&self) -> StatusCode {
@@ -72,7 +93,9 @@ impl CpError {
             CpError::NotFound(_) | CpError::NoPipeline(_) | CpError::NoGateway(_) => {
                 StatusCode::NOT_FOUND
             }
-            CpError::Validation(_) | CpError::UnknownPlugin(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            CpError::Validation(_) | CpError::UnknownPlugin(_) | CpError::StepConfig(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             CpError::Db(_) | CpError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -87,6 +110,7 @@ impl CpError {
             CpError::NoPipeline(_) => "no_pipeline",
             CpError::Validation(_) => "validation",
             CpError::UnknownPlugin(_) => "unknown_plugin",
+            CpError::StepConfig(_) => "invalid_step_config",
             CpError::InsufficientCredits(_) => "insufficient_credits",
             CpError::LabUnavailable(_) => "lab_unavailable",
             CpError::NoGateway(_) => "no_gateway",
@@ -118,7 +142,15 @@ impl IntoResponse for CpError {
         } else {
             tracing::debug!(error = %self, code = self.code(), "request rejected");
         }
-        (self.status(), Json(self.body())).into_response()
+        let body = match &self {
+            CpError::StepConfig(diagnostics) => serde_json::json!({
+                "error": self.to_string(),
+                "code": self.code(),
+                "diagnostics": diagnostics,
+            }),
+            _ => serde_json::to_value(self.body()).unwrap_or_default(),
+        };
+        (self.status(), Json(body)).into_response()
     }
 }
 
@@ -163,6 +195,11 @@ mod tests {
                 CpError::UnknownPlugin("x".into()),
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unknown_plugin",
+            ),
+            (
+                CpError::StepConfig(vec![]),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_step_config",
             ),
             (
                 CpError::InsufficientCredits("x".into()),

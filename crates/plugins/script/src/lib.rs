@@ -27,10 +27,10 @@
 //! if doc.content.is_empty() { return false; }     // drop this document
 //! ```
 //!
-//! Rhai's string methods (`trim`, `to_upper`, `pad`, ...) take `&mut self` and
-//! return `()`: they edit the string in place rather than returning a copy. So
-//! `doc.content.trim() == ""` is always `false` — trim as its own statement, then
-//! test `is_empty()`.
+//! Some rhai string methods edit the string in place and return `()`: `trim`,
+//! `replace`, `pad`, `truncate`, `clear`, `make_upper`, `make_lower`. So
+//! `doc.content.trim() == ""` is always `false` — trim as its own statement, then test
+//! `is_empty()`. `to_upper()` and `to_lower()` return a new string.
 //!
 //! Float arithmetic that produces NaN or an infinity (`x / 0.0`, which rhai does
 //! not raise on) fails the document rather than writing `null` into the index.
@@ -44,42 +44,39 @@
 //! operation budget (`max_ops`), a wall-clock budget (`timeout_ms`) and fixed caps on
 //! expression depth, call depth, string, array and map sizes.
 //!
-//! Configuration:
+//! Configuration — set exactly one of `script` or `ops`:
 //!
 //! | key | default | meaning |
 //! |---|---|---|
-//! | `script` | required | the rhai script, run once per document |
+//! | `script` | one of `script`/`ops` | the rhai script, run once per document |
+//! | `ops` | one of `script`/`ops` | builder operations (`rename`, `drop`, `set`, `filter`, …), compiled to rhai and applied in order |
 //! | `on_error` | `fail` | what a per-document error does: `fail`, `skip` or `keep` |
 //! | `max_ops` | `100000` | rhai operations one document may use |
 //! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+mod check;
+mod codegen;
+mod config;
+mod convert;
+mod diagnostic;
+mod helpers;
+mod ops;
+mod resolver;
+mod runner;
+
+pub use check::{CheckResult, check_config};
+pub use diagnostic::Diagnostic;
 
 use meili_ingest_plugin_sdk::prelude::*;
-use rhai::{AST, Dynamic, Engine, Map, Scope};
-use serde::Deserialize;
-use serde_json::Value;
+
+use crate::config::{Config, OnError};
+use crate::runner::{Runner, Verdict};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "document_script";
 
 /// Documents between two heartbeats.
 const HEARTBEAT_EVERY: usize = 10;
-
-/// Longest expression nesting a script may use, inside and outside functions.
-const MAX_EXPR_DEPTH: usize = 64;
-/// Deepest function call chain a script may build (bounds recursion).
-const MAX_CALL_LEVELS: usize = 16;
-/// Longest string a script may build, in characters.
-const MAX_STRING_SIZE: usize = 512 * 1024;
-/// Largest array a script may build.
-const MAX_ARRAY_SIZE: usize = 10_000;
-/// Largest map a script may build.
-const MAX_MAP_SIZE: usize = 10_000;
-/// Operations between two wall-clock checks in `on_progress`.
-const PROGRESS_EVERY: u64 = 1_000;
 
 /// The document script plugin. Stateless; construct with [`DocumentScriptPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -90,290 +87,6 @@ impl DocumentScriptPlugin {
     pub fn new() -> Self {
         Self
     }
-}
-
-/// What a per-document script error does to that document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-enum OnError {
-    /// Fail the step, naming the document and the rhai error.
-    #[default]
-    Fail,
-    /// Drop the document and carry on.
-    Skip,
-    /// Emit the document untouched and carry on.
-    Keep,
-}
-
-/// Step configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    /// The rhai script, run once per document.
-    script: String,
-    /// What a per-document error does.
-    #[serde(default)]
-    on_error: OnError,
-    /// Rhai operations one document may use.
-    #[serde(default = "default_max_ops")]
-    max_ops: u64,
-    /// Wall-clock milliseconds one document may use.
-    #[serde(default = "default_timeout_ms")]
-    timeout_ms: u64,
-}
-
-fn default_max_ops() -> u64 {
-    100_000
-}
-
-fn default_timeout_ms() -> u64 {
-    1_000
-}
-
-impl Config {
-    /// Validate a raw `config:` block. `script` is required, so `null` is an error.
-    fn parse(value: Value) -> Result<Self, PluginError> {
-        let cfg: Config = serde_json::from_value(value)
-            .map_err(|e| PluginError::InvalidConfig(format!("{NAME}: {e}")))?;
-        if cfg.script.trim().is_empty() {
-            return Err(PluginError::InvalidConfig(format!(
-                "{NAME}: `script` must not be empty"
-            )));
-        }
-        if cfg.max_ops == 0 {
-            return Err(PluginError::InvalidConfig(format!(
-                "{NAME}: `max_ops` must be at least 1"
-            )));
-        }
-        if cfg.timeout_ms == 0 {
-            return Err(PluginError::InvalidConfig(format!(
-                "{NAME}: `timeout_ms` must be at least 1"
-            )));
-        }
-        Ok(cfg)
-    }
-}
-
-/// One step's compiled script and the engine that runs it.
-///
-/// The engine is built once and reused for every document: compiling and installing
-/// the sandbox per document would dominate the cost of a small script. Rhai's only
-/// abort hook is `on_progress`, and an `Engine` cannot be cloned, so the per-document
-/// wall-clock budget is carried in a shared deadline the closure reads and
-/// [`Runner::run`] rewrites before each document.
-struct Runner {
-    engine: Engine,
-    ast: AST,
-    /// Start of the step; both the deadline and the progress closure measure from it.
-    base: Instant,
-    /// Nanoseconds after `base` at which the current document must stop.
-    deadline: Arc<AtomicU64>,
-    timeout_ms: u64,
-}
-
-impl Runner {
-    /// Build the sandboxed engine and compile the script.
-    ///
-    /// A syntax error surfaces here — before any document is touched — so it fails
-    /// the step as `InvalidConfig` whatever `on_error` says.
-    fn new(cfg: &Config) -> Result<Self, PluginError> {
-        let mut engine = Engine::new();
-        engine.set_max_operations(cfg.max_ops);
-        engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
-        engine.set_max_call_levels(MAX_CALL_LEVELS);
-        engine.set_max_string_size(MAX_STRING_SIZE);
-        engine.set_max_array_size(MAX_ARRAY_SIZE);
-        engine.set_max_map_size(MAX_MAP_SIZE);
-
-        let base = Instant::now();
-        let deadline = Arc::new(AtomicU64::new(u64::MAX));
-        let watch = Arc::clone(&deadline);
-        engine.on_progress(move |ops| {
-            if ops % PROGRESS_EVERY != 0 {
-                return None;
-            }
-            let elapsed = base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            if elapsed >= watch.load(Ordering::Relaxed) {
-                // Any `Some` aborts the script; the value is discarded by rhai.
-                Some(Dynamic::UNIT)
-            } else {
-                None
-            }
-        });
-
-        let ast = engine.compile(&cfg.script).map_err(|e| {
-            PluginError::InvalidConfig(format!("{NAME}: script does not compile: {e}"))
-        })?;
-
-        Ok(Self {
-            engine,
-            ast,
-            base,
-            deadline,
-            timeout_ms: cfg.timeout_ms,
-        })
-    }
-
-    /// Give the next document a fresh wall-clock budget.
-    fn arm_deadline(&self) {
-        let now = self.base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        let budget = self.timeout_ms.saturating_mul(1_000_000);
-        self.deadline
-            .store(now.saturating_add(budget), Ordering::Relaxed);
-    }
-
-    /// Run the script over one document, mutating it in place.
-    fn run(&self, doc: &mut Document) -> Result<Verdict, PluginError> {
-        let map = to_scope_map(doc)?;
-        let mut scope = Scope::new();
-        scope.push("doc", map);
-
-        self.arm_deadline();
-        let result: Dynamic = self
-            .engine
-            .eval_ast_with_scope(&mut scope, &self.ast)
-            .map_err(|e| PluginError::InvalidInput(format!("{e}")))?;
-
-        let map = scope.get_value::<Map>("doc").ok_or_else(|| {
-            PluginError::InvalidInput(format!(
-                "{NAME}: the script replaced `doc` with a non-map value"
-            ))
-        })?;
-        from_scope_map(&map, doc)?;
-
-        if result.as_bool() == Ok(false) {
-            return Ok(Verdict::Drop);
-        }
-        Ok(Verdict::Keep)
-    }
-}
-
-/// Bind a document as the rhai map the script mutates.
-///
-/// Built key by key rather than through `serde`: `Document` skips empty `title` and
-/// `fields` when it serialises, and a script that cannot count on `doc.fields`
-/// existing is unusable.
-fn to_scope_map(doc: &Document) -> Result<Map, PluginError> {
-    let mut map = Map::new();
-    map.insert("id".into(), Dynamic::from(doc.id.clone()));
-    map.insert(
-        "title".into(),
-        match &doc.title {
-            Some(t) => Dynamic::from(t.clone()),
-            None => Dynamic::UNIT,
-        },
-    );
-    map.insert("content".into(), Dynamic::from(doc.content.clone()));
-    map.insert(
-        "fields".into(),
-        json_to_dynamic(&Value::Object(doc.fields.clone()))?,
-    );
-    map.insert(
-        "meta".into(),
-        json_to_dynamic(
-            &serde_json::to_value(&doc.meta).map_err(|e| {
-                PluginError::NonRetryable(format!("{NAME}: cannot expose meta: {e}"))
-            })?,
-        )?,
-    );
-    Ok(map)
-}
-
-/// Convert JSON into rhai values.
-fn json_to_dynamic(value: &Value) -> Result<Dynamic, PluginError> {
-    rhai::serde::to_dynamic(value).map_err(|e| {
-        PluginError::NonRetryable(format!("{NAME}: cannot convert to script value: {e}"))
-    })
-}
-
-/// Reject floats JSON cannot represent, before they are silently turned into `null`.
-///
-/// Rhai produces NaN and infinities from ordinary float arithmetic — `x / 0.0` does
-/// not raise, unlike integer division — and `serde_json` maps every non-finite float
-/// onto `null`. Left alone that writes a null field into the index and reports
-/// success, so the conversion refuses instead and the step's `on_error` policy
-/// decides what happens to the document.
-fn reject_non_finite(value: &Dynamic, path: &str) -> Result<(), PluginError> {
-    if value.is_float() {
-        let f = value.as_float().unwrap_or(0.0);
-        if !f.is_finite() {
-            return Err(PluginError::NonRetryable(format!(
-                "{NAME}: `{path}` is not a finite number ({f})"
-            )));
-        }
-    } else if let Some(map) = value.read_lock::<Map>() {
-        for (k, v) in map.iter() {
-            reject_non_finite(v, &format!("{path}.{k}"))?;
-        }
-    } else if let Some(array) = value.read_lock::<rhai::Array>() {
-        for (i, v) in array.iter().enumerate() {
-            reject_non_finite(v, &format!("{path}[{i}]"))?;
-        }
-    }
-    Ok(())
-}
-
-/// Convert rhai values back into JSON.
-fn dynamic_to_json(value: &Dynamic) -> Result<Value, PluginError> {
-    rhai::serde::from_dynamic(value).map_err(|e| {
-        PluginError::InvalidInput(format!(
-            "{NAME}: script produced a value that is not valid JSON: {e}"
-        ))
-    })
-}
-
-/// Read the mutated map back onto the document.
-///
-/// `meta` is deliberately not read back: it is provenance the pipeline owns, so the
-/// script sees it but cannot rewrite it.
-fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
-    for key in ["id", "title", "content", "fields"] {
-        if let Some(v) = map.get(key) {
-            reject_non_finite(v, &format!("doc.{key}"))?;
-        }
-    }
-    if let Some(id) = map.get("id") {
-        let id = match dynamic_to_json(id)? {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        doc.id = sanitize_id(&id);
-    }
-    doc.title = match map.get("title") {
-        None => None,
-        Some(t) if t.is_unit() => None,
-        Some(t) => Some(match dynamic_to_json(t)? {
-            Value::String(s) => s,
-            other => other.to_string(),
-        }),
-    };
-    if let Some(content) = map.get("content") {
-        doc.content = match dynamic_to_json(content)? {
-            Value::String(s) => s,
-            Value::Null => String::new(),
-            other => other.to_string(),
-        };
-    }
-    doc.fields = match map.get("fields") {
-        Some(f) => match dynamic_to_json(f)? {
-            Value::Object(o) => o,
-            other => {
-                return Err(PluginError::InvalidInput(format!(
-                    "{NAME}: `doc.fields` must stay a map, got {other}"
-                )));
-            }
-        },
-        None => Default::default(),
-    };
-    Ok(())
-}
-
-/// What the script decided about one document.
-enum Verdict {
-    /// Keep it, with the script's mutations applied.
-    Keep,
-    /// Drop it: the script returned `false`.
-    Drop,
 }
 
 #[async_trait]
@@ -391,12 +104,26 @@ impl Plugin for DocumentScriptPlugin {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["script"],
+                "oneOf": [{ "required": ["script"] }, { "required": ["ops"] }],
                 "properties": {
                     "script": {
                         "type": "string",
-                        "minLength": 1,
+                        "maxLength": 65536,
                         "description": "Rhai script run once per document. The document is bound as `doc` (id, title, content, fields, and read-only meta); return false to drop it."
+                    },
+                    "ops": {
+                        "type": "array",
+                        "description": "Builder operations, applied in order. Each item is a single-key object: rename, drop, keep, copy, set, filter, trim, lowercase, uppercase, split, join, promote, round, cast or default.",
+                        "items": {
+                            "type": "object",
+                            "minProperties": 1,
+                            "maxProperties": 1,
+                            "propertyNames": {
+                                "enum": ["rename", "drop", "keep", "copy", "set", "filter", "trim",
+                                         "lowercase", "uppercase", "split", "join", "promote",
+                                         "round", "cast", "default"]
+                            }
+                        }
                     },
                     "on_error": {
                         "type": "string",
@@ -463,7 +190,10 @@ impl Plugin for DocumentScriptPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::runner::Runner;
     use serde_json::{Value, json};
+    use std::sync::atomic::Ordering;
 
     fn doc(id: &str, content: &str) -> Document {
         Document::with_id(id, content)
@@ -500,6 +230,131 @@ mod tests {
 
     fn script(src: &str) -> Value {
         json!({ "script": src })
+    }
+
+    fn with_fields(fields: Value) -> Document {
+        let mut d = doc("a", "x");
+        d.fields = fields.as_object().unwrap().clone();
+        d
+    }
+
+    fn fields(d: &Document) -> Value {
+        Value::Object(d.fields.clone())
+    }
+
+    #[tokio::test]
+    async fn rename_field_moves_and_overwrites() {
+        let out = run(
+            vec![with_fields(json!({"prix": 10, "price": 1}))],
+            script(r#"doc.rename_field("prix", "price");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"price": 10}));
+    }
+
+    #[tokio::test]
+    async fn drop_keep_and_copy_fields() {
+        let out = run(
+            vec![with_fields(json!({"a": 1, "b": 2, "c": 3}))],
+            script(r#"doc.drop_fields(["a"]); doc.keep_fields(["b", "zzz"]); doc.copy_field("b", "d");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"b": 2, "d": 2}));
+    }
+
+    #[tokio::test]
+    async fn field_helpers_ignore_a_missing_field() {
+        let out = run(
+            vec![with_fields(json!({"a": 1}))],
+            script(r#"doc.rename_field("nope", "x"); doc.copy_field("nope", "y"); doc.drop_fields(["nope"]);"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn field_names_must_be_strings() {
+        let err = try_run(
+            vec![with_fields(json!({}))],
+            script("doc.drop_fields([1]);"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("must be strings")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_is_empty_covers_missing_null_blank_and_empty_collections() {
+        let docs = vec![
+            with_fields(json!({})),
+            with_fields(json!({"v": null})),
+            with_fields(json!({"v": "   "})),
+            with_fields(json!({"v": []})),
+            with_fields(json!({"v": {}})),
+            with_fields(json!({"v": "x"})),
+            with_fields(json!({"v": 0})),
+        ];
+        let out = run(
+            docs,
+            script(r#"if doc.field_is_empty("v") { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 2, "only \"x\" and 0 are non-empty");
+    }
+
+    #[tokio::test]
+    async fn field_is_missing_distinguishes_null_from_absent() {
+        let out = run(
+            vec![with_fields(json!({})), with_fields(json!({"v": null}))],
+            script(r#"if doc.field_is_missing("v") { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(fields(&out[0]), json!({"v": null}));
+    }
+
+    #[tokio::test]
+    async fn field_equals_is_type_sensitive_and_treats_missing_as_null() {
+        let docs = vec![
+            with_fields(json!({"s": "1"})),
+            with_fields(json!({"s": 1})),
+            with_fields(json!({})),
+        ];
+        let out = run(
+            docs,
+            script(r#"if doc.field_equals("s", 1) { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 2, "only the integer 1 equals 1");
+
+        let out = run(
+            vec![with_fields(json!({})), with_fields(json!({"s": "x"}))],
+            script(r#"if doc.field_equals("s", ()) { return false; } true"#),
+        )
+        .await;
+        assert_eq!(out.len(), 1, "a missing field equals null");
+    }
+
+    #[tokio::test]
+    async fn filter_helpers_read_id_title_and_content_from_the_document() {
+        let mut d = with_fields(json!({"content": "a field, not the text"}));
+        d.content = "   ".into();
+        let out = run(
+            vec![d],
+            script(r#"if doc.field_is_empty("content") { return false; } true"#),
+        )
+        .await;
+        assert!(out.is_empty(), "`content` means the document's own text");
+
+        let out = run(
+            vec![doc("a", "x")],
+            script(r#"if doc.field_is_missing("title") { return false; } true"#),
+        )
+        .await;
+        assert!(out.is_empty(), "a document without a title is missing one");
     }
 
     #[tokio::test]
@@ -874,6 +729,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bare_name_reads_the_field() {
+        let mut d = doc("a", "x");
+        d.fields.insert("price".into(), json!(10));
+        d.fields.insert("qty".into(), json!(3));
+
+        let out = run(vec![d], script("doc.fields.total = price * qty;")).await;
+
+        assert_eq!(out[0].fields.get("total"), Some(&json!(30)));
+    }
+
+    /// Rhai asks the resolver *before* it searches the scope, so without the guard a
+    /// field named `price` would silently replace the author's `let price`.
+    #[tokio::test]
+    async fn a_variable_wins_over_a_field_of_the_same_name() {
+        let mut d = doc("a", "x");
+        d.fields.insert("price".into(), json!(10));
+
+        let out = run(vec![d], script("let price = 5; doc.fields.out = price;")).await;
+
+        assert_eq!(out[0].fields.get("out"), Some(&json!(5)));
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_neither_variable_nor_field_is_an_error() {
+        let err = try_run(vec![doc("a", "x")], script("doc.fields.x = nope;"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("nope")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn manifest_is_correct() {
         let m = DocumentScriptPlugin.manifest();
 
@@ -885,10 +775,442 @@ mod tests {
         for key in ["script", "on_error", "max_ops", "timeout_ms"] {
             assert!(props.contains_key(key), "schema missing {key}");
         }
+        assert!(props.contains_key("ops"), "schema missing ops");
+        assert!(
+            m.config_schema.get("required").is_none(),
+            "neither key is required on its own"
+        );
         assert_eq!(
-            m.config_schema["required"],
-            json!(["script"]),
-            "script must be required"
+            m.config_schema["oneOf"],
+            json!([{"required": ["script"]}, {"required": ["ops"]}])
+        );
+    }
+
+    #[tokio::test]
+    async fn text_helpers_transform_listed_strings() {
+        let out = run(
+            vec![with_fields(json!({"a": "  Hi  ", "b": "MiXed", "c": "ab-1"}))],
+            script(r#"doc.trim_fields(["a"]); doc.lowercase_fields(["b"]); doc.uppercase_fields(["c"]);"#),
+        )
+        .await;
+        assert_eq!(
+            fields(&out[0]),
+            json!({"a": "Hi", "b": "mixed", "c": "AB-1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_helper_on_a_non_string_is_an_error() {
+        let err = try_run(
+            vec![with_fields(json!({"n": 1}))],
+            script(r#"doc.trim_fields(["n"]);"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_and_join_round_trip() {
+        let out = run(
+            vec![with_fields(
+                json!({"tags": "a,b,c", "list": ["x", 2, true]}),
+            )],
+            script(r#"doc.split_field("tags", ","); doc.join_field("list", " | ");"#),
+        )
+        .await;
+        assert_eq!(
+            fields(&out[0]),
+            json!({"tags": ["a", "b", "c"], "list": "x | 2 | true"})
+        );
+    }
+
+    #[tokio::test]
+    async fn join_rejects_nested_collections() {
+        let err = try_run(
+            vec![with_fields(json!({"l": [{"k": 1}]}))],
+            script(r#"doc.join_field("l", ",");"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("cannot be joined")),
+            "got {err:?}"
+        );
+    }
+
+    /// rhai checks sizes only after a helper returns, so `join_field` must refuse a join
+    /// whose result would exceed the string limit before allocating it. 10,000 empty
+    /// items joined by a 60-byte separator project 599,940 bytes (> 512 KiB) while the
+    /// test itself stays small.
+    #[tokio::test]
+    async fn join_refuses_a_result_over_the_string_limit_before_building_it() {
+        let items = vec![json!(""); 10_000];
+        let err = try_run(
+            vec![with_fields(json!({ "l": items }))],
+            script(&format!(r#"doc.join_field("l", "{}");"#, "x".repeat(60))),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("join_field") && m.contains("599940")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_refuses_more_parts_than_the_array_limit_before_building_them() {
+        let err = try_run(
+            vec![with_fields(json!({ "s": ",".repeat(10_000) }))],
+            script(r#"doc.split_field("s", ",");"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("split_field") && m.contains("10001")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_moves_a_field_into_title_or_content() {
+        let out = run(
+            vec![with_fields(
+                json!({"name": "Widget", "body": "Text", "keep": 1}),
+            )],
+            script(r#"doc.promote_field("name", "title"); doc.promote_field("body", "content");"#),
+        )
+        .await;
+        assert_eq!(out[0].title.as_deref(), Some("Widget"));
+        assert_eq!(out[0].content, "Text");
+        assert_eq!(fields(&out[0]), json!({"keep": 1}));
+    }
+
+    #[tokio::test]
+    async fn promote_rejects_a_non_string() {
+        let err = try_run(
+            vec![with_fields(json!({"n": 3}))],
+            script(r#"doc.promote_field("n", "title");"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("not a string")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_field_rounds_floats_and_leaves_integers() {
+        let out = run(
+            vec![with_fields(json!({"f": 10.456, "i": 7}))],
+            script(r#"doc.round_field("f", 2); doc.round_field("i", 2);"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"f": 10.46, "i": 7}));
+    }
+
+    #[tokio::test]
+    async fn round_takes_decimals_in_expressions() {
+        let out = run(
+            vec![with_fields(json!({"price": 10, "qty": 3}))],
+            script("doc.fields.t = round(price * qty * 1.2, 2); doc.fields.i = round(7, 2);"),
+        )
+        .await;
+        assert_eq!(out[0].fields.get("t"), Some(&json!(36.0)));
+        assert_eq!(out[0].fields.get("i"), Some(&json!(7)));
+    }
+
+    #[tokio::test]
+    async fn round_rejects_decimals_out_of_range() {
+        let err = try_run(
+            vec![with_fields(json!({"f": 1.5}))],
+            script(r#"doc.round_field("f", 16);"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("between 0 and 15")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cast_field_follows_the_documented_table() {
+        let out = run(
+            vec![with_fields(json!({
+                "i": "10", "f": " 2.5 ", "b": true, "t": "TRUE", "z": 0, "n": 3, "s": 1.5
+            }))],
+            script(
+                r#"
+                doc.cast_field("i", "number"); doc.cast_field("f", "number");
+                doc.cast_field("b", "number"); doc.cast_field("t", "boolean");
+                doc.cast_field("z", "boolean"); doc.cast_field("n", "string");
+                doc.cast_field("s", "string");
+            "#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            fields(&out[0]),
+            json!({"i": 10, "f": 2.5, "b": 1, "t": true, "z": false, "n": "3", "s": "1.5"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cast_that_cannot_convert_is_an_error() {
+        for (value, to) in [
+            (json!("abc"), "number"),
+            (json!(2), "boolean"),
+            (json!([1]), "string"),
+        ] {
+            let err = try_run(
+                vec![with_fields(json!({ "v": value }))],
+                script(&format!(r#"doc.cast_field("v", "{to}");"#)),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, PluginError::NonRetryable(_)),
+                "{value} -> {to}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_field_fills_missing_and_null_only() {
+        let out = run(
+            vec![with_fields(json!({"b": null, "c": "set"}))],
+            script(r#"doc.default_field("a", "EUR"); doc.default_field("b", 1); doc.default_field("c", "no");"#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": "EUR", "b": 1, "c": "set"}));
+    }
+
+    #[tokio::test]
+    async fn text_and_number_helpers_ignore_a_missing_field() {
+        let out = run(
+            vec![with_fields(json!({"a": 1}))],
+            script(r#"
+                doc.trim_fields(["nope"]); doc.lowercase_fields(["nope"]); doc.uppercase_fields(["nope"]);
+                doc.split_field("nope", ","); doc.join_field("nope", ",");
+                doc.promote_field("nope", "title"); doc.round_field("nope", 2);
+                doc.cast_field("nope", "string");
+            "#),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+        assert_eq!(out[0].title, None);
+    }
+
+    use crate::codegen::{generate, string_literal, value_literal};
+    use crate::ops::Op;
+
+    fn ops(value: Value) -> Vec<Op> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn each_operation_becomes_one_readable_line() {
+        let program = generate(&ops(json!([
+            {"rename": {"from": "prix", "to": "price"}},
+            {"drop": ["a", "b"]},
+            {"filter": {"drop_if": {"field": "content", "is": "empty"}}},
+            {"filter": {"drop_if": {"field": "s", "not_equals": "live"}}},
+            {"round": {"field": "p", "decimals": 2}}
+        ])));
+        assert_eq!(
+            program,
+            concat!(
+                "doc.rename_field(\"prix\", \"price\");\n",
+                "doc.drop_fields([\"a\", \"b\"]);\n",
+                "if doc.field_is_empty(\"content\") { return false; }\n",
+                "if !doc.field_equals(\"s\", \"live\") { return false; }\n",
+                "doc.round_field(\"p\", 2);\n",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn adversarial_field_names_touch_only_their_own_key() {
+        for name in [
+            r#""]; loop {}; //"#,
+            "a\"b",
+            "back\\slash",
+            "new\nline",
+            "tab\tbed",
+            "é日本",
+            "${x}",
+            "`tick`",
+        ] {
+            let mut d = with_fields(json!({ "other": 1 }));
+            d.fields.insert(name.into(), json!("v"));
+            let program = generate(&ops(json!([{ "rename": { "from": name, "to": "safe" } }])));
+
+            let out = run(vec![d], json!({ "script": program })).await;
+
+            assert_eq!(
+                fields(&out[0]),
+                json!({"other": 1, "safe": "v"}),
+                "name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_literals_escape_everything_but_printable_ascii() {
+        assert_eq!(
+            string_literal("a\"b\\c\né"),
+            r#""a\U00000022b\U0000005Cc\U0000000A\U000000E9""#
+        );
+    }
+
+    #[tokio::test]
+    async fn value_literals_round_trip() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(3),
+            json!(-5),
+            json!(2.5),
+            json!(1e20),
+            json!(1.5e-7),
+            json!("é\n\"q\""),
+            json!([1, "a", null]),
+            json!({"k": [1, {"n": null}], "odd key": "x"}),
+        ] {
+            let program = format!("doc.fields.out = {};", value_literal(&value));
+            let out = run(vec![with_fields(json!({}))], json!({ "script": program })).await;
+            assert_eq!(
+                out[0].fields.get("out"),
+                Some(&value),
+                "literal {}",
+                value_literal(&value)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trailing_comment_in_a_set_expression_cannot_swallow_the_statement() {
+        let program = generate(&ops(json!([
+            {"set": {"field": "t", "expr": "price * 2 // double it"}},
+            {"drop": ["price"]}
+        ])));
+        let out = run(
+            vec![with_fields(json!({"price": 4}))],
+            json!({ "script": program }),
+        )
+        .await;
+        assert_eq!(fields(&out[0]), json!({"t": 8}));
+    }
+
+    #[tokio::test]
+    async fn ops_run_end_to_end() {
+        let docs = vec![
+            with_fields(json!({"prix": 10, "qty": 3, "status": "live"})),
+            with_fields(json!({"prix": 1, "qty": 1, "status": "draft"})),
+        ];
+        let out = run(
+            docs,
+            json!({"ops": [
+                {"rename": {"from": "prix", "to": "price"}},
+                {"set": {"field": "total", "expr": "price * qty"}},
+                {"filter": {"drop_if": {"field": "status", "equals": "draft"}}}
+            ]}),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            fields(&out[0]),
+            json!({"price": 10, "qty": 3, "status": "live", "total": 30})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_ops_list_passes_documents_through() {
+        let out = run(vec![with_fields(json!({"a": 1}))], json!({"ops": []})).await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn script_and_ops_together_is_a_config_error() {
+        let err = try_run(vec![doc("a", "x")], json!({"script": "1", "ops": []}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("exactly one")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_script_over_64_kib_is_a_config_error() {
+        let big = format!("// {}\n1", "x".repeat(65536));
+        let err = try_run(vec![doc("a", "x")], json!({ "script": big }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("65536")),
+            "got {err:?}"
+        );
+    }
+
+    /// A trailing `/*` in a `set` expression must not be able to swallow the generated
+    /// `);` and let a later op's field name smuggle statements into the program. The
+    /// second payload has no quotes, so the generated program would compile and run.
+    #[tokio::test]
+    async fn an_unterminated_comment_cannot_inject_code_through_a_later_op() {
+        for payload in [
+            r#"*/ ); doc.fields["pwned"] = 42; //"#,
+            "*/ ); doc.fields.pwned = 42; //",
+        ] {
+            let config = json!({"ops": [
+                {"set": {"field": "t", "expr": "1 /*"}},
+                {"rename": {"from": payload, "to": "x"}}
+            ]});
+
+            let checked = check_config(&config);
+            assert_eq!(
+                checked
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["ops[0].expr"],
+                "{payload}: got {checked:?}"
+            );
+            assert_eq!(checked.generated_script, None);
+
+            let result = try_run(vec![with_fields(json!({"a": 1}))], config).await;
+            assert!(
+                matches!(&result, Err(PluginError::InvalidConfig(m)) if m.contains("ops[0].expr")),
+                "{payload}: got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_script_of_exactly_64_kib_is_accepted() {
+        let exact = format!("//{}", "x".repeat(65536 - 2));
+        assert_eq!(exact.len(), 65536);
+        let out = run(vec![with_fields(json!({"a": 1}))], script(&exact)).await;
+        assert_eq!(fields(&out[0]), json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn a_bad_operation_names_its_index() {
+        let err = try_run(
+            vec![doc("a", "x")],
+            json!({"ops": [{"drop": ["a"]}, {"round": {"field": "p", "decimals": 99}}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidConfig(m) if m.contains("ops[1].decimals")),
+            "got {err:?}"
         );
     }
 }

@@ -497,6 +497,63 @@ steps:
     }
 
     #[tokio::test]
+    async fn validate_forwards_step_config_diagnostics_unchanged() {
+        let server = MockServer::start().await;
+        let diagnostics =
+            json!([{"step": "a", "path": "script", "line": 1, "column": 15, "message": "boom"}]);
+        Mock::given(method("POST"))
+            .and(path("/pipelines/validate"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": "step `a` has invalid configuration",
+                "code": "invalid_step_config",
+                "diagnostics": diagnostics,
+            })))
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let body =
+            json!({"uid": "g", "steps": [{"id": "a", "plugin": "document_script"}]}).to_string();
+        let req = Request::post("/pipelines/validate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = json_body(resp).await;
+        assert_eq!(json["code"], "invalid_step_config");
+        assert_eq!(json["error"], "step `a` has invalid configuration");
+        assert_eq!(json["diagnostics"], diagnostics);
+    }
+
+    #[tokio::test]
+    async fn other_upstream_422s_still_map_to_invalid_pipeline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/pipelines/validate"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"error": "cycle", "code": "validation"})),
+            )
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"uid": "g", "steps": [{"id": "a", "plugin": "chunker"}]}).to_string();
+        let req = Request::post("/pipelines/validate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = json_body(resp).await;
+        assert_eq!(json["code"], "invalid_pipeline");
+        assert!(json.get("diagnostics").is_none());
+    }
+
+    #[tokio::test]
     async fn list_get_delete_are_proxied_with_tenant_and_403_passes_through() {
         let server = MockServer::start().await;
         let def = sample_pipeline("builtin.pdf", None);
