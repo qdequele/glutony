@@ -126,8 +126,21 @@ deployments need no analytics account.
 
 Deploy the schema and pipes with the Tinybird Forward CLI from the `tinybird/` directory
 (`tb --local deploy` against Tinybird Local, `tb --cloud deploy` against a workspace).
-The deployment also mints the gateway's read token, `glutony_gateway_read`
-(`TINYBIRD_READ_TOKEN`); see `tinybird/README.md`.
+The deployment also mints the gateway's read token, `glutony_gateway_read`; see
+`tinybird/README.md`.
+
+Reading usage back (`GET /usage`, the Lab's Pipelines **Usage** page) is configured on
+the gateway:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TINYBIRD_READ_TOKEN` | — | Read token for the `tenant_usage` endpoint (`glutony_gateway_read`). Absent: `GET /usage` answers `501` ("usage analytics is not configured on this deployment"). |
+| `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Same region URL as the workers'. |
+| `TINYBIRD_USAGE_PIPE` | `tenant_usage` | Endpoint pipe to read. |
+
+Set both tokens: with only the read token the page is empty because nothing is recorded,
+and with only the append token usage is recorded but `GET /usage` still answers `501`.
+Only jobs that run after `TINYBIRD_TOKEN` is set are counted.
 
 ## Usage data is not monitoring
 

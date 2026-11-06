@@ -190,6 +190,9 @@ services:
       # travelling inside the Temporal payload.
       BLOB_STORE_URL: file:///data/blobs
       INLINE_MAX_BYTES: "1048576"
+      # Usage analytics read side (GET /usage). Empty = 501, like the append side.
+      TINYBIRD_READ_TOKEN: ${TINYBIRD_READ_TOKEN:-}
+      TINYBIRD_BASE_URL: ${TINYBIRD_BASE_URL:-https://api.tinybird.co}
       # ENVOY_TRUSTED_HEADER is intentionally unset: X-Meili-* headers are trusted (dev mode).
     volumes:
       - cargo-registry:/usr/local/cargo/registry

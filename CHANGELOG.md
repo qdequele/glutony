@@ -6,6 +6,13 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+- The gateway's `TINYBIRD_READ_TOKEN` (and `TINYBIRD_USAGE_PIPE`), which `GET /usage`
+  needs, is now documented in the environment variables reference and the usage page,
+  passed to the gateway by the Kubernetes manifests (`k8s/gateway.yaml`, optional key of
+  `meili-ingest-secrets`) and by `compose.yaml`. Without it the Lab's Pipelines Usage
+  page reports "no usage metering configured".
+
 ### Changed
 - Gateway model ids are `provider/model` (`openai/gpt-4o-mini`): the Lab AI target
   fixtures use that form, and the provider cost table prices a prefixed id like its
