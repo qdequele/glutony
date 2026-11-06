@@ -11,7 +11,9 @@
 //! Scoping follows [`crate::pipelines::PipelineRepo`]: reads return the tenant's row
 //! when it exists and fall back to the global one, while writes touch exactly the
 //! caller's scope — a tenant must never be able to repoint or delete a global
-//! connection.
+//! connection. **Use** is stricter than reads: a job resolves a connection in exactly
+//! its own scope ([`ConnectionRepo::get_owned`]), so a tenant's job can never write with
+//! a global connection's key.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -232,10 +234,9 @@ impl ConnectionRepo {
     ///
     /// For a tenant connection that is the tenant's pipelines plus global ones (a global
     /// pipeline run for that tenant resolves the name in its scope). For a global
-    /// connection it is every pipeline naming it, since any tenant without its own
-    /// connection of that name falls back to the global one. That can over-report a
-    /// pipeline whose tenant shadows the name, which is the safe direction for a "what
-    /// will this delete break" hint.
+    /// connection it is the global pipelines only: a tenant's job never resolves a
+    /// global connection ([`ConnectionRepo::get_owned`]), so only runs without a tenant
+    /// use it.
     pub async fn used_by(
         &self,
         uid: &str,
@@ -248,7 +249,7 @@ impl ConnectionRepo {
                      AS s(step) \
                  WHERE s.step ->> 'plugin' = $3 \
                    AND s.step -> 'config' ->> 'connection' = $1) \
-               AND ($2::text IS NULL OR p.tenant_id IS NULL OR p.tenant_id = $2) \
+               AND (p.tenant_id IS NULL OR p.tenant_id = $2) \
              ORDER BY p.uid",
         )
         .bind(uid)

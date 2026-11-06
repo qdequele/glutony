@@ -394,3 +394,34 @@ async fn a_tenant_pipeline_cannot_name_a_global_connection() {
         assert_eq!(status, expected, "{connection}");
     }
 }
+
+#[tokio::test]
+async fn used_by_a_global_connection_lists_only_global_pipelines() {
+    let Some(pool) = pool("cn-gused").await else {
+        return;
+    };
+    let repo = ConnectionRepo::new(pool.clone());
+    let pipelines = PipelineRepo::new(pool);
+    repo.insert(&new_connection("cn-gused-1", None))
+        .await
+        .expect("global");
+    pipelines
+        .upsert(&pipeline_using("cn-gused-global", None, "cn-gused-1"))
+        .await
+        .expect("global pipeline");
+    pipelines
+        .upsert(&pipeline_using(
+            "cn-gused-tenant",
+            Some("cp-12"),
+            "cn-gused-1",
+        ))
+        .await
+        .expect("tenant pipeline naming the global uid");
+
+    // A tenant's pipeline can never use a global connection, so deleting it breaks
+    // only the global pipelines run without a tenant.
+    assert_eq!(
+        repo.used_by("cn-gused-1", None).await.expect("used_by"),
+        vec!["cn-gused-global".to_string()]
+    );
+}

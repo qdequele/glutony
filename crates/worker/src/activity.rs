@@ -821,6 +821,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/internal/connections/prod-movies"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tenant_id": "tenant-1",
                 "host": "http://meilisearch:7700",
                 "api_key": sealed,
             })))

@@ -359,6 +359,28 @@ pub mod test_support {
             .await;
     }
 
+    /// Mount `GET /internal/connections/{uid}` (the read, which falls back to the global
+    /// row) → 200 with a row owned by `owner` (`None` = global).
+    pub async fn mount_connection(server: &MockServer, uid: &str, owner: Option<&str>) {
+        let mut row = serde_json::json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "uid": uid,
+            "name": uid,
+            "host": "https://ms.example",
+            "api_key": [1, 2, 3],
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:00:00Z",
+        });
+        if let Some(t) = owner {
+            row["tenant_id"] = t.into();
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/connections/{uid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(row))
+            .mount(server)
+            .await;
+    }
+
     /// Mount `POST /internal/jobs` → 201.
     pub async fn mount_jobs_ok(server: &MockServer) {
         Mock::given(method("POST"))

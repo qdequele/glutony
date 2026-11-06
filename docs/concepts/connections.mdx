@@ -89,11 +89,11 @@ the document, rather than looping on `413`.
   never written to Temporal history.
 - The host is re-checked against `MEILI_CONNECTION_HOSTS` at every run, so
   tightening the policy takes effect immediately.
-- Connections are tenant-scoped like pipelines: a project sees its own
+- Connections are tenant-scoped like pipelines: a tenant sees its own
   connections first, then global ones, and can only modify its own.
 - A tenant pipeline may only name its **own** connections. Global connections are
-  templates: a tenant pipeline that names one is refused (`422`) and its jobs never
-  resolve to it.
+  templates: a tenant can **see** one but never **use** it. See
+  [Tenants and global connections](#tenants-and-global-connections).
 
 `MEILI_CONNECTION_HOSTS` controls where connections may point:
 
@@ -107,8 +107,44 @@ The default is safe for a multi-tenant deployment. A self-hosted deployment
 writing to Meilisearch on a private network lists that host; the dev
 `compose.yaml` sets `MEILI_CONNECTION_HOSTS=meilisearch:7700`.
 
+## Tenants and global connections
+
+A job only writes through a connection its own tenant owns:
+
+| Job | `connection: prod` resolves to |
+|---|---|
+| has a tenant (edge `X-Meili-Project-Id`, Lab token, or a tenant's source) | that tenant's `prod`, and nothing else |
+| has no tenant (standalone, untagged ingest, a global source) | the global `prod` |
+
+A tenant's job never falls back to a global connection: it would write with the
+operator's key. It is refused with `422` before anything runs:
+
+- `POST /pipelines` and `POST /pipelines/validate` for a tenant's pipeline
+  (the caller's tenant, or a body `tenant_id` from a global caller) whose
+  indexer names anything but one of the tenant's own connections;
+- `POST /sources` and a `PATCH /sources/{uid}` that changes `pipeline`, when
+  the source's tenant cannot use the pipeline's connections. This includes a
+  global pipeline pinned to a global connection;
+- `POST /ingest…` with a tenant, when the chosen pipeline names a global
+  connection.
+
+Anything that slips past (a connection deleted after the pipeline was saved, a
+pipeline saved before this rule existed) fails the indexer step at run time,
+without retrying: the worker asks only for the tenant's own row, and refuses a
+global row even from a control plane that would still fall back.
+
+A global pipeline pinned to a global connection keeps working for jobs without
+a tenant. To let a tenant use it, create a connection **with the same uid** for
+that tenant. The tenant's row shadows the global one, so the same pipeline then
+writes through the tenant's own connection.
+
 ## Deleting
 
 Deleting a connection is never blocked. Pipelines that still name it fail at
 run time with `connection "<uid>" not found` until they are pointed elsewhere.
 Nothing is archived. The pipeline editor flags the dangling reference.
+
+`used_by` lists what a delete would break. For a tenant's connection, that is the
+tenant's pipelines plus the global ones (a global pipeline run for the tenant
+uses the tenant's connection). For a global connection, it is only the global
+pipelines, since no tenant's job can use it.

@@ -1436,7 +1436,7 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "source \"tmdb\" not found", "code": "not_found" }
     Unprocessable:
-      description: Validation failed (bad cron — including one without exactly 5 fields — or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline).
+      description: Validation failed (bad cron — including one without exactly 5 fields — or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline, or a tenant's job whose pipeline names a global connection).
       content:
         application/json:
           schema:
