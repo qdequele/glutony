@@ -320,7 +320,7 @@ fn actions() -> Vec<ActionEntry> {
                 "Generate summaries and keywords for search snippets",
                 "Classify documents into facets you can filter on",
             ],
-            "\n- id: enrich\n  plugin: llm_enricher\n  depends_on: [chunk]\n  fan_out: $.documents\n  config:\n    model: gpt-4o-mini\n    max_concurrent: 20\n    merge_strategy: merge\n",
+            "\n- id: enrich\n  plugin: llm_enricher\n  depends_on: [chunk]\n  fan_out: $.documents\n  config:\n    model: openai/gpt-4o-mini\n    max_concurrent: 20\n    merge_strategy: merge\n",
             (&[I::Documents], OutputKind::Documents),
         ),
         action(

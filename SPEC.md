@@ -294,7 +294,7 @@ steps:
     depends_on: [chunk]
     fan_out: "$.documents"    # JSONPath into previous step output
     config:
-      model: gpt-4o-mini
+      model: openai/gpt-4o-mini
       max_concurrent: 20
       prompt: |
         Extract as JSON: title, summary, keywords, language.

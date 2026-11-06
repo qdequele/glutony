@@ -140,6 +140,12 @@ Vision captioning through an OpenAI-compatible chat endpoint. One document
 whose `content` is the caption. Queue: `workers-general`. Requires `LLM_API_KEY`
 on the worker (`LLM_BASE_URL`, `LLM_MODEL` optional).
 
+Behind the Meilisearch Lab, the call goes to the team's hosted Gateway, whose model ids are
+`provider/model` (`openai/gpt-4o-mini`, not `gpt-4o-mini`); without `model` the Lab's default is used.
+Self-hosted, the same id works: calling a vendor's public API directly (`api.openai.com`,
+`api.groq.com`, …), the plugin drops that vendor's own prefix (`openai/gpt-4o-mini` →
+`gpt-4o-mini`). Bare ids, and ids sent to any other host, go out unchanged.
+
 | Key | Default | Description |
 |---|---|---|
 | `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Vision-capable chat model. |
@@ -230,6 +236,12 @@ Calls an OpenAI-compatible `/chat/completions` endpoint with
 reply into the document. Accepts `documents` and `many`; usually used with
 `fan_out: "$.documents"`. Queue: `workers-general`. Requires `LLM_API_KEY`.
 
+Behind the Meilisearch Lab, the call goes to the team's hosted Gateway, whose model ids are
+`provider/model` (`openai/gpt-4o-mini`, not `gpt-4o-mini`); without `model` the Lab's default is used.
+Self-hosted, the same id works: calling a vendor's public API directly (`api.openai.com`,
+`api.groq.com`, …), the plugin drops that vendor's own prefix (`openai/gpt-4o-mini` →
+`gpt-4o-mini`). Bare ids, and ids sent to any other host, go out unchanged.
+
 | Key | Default | Description |
 |---|---|---|
 | `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Chat model. |
@@ -279,7 +291,7 @@ usually used with `fan_out: "$.documents"`. Queue: `workers-general`. Requires
 | Key | Default | Description |
 |---|---|---|
 | `questions` | required | Named questions; each key is also the output field. |
-| `model` | `"jev-latest"` (or `JEV_MODEL`) | Jev model or versioned id such as `jev-1.13.0`. |
+| `model` | `"jev-latest"` (or `JEV_MODEL`) | Jev model or versioned id such as `jev-1.13.0`. The Gateway form `typesafe/jev` also works against `api.typesafe.ai`: the prefix is dropped there. |
 | `include_confidence` | `false` | Also write `fields.<key>_confidence` when Jev reports one. |
 | `noul_threshold` | `0.5` | A `noul` answer is `true` when Jev's probability is at or above this. |
 | `merge_strategy` | `"merge"` | `merge` keeps existing fields; `replace` overwrites them. |
@@ -347,7 +359,7 @@ equivalent. Runs on the `workers-general` queue.
 
 | Key | Default | Description |
 |---|---|---|
-| `model` | `whisper-1` | Overrides `TRANSCRIBE_MODEL`. |
+| `model` | `whisper-1` | Overrides `TRANSCRIBE_MODEL`. A Gateway-style `openai/whisper-1` (or `groq/…` on Groq) is sent without the prefix of the vendor called. |
 | `language` | `null` | ISO-639-1 hint. |
 | `prompt` | `null` | Biasing prompt for names and jargon. |
 | `temperature` | `null` | Sampling temperature. |

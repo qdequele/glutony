@@ -77,6 +77,7 @@ use futures::StreamExt;
 use meili_ingest_plugin_sdk::ai::gateway_failure;
 use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
 /// Plugin name referenced by `steps[].plugin`.
@@ -565,8 +566,15 @@ impl JevClient {
         mut doc: Document,
     ) -> Result<Document, PluginError> {
         let model = cfg.model.as_deref().unwrap_or(&self.default_model);
+        // The Lab's Gateway takes the id as written (`typesafe/jev`); TypeSafe called
+        // directly gets it without its own `typesafe/` prefix.
+        let wire_model = if self.lab.is_some() {
+            model
+        } else {
+            direct_model(&self.base_url, model)
+        };
         let body = serde_json::json!({
-            "model": model,
+            "model": wire_model,
             "state": state_for(&doc, cfg.max_input_chars),
             "questions": cfg.questions,
         });
@@ -1482,5 +1490,57 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("TYPESAFE_API_KEY")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_to_typesafe_drops_its_gateway_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(serde_json::json!({ "model": "jev" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .resolve("api.typesafe.ai", *server.address())
+            .build()
+            .unwrap();
+        let base = format!("http://api.typesafe.ai:{}/v1", server.address().port());
+        // From the step's config and from the plugin default (`JEV_MODEL`).
+        let p = JevEnricherPlugin::with_client(base, "test-key", "typesafe/jev", http);
+        run(
+            &p,
+            vec![Document::with_id("d1", "x")],
+            with_config(serde_json::json!({ "model": "typesafe/jev" })),
+        )
+        .await
+        .unwrap();
+        run(&p, vec![Document::with_id("d2", "y")], three_questions())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_gets_the_prefixed_jev_id() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(
+                serde_json::json!({ "model": "typesafe/jev" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, Some("typesafe/jev")));
+        JevEnricherPlugin::disabled()
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![Document::with_id("d1", "x")]),
+                three_questions(),
+            )
+            .await
+            .unwrap();
     }
 }

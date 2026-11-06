@@ -294,8 +294,8 @@ mod tests {
             "base_url": "https://gateway.example/v1",
             "api_key": KEY,
             "key_id": key_id,
-            "default_model": "gpt-4o-mini",
-            "vision_model": "gpt-4o",
+            "default_model": "openai/gpt-4o-mini",
+            "vision_model": "openai/gpt-4o",
             "cache_ttl": cache_ttl,
         })
     }
@@ -698,9 +698,9 @@ mod tests {
         let t: LabAiTarget = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(t.decision_model, None);
         assert_eq!(serde_json::to_value(&t).unwrap(), v);
-        v["decision_model"] = serde_json::json!("gpt-4o");
+        v["decision_model"] = serde_json::json!("typesafe/jev");
         let t: LabAiTarget = serde_json::from_value(v.clone()).unwrap();
-        assert_eq!(t.decision_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(t.decision_model.as_deref(), Some("typesafe/jev"));
         assert_eq!(serde_json::to_value(&t).unwrap(), v);
     }
 }

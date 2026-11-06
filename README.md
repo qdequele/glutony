@@ -169,7 +169,7 @@ steps:
   - id: enrich
     plugin: llm_enricher
     fan_out: "$.documents"
-    config: { model: gpt-4o-mini, prompt: "Extract as JSON: title, summary, keywords, language." }
+    config: { model: openai/gpt-4o-mini, prompt: "Extract as JSON: title, summary, keywords, language." }
   - id: index
     plugin: meili_indexer
 ```
