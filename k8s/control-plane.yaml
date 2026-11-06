@@ -39,6 +39,11 @@ data:
   # region: api.tinybird.co, api.eu-central-1.aws.tinybird.co, and so on.
   TINYBIRD_BASE_URL: "https://api.tinybird.co"
   TINYBIRD_DATASOURCE: "meili_ingest_usage"
+  # Or a self-hosted ClickHouse instead of Tinybird (read by the gateway and workers;
+  # never both stores). The password goes in the Secret as USAGE_CLICKHOUSE_PASSWORD.
+  # USAGE_CLICKHOUSE_URL: "http://clickhouse:8123"
+  # USAGE_CLICKHOUSE_DATABASE: "glutony"
+  # USAGE_CLICKHOUSE_USER: "glutony"
   # Meilisearch Lab (platform contract v2). Leave LAB_URL empty to run without a Lab.
   # Edit here and re-apply (`kubectl apply -k k8s/`), then `kubectl rollout restart`
   # the control plane, gateway and workers: env is read at pod start.

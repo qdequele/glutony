@@ -98,6 +98,22 @@ spec:
                   name: meili-ingest-secrets
                   key: LAB_INSTANCE_SECRET
                   optional: true
+            # Usage analytics read token (GET /usage, the Lab's Usage page).
+            # Optional: without it GET /usage answers 501. TINYBIRD_BASE_URL
+            # comes from the ConfigMap (envFrom).
+            - name: TINYBIRD_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: TINYBIRD_READ_TOKEN
+                  optional: true
+            # Password of USAGE_CLICKHOUSE_USER when usage lives in ClickHouse.
+            - name: USAGE_CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: USAGE_CLICKHOUSE_PASSWORD
+                  optional: true
             # Uncomment for a standalone (non-Envoy) deployment:
             # - name: MEILI_URL
             #   value: "http://meilisearch:7700"

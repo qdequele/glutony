@@ -21,6 +21,7 @@ default = []
 [dependencies]
 # internal
 meili-ingest-plugin-sdk.workspace = true
+meili-ingest-usage.workspace = true
 meili-ingest-router.workspace = true
 meili-ingest-blob.workspace = true
 meili-ingest-source.workspace = true

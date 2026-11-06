@@ -1,11 +1,11 @@
 //! `GET /usage` — per-tenant consumption for the dashboard.
 //!
-//! The browser never talks to Tinybird directly. A read token in front-end code would
-//! be extractable by anyone with dev tools, and Tinybird endpoint parameters are
-//! caller-supplied, so a tenant could simply ask for another tenant's `tenant_id`.
-//! This handler holds the token server-side and forces `tenant_id` to the value
-//! resolved from the request's own context, which the tenant cannot influence when
-//! Envoy is in front.
+//! The browser never talks to the usage store (Tinybird or ClickHouse) directly. A
+//! read token in front-end code would be extractable by anyone with dev tools, and
+//! query parameters are caller-supplied, so a tenant could simply ask for another
+//! tenant's `tenant_id`. This handler holds the credentials server-side and forces
+//! `tenant_id` to the value resolved from the request's own context, which the tenant
+//! cannot influence when Envoy is in front.
 
 use std::collections::HashMap;
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::Scope;
 use crate::error::GatewayError;
-use crate::state::AppState;
+use crate::state::{AppState, UsageApiConfig};
 
 /// Query parameters accepted by [`get_usage`].
 #[derive(Debug, Clone, Deserialize)]
@@ -26,7 +26,8 @@ pub struct UsageQuery {
     pub date_to: String,
 }
 
-/// One day of a tenant's consumption, as returned by the Tinybird endpoint.
+/// One day of a tenant's consumption, as returned by the Tinybird endpoint or the
+/// ClickHouse query (same columns).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRow {
     /// Day (`YYYY-MM-DD`).
@@ -72,14 +73,54 @@ pub async fn get_usage(
     validate_date(&q.date_to, "date_to")?;
     let tenant_id = scope.tenant_id.clone().unwrap_or_default();
 
-    let url = format!("{}/v0/pipes/{}.json", usage.base_url, usage.pipe);
-    let resp = state
-        .http
+    let data = match usage {
+        UsageApiConfig::Tinybird {
+            base_url,
+            token,
+            pipe,
+        } => fetch_tinybird(&state.http, base_url, token, pipe, &tenant_id, &q).await?,
+        UsageApiConfig::ClickHouse(config) => {
+            fetch_clickhouse(&state.http, config, &tenant_id, &q).await?
+        }
+    };
+    Ok(Json(UsageResponse { tenant_id, data }))
+}
+
+/// Daily rows from the ClickHouse usage table (deduplicated, no hourly lag).
+async fn fetch_clickhouse(
+    http: &reqwest::Client,
+    config: &meili_ingest_usage::clickhouse::ClickHouseConfig,
+    tenant_id: &str,
+    q: &UsageQuery,
+) -> Result<Vec<UsageRow>, GatewayError> {
+    let rows = config
+        .daily_usage(http, tenant_id, &q.date_from, &q.date_to)
+        .await
+        .map_err(|e| GatewayError::Upstream(format!("usage analytics: {e}")))?;
+    rows.into_iter()
+        .map(|row| {
+            serde_json::from_value(row)
+                .map_err(|e| GatewayError::Upstream(format!("unexpected usage row: {e}")))
+        })
+        .collect()
+}
+
+/// Daily rows from the Tinybird endpoint pipe.
+async fn fetch_tinybird(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    pipe: &str,
+    tenant_id: &str,
+    q: &UsageQuery,
+) -> Result<Vec<UsageRow>, GatewayError> {
+    let url = format!("{base_url}/v0/pipes/{pipe}.json");
+    let resp = http
         .get(&url)
-        .bearer_auth(&usage.token)
+        .bearer_auth(token)
         .query(&[
             // The Tinybird pipe parameter keeps its historical name (spec §3.5).
-            ("project_id", tenant_id.as_str()),
+            ("project_id", tenant_id),
             ("date_from", q.date_from.as_str()),
             ("date_to", q.date_to.as_str()),
         ])
@@ -98,10 +139,7 @@ pub async fn get_usage(
     }
     let parsed: TinybirdResponse = serde_json::from_str(&body)
         .map_err(|e| GatewayError::Upstream(format!("unexpected usage response: {e}")))?;
-    Ok(Json(UsageResponse {
-        tenant_id,
-        data: parsed.data,
-    }))
+    Ok(parsed.data)
 }
 
 #[derive(Deserialize)]
@@ -138,6 +176,68 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meili_ingest_usage::clickhouse::ClickHouseConfig;
+    use wiremock::matchers::{method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn query() -> UsageQuery {
+        UsageQuery {
+            date_from: "2026-11-01".into(),
+            date_to: "2026-11-06".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn clickhouse_rows_come_back_in_the_tinybird_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("param_project_id", "acme"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"day": "2026-11-02", "pipeline_uid": "builtin.pdf", "plugin": "",
+                          "jobs": 2, "documents_indexed": 40, "audio_seconds": 1.5}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config =
+            ClickHouseConfig::new(server.uri(), "glutony", "meili_ingest_usage", "u", None);
+        let rows = fetch_clickhouse(&reqwest::Client::new(), &config, "acme", &query())
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].day, "2026-11-02");
+        assert_eq!(rows[0].pipeline_uid, "builtin.pdf");
+        // Counters pass through as numbers, like Tinybird's.
+        let json = serde_json::to_value(&rows[0]).expect("serializes");
+        assert_eq!(json["jobs"], 2);
+        assert_eq!(json["documents_indexed"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_clickhouse_failure_is_a_bad_gateway_without_the_password() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("X-ClickHouse-Exception-Code", "497")
+                    .set_body_string("Code: 497. Not enough privileges"),
+            )
+            .mount(&server)
+            .await;
+        let config = ClickHouseConfig::new(
+            server.uri(),
+            "glutony",
+            "meili_ingest_usage",
+            "u",
+            Some("ch-secret".into()),
+        );
+        let err = fetch_clickhouse(&reqwest::Client::new(), &config, "acme", &query())
+            .await
+            .expect_err("refused");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, GatewayError::Upstream(_)), "{msg}");
+        assert!(msg.contains("497") && !msg.contains("ch-secret"), "{msg}");
+    }
 
     #[test]
     fn only_plain_dates_are_accepted() {

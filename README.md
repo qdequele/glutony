@@ -264,7 +264,8 @@ variables behaves as a standalone one. See
 ## Usage & metering
 
 Every job records per-tenant usage — documents, bytes, LLM tokens, transcription
-seconds, pages — into Tinybird (managed ClickHouse) for analytics (dashboards,
+seconds, pages — into Tinybird (managed ClickHouse) or a self-hosted ClickHouse
+(`USAGE_CLICKHOUSE_URL`) for analytics (dashboards,
 `GET /usage`, reconciliation). Billing is the Meilisearch Lab's: see
 [docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx). Reporting
 runs as a Temporal activity, so it is retried until it lands and survives worker
@@ -273,8 +274,8 @@ double-counts. Read `usage_daily_billing` for deduplicated daily totals; see
 [docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
 [tinybird/README.md](tinybird/README.md).
 
-Without `TINYBIRD_TOKEN` the reporting step is a no-op, so self-hosted deployments need
-no analytics account.
+Without `TINYBIRD_TOKEN` or `USAGE_CLICKHOUSE_URL` the reporting step is a no-op, so
+self-hosted deployments need no analytics account.
 
 ## Deployment
 
