@@ -201,7 +201,8 @@ pub mod test_support {
     use axum::response::Response;
     use meili_ingest_blob::BlobStore;
     use meili_ingest_plugin_sdk::{
-        PipelineDefinition, PipelineTrigger, PipelineWorkflowInput, StepDefinition,
+        ArchiveWorkflowInput, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput,
+        StepDefinition,
     };
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
@@ -219,6 +220,7 @@ pub mod test_support {
     #[derive(Default)]
     pub struct FakeStarter {
         inputs: Mutex<Vec<PipelineWorkflowInput>>,
+        archive_inputs: Mutex<Vec<ArchiveWorkflowInput>>,
         cancelled: Mutex<Vec<Uuid>>,
         snapshots: Mutex<HashMap<Uuid, JobSnapshot>>,
         forgotten: Mutex<Vec<Uuid>>,
@@ -229,6 +231,10 @@ pub mod test_support {
         /// Every workflow input received so far.
         pub fn inputs(&self) -> Vec<PipelineWorkflowInput> {
             self.inputs.lock().unwrap().clone()
+        }
+        /// Every archive workflow input received so far.
+        pub fn archive_inputs(&self) -> Vec<ArchiveWorkflowInput> {
+            self.archive_inputs.lock().unwrap().clone()
         }
         /// Every cancelled job id.
         pub fn cancelled(&self) -> Vec<Uuid> {
@@ -259,6 +265,19 @@ pub mod test_support {
                 return Err(GatewayError::Upstream("temporal unavailable".into()));
             }
             self.inputs.lock().unwrap().push(input.clone());
+            Ok(StartedWorkflow {
+                workflow_id: PipelineWorkflowInput::workflow_id(input.job_id),
+                run_id: Some("run-1".into()),
+            })
+        }
+        async fn start_archive(
+            &self,
+            input: &ArchiveWorkflowInput,
+        ) -> Result<StartedWorkflow, GatewayError> {
+            if *self.fail_start.lock().unwrap() {
+                return Err(GatewayError::Upstream("temporal unavailable".into()));
+            }
+            self.archive_inputs.lock().unwrap().push(input.clone());
             Ok(StartedWorkflow {
                 workflow_id: PipelineWorkflowInput::workflow_id(input.job_id),
                 run_id: Some("run-1".into()),

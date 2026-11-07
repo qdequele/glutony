@@ -1905,6 +1905,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3276,6 +3286,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "meili-ingest-archive"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "tar",
+ "thiserror 2.0.20",
+ "zip",
+]
+
+[[package]]
 name = "meili-ingest-blob"
 version = "0.1.0"
 dependencies = [
@@ -3753,6 +3773,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "jsonschema",
+ "meili-ingest-archive",
  "meili-ingest-blob",
  "meili-ingest-lab",
  "meili-ingest-plugin-audio-transcriber",
@@ -3796,6 +3817,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -6513,6 +6535,16 @@ dependencies = [
  "rustix 0.38.44",
  "windows-sys 0.52.0",
  "winx",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]

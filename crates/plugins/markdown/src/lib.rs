@@ -76,13 +76,8 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref())
+        .unwrap_or_else(|| sanitize_id(""))
 }
 
 /// Provenance metadata shared by every document produced from `blob`.
@@ -593,7 +588,7 @@ Hard break above.
         assert_eq!(docs.len(), 3, "{docs:#?}");
 
         let preamble = &docs[0];
-        assert_eq!(preamble.id, "Getting_Started_s1");
+        assert_eq!(preamble.id, "guides_Getting_Started_s1");
         assert_eq!(preamble.title.as_deref(), Some("Getting Started"));
         assert_eq!(preamble.meta.section, None);
         assert_eq!(preamble.content, "Welcome to the project. See the docs.");
@@ -610,7 +605,7 @@ Hard break above.
         assert_eq!(preamble.meta.mime.as_deref(), Some("text/markdown"));
 
         let install = &docs[1];
-        assert_eq!(install.id, "Getting_Started_s2");
+        assert_eq!(install.id, "guides_Getting_Started_s2");
         assert_eq!(install.title.as_deref(), Some("Install"));
         assert_eq!(install.meta.section.as_deref(), Some("Install"));
         assert_eq!(install.fields["version"], 2);
@@ -632,7 +627,7 @@ Hard break above.
         // No splitting: one document titled from the front matter.
         let docs = run(README, serde_json::json!({"split_on_headings": false})).await;
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].id, "Getting_Started");
+        assert_eq!(docs[0].id, "guides_Getting_Started");
         assert_eq!(docs[0].title.as_deref(), Some("Getting Started"));
         assert!(
             docs[0].content.starts_with(

@@ -7,6 +7,18 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 ## [Unreleased]
 
 ### Added
+- Archive uploads: a zip, tar, `.tar.gz` / `.tgz` or gzipped file sent to any ingest
+  route (file, URL or object ref) starts an archive job that ingests every file inside
+  it as its own job, each routed by its own type and name (or through the pipeline
+  forced with `?pipeline=` / `/ingest/pipeline/{name}`). Nested archives are opened up
+  to three levels; folders, `__MACOSX` and `.DS_Store` are dropped; unsafe paths,
+  links, empty, oversized and unroutable files are skipped and reported. The response
+  reads `pipeline_used: "archive"` and `target_index: "*"` (or the one shared index),
+  `GET /jobs/{id}` reports per-file counts under `progress.archive`, and
+  `GET /jobs?parent_job_id=` lists the file jobs. Bounded by `ARCHIVE_MAX_FILES`,
+  `ARCHIVE_MAX_FILE_MB`, `ARCHIVE_MAX_UNPACKED_MB` and `ARCHIVE_MAX_DEPTH` on the
+  workers. A pipeline whose trigger names the archive type itself still gets the
+  archive whole. See [Archives](docs/concepts/archives.mdx).
 - Usage analytics can live in a self-hosted ClickHouse instead of Tinybird: set
   `USAGE_CLICKHOUSE_URL` (plus `_DATABASE`, `_TABLE`, `_USER`, `_PASSWORD`) on the
   workers and the gateway. The workers create the table (same columns, engine and TTL
@@ -22,6 +34,11 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   page reports "no usage metering configured".
 
 ### Changed
+- Document ids built from a filename keep its folders: `reports/eu/q3.pdf` gives
+  `reports_eu_q3` instead of `q3`, so same-named files in different folders of an
+  archive no longer overwrite each other. Plain filenames (every upload, URL and object
+  ref so far) give the same ids as before; only a `filename` field naming folders
+  changes. Applies to every extractor and parser plugin.
 - Gateway model ids are `provider/model` (`openai/gpt-4o-mini`): the Lab AI target
   fixtures use that form, and the provider cost table prices a prefixed id like its
   bare model (an exact `[plugin."provider/model"]` entry still wins). The docs of

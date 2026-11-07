@@ -355,12 +355,7 @@ pub fn documents_from_values(
 /// `fallback` names the format (`json`, `msgpack`, ...) and is used when there is
 /// no filename to derive a stem from.
 pub fn id_stem(filename: Option<&str>, fallback: &str) -> String {
-    let stem = filename
-        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
-        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
-        .filter(|s| !s.is_empty())
-        .unwrap_or(fallback);
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(filename).unwrap_or_else(|| sanitize_id(fallback))
 }
 
 #[async_trait]

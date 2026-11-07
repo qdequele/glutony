@@ -444,6 +444,7 @@ async fn jobs_insert_patch_get() {
         started_at: now,
         updated_at: now,
         source_id: None,
+        parent_job_id: None,
     };
 
     let (status, body) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
@@ -522,6 +523,82 @@ async fn jobs_insert_patch_get() {
 }
 
 #[tokio::test]
+async fn archive_file_jobs_are_listed_under_their_archive() {
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let now = Utc::now();
+    let record = |id: Uuid, pipeline: &str, parent: Option<Uuid>| JobRecord {
+        job_id: id,
+        workflow_id: format!("ingest-{id}"),
+        pipeline_uid: pipeline.into(),
+        tenant_id: Some("t1".into()),
+        index_name: None,
+        status: JobStatus::Queued,
+        current_step: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+        source_id: None,
+        parent_job_id: parent,
+    };
+    let archive = Uuid::new_v4();
+    let files = [Uuid::new_v4(), Uuid::new_v4()];
+    let mut rows = vec![
+        record(archive, "archive", None),
+        record(Uuid::new_v4(), "builtin.pdf", None),
+    ];
+    rows.extend(
+        files
+            .iter()
+            .map(|f| record(*f, "builtin.pdf", Some(archive))),
+    );
+    for row in &rows {
+        let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", row)).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) = call(
+        app(state.clone()),
+        get(&format!("/jobs?parent_job_id={archive}&tenant_id=t1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let page: serde_json::Value = json(&body);
+    assert_eq!(page["total"], 2);
+    let mut listed: Vec<String> = page["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| {
+            assert_eq!(j["parent_job_id"], serde_json::json!(archive));
+            j["job_id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    listed.sort();
+    let mut expected: Vec<String> = files.iter().map(Uuid::to_string).collect();
+    expected.sort();
+    assert_eq!(listed, expected);
+
+    // A re-insert without the link (the gateway's write-through) keeps it.
+    let mut again = record(files[0], "builtin.pdf", None);
+    again.status = JobStatus::Running;
+    let (_, body) = call(
+        app(state.clone()),
+        req_json("POST", "/internal/jobs", &again),
+    )
+    .await;
+    let stored: JobRecord = json(&body);
+    assert_eq!(stored.parent_job_id, Some(archive));
+
+    // Without the filter every job is listed.
+    let (_, body) = call(app(state.clone()), get("/jobs?tenant_id=t1")).await;
+    let page: serde_json::Value = json(&body);
+    assert_eq!(page["total"], 4);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
 async fn terminal_status_clears_the_current_step() {
     // A job that succeeded is not "on" a step. The worker patches the terminal status
     // without naming one, so this has to hold server-side or the last running value
@@ -543,6 +620,7 @@ async fn terminal_status_clears_the_current_step() {
         started_at: now,
         updated_at: now,
         source_id: None,
+        parent_job_id: None,
     };
     let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
     assert_eq!(status, StatusCode::CREATED);

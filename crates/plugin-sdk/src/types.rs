@@ -156,6 +156,36 @@ impl Document {
     }
 }
 
+/// The stem a document id is built from: the filename without its extension, with
+/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), sanitized by
+/// [`sanitize_id`]. Files of the same name in different folders of an archive thus get
+/// different ids, while a plain filename gives the stem it always did. A Windows
+/// path sent by an old browser (`C:\\docs\\a.pdf`) keeps only its last part.
+/// `None` when nothing is left.
+pub fn filename_id_stem(filename: Option<&str>) -> Option<String> {
+    let name = filename?;
+    let name = name
+        .rsplit('\\')
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches('/');
+    let (dir, base) = match name.rsplit_once('/') {
+        Some((dir, base)) => (dir, base),
+        None => ("", name),
+    };
+    let stem = base
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(base);
+    let joined = match (dir.is_empty(), stem.is_empty()) {
+        (_, true) => return None,
+        (true, false) => stem.to_string(),
+        (false, false) => format!("{dir}/{stem}"),
+    };
+    Some(sanitize_id(&joined))
+}
+
 /// Make an arbitrary string a valid Meilisearch document id
 /// (only `a-zA-Z0-9`, `-` and `_`; max 511 bytes).
 pub fn sanitize_id(raw: &str) -> String {
@@ -1249,6 +1279,151 @@ pub struct WorkflowProgress {
     /// True once a cancel signal was received.
     #[serde(default)]
     pub cancel_requested: bool,
+    /// Per-file counts, for an archive job only (see [`ArchiveWorkflowInput`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveProgress>,
+}
+
+// ---------------------------------------------------------------------------
+// Archives
+// ---------------------------------------------------------------------------
+
+/// Temporal workflow type that expands an archive upload.
+pub const ARCHIVE_WORKFLOW_TYPE: &str = "ArchiveWorkflow";
+
+/// What an archive job's `pipeline_uid` reads: the archive job runs no pipeline of its
+/// own, each file it holds gets its own job and pipeline.
+pub const ARCHIVE_JOB_PIPELINE: &str = "archive";
+
+/// How many file issues an archive job keeps in its progress, per list. The counts
+/// stay exact past it; the jobs list (`parent_job_id=`) has every file job.
+pub const ARCHIVE_ISSUES_KEPT: usize = 50;
+
+/// A pipeline forced onto every file of an archive (`?pipeline=`, or
+/// `POST /ingest/pipeline/{name}`), instead of routing each file by its own type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForcedPipeline {
+    /// The pipeline, as resolved when the archive was submitted.
+    pub pipeline: PipelineDefinition,
+    /// Index override from the trigger it was resolved through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_pattern: Option<String>,
+}
+
+/// Input of the `ArchiveWorkflow`: one archive upload, expanded into one
+/// `PipelineWorkflow` per file it holds.
+///
+/// Its workflow id is [`PipelineWorkflowInput::workflow_id`] of `job_id`, so
+/// `GET /jobs/{id}` and cancellation treat an archive job like any other.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveWorkflowInput {
+    /// The archive job's id.
+    pub job_id: Uuid,
+    /// The archive: a staged upload or a URL / object-store reference. Never inline
+    /// bytes, which would sit in workflow history.
+    pub input: PluginInput,
+    /// The request's tenant context, handed to every file's job.
+    pub context: MeiliContext,
+    /// Pipeline every file goes through; `None` routes each file by its type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_pipeline: Option<ForcedPipeline>,
+    /// Index named by an `/indexes/{index_uid}/…` route: every file writes there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_index: Option<String>,
+    /// Set when the workflow continues as new to keep its history small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ArchiveResume>,
+    /// Batch sizes; the gateway leaves them to the worker's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batching: Option<ArchiveBatching>,
+}
+
+/// How an `ArchiveWorkflow` paces its files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveBatching {
+    /// Files started at once.
+    pub wave: usize,
+    /// Waves per workflow run before it continues as new.
+    pub waves_per_run: usize,
+}
+
+/// Where an `ArchiveWorkflow` that continued as new picks up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveResume {
+    /// Blob-store key of the manifest of staged files.
+    pub manifest: String,
+    /// Files in the manifest.
+    pub total: usize,
+    /// Index of the first manifest entry not started yet.
+    pub next: usize,
+    /// Progress so far.
+    pub progress: WorkflowProgress,
+}
+
+/// Per-file counts of an archive job.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveProgress {
+    /// Files found in the archive (nested archives included), skipped ones excluded.
+    pub files_total: usize,
+    /// Files whose job was started.
+    pub files_started: usize,
+    /// Files whose job succeeded.
+    pub files_succeeded: usize,
+    /// Files whose job failed, or that could not get one (no destination, wrong index).
+    pub files_failed: usize,
+    /// Entries not ingested: unsafe paths, links, empty or oversized files, too-deep
+    /// archives, and types no pipeline handles.
+    pub files_skipped: usize,
+    /// The first [`ARCHIVE_ISSUES_KEPT`] skipped entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<ArchiveFileIssue>,
+    /// The first [`ARCHIVE_ISSUES_KEPT`] failed files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<ArchiveFileIssue>,
+}
+
+impl ArchiveProgress {
+    /// Count a skipped entry, keeping its details while there is room.
+    pub fn skip(&mut self, issue: ArchiveFileIssue) {
+        self.files_skipped += 1;
+        if self.skipped.len() < ARCHIVE_ISSUES_KEPT {
+            self.skipped.push(issue);
+        }
+    }
+
+    /// Count a failed file, keeping its details while there is room.
+    pub fn fail(&mut self, issue: ArchiveFileIssue) {
+        self.files_failed += 1;
+        if self.failed.len() < ARCHIVE_ISSUES_KEPT {
+            self.failed.push(issue);
+        }
+    }
+}
+
+/// One file of an archive that was skipped or failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveFileIssue {
+    /// Path inside the archive.
+    pub path: String,
+    /// What happened.
+    pub reason: String,
+    /// The file's job, when it got one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
+}
+
+/// Output of the `ArchiveWorkflow`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveWorkflowOutput {
+    /// The archive job's id.
+    pub job_id: Uuid,
+    /// Terminal status.
+    pub status: JobStatus,
+    /// Per-file counts.
+    pub archive: ArchiveProgress,
+    /// Why it failed, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Output of the `PipelineWorkflow`.
@@ -1445,6 +1620,21 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_stems_keep_folders_and_drop_the_extension() {
+        let stem = |f: &str| filename_id_stem(Some(f));
+        assert_eq!(stem("Annual Report.pdf").as_deref(), Some("Annual_Report"));
+        assert_eq!(stem("reports/eu/a.pdf").as_deref(), Some("reports_eu_a"));
+        assert_eq!(stem("reports/us/a.pdf").as_deref(), Some("reports_us_a"));
+        assert_eq!(stem("/abs/a.tar.gz").as_deref(), Some("abs_a_tar"));
+        assert_eq!(stem("C:\\Users\\me\\data.csv").as_deref(), Some("data"));
+        assert_eq!(stem("README").as_deref(), Some("README"));
+        assert_eq!(stem(".env").as_deref(), Some("_env"));
+        assert_eq!(stem("dir/").as_deref(), None);
+        assert_eq!(stem(""), None);
+        assert_eq!(filename_id_stem(None), None);
+    }
 
     #[test]
     fn cost_fields_merge_and_default_for_old_payloads() {

@@ -11,6 +11,7 @@ members = [
     "crates/lab",
     "crates/plugin-runtime",
     "crates/source",
+    "crates/archive",
     "crates/plugins/pdf",
     "crates/plugins/docx",
     "crates/plugins/xlsx",
@@ -67,6 +68,7 @@ meili-ingest-plugin-msgpack = { path = "crates/plugins/msgpack" }
 meili-ingest-plugin-avro = { path = "crates/plugins/avro" }
 meili-ingest-plugin-parquet = { path = "crates/plugins/parquet" }
 meili-ingest-source = { path = "crates/source" }
+meili-ingest-archive = { path = "crates/archive" }
 
 # async / runtime
 tokio = { version = "1.47", features = ["full"] }
@@ -142,6 +144,8 @@ arrow-array = "59"
 arrow-schema = "59"
 arrow-json = "59"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Archive uploads (`meili-ingest-archive`): tar, plain or inside gzip.
+tar = { version = "0.4", default-features = false }
 quick-xml = "0.41"
 symphonia = { version = "0.6", default-features = false, features = ["isomp4", "mkv", "ogg", "wav", "aac", "mp3", "alac", "flac", "vorbis", "pcm"] }
 hound = "3.5"

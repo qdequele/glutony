@@ -4,7 +4,9 @@ description: Job lifecycle, status, progress and cancellation
 ---
 
 Every ingest request creates one **job** = one Temporal `PipelineWorkflow`
-execution with id `ingest-<job_id>`.
+execution with id `ingest-<job_id>`. An [archive](/concepts/archives) upload creates
+an archive job (an `ArchiveWorkflow`, same id scheme) that starts one job per file
+it holds; `GET /jobs?parent_job_id=<archive job>` lists them.
 
 ## Lifecycle
 

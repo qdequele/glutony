@@ -45,6 +45,9 @@ pub struct JobRecord {
     /// Scheduled source that started this job; `None` for request-driven jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<Uuid>,
+    /// Archive job this job ingests one file of; `None` for every other job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_job_id: Option<Uuid>,
 }
 
 /// Partial update for `PATCH /internal/jobs/{job_id}`; absent fields are left as-is.
@@ -90,6 +93,7 @@ struct JobRow {
     started_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     source_id: Option<Uuid>,
+    parent_job_id: Option<Uuid>,
 }
 
 impl TryFrom<JobRow> for JobRecord {
@@ -114,6 +118,7 @@ impl TryFrom<JobRow> for JobRecord {
             started_at: r.started_at,
             updated_at: r.updated_at,
             source_id: r.source_id,
+            parent_job_id: r.parent_job_id,
         })
     }
 }
@@ -122,16 +127,18 @@ impl TryFrom<JobRow> for JobRecord {
 pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpError> {
     let row: JobRow = sqlx::query_as(
         "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
-                           current_step, error, started_at, updated_at, source_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                           current_step, error, started_at, updated_at, source_id, \
+                           parent_job_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (job_id) DO UPDATE SET \
             workflow_id = EXCLUDED.workflow_id, pipeline_uid = EXCLUDED.pipeline_uid, \
             tenant_id = EXCLUDED.tenant_id, index_name = EXCLUDED.index_name, \
             status = EXCLUDED.status, current_step = EXCLUDED.current_step, \
             error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now(), \
-            source_id = COALESCE(EXCLUDED.source_id, jobs.source_id) \
+            source_id = COALESCE(EXCLUDED.source_id, jobs.source_id), \
+            parent_job_id = COALESCE(EXCLUDED.parent_job_id, jobs.parent_job_id) \
          RETURNING job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
-                   current_step, error, started_at, updated_at, source_id",
+                   current_step, error, started_at, updated_at, source_id, parent_job_id",
     )
     .bind(job.job_id)
     .bind(&job.workflow_id)
@@ -144,6 +151,7 @@ pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpE
     .bind(job.started_at)
     .bind(job.updated_at)
     .bind(job.source_id)
+    .bind(job.parent_job_id)
     .fetch_one(pool)
     .await?;
     JobRecord::try_from(row)
@@ -169,7 +177,7 @@ pub async fn update_job_row(
             updated_at = now() \
          WHERE job_id = $1 \
          RETURNING job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
-                   current_step, error, started_at, updated_at, source_id",
+                   current_step, error, started_at, updated_at, source_id, parent_job_id",
     )
     .bind(job_id)
     .bind(upd.status.map(|s| s.as_str()))
@@ -186,7 +194,7 @@ pub async fn update_job_row(
 pub async fn fetch_job(pool: &PgPool, job_id: Uuid) -> Result<Option<JobRecord>, CpError> {
     let row: Option<JobRow> = sqlx::query_as(
         "SELECT job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
-                current_step, error, started_at, updated_at, source_id \
+                current_step, error, started_at, updated_at, source_id, parent_job_id \
          FROM jobs WHERE job_id = $1",
     )
     .bind(job_id)
@@ -227,6 +235,8 @@ pub struct JobListQuery {
     pub status: Option<String>,
     /// Only jobs started by this pipeline.
     pub pipeline_uid: Option<String>,
+    /// Only the file jobs of this archive job.
+    pub parent_job_id: Option<Uuid>,
     /// Page size, 1..=200, default 50.
     pub limit: Option<i64>,
     /// Rows to skip, for paging.
@@ -248,7 +258,8 @@ pub struct JobList {
     pub total: i64,
 }
 
-/// `GET /jobs?tenant_id=&status=&pipeline_uid=&limit=&offset=` → newest first.
+/// `GET /jobs?tenant_id=&status=&pipeline_uid=&parent_job_id=&limit=&offset=` → newest
+/// first.
 ///
 /// Reads the denormalized `jobs` table rather than Temporal: listing is a browsing
 /// operation and must not fan out gRPC calls per row. Individual job detail still
@@ -266,11 +277,12 @@ pub async fn list_jobs(
     // sqlx 0.9 requires, and lets Postgres use the (tenant_id, started_at) index.
     let rows: Vec<JobRow> = sqlx::query_as(
         "SELECT job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
-                current_step, error, started_at, updated_at, source_id \
+                current_step, error, started_at, updated_at, source_id, parent_job_id \
          FROM jobs \
          WHERE ($1::text IS NULL OR tenant_id = $1) \
            AND ($2::text IS NULL OR status = $2) \
            AND ($3::text IS NULL OR pipeline_uid = $3) \
+           AND ($6::uuid IS NULL OR parent_job_id = $6) \
          ORDER BY started_at DESC \
          LIMIT $4 OFFSET $5",
     )
@@ -279,6 +291,7 @@ pub async fn list_jobs(
     .bind(q.pipeline_uid.as_deref())
     .bind(limit)
     .bind(offset)
+    .bind(q.parent_job_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -291,11 +304,13 @@ pub async fn list_jobs(
         "SELECT count(*) FROM jobs \
          WHERE ($1::text IS NULL OR tenant_id = $1) \
            AND ($2::text IS NULL OR status = $2) \
-           AND ($3::text IS NULL OR pipeline_uid = $3)",
+           AND ($3::text IS NULL OR pipeline_uid = $3) \
+           AND ($4::uuid IS NULL OR parent_job_id = $4)",
     )
     .bind(tenant_id.as_deref())
     .bind(q.status.as_deref())
     .bind(q.pipeline_uid.as_deref())
+    .bind(q.parent_job_id)
     .fetch_one(&state.pool)
     .await?;
 
@@ -355,6 +370,7 @@ mod tests {
             started_at: now,
             updated_at: now,
             source_id: None,
+            parent_job_id: None,
         };
         assert_eq!(JobRecord::try_from(row).unwrap_err().code(), "internal");
     }
@@ -384,11 +400,16 @@ mod tests {
             started_at: now,
             updated_at: now,
             source_id: None,
+            parent_job_id: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert!(
             v.get("source_id").is_none(),
             "request-driven jobs omit source_id, so older readers are unaffected"
+        );
+        assert!(
+            v.get("parent_job_id").is_none(),
+            "only archive file jobs carry it"
         );
         assert_eq!(v["status"], "queued");
         assert_eq!(v["tenant_id"], "t1");

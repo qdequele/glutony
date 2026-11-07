@@ -31,6 +31,9 @@ pub struct WorkerConfig {
     /// How long in-flight activities may run after SIGTERM / SIGINT before they are
     /// cancelled and handed back to Temporal (`SHUTDOWN_GRACE_SECS`, default 60).
     pub shutdown_grace: std::time::Duration,
+    /// Bounds on one archive upload (`ARCHIVE_MAX_FILES`, `ARCHIVE_MAX_FILE_MB`,
+    /// `ARCHIVE_MAX_UNPACKED_MB`, `ARCHIVE_MAX_DEPTH`).
+    pub archive_limits: meili_ingest_archive::Limits,
 }
 
 /// Default of `SHUTDOWN_GRACE_SECS`: with [`SHUTDOWN_HARD_MARGIN`] the worker is gone
@@ -58,6 +61,7 @@ impl WorkerConfig {
             Err(_) => 20,
         };
         let shutdown_grace = shutdown_grace(std::env::var("SHUTDOWN_GRACE_SECS").ok().as_deref())?;
+        let archive_limits = archive_limits(|name| std::env::var(name).ok())?;
         Ok(Self {
             temporal_url: std::env::var("TEMPORAL_URL")
                 .unwrap_or_else(|_| "http://temporal-frontend:7233".to_string()),
@@ -80,8 +84,40 @@ impl WorkerConfig {
             lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
             lab_ai_gateway: lab_ai_gateway(std::env::var("LAB_AI_GATEWAY").ok().as_deref()),
             shutdown_grace,
+            archive_limits,
         })
     }
+}
+
+/// The archive limits, each from its variable when set (blank is unset). Sizes are in
+/// MiB. Zero is refused: an archive that may hold nothing is a misconfiguration.
+pub fn archive_limits(
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<meili_ingest_archive::Limits> {
+    const MIB: u64 = 1024 * 1024;
+    let read = |name: &str| -> anyhow::Result<Option<u64>> {
+        match env(name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            None => Ok(None),
+            Some(v) => match v.parse::<u64>() {
+                Ok(0) => anyhow::bail!("{name} must be greater than 0"),
+                Ok(n) => Ok(Some(n)),
+                Err(_) => anyhow::bail!("{name} must be a positive integer, got {v:?}"),
+            },
+        }
+    };
+    let defaults = meili_ingest_archive::Limits::default();
+    let as_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+    Ok(meili_ingest_archive::Limits {
+        max_files: read("ARCHIVE_MAX_FILES")?.map_or(defaults.max_files, as_usize),
+        max_file_bytes: read("ARCHIVE_MAX_FILE_MB")?
+            .map_or(defaults.max_file_bytes, |n| n.saturating_mul(MIB)),
+        max_total_bytes: read("ARCHIVE_MAX_UNPACKED_MB")?
+            .map_or(defaults.max_total_bytes, |n| n.saturating_mul(MIB)),
+        max_depth: read("ARCHIVE_MAX_DEPTH")?.map_or(defaults.max_depth, as_usize),
+    })
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -103,6 +139,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("lab_events_enabled", &self.lab_events_enabled)
             .field("lab_ai_gateway", &self.lab_ai_gateway)
             .field("shutdown_grace", &self.shutdown_grace)
+            .field("archive_limits", &self.archive_limits)
             .finish()
     }
 }
@@ -248,10 +285,40 @@ mod tests {
             lab_events_enabled: false,
             lab_ai_gateway: true,
             shutdown_grace: std::time::Duration::from_secs(1),
+            archive_limits: meili_ingest_archive::Limits::default(),
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("cp-token-value"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
         assert!(shown.contains("lab_ai_gateway: true"), "{shown}");
+    }
+
+    #[test]
+    fn archive_limits_default_and_parse() {
+        let none = |_: &str| None;
+        assert_eq!(
+            super::archive_limits(none).unwrap(),
+            meili_ingest_archive::Limits::default()
+        );
+        let env = |name: &str| match name {
+            "ARCHIVE_MAX_FILES" => Some("200".to_string()),
+            "ARCHIVE_MAX_FILE_MB" => Some(" 5 ".to_string()),
+            "ARCHIVE_MAX_UNPACKED_MB" => Some("".to_string()),
+            "ARCHIVE_MAX_DEPTH" => Some("1".to_string()),
+            _ => None,
+        };
+        let l = super::archive_limits(env).unwrap();
+        assert_eq!(l.max_files, 200);
+        assert_eq!(l.max_file_bytes, 5 * 1024 * 1024);
+        assert_eq!(
+            l.max_total_bytes,
+            meili_ingest_archive::Limits::default().max_total_bytes
+        );
+        assert_eq!(l.max_depth, 1);
+        for bad in ["0", "-1", "lots"] {
+            let env = |name: &str| (name == "ARCHIVE_MAX_FILES").then(|| bad.to_string());
+            let err = super::archive_limits(env).unwrap_err().to_string();
+            assert!(err.contains("ARCHIVE_MAX_FILES"), "{err}");
+        }
     }
 }
