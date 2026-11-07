@@ -90,7 +90,7 @@ impl SourceActivities {
         })
     }
 
-    fn url(&self, segments: &[&str]) -> Result<Url, PluginError> {
+    pub(crate) fn url(&self, segments: &[&str]) -> Result<Url, PluginError> {
         let mut url = Url::parse(&format!("{}/", self.base()?))
             .map_err(|e| PluginError::NonRetryable(format!("control plane url: {e}")))?;
         {
@@ -215,7 +215,7 @@ pub fn resolve_index(
 }
 
 impl SourceActivities {
-    async fn get_json<T: serde::de::DeserializeOwned>(
+    pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: Url,
         what: &str,
@@ -240,7 +240,11 @@ impl SourceActivities {
             .map_err(|e| PluginError::NonRetryable(format!("{what}: unreadable response: {e}")))
     }
 
-    async fn send_json(&self, req: reqwest::RequestBuilder, what: &str) -> Result<(), PluginError> {
+    pub(crate) async fn send_json(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<(), PluginError> {
         if self.send_json_unless_gone(req, what).await? {
             Ok(())
         } else {
@@ -252,7 +256,7 @@ impl SourceActivities {
 
     /// Like [`Self::send_json`], but a 404 is `Ok(false)` instead of an error: the
     /// thing written about no longer exists, and retrying will not bring it back.
-    async fn send_json_unless_gone(
+    pub(crate) async fn send_json_unless_gone(
         &self,
         req: reqwest::RequestBuilder,
         what: &str,

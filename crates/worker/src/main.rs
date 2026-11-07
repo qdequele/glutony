@@ -1,6 +1,7 @@
 //! meili-ingest worker binary. Polls one Temporal task queue (`TASK_QUEUE`) and runs
 //! the `PipelineWorkflow` plus the `execute_step` / `expand_fan_out` activities, and the
-//! `SourceRunWorkflow` that scheduled sources start.
+//! `SourceRunWorkflow` that scheduled sources start, and the `ArchiveWorkflow` that
+//! expands archive uploads into one job per file.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,8 +9,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use meili_ingest_blob::BlobStore;
 use meili_ingest_worker::{
-    PipelineWorkflow, PluginRegistry, SourceActivities, SourceRunWorkflow, StepActivities,
-    WorkerConfig,
+    ArchiveActivities, ArchiveWorkflow, PipelineWorkflow, PluginRegistry, SourceActivities,
+    SourceRunWorkflow, StepActivities, WorkerConfig,
 };
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Url};
 use temporalio_sdk::runtime::worker_tuner::{FixedSizeSlotSupplier, TunerHolder};
@@ -142,15 +143,23 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(policy = ?host_policy, "Meilisearch connection host policy");
 
+    let default_index = std::env::var("DEFAULT_INDEX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "documents".to_string());
     let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
         .with_control_plane_token(config.control_plane_token.clone())
         .with_security(connection_key.clone(), fetch_policy)
-        .with_default_index(
-            std::env::var("DEFAULT_INDEX")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "documents".to_string()),
-        );
+        .with_default_index(default_index.clone());
+    // Archives route their files through the control plane like the gateway does, and
+    // stage them in the same blob store; they need no fetch credential.
+    tracing::info!(limits = ?config.archive_limits, "archive limits");
+    let archive_activities = ArchiveActivities::new(
+        SourceActivities::new(config.control_plane_url.clone(), blob.clone())
+            .with_control_plane_token(config.control_plane_token.clone())
+            .with_default_index(default_index),
+        config.archive_limits.clone(),
+    );
 
     if config.lab_events_enabled && config.control_plane_url.is_none() {
         anyhow::bail!("LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL: the events go to its outbox");
@@ -187,8 +196,10 @@ async fn main() -> anyhow::Result<()> {
     let options = WorkerOptions::new(config.task_queue.clone())
         .register_workflow::<PipelineWorkflow>()?
         .register_workflow::<SourceRunWorkflow>()?
+        .register_workflow::<ArchiveWorkflow>()?
         .register_activities(activities)
         .register_activities(source_activities)
+        .register_activities(archive_activities)
         .tuner(tuner)
         // On SIGTERM the worker stops polling at once; activities still running after
         // this long are cancelled, which Temporal records as a retryable `WorkerShutdown`

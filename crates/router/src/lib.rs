@@ -66,6 +66,10 @@ pub mod mime {
     pub const YAML: &str = "application/yaml";
     /// Zip archive.
     pub const ZIP: &str = "application/zip";
+    /// Gzip stream: one compressed file, or a `.tar.gz`.
+    pub const GZIP: &str = "application/gzip";
+    /// Tar archive.
+    pub const TAR: &str = "application/x-tar";
     /// WAV audio, canonical spelling.
     pub const WAV: &str = "audio/wav";
     /// MP3 audio, canonical spelling.
@@ -111,8 +115,24 @@ pub fn canonical_mime(mime: &str) -> &str {
         "application/x-msgpack" | "application/msgpack" | "application/x-messagepack" => {
             mime::MSGPACK
         }
+        "application/x-zip-compressed" | "application/x-zip" | "multipart/x-zip" => mime::ZIP,
+        "application/x-gzip"
+        | "application/gzip-compressed"
+        | "application/x-gtar"
+        | "application/x-tgz"
+        | "application/x-compressed" => mime::GZIP,
+        "application/tar" => mime::TAR,
         other => other,
     }
+}
+
+/// Whether `mime` is an archive the gateway expands into one job per file (zip, tar,
+/// gzip). Takes a canonical type ([`canonical_mime`]).
+///
+/// Office documents, EPUBs and JARs are zip files underneath but have their own types,
+/// so they are not archives here.
+pub fn is_archive(mime: &str) -> bool {
+    matches!(mime, mime::ZIP | mime::GZIP | mime::TAR)
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1281,42 @@ mod tests {
             detect_mime(&zip, Some("weird.txt"), None),
             "application/zip"
         );
+    }
+
+    #[test]
+    fn archives_are_detected_and_canonical() {
+        // gzip magic, whatever the name says.
+        let gz = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        assert_eq!(detect_mime(&gz, Some("dump.tgz"), None), mime::GZIP);
+        assert_eq!(detect_mime(&gz, Some("report.pdf.gz"), None), mime::GZIP);
+        // tar: `ustar` at offset 257.
+        let mut tar = vec![0u8; 512];
+        tar[..5].copy_from_slice(b"a.txt");
+        tar[257..262].copy_from_slice(b"ustar");
+        assert_eq!(detect_mime(&tar, None, None), mime::TAR);
+        // URL refs are typed from the extension, through the aliases.
+        for alias in [
+            "application/x-gzip",
+            "application/x-compressed",
+            "application/x-gtar",
+        ] {
+            assert_eq!(canonical_mime(alias), mime::GZIP, "{alias}");
+        }
+        assert_eq!(canonical_mime("application/x-zip-compressed"), mime::ZIP);
+        assert_eq!(canonical_mime("application/tar"), mime::TAR);
+
+        for m in [mime::ZIP, mime::GZIP, mime::TAR] {
+            assert!(is_archive(m), "{m}");
+        }
+        for m in [
+            mime::DOCX,
+            mime::XLSX,
+            mime::PPTX,
+            mime::PDF,
+            "application/epub+zip",
+        ] {
+            assert!(!is_archive(m), "{m}");
+        }
     }
 
     #[test]

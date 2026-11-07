@@ -82,13 +82,8 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref())
+        .unwrap_or_else(|| sanitize_id(""))
 }
 
 /// Provenance metadata shared by every document produced from `blob`.
@@ -431,7 +426,7 @@ mod tests {
         assert_eq!(docs.len(), 3, "{docs:#?}");
 
         let alice = &docs[0];
-        assert_eq!(alice.id, "Team_Roster_People_r2");
+        assert_eq!(alice.id, "data_Team_Roster_People_r2");
         assert_eq!(alice.fields["name"], "Alice");
         assert_eq!(alice.fields["age"], 30);
         assert_eq!(alice.fields["active"], true);
@@ -447,12 +442,12 @@ mod tests {
         assert_eq!(alice.meta.mime.as_deref(), Some(XLSX_MIME));
 
         let bob = &docs[1];
-        assert_eq!(bob.id, "Team_Roster_People_r4");
+        assert_eq!(bob.id, "data_Team_Roster_People_r4");
         assert_eq!(bob.fields["_row"], 4);
         assert!(!bob.fields.contains_key("score"), "empty cells are skipped");
 
         let note = &docs[2];
-        assert_eq!(note.id, "Team_Roster_Notes_r2");
+        assert_eq!(note.id, "data_Team_Roster_Notes_r2");
         assert_eq!(note.fields["note"], "hello world");
         assert_eq!(note.meta.page, Some(2));
     }
@@ -472,7 +467,7 @@ mod tests {
             .unwrap();
         let docs = out.into_documents().unwrap();
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0].id, "Team_Roster_People");
+        assert_eq!(docs[0].id, "data_Team_Roster_People");
         assert_eq!(docs[0].title.as_deref(), Some("People"));
         assert_eq!(
             docs[0].content,
@@ -500,7 +495,7 @@ mod tests {
         let docs = out.into_documents().unwrap();
         assert_eq!(
             docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-            vec!["Team_Roster_People_r2", "Team_Roster_Notes_r2"]
+            vec!["data_Team_Roster_People_r2", "data_Team_Roster_Notes_r2"]
         );
 
         let out = plugin

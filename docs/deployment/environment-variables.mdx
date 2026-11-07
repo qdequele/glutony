@@ -49,6 +49,10 @@ inside plugins or workflow code.
 | `BLOB_STORE_URL` | `file://./blobs` | Same store as the gateway. |
 | `PAYLOAD_SPILL_BYTES` | `1048576` | Step outputs larger than this are spilled to the blob store. |
 | `MAX_CONCURRENT_ACTIVITIES` | `20` | Activities executed concurrently by this process. |
+| `ARCHIVE_MAX_FILES` | `10000` | Most files one [archive](/concepts/archives) may hold, nested archives included. More fails the archive job before anything is ingested. |
+| `ARCHIVE_MAX_FILE_MB` | `512` | Largest file inside an archive, uncompressed. Larger ones are skipped and reported. |
+| `ARCHIVE_MAX_UNPACKED_MB` | `8192` | Most data decompressing one archive may produce (zip-bomb guard). More fails the archive job. |
+| `ARCHIVE_MAX_DEPTH` | `3` | Archive layers opened, the uploaded one included. A deeper nested archive is skipped. `0` or a non-integer stops the worker at boot, as for the three above. |
 | `EXTERNAL_PLUGINS` | — | Comma-separated external plugins: `wasm:/path/plugin.wasm`, `grpc:http://host:50051`. |
 | `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-general` pool). Without it those plugins register as unavailable. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |

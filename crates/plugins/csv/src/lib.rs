@@ -136,12 +136,7 @@ fn typed_cell(cell: &str) -> Value {
 
 /// Filename stem used to build generated ids (`<stem>_r<n>`).
 fn id_stem(filename: Option<&str>) -> String {
-    let stem = filename
-        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
-        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
-        .filter(|s| !s.is_empty())
-        .unwrap_or("csv");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(filename).unwrap_or_else(|| sanitize_id("csv"))
 }
 
 fn column_name(headers: &[String], idx: usize) -> String {

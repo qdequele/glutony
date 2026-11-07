@@ -111,13 +111,8 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref())
+        .unwrap_or_else(|| sanitize_id(""))
 }
 
 /// Provenance metadata for the document produced from `blob`.
@@ -423,7 +418,7 @@ mod tests {
         let docs = out.into_documents().unwrap();
         assert_eq!(docs.len(), 1);
         let doc = &docs[0];
-        assert_eq!(doc.id, "install_guide");
+        assert_eq!(doc.id, "docs_install_guide");
         assert_eq!(doc.title.as_deref(), Some("Guide d'installation"));
         assert_eq!(doc.fields["description"], "Comment installer le produit.");
         assert!(!doc.fields.contains_key("links"));

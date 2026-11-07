@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use meili_ingest_blob::BlobStore;
 use meili_ingest_plugin_sdk::{
-    JobStatus, PipelineDefinition, PipelineWorkflowInput, PluginManifest, WorkflowProgress,
+    ARCHIVE_WORKFLOW_TYPE, ArchiveWorkflowInput, JobStatus, PipelineDefinition,
+    PipelineWorkflowInput, PluginManifest, WorkflowProgress,
 };
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
@@ -347,6 +348,12 @@ pub struct JobSnapshot {
 pub trait WorkflowStarter: Send + Sync {
     /// Start a `PipelineWorkflow` for `input`.
     async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError>;
+    /// Start an `ArchiveWorkflow` for `input`, under the same `ingest-<job_id>` id
+    /// scheme, so `progress` and `cancel` work on it unchanged.
+    async fn start_archive(
+        &self,
+        input: &ArchiveWorkflowInput,
+    ) -> Result<StartedWorkflow, GatewayError>;
     /// Describe + `progress`-query the workflow of `job_id`. `Ok(None)` when Temporal does
     /// not know the workflow.
     async fn progress(&self, job_id: Uuid) -> Result<Option<JobSnapshot>, GatewayError>;
@@ -400,19 +407,24 @@ pub fn combine_status(described: JobStatus, progress: Option<&WorkflowProgress>)
     }
 }
 
-#[async_trait]
-impl WorkflowStarter for TemporalStarter {
-    async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError> {
+impl TemporalStarter {
+    /// Start workflow `workflow_type` for job `job_id` on [`WORKFLOW_TASK_QUEUE`].
+    async fn start_job<T: Serialize + 'static>(
+        &self,
+        workflow_type: &str,
+        job_id: Uuid,
+        input: &T,
+    ) -> Result<StartedWorkflow, GatewayError> {
         let conv = PayloadConverter::default();
         let raw = RawValue::from_value(input, &conv);
         let handle = self
             .0
             .start_workflow(
-                UntypedWorkflow::new(WORKFLOW_TYPE),
+                UntypedWorkflow::new(workflow_type),
                 raw,
                 WorkflowStartOptions::new(
                     WORKFLOW_TASK_QUEUE,
-                    PipelineWorkflowInput::workflow_id(input.job_id),
+                    PipelineWorkflowInput::workflow_id(job_id),
                 )
                 .build(),
             )
@@ -422,6 +434,21 @@ impl WorkflowStarter for TemporalStarter {
             workflow_id: handle.info().workflow_id.clone(),
             run_id: handle.info().run_id.clone(),
         })
+    }
+}
+
+#[async_trait]
+impl WorkflowStarter for TemporalStarter {
+    async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError> {
+        self.start_job(WORKFLOW_TYPE, input.job_id, input).await
+    }
+
+    async fn start_archive(
+        &self,
+        input: &ArchiveWorkflowInput,
+    ) -> Result<StartedWorkflow, GatewayError> {
+        self.start_job(ARCHIVE_WORKFLOW_TYPE, input.job_id, input)
+            .await
     }
 
     async fn progress(&self, job_id: Uuid) -> Result<Option<JobSnapshot>, GatewayError> {

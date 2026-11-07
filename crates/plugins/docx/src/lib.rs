@@ -56,13 +56,8 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref())
+        .unwrap_or_else(|| sanitize_id(""))
 }
 
 /// Provenance metadata shared by every document produced from `blob`.
@@ -429,7 +424,7 @@ mod tests {
         let docs = out.into_documents().unwrap();
         assert_eq!(docs.len(), 1);
         let doc = &docs[0];
-        assert_eq!(doc.id, "Q3_review");
+        assert_eq!(doc.id, "reports_Q3_review");
         assert_eq!(doc.title.as_deref(), Some("Quarterly Review"));
         assert_eq!(doc.meta.filename.as_deref(), Some("reports/Q3 review.docx"));
         assert_eq!(doc.meta.mime.as_deref(), Some(DOCX_MIME));
@@ -452,11 +447,11 @@ mod tests {
         let docs = out.into_documents().unwrap();
         assert_eq!(docs.len(), 3, "{docs:#?}");
         // Preamble keeps the document title, no section.
-        assert_eq!(docs[0].id, "Q3_review_s1");
+        assert_eq!(docs[0].id, "reports_Q3_review_s1");
         assert_eq!(docs[0].title.as_deref(), Some("Quarterly Review"));
         assert_eq!(docs[0].meta.section, None);
         assert_eq!(docs[0].content, "Intro paragraph.");
-        assert_eq!(docs[1].id, "Q3_review_s2");
+        assert_eq!(docs[1].id, "reports_Q3_review_s2");
         assert_eq!(docs[1].title.as_deref(), Some("Sales"));
         assert_eq!(docs[1].meta.section.as_deref(), Some("Sales"));
         assert_eq!(docs[1].content, "Sales went up.");

@@ -128,6 +128,9 @@ invisible to plugins and to pipeline authors.
 | `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4`, `audio/flac` | whisper_transcriber → meili_indexer |
 | `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm`, `video/x-matroska` | video_audio_extractor → whisper_transcriber → meili_indexer |
 
+Zip, tar and gzip uploads are not routed to a pipeline: each file inside them is,
+as its own job. See [Archives](/concepts/archives).
+
 Default chunker config: `strategy: sentence, chunk_size: 512, overlap: 64`.
 Default retry: `max_attempts: 3, backoff: exponential`.
 

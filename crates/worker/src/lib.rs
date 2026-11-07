@@ -1,10 +1,13 @@
-//! meili-ingest worker library: the `PipelineWorkflow`, the `execute_step` activity,
+//! meili-ingest worker library: the `PipelineWorkflow`, the `ArchiveWorkflow` that
+//! expands archive uploads, the `execute_step` activity,
 //! the plugin registry and pure DAG-scheduling helpers.
 //!
 //! The binary in `main.rs` wires these to a Temporal worker polling one task queue.
 
 pub mod activity;
 pub mod ai_target;
+pub mod archive_activity;
+pub mod archive_workflow;
 pub mod config;
 pub mod connection;
 pub mod dag;
@@ -15,6 +18,8 @@ pub mod source_workflow;
 pub mod workflow;
 
 pub use activity::StepActivities;
+pub use archive_activity::ArchiveActivities;
+pub use archive_workflow::ArchiveWorkflow;
 pub use config::WorkerConfig;
 pub use registry::PluginRegistry;
 pub use source_activity::SourceActivities;

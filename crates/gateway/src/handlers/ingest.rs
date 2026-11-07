@@ -6,7 +6,8 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use meili_ingest_plugin_sdk::{
-    ContentRef, JobStatus, MeiliContext, PipelineDefinition, PipelineWorkflowInput, PluginInput,
+    ARCHIVE_JOB_PIPELINE, ArchiveWorkflowInput, ContentRef, ForcedPipeline, JobStatus,
+    MeiliContext, PipelineDefinition, PipelineWorkflowInput, PluginInput,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -139,6 +140,16 @@ pub async fn submit_one(
             }
             Err(e) => return Err(GatewayError::BadRequest(e.to_string())),
         }
+    }
+
+    // An archive is expanded into one job per file, unless a pipeline asks for the
+    // archive type itself.
+    if meili_ingest_router::is_archive(&mime)
+        && let ArchivePlan::Expand(forced) =
+            archive_plan(state, &mime, filename.as_deref(), &ctx, selection).await?
+    {
+        let forced = forced.map(|f| *f);
+        return submit_archive(state, payload, ctx, forced, locked_index, &mime).await;
     }
 
     let (pipeline, index_pattern) = match selection {
@@ -290,6 +301,205 @@ pub async fn submit_one(
         job_id,
         pipeline_used: pipeline_uid,
         target_index,
+        status: "queued".into(),
+    })
+}
+
+/// What to do with an archive upload.
+#[derive(Debug, Clone, PartialEq)]
+enum ArchivePlan {
+    /// A pipeline names the archive type in its trigger: it takes the archive whole.
+    Whole,
+    /// Expand it, every file through the forced pipeline or routed by its own type.
+    Expand(Option<Box<ForcedPipeline>>),
+}
+
+/// Whether `pipeline` asks for `mime` by name. A wildcard (`*/*`, `application/*`)
+/// does not count: a catch-all pipeline was not written for archives.
+fn takes_archive_whole(pipeline: &PipelineDefinition, mime: &str) -> bool {
+    pipeline.trigger.as_ref().is_some_and(|t| {
+        t.content_types
+            .iter()
+            .any(|ct| meili_ingest_router::canonical_mime(ct.trim()).eq_ignore_ascii_case(mime))
+    })
+}
+
+/// Decide how an archive upload runs. A forced pipeline (`?pipeline=`, or the
+/// explicit-pipeline route) that does not take the archive whole runs on every file.
+async fn archive_plan(
+    state: &AppState,
+    mime: &str,
+    filename: Option<&str>,
+    ctx: &MeiliContext,
+    selection: &PipelineSelection,
+) -> Result<ArchivePlan, GatewayError> {
+    let tenant = ctx.tenant_id.as_deref();
+    match selection {
+        PipelineSelection::Auto { explicit: None } => {
+            match state
+                .control_plane
+                .resolve(mime, filename, tenant, None)
+                .await
+            {
+                Ok(r) if takes_archive_whole(&r.pipeline, mime) => Ok(ArchivePlan::Whole),
+                Ok(_) | Err(GatewayError::NotFound(_)) => Ok(ArchivePlan::Expand(None)),
+                Err(e) => Err(e),
+            }
+        }
+        PipelineSelection::Auto {
+            explicit: Some(uid),
+        } => {
+            let r = state
+                .control_plane
+                .resolve(mime, filename, tenant, Some(uid))
+                .await?;
+            if takes_archive_whole(&r.pipeline, mime) {
+                Ok(ArchivePlan::Whole)
+            } else {
+                Ok(ArchivePlan::Expand(Some(Box::new(ForcedPipeline {
+                    pipeline: r.pipeline,
+                    index_pattern: r.index_pattern,
+                }))))
+            }
+        }
+        PipelineSelection::Explicit(def) => {
+            if takes_archive_whole(def, mime) {
+                Ok(ArchivePlan::Whole)
+            } else {
+                Ok(ArchivePlan::Expand(Some(Box::new(ForcedPipeline {
+                    pipeline: (**def).clone(),
+                    index_pattern: def.trigger.as_ref().and_then(|t| t.index_pattern.clone()),
+                }))))
+            }
+        }
+    }
+}
+
+/// What `target_index` reads for an archive whose files may land in several indexes.
+pub const ARCHIVE_ANY_INDEX: &str = "*";
+
+/// The one index every file of an archive writes to, when that is known up front: the
+/// route's index, or a forced pipeline's own index, trigger pattern or the request's
+/// index. Files routed by their own type can each land elsewhere.
+fn archive_target_index(
+    locked: Option<&str>,
+    forced: Option<&ForcedPipeline>,
+    request_index: Option<&str>,
+) -> Option<String> {
+    fn non_blank(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    if let Some(i) = non_blank(locked) {
+        return Some(i.to_string());
+    }
+    let f = forced?;
+    f.pipeline
+        .fixed_index()
+        .or(non_blank(f.index_pattern.as_deref()))
+        .or(non_blank(request_index))
+        .map(str::to_string)
+}
+
+/// Submit an archive: stage it and start an `ArchiveWorkflow`, which gives each file
+/// its own job. Checks that hold for every file (destination, index, credits) happen
+/// here; the per-file ones happen as each file is routed.
+async fn submit_archive(
+    state: &AppState,
+    payload: IngestPayload,
+    ctx: MeiliContext,
+    forced: Option<ForcedPipeline>,
+    locked_index: Option<&str>,
+    mime: &str,
+) -> Result<IngestResponse, GatewayError> {
+    if let Some(f) = &forced {
+        if !f.pipeline.pins_destination() {
+            require_destination(&ctx)?;
+        }
+        if let Some(index) = locked_index
+            && let Some(other) = f.pipeline.step_indexes().find(|named| *named != index)
+        {
+            return Err(GatewayError::Unprocessable(format!(
+                "pipeline {:?} writes to index {other:?}, not {index:?}; send it to \
+                 /ingest/pipeline/{} instead",
+                f.pipeline.uid, f.pipeline.uid
+            )));
+        }
+    }
+    let target_index = archive_target_index(locked_index, forced.as_ref(), ctx.index.as_deref());
+
+    if state.config.write_preflight
+        && !forced
+            .as_ref()
+            .is_some_and(|f| f.pipeline.pins_destination())
+        && let (Some(index), Some(host), Some(key)) = (&target_index, &ctx.host, &ctx.api_key)
+    {
+        crate::preflight::check_write(&state.http, host, key, index).await?;
+    }
+    if let (Some(lab), Some(account)) = (&state.lab, ctx.tenant_id.as_deref()) {
+        lab.check_credits(account).await?;
+    }
+
+    let job_id = Uuid::new_v4();
+    let input = match payload {
+        // Always staged, whatever its size: workflow history never holds the bytes.
+        IngestPayload::File(blob) => state.blob.stage_upload(job_id, blob, 0).await?,
+        IngestPayload::Url { url, filename } => PluginInput::Ref(ContentRef::Url {
+            url,
+            mime: Some(mime.to_string()),
+            filename,
+        }),
+        IngestPayload::S3 { uri, filename } => PluginInput::Ref(ContentRef::S3 {
+            uri,
+            mime: Some(mime.to_string()),
+            filename,
+        }),
+        IngestPayload::Documents(_) | IngestPayload::Batch(_) => {
+            return Err(GatewayError::BadRequest(
+                "only a file, a URL or an object reference can be an archive".into(),
+            ));
+        }
+    };
+    let wf_input = ArchiveWorkflowInput {
+        job_id,
+        input,
+        context: ctx.clone(),
+        forced_pipeline: forced.clone(),
+        locked_index: locked_index.map(str::to_string),
+        resume: None,
+        batching: None,
+    };
+    let started = state.temporal.start_archive(&wf_input).await?;
+    tracing::info!(
+        job_id = %job_id,
+        workflow_id = %started.workflow_id,
+        forced_pipeline = forced.as_ref().map(|f| f.pipeline.uid.as_str()),
+        index = target_index.as_deref().unwrap_or(ARCHIVE_ANY_INDEX),
+        mime = %mime,
+        context = %ctx.redacted(),
+        "archive job queued"
+    );
+
+    let now = Utc::now();
+    let record = JobRecord {
+        job_id,
+        workflow_id: started.workflow_id,
+        pipeline_uid: ARCHIVE_JOB_PIPELINE.to_string(),
+        tenant_id: ctx.tenant_id.clone(),
+        index_name: target_index.clone(),
+        status: JobStatus::Queued,
+        current_step: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+    };
+    if let Err(e) = state.control_plane.create_job(&record).await {
+        tracing::warn!(job_id = %job_id, "could not record job in the control plane: {e}");
+    }
+
+    Ok(IngestResponse {
+        job_id,
+        pipeline_used: ARCHIVE_JOB_PIPELINE.to_string(),
+        target_index: target_index.unwrap_or_else(|| ARCHIVE_ANY_INDEX.to_string()),
         status: "queued".into(),
     })
 }
@@ -1245,5 +1455,229 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(json_body(resp).await["code"], "insufficient_credits");
         assert!(starter.inputs().is_empty(), "nothing was queued");
+    }
+
+    // -- archives ---------------------------------------------------------
+
+    /// The smallest valid zip: just its end-of-central-directory record.
+    const EMPTY_ZIP: &[u8] = b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+    async fn mount_resolve_none(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "no match"})))
+            .mount(server)
+            .await;
+    }
+
+    fn zip_upload(uri: &str) -> Request<Body> {
+        let (ct, body) = multipart_body("file", "bundle.zip", "application/zip", EMPTY_ZIP);
+        standalone_request(uri, ct, body)
+    }
+
+    #[tokio::test]
+    async fn a_zip_starts_an_archive_job_routed_file_by_file() {
+        let server = MockServer::start().await;
+        mount_resolve_none(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/internal/jobs"))
+            .and(body_partial_json(
+                json!({"pipeline_uid": "archive", "status": "queued"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app.oneshot(zip_upload("/ingest")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = json_body(resp).await;
+        assert_eq!(body["pipeline_used"], "archive");
+        assert_eq!(
+            body["target_index"], "*",
+            "files may land in several indexes"
+        );
+        assert_eq!(body["status"], "queued");
+
+        assert!(
+            starter.inputs().is_empty(),
+            "no pipeline job for the archive itself"
+        );
+        let archives = starter.archive_inputs();
+        assert_eq!(archives.len(), 1);
+        let a = &archives[0];
+        assert_eq!(body["job_id"], a.job_id.to_string());
+        assert_eq!(a.forced_pipeline, None);
+        assert_eq!(a.locked_index, None);
+        assert_eq!(a.resume, None);
+        assert_eq!(a.context.host.as_deref(), Some("http://localhost:7700"));
+        // Staged even though it is tiny: bytes never enter workflow history.
+        match &a.input {
+            PluginInput::Ref(ContentRef::Staged {
+                uri,
+                mime,
+                filename,
+            }) => {
+                assert!(uri.contains(&a.job_id.to_string()), "{uri}");
+                assert_eq!(mime.as_deref(), Some("application/zip"));
+                assert_eq!(filename.as_deref(), Some("bundle.zip"));
+            }
+            other => panic!("expected a staged ref, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_that_names_the_archive_type_takes_it_whole() {
+        let server = MockServer::start().await;
+        let mut whole = sample_pipeline("zip-inspector", None);
+        whole.trigger.as_mut().unwrap().content_types = vec!["application/zip".into()];
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pipeline": whole})))
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app.oneshot(zip_upload("/ingest")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(resp).await["pipeline_used"], "zip-inspector");
+        assert_eq!(starter.inputs().len(), 1);
+        assert!(starter.archive_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_catch_all_pipeline_does_not_swallow_archives() {
+        // `sample_pipeline` triggers on `*/*`.
+        let server = MockServer::start().await;
+        mount_resolve(&server, "catch-all", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app.oneshot(zip_upload("/ingest")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(starter.archive_inputs().len(), 1);
+        assert_eq!(starter.archive_inputs()[0].forced_pipeline, None);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_pipeline_runs_on_every_file_of_the_archive() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .and(body_partial_json(json!({"pipeline": "builtin.pdf"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pipeline": sample_pipeline("builtin.pdf", None),
+                "index_pattern": "contracts",
+            })))
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app
+            .oneshot(zip_upload("/ingest?pipeline=builtin.pdf"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(resp).await["target_index"], "contracts");
+        let forced = starter.archive_inputs()[0].forced_pipeline.clone().unwrap();
+        assert_eq!(forced.pipeline.uid, "builtin.pdf");
+        assert_eq!(forced.index_pattern.as_deref(), Some("contracts"));
+    }
+
+    #[tokio::test]
+    async fn an_index_route_locks_every_file_of_the_archive() {
+        let server = MockServer::start().await;
+        mount_resolve_none(&server).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(zip_upload("/indexes/manuals/ingest"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(resp).await["target_index"], "manuals");
+        assert_eq!(
+            starter.archive_inputs()[0].locked_index.as_deref(),
+            Some("manuals")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_url_is_expanded_by_the_worker() {
+        let server = MockServer::start().await;
+        mount_resolve_none(&server).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"url": "https://1.1.1.1/exports/dump.tar.gz"}).to_string();
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest",
+                "application/json",
+                body.into_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        match &starter.archive_inputs()[0].input {
+            PluginInput::Ref(ContentRef::Url { url, mime, .. }) => {
+                assert_eq!(url, "https://1.1.1.1/exports/dump.tar.gz");
+                assert_eq!(mime.as_deref(), Some("application/gzip"));
+            }
+            other => panic!("expected a URL ref, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forced_pipeline_without_a_destination_is_refused_up_front() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let (ct, body) = multipart_body("file", "bundle.zip", "application/zip", EMPTY_ZIP);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ingest?pipeline=builtin.pdf")
+            .header(CONTENT_TYPE, ct)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        assert!(starter.archive_inputs().is_empty());
+    }
+
+    #[test]
+    fn the_archive_target_index_is_known_only_when_shared() {
+        let forced = |fixed: Option<&str>, pattern: Option<&str>| {
+            let mut p = sample_pipeline("p", None);
+            if let Some(i) = fixed {
+                p.steps[0].config = json!({"index": i});
+            }
+            ForcedPipeline {
+                pipeline: p,
+                index_pattern: pattern.map(str::to_string),
+            }
+        };
+        assert_eq!(
+            archive_target_index(Some("l"), None, Some("q")).as_deref(),
+            Some("l")
+        );
+        assert_eq!(archive_target_index(None, None, Some("q")), None);
+        let f = forced(Some("fixed"), Some("pat"));
+        assert_eq!(
+            archive_target_index(None, Some(&f), Some("q")).as_deref(),
+            Some("fixed")
+        );
+        let f = forced(None, Some("pat"));
+        assert_eq!(
+            archive_target_index(None, Some(&f), Some("q")).as_deref(),
+            Some("pat")
+        );
+        let f = forced(None, None);
+        assert_eq!(
+            archive_target_index(None, Some(&f), Some("q")).as_deref(),
+            Some("q")
+        );
+        assert_eq!(archive_target_index(None, Some(&f), None), None);
     }
 }

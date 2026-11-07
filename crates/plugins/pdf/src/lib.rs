@@ -94,13 +94,8 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref())
+        .unwrap_or_else(|| sanitize_id(""))
 }
 
 /// Provenance metadata shared by every document produced from `blob`.

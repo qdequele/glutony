@@ -73,7 +73,8 @@ pub async fn ensure_job_visible(
     }
 }
 
-/// `GET /jobs?status=&pipeline_uid=&limit=&offset=` — recent jobs, newest first.
+/// `GET /jobs?status=&pipeline_uid=&parent_job_id=&limit=&offset=` — recent jobs, newest
+/// first. `parent_job_id` lists the file jobs of an archive job.
 ///
 /// Scoped to the caller's tenant: the `tenant_id` filter is taken from the resolved
 /// context, never from the query string, so one tenant cannot list another's jobs.
@@ -83,7 +84,7 @@ pub async fn list_jobs(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let mut query: Vec<(String, String)> = Vec::new();
-    for key in ["status", "pipeline_uid", "limit", "offset"] {
+    for key in ["status", "pipeline_uid", "parent_job_id", "limit", "offset"] {
         if let Some(v) = params.get(key) {
             query.push((key.to_string(), v.clone()));
         }

@@ -159,13 +159,8 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref())
+        .unwrap_or_else(|| sanitize_id(""))
 }
 
 /// Provenance metadata shared by every document produced from `blob`.
@@ -856,7 +851,7 @@ mod tests {
         .await;
 
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0].id, "Q3_all_hands_s1");
+        assert_eq!(docs[0].id, "decks_Q3_all_hands_s1");
         assert_eq!(docs[0].title.as_deref(), Some("Agenda"));
         assert_eq!(docs[0].meta.page, Some(1));
         assert_eq!(docs[0].meta.section.as_deref(), Some("Agenda"));
@@ -867,7 +862,7 @@ mod tests {
         assert_eq!(docs[0].meta.mime.as_deref(), Some(PPTX_MIME));
         // Bullets end up on their own lines, and `&amp;` is decoded.
         assert_eq!(docs[0].content, "Agenda\nNumbers\nRoadmap\nQ&A");
-        assert_eq!(docs[1].id, "Q3_all_hands_s2");
+        assert_eq!(docs[1].id, "decks_Q3_all_hands_s2");
         assert_eq!(docs[1].meta.page, Some(2));
         assert_eq!(docs[1].content, "Numbers\nRevenue up 12%");
     }
@@ -889,7 +884,7 @@ mod tests {
         for (i, doc) in docs.iter().enumerate() {
             let n = i + 1;
             assert_eq!(doc.meta.page, Some(n as u32), "position {i}");
-            assert_eq!(doc.id, format!("Q3_all_hands_s{n}"), "position {i}");
+            assert_eq!(doc.id, format!("decks_Q3_all_hands_s{n}"), "position {i}");
             assert_eq!(doc.title.as_deref(), Some(format!("Slide {n}").as_str()));
         }
         assert_eq!(docs[8].title.as_deref(), Some("Slide 9"));
@@ -905,7 +900,7 @@ mod tests {
         .await;
 
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].id, "Q3_all_hands");
+        assert_eq!(docs[0].id, "decks_Q3_all_hands");
         assert_eq!(docs[0].title.as_deref(), Some("One"));
         assert_eq!(docs[0].meta.page, None);
         assert_eq!(docs[0].content, "One\nfirst\n\nTwo\nsecond");

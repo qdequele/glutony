@@ -1,0 +1,149 @@
+---
+title: Archives
+description: Zip, tar and gzip uploads, ingested one job per file
+---
+
+Send a zip, a tar, a `.tar.gz` / `.tgz` or a gzipped file to any ingest route and
+every file inside it is ingested as if it had been uploaded on its own: each one is
+routed by its own type and name, runs its own pipeline and gets its own job. A
+folder of PDFs, Markdown and spreadsheets goes in as one upload.
+
+```bash
+curl -X POST $INGEST/ingest -F file=@handbook.zip
+```
+
+```json
+{
+  "job_id": "0b7c1e5a-9d4e-4f7a-8f0e-2a6b1c3d4e5f",
+  "pipeline_used": "archive",
+  "target_index": "*",
+  "status": "queued"
+}
+```
+
+`pipeline_used` is `archive`: this job runs no pipeline itself, it starts one job per
+file. `target_index` is `*` because files of different types can land in different
+indexes (PDFs in `documents`, images in `images`…). It names the index when every
+file goes to the same one: under an `/indexes/{index_uid}/…` route, or with a forced
+pipeline that fixes it.
+
+URLs and object refs work too: `{"url": "https://example.com/export.tar.gz"}` is
+fetched and expanded by the worker.
+
+## What happens
+
+1. The gateway sees an archive type (`application/zip`, `application/x-tar`,
+   `application/gzip`), stages the upload and starts an archive job, `ingest-<job_id>`
+   like any job.
+2. A worker reads the archive once and stages every file it holds in the blob store.
+   Archives nested inside it are opened too (a `.zip` inside a `.tar.gz`, say), up to
+   three levels.
+3. Files are then routed 50 at a time, exactly as the gateway routes an upload:
+   tenant pipelines first, then global ones, then built-ins. Each file runs as its own
+   `PipelineWorkflow`, under its own job id.
+4. The archive job ends when every file's job has.
+
+Office documents, EPUBs and JARs are zip files underneath. Only a file named `.zip`
+is opened as a nested archive: a `.docx` inside an archive is ingested as a Word
+document.
+
+## Folders and document ids
+
+A file's path inside the archive becomes its filename, so documents keep their
+folder in `meta.filename` (`reports/eu/q3.pdf`), and ids include it:
+`reports/eu/q3.pdf` becomes `reports_eu_q3`, so `reports/us/q3.pdf` does not
+overwrite it. Uploading the same archive again updates the same documents.
+
+## Following an archive job
+
+`GET /jobs/{job_id}` reports per-file counts under `progress.archive`:
+
+```json
+{
+  "job_id": "0b7c1e5a-9d4e-4f7a-8f0e-2a6b1c3d4e5f",
+  "status": "running",
+  "current_step": "files 51-100 of 214",
+  "progress": {
+    "status": "running",
+    "current_step": "files 51-100 of 214",
+    "completed_steps": 50,
+    "total_steps": 214,
+    "archive": {
+      "files_total": 214,
+      "files_started": 50,
+      "files_succeeded": 49,
+      "files_failed": 1,
+      "files_skipped": 3,
+      "skipped": [
+        { "path": "__build/tool.exe", "reason": "no pipeline handles application/x-msdownload" },
+        { "path": "notes/empty.md", "reason": "empty file" },
+        { "path": "link-to-etc", "reason": "symbolic link" }
+      ],
+      "failed": [
+        { "path": "scans/broken.pdf", "reason": "step extract (pdf_extractor) failed: …", "job_id": "…" }
+      ]
+    }
+  },
+  "pipeline_used": "archive"
+}
+```
+
+`skipped` and `failed` keep the first 50 entries each; the counts stay exact. Every
+file job is listed with:
+
+```bash
+curl "$INGEST/jobs?parent_job_id=0b7c1e5a-9d4e-4f7a-8f0e-2a6b1c3d4e5f"
+```
+
+The archive job **succeeds** when every file handed to a pipeline succeeded and at
+least one did. It **fails** when any file's job failed (the error names the first
+one), when no file could be ingested at all, or when the archive cannot be read.
+Skipped entries are reported but do not fail it.
+
+`POST /jobs/{job_id}/cancel` stops the archive job: no further file starts and the
+running ones are cancelled.
+
+## What is skipped
+
+| Entry | Reason |
+|---|---|
+| Directories, `__MACOSX/`, `.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini` | Dropped silently. |
+| Paths that are absolute or climb with `..` | `unsafe path` |
+| Symbolic and hard links | `symbolic link` / `link` |
+| Empty files | `empty file` |
+| Files over `ARCHIVE_MAX_FILE_MB` | `larger than … bytes` |
+| Archives nested deeper than `ARCHIVE_MAX_DEPTH` | `archive nested more than … levels deep` |
+| A nested archive that cannot be read | `not a readable … archive` |
+| Encrypted entries, or zip compression other than deflate | `unreadable: …` |
+| Types no pipeline handles | `no pipeline handles …` |
+
+Files that cannot run as asked count as **failed**, not skipped: a pipeline that
+needs a Meilisearch destination when the request named none, or a pipeline pinned to
+another index than the `/indexes/{index_uid}/…` route.
+
+## Limits
+
+An archive is refused as a whole (the job fails, nothing is ingested) when it holds
+more than `ARCHIVE_MAX_FILES` files or decompression produces more than
+`ARCHIVE_MAX_UNPACKED_MB`: a small zip can expand to terabytes. The upload itself is
+bounded by the gateway's `MAX_UPLOAD_MB`. The worker holds the archive in memory while
+it expands it, plus a few files at a time.
+
+| Variable (worker) | Default |
+|---|---|
+| `ARCHIVE_MAX_FILES` | `10000` |
+| `ARCHIVE_MAX_FILE_MB` | `512` |
+| `ARCHIVE_MAX_UNPACKED_MB` | `8192` |
+| `ARCHIVE_MAX_DEPTH` | `3` |
+
+## Choosing the pipeline
+
+| Request | Each file runs |
+|---|---|
+| `POST /ingest` | The pipeline its own type and name resolve to. |
+| `POST /ingest?pipeline=<uid>` or `POST /ingest/pipeline/<uid>` | That pipeline. |
+| `POST /indexes/{index_uid}/ingest` | Its own pipeline, into `index_uid`. |
+
+A pipeline whose trigger names an archive type itself (`content_types:
+["application/zip"]`) gets the archive whole instead, for a plugin of your own that
+reads archives. A catch-all trigger such as `*/*` does not count.

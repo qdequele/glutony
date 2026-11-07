@@ -517,14 +517,10 @@ fn encode_wav(samples: &[f32], channels: u16, rate: u32) -> Result<Vec<u8>, Plug
     Ok(cursor.into_inner())
 }
 
-/// Filename without directories or extension, sanitized for use in an id.
+/// Filename without its extension, folders kept, sanitized for use in an id.
 fn file_stem(filename: Option<&str>) -> String {
-    let base = filename
-        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
-        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
-        .filter(|s| !s.is_empty())
-        .unwrap_or("audio");
-    meili_ingest_plugin_sdk::sanitize_id(base)
+    meili_ingest_plugin_sdk::filename_id_stem(filename)
+        .unwrap_or_else(|| meili_ingest_plugin_sdk::sanitize_id("audio"))
 }
 
 /// Lower-case file extension, used as a probe hint.

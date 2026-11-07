@@ -398,13 +398,7 @@ fn document_from_text(blob: meili_ingest_plugin_sdk::Blob) -> Result<Document, P
                 .to_string(),
         )
     })?;
-    let stem = blob
-        .filename
-        .as_deref()
-        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
-        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
-        .filter(|s| !s.is_empty())
-        .map(meili_ingest_plugin_sdk::sanitize_id);
+    let stem = meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref());
     let mut doc = match stem {
         Some(id) => Document::with_id(id, content),
         None => Document::new(content),

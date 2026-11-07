@@ -103,6 +103,15 @@ paths:
         Accepts a multipart upload, a JSON body (URL / S3 / inline documents) or a
         raw binary body. The pipeline is chosen from the detected MIME type and
         filename; the target index from the [index resolution chain](#).
+
+        An archive (zip, tar, gzip, `.tar.gz`) starts an archive job instead: the
+        worker expands it and ingests every file it holds as its own job, routed by
+        the file's own type and name. The response's `pipeline_used` is `archive` and
+        its `target_index` is `*` unless every file goes to one index (an
+        `/indexes/{index_uid}/…` route, or a forced pipeline that fixes it).
+        `GET /jobs/{job_id}` reports per-file counts under `progress.archive`, and
+        `GET /jobs?parent_job_id=` lists the file jobs. A pipeline whose trigger
+        names the archive type itself (`application/zip`, …) takes the archive whole.
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -213,6 +222,10 @@ paths:
         Same body formats as `POST /ingest`, but the pipeline is chosen by `name`
         (a pipeline `uid`, e.g. `builtin.pdf` or `my-pdf-with-enrichment`).
         MIME detection still runs to fill document metadata.
+
+        An archive is expanded and every file it holds runs through this pipeline,
+        unless the pipeline's trigger names the archive type, in which case it gets
+        the archive whole.
       parameters:
         - name: name
           in: path
@@ -425,6 +438,10 @@ paths:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - { name: status, in: query, schema: { $ref: "#/components/schemas/JobStatus" } }
         - { name: pipeline_uid, in: query, schema: { type: string } }
+        - name: parent_job_id
+          in: query
+          description: Only the file jobs of this archive job.
+          schema: { type: string, format: uuid }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
       responses:
@@ -1507,6 +1524,10 @@ components:
         started_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         source_id: { type: string, format: uuid }
+        parent_job_id:
+          type: string
+          format: uuid
+          description: The archive job this job ingests one file of. Absent for other jobs.
     JobList:
       type: object
       required: [jobs, limit, offset, total]
@@ -1667,11 +1688,15 @@ components:
           format: uuid
         pipeline_used:
           type: string
-          description: "`uid` of the pipeline that will run."
+          description: |
+            `uid` of the pipeline that will run; `archive` for an archive job, whose
+            files each get their own job and pipeline.
           example: builtin.pdf
         target_index:
           type: string
-          description: Fully resolved Meilisearch index name.
+          description: |
+            Fully resolved Meilisearch index name; `*` for an archive whose files may
+            land in several indexes.
           example: documents
         status:
           $ref: "#/components/schemas/JobStatus"
@@ -1737,6 +1762,58 @@ components:
         cancel_requested:
           type: boolean
           default: false
+        archive:
+          $ref: "#/components/schemas/ArchiveProgress"
+
+    ArchiveProgress:
+      type: object
+      description: |
+        Per-file counts of an archive job. The job succeeds when every file handed
+        to a pipeline succeeded and at least one did; skipped entries do not fail it.
+      required: [files_total, files_started, files_succeeded, files_failed, files_skipped]
+      properties:
+        files_total:
+          type: integer
+          minimum: 0
+          description: Files found, nested archives included, skipped entries excluded.
+        files_started:
+          type: integer
+          minimum: 0
+        files_succeeded:
+          type: integer
+          minimum: 0
+        files_failed:
+          type: integer
+          minimum: 0
+          description: Files whose job failed or that could not get one (no destination, wrong index).
+        files_skipped:
+          type: integer
+          minimum: 0
+          description: |
+            Entries not ingested: unsafe paths, links, empty or oversized files,
+            archives nested too deep, types no pipeline handles.
+        skipped:
+          type: array
+          description: The first 50 skipped entries.
+          items: { $ref: "#/components/schemas/ArchiveFileIssue" }
+        failed:
+          type: array
+          description: The first 50 failed files.
+          items: { $ref: "#/components/schemas/ArchiveFileIssue" }
+
+    ArchiveFileIssue:
+      type: object
+      required: [path, reason]
+      properties:
+        path:
+          type: string
+          description: Path inside the archive (`reports/eu/a.pdf`).
+        reason:
+          type: string
+        job_id:
+          type: string
+          format: uuid
+          description: The file's job, when it got one.
 
     CancelJobResponse:
       type: object
