@@ -169,6 +169,11 @@ table with `FINAL`: redelivered rows are collapsed before they are counted, and 
 no hourly lag. The tenant and dates are bound as typed query parameters. Before the
 first row is written (no table yet) it answers an empty list.
 
+With either store, usage is recorded when a job finishes, so only jobs that finish after
+the store is configured are counted. Nothing is backfilled: older jobs, succeeded or
+failed, still appear in `GET /jobs` but not in `GET /usage`, and a usage total for a
+period that starts before the store was set up is lower than the job count.
+
 ## Usage data is not monitoring
 
 These two answer different questions and must stay separate. Prometheus answers "is the

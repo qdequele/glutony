@@ -94,7 +94,8 @@ pub struct DocumentMeta {
 ///
 /// `fields` carries arbitrary structured attributes (CSV columns, JSON keys, LLM
 /// extractions). When indexed, the document is flattened as
-/// `{ id, title?, content, ...fields, _meta: { ... } }`.
+/// `{ id, title?, content, ...fields, _meta: { ... } }`, with `_meta` left out
+/// when the document carries no metadata.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     /// Stable identifier. Must be Meilisearch-safe (`[a-zA-Z0-9_-]`, ≤ 511 bytes).
@@ -148,10 +149,13 @@ impl Document {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        obj.insert(
-            "_meta".into(),
-            serde_json::to_value(&self.meta).unwrap_or(serde_json::Value::Null),
-        );
+        // No provenance at all (e.g. JSON records) → no `_meta` key, rather than an
+        // empty `_meta: {}` on every document.
+        if self.meta != DocumentMeta::default()
+            && let Ok(meta) = serde_json::to_value(&self.meta)
+        {
+            obj.insert("_meta".into(), meta);
+        }
         serde_json::Value::Object(obj)
     }
 }
@@ -2047,6 +2051,15 @@ steps:
         assert_eq!(v["content"], "hello");
         assert_eq!(v["price"], 3);
         assert_eq!(v["_meta"]["page"], 2);
+    }
+
+    #[test]
+    fn document_index_json_omits_empty_meta() {
+        let mut d = Document::with_id("doc", "hello");
+        d.fields.insert("_meta".into(), serde_json::json!({"x": 1}));
+        let v = d.to_index_json();
+        assert!(v.get("_meta").is_none(), "{v}");
+        assert_eq!(v.as_object().unwrap().len(), 2);
     }
 
     #[test]

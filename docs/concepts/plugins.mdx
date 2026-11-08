@@ -72,7 +72,7 @@ pub enum PluginOutput { Bytes(Blob), Ref(ContentRef), Documents(Vec<Document>), 
 }
 ```
 
-When indexed it is flattened to `{ id, title?, content, ...fields, _meta: {...} }`.
+When indexed it is flattened to `{ id, title?, content, ...fields, _meta: {...} }`; `_meta` is left out when the document has no metadata.
 Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes).
 
 ## ActivityContext
