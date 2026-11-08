@@ -7,6 +7,13 @@ name: Release
 # then notifies meilisearch/lab (`glutony-released`) so its Contracts sync
 # re-vendors docs/openapi.yaml (only with the LAB_DISPATCH_TOKEN secret).
 #
+# Nothing is published until the `verify` job has checked the tagged tree is
+# the release the tag names (scripts/prepare-release.sh --verify-tag): a tag
+# made without merging the release PR, pushed by hand or created from the
+# GitHub "Draft a new release" form, stops there: no image, no `latest`, no
+# Lab dispatch (a release published from that form stays, without an image).
+# That is how v0.2.0 shipped a 0.1.0 tree as `0.2.0` and `latest`.
+#
 # Production on the Lab's box does not deploy these images: it builds every
 # green `main` commit from source (qdq-server glutony/autodeploy.sh).
 
@@ -30,11 +37,21 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  verify:
+    name: verify the tag is a prepared release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - run: scripts/prepare-release.sh --verify-tag "$RELEASE_TAG"
+
   # One native build per architecture (no QEMU: an emulated release build of this
   # workspace takes hours), each pushed by digest, then merged into one multi-arch tag.
   # linux/arm64 is what AWS Graviton runs.
   build:
     name: Build ${{ matrix.platform }}
+    needs: [verify]
     strategy:
       fail-fast: true
       matrix:

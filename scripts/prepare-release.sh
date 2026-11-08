@@ -8,6 +8,8 @@
 #                                              prepare that release
 #   scripts/prepare-release.sh --check         fail when Cargo.toml, Cargo.lock and docs/openapi.yaml disagree
 #   scripts/prepare-release.sh --notes X.Y.Z   print the CHANGELOG section of X.Y.Z
+#   scripts/prepare-release.sh --verify-tag vX.Y.Z
+#                                              fail unless the tree is a consistent X.Y.Z release
 #
 # A release edits, together or not at all:
 #   1. Cargo.toml `[workspace.package] version`, the `version` of the internal
@@ -41,7 +43,7 @@ SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 die() { echo "prepare-release: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- readers -----------------------------------------------------------------
@@ -355,11 +357,33 @@ cmd_notes() {
   section_body "$ver" | awk 'NF { started = 1 } started { buf[++n] = $0 } END { while (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--; for (i = 1; i <= n; i++) print buf[i] }'
 }
 
+# The gate release.yml runs on the tagged tree before publishing anything: the
+# version copies agree (--check), the crate version is the tag's, and the
+# CHANGELOG has the tag's section. A tag made without the release PR (pushed
+# by hand, or created from the GitHub "Draft a new release" form) fails here.
+cmd_verify_tag() {
+  local tag="$1" ver crate
+  ver="${tag#v}"
+  [ "$ver" != "$tag" ] && [[ "$ver" =~ $SEMVER_RE ]] || die "--verify-tag needs vX.Y.Z, got '$tag'"
+  cmd_check >/dev/null || die "the version copies at $tag disagree (see above)"
+  crate="$(crate_version)"
+  if [ "$crate" != "$ver" ]; then
+    echo "::error file=$CARGO_TOML::tag $tag but the crate version is '$crate': the tag was not made by merging a 'chore(release): $tag' PR" >&2
+    die "tag $tag does not match the crate version $crate"
+  fi
+  if ! has_section "$ver"; then
+    echo "::error file=$CHANGELOG::tag $tag but $CHANGELOG has no [$ver] section" >&2
+    die "no [$ver] section in $CHANGELOG"
+  fi
+  echo "$tag matches the crate version and has a CHANGELOG section"
+}
+
 case "${1:-}" in
   "") cmd_suggest ;;
   -h | --help) usage ;;
   --check) cmd_check ;;
   --notes) cmd_notes "${2:-}" ;;
+  --verify-tag) cmd_verify_tag "${2:-}" ;;
   -*) usage >&2; exit 2 ;;
   *)
     [ "$#" -eq 1 ] || { usage >&2; exit 2; }
