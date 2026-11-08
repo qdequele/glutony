@@ -55,7 +55,12 @@ makes (re-running it is safe: bumps count from the last tag).
 
 A tag pushed with `GITHUB_TOKEN` triggers no workflow, so
 `release-on-merge.yml` calls `release.yml` as a reusable workflow; a tag pushed
-by hand still runs `release.yml` (recovery only).
+by hand still runs `release.yml` (recovery only). Either way `release.yml`
+publishes nothing unless `scripts/prepare-release.sh --verify-tag vX.Y.Z`
+passes on the tagged tree: the crate version is `X.Y.Z`, every copy agrees and
+`CHANGELOG.md` has the `[X.Y.Z]` section. So never create a release or tag from
+GitHub's "Draft a new release" form: it tags `main` as it is, unbumped.
+`scripts/test-prepare-release.sh` tests the script (CI's `version sync` job).
 
 Repository setup: Settings > Actions > General > "Allow GitHub Actions to
 create and approve pull requests". Optional secret `LAB_DISPATCH_TOKEN`: a

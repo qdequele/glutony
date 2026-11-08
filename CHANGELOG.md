@@ -35,6 +35,12 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   passed to the gateway by the Kubernetes manifests (`k8s/gateway.yaml`, optional key of
   `meili-ingest-secrets`) and by `compose.yaml`. Without it the Lab's Pipelines Usage
   page reports "no usage metering configured".
+- A release tag that was not made by merging a `chore(release): vX.Y.Z` PR no longer
+  publishes anything: `release.yml` first checks the tagged tree
+  (`scripts/prepare-release.sh --verify-tag`: the crate version is the tag's, every
+  version copy agrees, and `CHANGELOG.md` has the tag's section) before it builds or
+  pushes an image, moves `latest`, creates the release or notifies the Lab. `v0.2.0`,
+  created from the GitHub release form on a `0.1.0` tree, would have stopped there.
 
 ### Changed
 - Document ids built from a filename keep its folders: `reports/eu/q3.pdf` gives

@@ -19,12 +19,14 @@ concurrency:
 jobs:
   # The release invariant: the crate version (Cargo.toml package and pinned
   # path dependencies, Cargo.lock) and docs/openapi.yaml info.version agree.
+  # Also tests the release script itself (scripts/test-prepare-release.sh).
   version-sync:
     name: version sync
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: scripts/prepare-release.sh --check
+      - run: scripts/test-prepare-release.sh
 
   fmt:
     name: rustfmt
