@@ -85,6 +85,7 @@ impl ResolveRuntime {
     pub fn http_client() -> reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .user_agent(crate::USER_AGENT)
             .build()
             .unwrap_or_default()
     }

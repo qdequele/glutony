@@ -896,6 +896,9 @@ pub struct AppState {
     pub schedules: Arc<dyn crate::schedules::ScheduleClient>,
     /// Which hosts a source may fetch from (`SOURCE_FETCH_HOSTS`), checked on save.
     pub fetch_policy: meili_ingest_source::HostPolicy,
+    /// Client for probing the type of an ingest URL whose name says nothing. Follows no
+    /// redirect on its own, so `fetch_policy` sees every hop.
+    pub probe_http: reqwest::Client,
     /// The Lab, when this deployment reports to one (`LAB_URL` + `LAB_INSTANCE_*`).
     pub lab: Option<Arc<crate::lab::LabClient>>,
 }
@@ -931,6 +934,7 @@ impl AppState {
             connections: crate::connections::ConnectionConfig::default(),
             schedules: Arc::new(crate::schedules::DisabledSchedules),
             fetch_policy: meili_ingest_source::HostPolicy::default(),
+            probe_http: meili_ingest_source::ResolveRuntime::http_client(),
             lab: None,
         }
     }

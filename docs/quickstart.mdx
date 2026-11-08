@@ -85,10 +85,14 @@ curl --data-binary @document.pdf -H "Content-Type: application/pdf" \
 ```
 ```bash Batch
 curl -H "Content-Type: application/json" \
-     -d '{"items":[{"url":"https://example.com/a.pdf"},{"s3":"s3://bucket/b.mp4"}]}' \
+     -d '{"items":[{"url":"https://example.com/a.pdf","index":"contracts"},{"s3":"s3://bucket/b.mp4"}]}' \
      http://localhost:8080/ingest/batch
 ```
 </CodeGroup>
+
+A batch item may name its own `index` and `pipeline`. A URL or object ref whose name
+has no extension (`https://example.com/`) takes a `content_type` hint; without one,
+the gateway asks the URL's server for its type before routing it.
 
 ## 3. Follow the job
 

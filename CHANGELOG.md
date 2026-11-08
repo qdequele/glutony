@@ -27,6 +27,20 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   stores is refused at boot.
 
 ### Fixed
+- A batch item's `index` and `pipeline` are honoured. They were dropped without a
+  word, so `{"items": [{"url": …, "index": "pdfs"}]}` wrote into the default index
+  (`documents`, `datasets`, …) instead; the Lab's `pipelines_ingest_batch` tool
+  offers both per item. An item's own value wins over the batch's; the index of an
+  `/indexes/{index_uid}/…` path still wins over both.
+- A URL whose name says nothing about its type (`https://example.com/`,
+  `https://api.example.com/users`) can be ingested: it was refused with
+  `unsupported_media_type` (`application/octet-stream`). The gateway now reads a
+  `content_type` hint on `url` and `s3` refs (JSON key or multipart field, also per
+  batch item), and without one asks the URL's server (`HEAD`, falling back to a `GET`
+  whose body is not read, each hop under `SOURCE_FETCH_HOSTS`).
+- URL ingests and scheduled sources send a `User-Agent`
+  (`meili-ingest/<version> (+https://github.com/qdequele/glutony)`). Without one,
+  Wikimedia and several CDNs answer `403`, which failed the job's first step.
 - Documents fetched from two places whose last path segment matches no longer
   overwrite each other. Generated ids (the ones made when the content has no id of
   its own) were built from the filename alone, which for a URL ingest or a

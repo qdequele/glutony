@@ -6,6 +6,8 @@ use futures::StreamExt as _;
 
 use crate::SourceError;
 use crate::connector::{Resolution, ResolveRuntime, ResolvedItem, SourceConnector};
+use crate::guard::UrlGuard;
+use crate::host_policy::HostPolicy;
 use crate::model::{FetchAuth, IncrementalState, Location};
 use crate::template::render;
 
@@ -168,6 +170,62 @@ impl SourceConnector for UrlConnector {
             },
         })
     }
+}
+
+/// Learn the media type behind `url` without downloading it, for a URL whose name says
+/// nothing (`https://example.com/`, `/api/users`).
+///
+/// Sends a `HEAD`, then a `GET` whose body is never read when the `HEAD` fails or names
+/// no type (some servers refuse `HEAD`). Redirects are followed here, not by `http`, so
+/// `policy` sees every hop, as in [`UrlConnector`]. `Ok(None)` when the server names no
+/// type, only `application/octet-stream`, or answers with an error; a hop refused by
+/// `policy` is an error.
+pub async fn probe_content_type(
+    http: &reqwest::Client,
+    policy: Option<&HostPolicy>,
+    url: &url::Url,
+    limits: &UrlGuard,
+) -> Result<Option<String>, SourceError> {
+    for method in [reqwest::Method::HEAD, reqwest::Method::GET] {
+        let mut current = url.clone();
+        let mut hops = 0usize;
+        let response = loop {
+            if let Some(policy) = policy {
+                policy.check(&current).await?;
+            }
+            let sent = http
+                .request(method.clone(), current.clone())
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+            let Ok(response) = sent else { break None };
+            let status = response.status();
+            if !status.is_redirection() {
+                break Some(response);
+            }
+            let next = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|location| current.join(location).ok());
+            match next {
+                Some(next) if hops < limits.max_redirects => {
+                    current = next;
+                    hops += 1;
+                }
+                _ => break None,
+            }
+        };
+        let mime = response
+            .filter(|r| r.status().is_success())
+            .and_then(|r| header_string(&r, reqwest::header::CONTENT_TYPE))
+            .and_then(|ct| ct.split(';').next().map(|s| s.trim().to_ascii_lowercase()))
+            .filter(|m| !m.is_empty() && m != "application/octet-stream");
+        if mime.is_some() {
+            return Ok(mime);
+        }
+    }
+    Ok(None)
 }
 
 /// Attach a credential to the request.
@@ -778,5 +836,123 @@ mod tests {
             maybe_gunzip(b"plain".to_vec(), Some("a.json".into()), 1024).expect("no gzip");
         assert_eq!(bytes, b"plain");
         assert_eq!(name.as_deref(), Some("a.json"));
+    }
+
+    #[tokio::test]
+    async fn fetches_send_a_user_agent() {
+        // Wikimedia and several CDNs answer 403 to a request without one.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("user-agent", crate::USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let got = UrlConnector
+            .resolve(
+                &url_location(format!("{}/a.txt", server.uri())),
+                None,
+                &IncrementalState::default(),
+                &rt_without_guard(now()),
+            )
+            .await
+            .expect("the mock only answers a request carrying the user agent");
+        assert!(matches!(got, Resolution::Items { .. }));
+    }
+
+    #[tokio::test]
+    async fn probe_reads_the_type_from_a_head_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=UTF-8"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = url::Url::parse(&format!("{}/", server.uri())).unwrap();
+        let got = probe_content_type(
+            &ResolveRuntime::http_client(),
+            None,
+            &url,
+            &UrlGuard::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("text/html"));
+    }
+
+    #[tokio::test]
+    async fn probe_falls_back_to_get_when_head_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/users"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&server)
+            .await;
+        let url = url::Url::parse(&format!("{}/users", server.uri())).unwrap();
+        let got = probe_content_type(
+            &ResolveRuntime::http_client(),
+            None,
+            &url,
+            &UrlGuard::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn probe_knows_nothing_from_octet_stream_or_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(path("/bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("x", "application/octet-stream"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/gone"))
+            .respond_with(ResponseTemplate::new(404).set_body_raw("x", "text/html"))
+            .mount(&server)
+            .await;
+        for p in ["/bin", "/gone"] {
+            let url = url::Url::parse(&format!("{}{p}", server.uri())).unwrap();
+            let got = probe_content_type(
+                &ResolveRuntime::http_client(),
+                None,
+                &url,
+                &UrlGuard::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, None, "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_checks_every_redirect_hop_against_the_policy() {
+        let allowed = MockServer::start().await;
+        let other = MockServer::start().await;
+        Mock::given(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/elsewhere", other.uri()).as_str()),
+            )
+            .mount(&allowed)
+            .await;
+        Mock::given(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/html"))
+            .expect(0)
+            .mount(&other)
+            .await;
+        let rt = rt_allowing(&[&allowed]);
+        let url = url::Url::parse(&format!("{}/start", allowed.uri())).unwrap();
+        let err = probe_content_type(&rt.http, rt.policy.as_ref(), &url, &rt.limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::Blocked(_)), "{err:?}");
     }
 }

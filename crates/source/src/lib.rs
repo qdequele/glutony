@@ -30,7 +30,15 @@ pub use model::{
 };
 pub use secret::{SecretKey, open_json, seal_json};
 pub use template::render;
-pub use url::UrlConnector;
+pub use url::{UrlConnector, probe_content_type};
+
+/// `User-Agent` sent with every fetch. Several hosts (Wikimedia, some CDNs) answer `403`
+/// to a request that carries none, which reqwest sends by default.
+pub const USER_AGENT: &str = concat!(
+    "meili-ingest/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/qdequele/glutony)"
+);
 
 /// Errors produced while handling a source.
 #[derive(Debug, thiserror::Error)]
