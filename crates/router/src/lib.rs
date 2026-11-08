@@ -339,6 +339,15 @@ fn detect_mime_raw(data: &[u8], filename: Option<&str>, content_type_hint: Optio
     OCTET_STREAM.to_owned()
 }
 
+/// The MIME a filename's extension names, canonicalised; `None` when it names none.
+///
+/// Step 2 of [`detect_mime`], for content that is not in hand yet (a URL or object
+/// ref routed before the worker fetches it), so `.avro`, `.msgpack` and `.m4a` route
+/// the same whether the bytes were uploaded or are fetched later.
+pub fn mime_from_filename(filename: &str) -> Option<String> {
+    mime_from_extension(filename).map(|m| canonical_mime(&m).to_owned())
+}
+
 /// MIME from a filename's extension, with a few overrides on top of `mime_guess`.
 fn mime_from_extension(filename: &str) -> Option<String> {
     let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
@@ -1417,6 +1426,16 @@ mod tests {
         // Alias spellings collapse onto the canonical names.
         assert_eq!(canonical_mime("application/x-parquet"), mime::PARQUET);
         assert_eq!(canonical_mime("avro/binary"), mime::AVRO);
+        assert_eq!(
+            mime_from_filename("weather.avro").as_deref(),
+            Some(mime::AVRO)
+        );
+        assert_eq!(
+            mime_from_filename("dir/cases.msgpack").as_deref(),
+            Some(mime::MSGPACK)
+        );
+        assert_eq!(mime_from_filename("talk.m4a").as_deref(), Some("audio/mp4"));
+        assert_eq!(mime_from_filename("users"), None);
         assert_eq!(canonical_mime("application/msgpack"), mime::MSGPACK);
     }
 

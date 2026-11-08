@@ -3363,7 +3363,6 @@ dependencies = [
  "meili-ingest-router",
  "meili-ingest-source",
  "meili-ingest-usage",
- "mime_guess",
  "regex",
  "reqwest 0.13.5",
  "serde",

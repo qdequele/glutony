@@ -87,8 +87,7 @@ impl IngestPayload {
             IngestPayload::Url { content_type, .. } | IngestPayload::S3 { content_type, .. } => {
                 Some(
                     self.filename()
-                        .and_then(|n| mime_guess::from_path(&n).first_raw())
-                        .map(str::to_string)
+                        .and_then(|n| meili_ingest_router::mime_from_filename(&n))
                         .or_else(|| content_type.as_deref().and_then(mime_hint))
                         .unwrap_or_else(|| "application/octet-stream".to_string()),
                 )
@@ -670,6 +669,20 @@ mod tests {
         assert_eq!(items[0].pipeline.as_deref(), Some("p"));
         assert_eq!(items[1].index, None);
         assert_eq!(e.index.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn refs_route_by_the_router_s_extension_table() {
+        // `mime_guess` knows neither `.avro` nor `.msgpack`: URLs to them were a 415
+        // although `builtin.avro` and `builtin.msgpack` exist.
+        for (url, mime) in [
+            ("https://e.com/weather.avro", "application/vnd.apache.avro"),
+            ("https://e.com/cases.msgpack", "application/vnd.msgpack"),
+            ("https://e.com/talk.m4a", "audio/mp4"),
+        ] {
+            let e = payload_from_json(json!({ "url": url })).unwrap();
+            assert_eq!(e.payload.mime().as_deref(), Some(mime), "{url}");
+        }
     }
 
     #[test]

@@ -45,7 +45,9 @@
 //!
 //! Behind the Meilisearch Lab the worker attaches the team's [`AiTarget`] (its hosted
 //! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
-//! plugin posts to `{target.base_url}/systemone` instead of the env-configured API, with
+//! plugin posts to `{target.base_url}/decisions` instead of the env-configured API (the
+//! Gateway's decisions route, which takes the TypeSafe format and answers in it; its old
+//! `/v1/systemone` alias is gone and answers `404 LM-1003`), with
 //! the target's `decision_model` (falling back to [`DEFAULT_MODEL`]; a step's
 //! `config.model` still wins), and even a [`JevEnricherPlugin::disabled`] instance works.
 //! A Gateway 401 marks the target rejected and is retried with a fresh key; a 402 means
@@ -593,14 +595,20 @@ impl JevClient {
         Ok(doc)
     }
 
-    /// POST `{base_url}/systemone`.
+    /// POST `{base_url}/systemone` to TypeSafe, `{base_url}/decisions` to the Lab's
+    /// Gateway.
     ///
     /// 429 / 5xx (incl. Jev's 529 "overloaded") / transport errors → `Retryable`;
     /// 401 / 403 → `NonRetryable` (credentials); 400 / 422 → `NonRetryable` with the
     /// body; other statuses → `NonRetryable`. With the Lab's target, a Gateway refusal
     /// (401 / 402) is mapped by [`gateway_failure`] first.
     async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, PluginError> {
-        let url = format!("{}/systemone", self.base_url);
+        let route = if self.lab.is_some() {
+            "decisions"
+        } else {
+            "systemone"
+        };
+        let url = format!("{}/{route}", self.base_url);
         let resp = self
             .http
             .post(&url)
@@ -1350,7 +1358,7 @@ mod tests {
             .await;
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/v1/decisions"))
             .and(header("authorization", "Bearer lab-key"))
             .and(body_partial_json(
                 serde_json::json!({"model": "lab-decision"}),
@@ -1362,6 +1370,31 @@ mod tests {
 
         let ctx = ctx_with_target(lab_target(&lab, Some("lab-decision")));
         let out = run_with(&plugin(&env), &ctx, three_questions())
+            .await
+            .unwrap();
+        assert_eq!(out[0].fields["category"], "api");
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_is_called_on_decisions_not_systemone() {
+        // The hosted Gateway (LUMEN >= 0.7) answers `/v1/systemone` with 404 LM-1003:
+        // every Jev step of a Lab team failed.
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {"code": "LM-1003", "message": "no route matches the request method and path"}
+            })))
+            .mount(&lab)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/decisions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, None));
+        let out = run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
             .await
             .unwrap();
         assert_eq!(out[0].fields["category"], "api");
@@ -1409,7 +1442,7 @@ mod tests {
     async fn jev_enricher_disabled_works_with_a_lab_target() {
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/v1/decisions"))
             .and(header("authorization", "Bearer lab-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
             .expect(1)
@@ -1525,7 +1558,7 @@ mod tests {
     async fn the_lab_gateway_gets_the_prefixed_jev_id() {
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/v1/decisions"))
             .and(body_partial_json(
                 serde_json::json!({ "model": "typesafe/jev" }),
             ))
