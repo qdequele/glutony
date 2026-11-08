@@ -10,7 +10,16 @@ block; every key is optional unless stated otherwise.
 <Note>
 Documents produced by extractors set `meta.source`, `meta.filename` and
 `meta.mime` from the input blob, and derive ids from the sanitised filename
-plus a page/row suffix (`report_pdf_p3`, `data_csv_r42`).
+without its extension plus a page/row suffix (`report_p3`, `data_r42`).
+
+Content fetched rather than uploaded (a URL or object-ref ingest, a scheduled
+source, and the files of such an archive) also carries a 12-character hash of
+where it came from: `https://a.example/export/data.json` gives `data_<hash>_0`,
+so another URL or source ending in `data.json` never overwrites its documents.
+The hash is of the URL without its query string (a pre-signed link keeps its ids
+when its signature changes), of the object URI, or of the source's project and
+`uid` (a templated source URL keeps its ids from run to run). A document's own
+id (`id_field`, `id_column`) is always kept as is.
 
 `csv_parser` additionally stores the 1-based row number in a `_row` field. The
 parsers that decode to JSON first — `json_flattener`, `msgpack_parser`,

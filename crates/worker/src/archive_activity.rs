@@ -255,7 +255,12 @@ impl ArchiveActivities {
                 ))
             })?;
 
-        let Blob { data, filename, .. } = blob;
+        let Blob {
+            data,
+            filename,
+            origin,
+            ..
+        } = blob;
         let limits = self.limits.clone();
         // Small buffer: at most a few files are held in memory between the walk and
         // the blob store.
@@ -280,7 +285,14 @@ impl ArchiveActivities {
                     // in different folders get different ids.
                     let staged = self
                         .blob()
-                        .stage_upload(job_id, Blob::new(data, mime.clone(), Some(path.clone())), 0)
+                        .stage_upload(
+                            job_id,
+                            // A fetched archive's files keep its origin: their ids are
+                            // tagged with it like the archive's own would be.
+                            Blob::new(data, mime.clone(), Some(path.clone()))
+                                .with_origin(origin.clone()),
+                            0,
+                        )
                         .await
                         .map_err(|e| from_blob_error("staging a file of the archive", e))?;
                     entries.push(ManifestEntry {
@@ -689,6 +701,37 @@ mod tests {
             .unwrap();
         assert_eq!(blob.data, b"%PDF-1.7 us");
         assert_eq!(blob.filename.as_deref(), Some("reports/us/a.pdf"));
+    }
+
+    #[tokio::test]
+    async fn the_files_of_a_fetched_archive_keep_its_origin() {
+        // `https://a.example/q3.zip` and `https://b.example/q3.zip` both hold
+        // `report.pdf`: the origin is what keeps their documents apart.
+        let a = activities("http://unused");
+        let job_id = Uuid::new_v4();
+        let archive = Blob::new(
+            zip_of(&[("report.pdf", b"%PDF-1.7")]),
+            "application/zip",
+            Some("q3.zip".into()),
+        )
+        .with_origin(Some("https://a.example/q3.zip".into()));
+        let input = a.blob().stage_upload(job_id, archive, 0).await.unwrap();
+        let out = a
+            .expand(&ExpandArchiveInput { job_id, input })
+            .await
+            .unwrap();
+        let entries: Vec<ManifestEntry> =
+            serde_json::from_slice(&a.blob().get(&out.manifest).await.unwrap()).unwrap();
+        let PluginInput::Ref(r) = &entries[0].input else {
+            panic!("expected a staged ref, got {:?}", entries[0].input);
+        };
+        let blob = a
+            .blob()
+            .fetch_ref(r, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(blob.origin.as_deref(), Some("https://a.example/q3.zip"));
+        assert_eq!(blob.filename.as_deref(), Some("report.pdf"));
     }
 
     #[tokio::test]

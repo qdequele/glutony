@@ -371,7 +371,7 @@ impl Plugin for AvroParserPlugin {
         let cancelled = ctx.cancellation_flag();
         let roots = run_blocking(move || decode_payload(&data, max_records, &cancelled)).await??;
 
-        let stem = id_stem(blob.filename.as_deref(), "avro");
+        let stem = id_stem(&blob, "avro");
         let meta = DocumentMeta {
             source: blob.filename.clone(),
             filename: blob.filename.clone(),

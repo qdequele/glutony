@@ -177,6 +177,13 @@ struct SourceRow {
 }
 
 /// Map a connector error onto retry semantics: what retrying cannot fix fails now.
+/// The [`Blob::origin`] of everything a source fetches: its scope and handle, which
+/// together are unique and survive edits to the URL. Not the URL itself: a templated
+/// URL (`export-{date}.json`) changes every run, and its documents must keep their ids.
+pub(crate) fn source_origin(tenant_id: Option<&str>, uid: &str) -> String {
+    format!("source:{}/{uid}", tenant_id.unwrap_or(""))
+}
+
 fn from_source_error(e: SourceError) -> PluginError {
     match e {
         SourceError::Fetch(m) | SourceError::Dns(m) => PluginError::Retryable(m),
@@ -423,10 +430,15 @@ impl SourceActivities {
                 &item.mime,
                 &self.default_index,
             );
-            // Always staged: bytes must never enter workflow history.
+            // Always staged: bytes must never enter workflow history. The origin names
+            // the source, so its documents' generated ids are its own (two sources
+            // fetching `…/data.json` into one index no longer overwrite each other)
+            // and stay the same from run to run, even when the URL is templated.
+            let blob = Blob::new(item.bytes, item.mime, item.filename)
+                .with_origin(Some(source_origin(d.tenant_id.as_deref(), &d.uid)));
             let staged = self
                 .blob
-                .stage_upload(job_id, Blob::new(item.bytes, item.mime, item.filename), 0)
+                .stage_upload(job_id, blob, 0)
                 .await
                 .map_err(|e| PluginError::Retryable(format!("staging a fetched item: {e}")))?;
             let context = MeiliContext {
@@ -725,10 +737,12 @@ mod tests {
         };
         assert_eq!(jobs.len(), 1, "one URL is one item");
         let job = &jobs[0].workflow_input;
-        assert!(matches!(
-            job.input,
-            PluginInput::Ref(ContentRef::Staged { .. })
-        ));
+        let PluginInput::Ref(ContentRef::Staged { origin, .. }) = &job.input else {
+            panic!("expected a staged ref, got {:?}", job.input);
+        };
+        // The source, not the templated URL: tomorrow's `movie_ids_09_13_2026.json`
+        // keeps the same origin, so its documents keep their ids.
+        assert_eq!(origin.as_deref(), Some("source:tenant-1/tmdb"));
         assert_eq!(
             job.context.index.as_deref(),
             Some("movies"),

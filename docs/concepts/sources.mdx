@@ -116,6 +116,22 @@ the one it replaces.
 An unknown token or a bad format is rejected when the source is saved, not at
 3 a.m. on the first run.
 
+## Document ids
+
+A document that carries its own id (`id_field` / `id_column`, `id` by default)
+keeps it. Otherwise its id is generated from the fetched file's name, the
+source and the document's position, for instance `json_<hash>_0` for the first
+record of `https://httpbin.org/json`. The hash names the source (its project and
+`uid`), not the URL, so:
+
+- every run of a source rewrites the same ids, even when its URL is templated
+  (`movie_ids_{{ date:%m_%d_%Y }}.json`): documents are replaced, not duplicated;
+- two sources whose URLs end with the same name (`…/export/data.json`,
+  `…/v2/data.json`) never overwrite each other in a shared index.
+
+A run that produces fewer documents than the previous one leaves the extra ones
+in place: delete them, or give the content an id of its own.
+
 ## Runs and change detection
 
 Each tick is one **run**, listed newest first:

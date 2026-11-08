@@ -135,8 +135,8 @@ fn typed_cell(cell: &str) -> Value {
 }
 
 /// Filename stem used to build generated ids (`<stem>_r<n>`).
-fn id_stem(filename: Option<&str>) -> String {
-    meili_ingest_plugin_sdk::filename_id_stem(filename).unwrap_or_else(|| sanitize_id("csv"))
+fn id_stem(blob: &Blob) -> String {
+    blob.id_stem("csv")
 }
 
 fn column_name(headers: &[String], idx: usize) -> String {
@@ -267,7 +267,7 @@ impl Plugin for CsvParserPlugin {
             None => None,
         };
 
-        let stem = id_stem(blob.filename.as_deref());
+        let stem = id_stem(&blob);
         let meta = DocumentMeta {
             source: blob.filename.clone(),
             filename: blob.filename.clone(),

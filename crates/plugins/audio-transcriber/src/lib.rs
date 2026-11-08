@@ -450,8 +450,12 @@ fn base_id(blob: &Blob) -> String {
             _ => name,
         })
         .unwrap_or("");
-    // `sanitize_id("")` generates a fresh UUID, which is exactly the fallback we want.
-    sanitize_id(stem)
+    match (stem.is_empty(), blob.origin.is_some()) {
+        // `sanitize_id("")` generates a fresh UUID, which is exactly the fallback we want.
+        (true, false) => sanitize_id(""),
+        (true, true) => blob.tag_id("audio"),
+        (false, _) => blob.tag_id(sanitize_id(stem)),
+    }
 }
 
 /// Assemble the `multipart/form-data` body (`file`, `model`, `response_format` and the

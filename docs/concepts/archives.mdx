@@ -53,6 +53,8 @@ A file's path inside the archive becomes its filename, so documents keep their
 folder in `meta.filename` (`reports/eu/q3.pdf`), and ids include it:
 `reports/eu/q3.pdf` becomes `reports_eu_q3`, so `reports/us/q3.pdf` does not
 overwrite it. Uploading the same archive again updates the same documents.
+The files of an archive fetched by URL or by a source also carry that origin's
+hash, like any fetched file ([Built-in plugins](/plugins/built-in)).
 
 ## Following an archive job
 
