@@ -27,6 +27,22 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   stores is refused at boot.
 
 ### Fixed
+- Documents fetched from two places whose last path segment matches no longer
+  overwrite each other. Generated ids (the ones made when the content has no id of
+  its own) were built from the filename alone, which for a URL ingest or a
+  scheduled source is the URL's last segment: `https://a.example/export/data.json`
+  and `https://b.example/v2/data.json` both wrote `data_0`, `data_1`, ... into a
+  shared index, and `https://httpbin.org/json` wrote `json_0`. Fetched content now
+  adds a 12-character hash of its origin: `data_<hash>_0`. The origin is the URL
+  without its query string for URL ingests, the URI for object refs, and the
+  source's project and `uid` for scheduled sources, so re-ingesting the same URL
+  or re-running a source (templated URL included) keeps replacing the same
+  documents. Uploads and documents with their own id (`id_field`, `id_column`)
+  keep the ids they had.
+  **Upgrading**: the next run of a source, or ingest of a URL, whose documents
+  have generated ids writes them under the new ids and leaves the ones written
+  before in the index. Delete those (their ids have no hash: `data_0`, `report_p3`)
+  or empty the index and run the source again.
 - `meili_indexer` no longer writes an empty `_meta: {}` into documents that carry no
   metadata (JSON records, for instance): `_meta` is sent only when it has a value.
   Documents already indexed keep their empty `_meta` until they are re-ingested.

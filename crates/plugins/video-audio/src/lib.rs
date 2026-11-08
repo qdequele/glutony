@@ -208,6 +208,7 @@ impl Plugin for VideoAudioExtractorPlugin {
         ctx.check_cancelled()?;
 
         let stem = file_stem(blob.filename.as_deref());
+        let origin = blob.origin.clone();
         let extension = extension(blob.filename.as_deref());
         ctx.heartbeat(format!("decoding {} bytes of {mime}", blob.data.len()));
 
@@ -282,11 +283,11 @@ impl Plugin for VideoAudioExtractorPlugin {
             wav_bytes = wav.len(),
             "extracted audio"
         );
-        Ok(PluginOutput::Bytes(Blob::new(
-            wav,
-            "audio/wav",
-            Some(format!("{stem}.wav")),
-        )))
+        // The extracted audio keeps the video's origin, so the transcript's ids are
+        // tagged like the video's would be.
+        Ok(PluginOutput::Bytes(
+            Blob::new(wav, "audio/wav", Some(format!("{stem}.wav"))).with_origin(origin),
+        ))
     }
 }
 

@@ -289,7 +289,7 @@ impl Plugin for MsgpackParserPlugin {
             roots.truncate(max);
         }
 
-        let stem = id_stem(blob.filename.as_deref(), "msgpack");
+        let stem = id_stem(&blob, "msgpack");
         let meta = DocumentMeta {
             source: blob.filename.clone(),
             filename: blob.filename.clone(),

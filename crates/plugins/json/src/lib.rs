@@ -350,12 +350,13 @@ pub fn documents_from_values(
     build_documents(ctx, items, cfg, label)
 }
 
-/// Filename stem used to build generated ids (`<stem>_<index>`).
+/// Stem used to build generated ids (`<stem>_<index>`): [`Blob::id_stem`].
 ///
 /// `fallback` names the format (`json`, `msgpack`, ...) and is used when there is
-/// no filename to derive a stem from.
-pub fn id_stem(filename: Option<&str>, fallback: &str) -> String {
-    meili_ingest_plugin_sdk::filename_id_stem(filename).unwrap_or_else(|| sanitize_id(fallback))
+/// no filename to derive a stem from. A fetched blob's stem carries its origin tag,
+/// so `https://a.example/data.json` and `https://b.example/data.json` never share ids.
+pub fn id_stem(blob: &Blob, fallback: &str) -> String {
+    blob.id_stem(fallback)
 }
 
 #[async_trait]
@@ -416,7 +417,7 @@ impl Plugin for JsonFlattenerPlugin {
         // (root value, generated id, fallbacks)
         let items: Vec<(Value, String, Fallback)> = match input {
             PluginInput::Bytes(blob) => {
-                let stem = id_stem(blob.filename.as_deref(), "json");
+                let stem = id_stem(&blob, "json");
                 let meta = DocumentMeta {
                     source: blob.filename.clone(),
                     filename: blob.filename.clone(),
@@ -486,6 +487,81 @@ mod tests {
             PluginOutput::Documents(d) => d,
             other => panic!("expected documents, got {other:?}"),
         }
+    }
+
+    fn fetched(data: &str, filename: &str, origin: &str) -> PluginInput {
+        PluginInput::Bytes(
+            Blob::new(
+                data.as_bytes().to_vec(),
+                "application/json",
+                Some(filename.to_owned()),
+            )
+            .with_origin(Some(origin.to_owned())),
+        )
+    }
+
+    #[tokio::test]
+    async fn two_origins_with_the_same_filename_get_distinct_ids() {
+        // Two sources ending in `/data.json` feeding one index used to both write
+        // `data_0`, `data_1`, ... and overwrite each other's documents.
+        let payload = r#"[{"name": "a"}, {"name": "b"}]"#;
+        let a = run(
+            fetched(payload, "data.json", "https://a.example/export/data.json"),
+            json!({}),
+        )
+        .await;
+        let b = run(
+            fetched(payload, "data.json", "https://b.example/v2/data.json"),
+            json!({}),
+        )
+        .await;
+        let ids = |d: &[Document]| d.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+        assert!(
+            ids(&a).iter().all(|id| !ids(&b).contains(id)),
+            "{:?} vs {:?}",
+            ids(&a),
+            ids(&b)
+        );
+        let tag = meili_ingest_plugin_sdk::origin_tag("https://a.example/export/data.json");
+        assert_eq!(ids(&a), [format!("data_{tag}_0"), format!("data_{tag}_1")]);
+    }
+
+    #[tokio::test]
+    async fn re_running_the_same_origin_keeps_the_ids() {
+        // Idempotent re-runs: the second run replaces the first one's documents.
+        let first = run(
+            fetched(r#"[{"v": 1}, {"v": 2}]"#, "json", "source:t1/httpbin"),
+            json!({}),
+        )
+        .await;
+        let second = run(
+            fetched(r#"[{"v": 10}, {"v": 20}]"#, "json", "source:t1/httpbin"),
+            json!({}),
+        )
+        .await;
+        let ids = |d: &[Document]| d.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&second));
+    }
+
+    #[tokio::test]
+    async fn a_documents_own_id_wins_over_the_origin() {
+        // The content's primary key is kept as is: fetched or uploaded, `id: 7` is `7`.
+        let docs = run(
+            fetched(
+                r#"[{"id": 7, "v": 1}]"#,
+                "data.json",
+                "https://a.example/data.json",
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(docs[0].id, "7");
+    }
+
+    #[tokio::test]
+    async fn an_upload_keeps_its_filename_ids() {
+        let docs = run(bytes(r#"[{"v": 1}]"#, Some("data.json")), json!({})).await;
+        assert_eq!(docs[0].id, "data_0");
     }
 
     #[test]

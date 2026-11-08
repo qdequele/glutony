@@ -1014,10 +1014,12 @@ mod tests {
                 data,
                 mime,
                 filename,
+                origin,
             }) => {
                 assert_eq!(data, PDF_MAGIC);
                 assert_eq!(mime, "application/pdf");
                 assert_eq!(filename.as_deref(), Some("report.pdf"));
+                assert_eq!(origin, &None, "an upload has no origin");
             }
             other => panic!("expected inline bytes, got {other:?}"),
         }
@@ -1066,10 +1068,12 @@ mod tests {
                 uri,
                 mime,
                 filename,
+                origin,
             }) => {
                 assert!(uri.contains(&inputs[0].job_id.to_string()), "{uri}");
                 assert_eq!(mime.as_deref(), Some("application/pdf"));
                 assert_eq!(filename.as_deref(), Some("big.pdf"));
+                assert_eq!(origin, &None, "an upload has no origin");
             }
             other => panic!("expected staged ref, got {other:?}"),
         }
@@ -1518,10 +1522,12 @@ mod tests {
                 uri,
                 mime,
                 filename,
+                origin,
             }) => {
                 assert!(uri.contains(&a.job_id.to_string()), "{uri}");
                 assert_eq!(mime.as_deref(), Some("application/zip"));
                 assert_eq!(filename.as_deref(), Some("bundle.zip"));
+                assert_eq!(origin, &None, "an upload has no origin");
             }
             other => panic!("expected a staged ref, got {other:?}"),
         }

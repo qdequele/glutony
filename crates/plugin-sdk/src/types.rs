@@ -206,10 +206,20 @@ pub fn sanitize_id(raw: &str) -> String {
     if out.is_empty() {
         out = Uuid::new_v4().to_string();
     }
-    if out.len() > 511 {
-        out.truncate(511);
-    }
+    truncate_at_char_boundary(&mut out, 511);
     out
+}
+
+/// Shorten `s` to at most `max` bytes. Sanitized ids are ASCII, so this never splits a
+/// character there, but it stays safe for any input.
+fn truncate_at_char_boundary(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +237,31 @@ pub struct Blob {
     /// Original filename if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+    /// Stable identity of where the bytes came from, when they were fetched rather
+    /// than uploaded: the URL (without its query string), the object-store URI, or the
+    /// scheduled source. Generated document ids carry a short hash of it (see
+    /// [`Blob::id_stem`]), so two origins whose filenames match (`a.example/data.json`
+    /// and `b.example/data.json`) never share ids, while the same origin keeps its ids
+    /// from one run to the next. `None` for uploads, whose ids come from the filename
+    /// alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// Longest filename stem kept in an id that also carries an origin tag, so the tag and
+/// the plugin's `_<index>` / `_p<page>` suffixes always fit in Meilisearch's 511 bytes.
+const MAX_TAGGED_STEM_LEN: usize = 400;
+
+/// Hex characters of the origin hash kept in ids (48 bits).
+const ORIGIN_TAG_LEN: usize = 12;
+
+/// Short, stable tag identifying `origin`: the first [`ORIGIN_TAG_LEN`] hex characters
+/// of its BLAKE3 hash. Stable across releases and platforms, because ids built from it
+/// must not change between two runs of the same source.
+pub fn origin_tag(origin: &str) -> String {
+    let mut hex = blake3::hash(origin.as_bytes()).to_hex().to_string();
+    hex.truncate(ORIGIN_TAG_LEN);
+    hex
 }
 
 impl Blob {
@@ -236,7 +271,58 @@ impl Blob {
             data,
             mime: mime.into(),
             filename,
+            origin: None,
         }
+    }
+
+    /// Set (or clear) [`Blob::origin`]. An empty origin counts as none.
+    pub fn with_origin(mut self, origin: Option<String>) -> Self {
+        self.origin = origin.filter(|o| !o.is_empty());
+        self
+    }
+
+    /// The [`origin_tag`] of this blob's origin, if it has one.
+    pub fn origin_tag(&self) -> Option<String> {
+        self.origin
+            .as_deref()
+            .filter(|o| !o.is_empty())
+            .map(origin_tag)
+    }
+
+    /// `stem` with this blob's origin tag appended (`<stem>_<tag>`), or `stem` unchanged
+    /// when the blob has no origin. The stem is shortened first so the tag survives
+    /// [`sanitize_id`]'s 511-byte cap.
+    pub fn tag_id(&self, stem: impl Into<String>) -> String {
+        let stem = stem.into();
+        match self.origin_tag() {
+            None => stem,
+            Some(tag) => {
+                let mut stem = sanitize_id(&stem);
+                truncate_at_char_boundary(&mut stem, MAX_TAGGED_STEM_LEN);
+                format!("{stem}_{tag}")
+            }
+        }
+    }
+
+    /// The stem generated document ids start with: [`filename_id_stem`] of the
+    /// filename, or `fallback` without one, tagged with the origin ([`Blob::tag_id`]).
+    ///
+    /// * upload `report.pdf` → `report` (unchanged from earlier releases);
+    /// * `https://a.example/export/report.pdf` → `report_<tag>`;
+    /// * no filename and no origin → `fallback`, or a fresh UUID when it is empty.
+    pub fn id_stem(&self, fallback: &str) -> String {
+        let stem = filename_id_stem(self.filename.as_deref());
+        if self.origin_tag().is_none() {
+            return stem.unwrap_or_else(|| sanitize_id(fallback));
+        }
+        let stem = stem.unwrap_or_else(|| {
+            if fallback.is_empty() {
+                "doc".to_owned()
+            } else {
+                sanitize_id(fallback)
+            }
+        });
+        self.tag_id(stem)
     }
 
     /// Interpret the bytes as UTF-8 text (lossy).
@@ -283,6 +369,10 @@ pub enum ContentRef {
         /// Filename hint.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
+        /// [`Blob::origin`] of the staged bytes (a source run's fetch, a file of a
+        /// fetched archive). `None` for uploads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
 }
 
@@ -1624,6 +1714,96 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json_blob(filename: Option<&str>, origin: Option<&str>) -> Blob {
+        Blob::new(vec![], "application/json", filename.map(str::to_owned))
+            .with_origin(origin.map(str::to_owned))
+    }
+
+    #[test]
+    fn origin_tags_are_pinned() {
+        // Ids already indexed are built from these values: changing the hash (or the
+        // tag length) would re-key every fetched document on the next run.
+        assert_eq!(origin_tag("source:/movies"), origin_tag("source:/movies"));
+        assert_eq!(origin_tag("https://httpbin.org/json"), "f6bebf6a48e1");
+        assert_eq!(origin_tag("source:t1/products").len(), 12);
+    }
+
+    #[test]
+    fn uploads_keep_their_filename_ids() {
+        // No origin: exactly the stems earlier releases produced.
+        assert_eq!(json_blob(Some("data.json"), None).id_stem("json"), "data");
+        assert_eq!(json_blob(None, None).id_stem("json"), "json");
+        assert_eq!(json_blob(Some("a/b.pdf"), None).tag_id("a_b"), "a_b");
+        // An empty origin is no origin.
+        assert_eq!(
+            json_blob(Some("data.json"), Some("")).id_stem("json"),
+            "data"
+        );
+        // No filename, no origin, no fallback: a fresh UUID each time.
+        assert_ne!(
+            json_blob(None, None).id_stem(""),
+            json_blob(None, None).id_stem("")
+        );
+    }
+
+    #[test]
+    fn fetched_blobs_get_ids_of_their_own_origin() {
+        let a = json_blob(
+            Some("data.json"),
+            Some("https://a.example/export/data.json"),
+        );
+        let b = json_blob(Some("data.json"), Some("https://b.example/v2/data.json"));
+        let tag_a = origin_tag("https://a.example/export/data.json");
+        assert_eq!(a.id_stem("json"), format!("data_{tag_a}"));
+        assert_ne!(
+            a.id_stem("json"),
+            b.id_stem("json"),
+            "same filename, other origin"
+        );
+        // Re-fetching the same origin gives the same stem: re-runs replace.
+        let again = json_blob(
+            Some("data.json"),
+            Some("https://a.example/export/data.json"),
+        );
+        assert_eq!(a.id_stem("json"), again.id_stem("json"));
+        // Without a filename the fallback (or `doc`) is tagged, never a random UUID.
+        let bare = json_blob(None, Some("https://httpbin.org/json"));
+        assert_eq!(bare.id_stem("json"), "json_f6bebf6a48e1");
+        assert_eq!(bare.id_stem(""), "doc_f6bebf6a48e1");
+        assert_eq!(bare.id_stem(""), bare.id_stem(""));
+    }
+
+    #[test]
+    fn a_long_stem_never_pushes_the_origin_tag_out_of_the_id() {
+        let name = format!("{}.json", "x".repeat(600));
+        let blob = json_blob(Some(&name), Some("source:/s"));
+        let stem = blob.id_stem("json");
+        assert!(
+            stem.ends_with(&format!("_{}", origin_tag("source:/s"))),
+            "{stem}"
+        );
+        // Room is left for the plugins' `_<index>` / `_p<page>` suffixes.
+        assert!(stem.len() <= 420, "{}", stem.len());
+        let id = Document::with_id(format!("{stem}_123456"), "").id;
+        assert!(id.ends_with("_123456"), "{id}");
+    }
+
+    #[test]
+    fn payloads_without_an_origin_still_deserialize() {
+        // Workflow histories recorded before the field existed.
+        let blob: Blob =
+            serde_json::from_value(serde_json::json!({"data": "", "mime": "text/plain"})).unwrap();
+        assert_eq!(blob.origin, None);
+        let r: ContentRef = serde_json::from_value(serde_json::json!({
+            "kind": "staged", "uri": "jobs/x/input/a.pdf", "filename": "a.pdf"
+        }))
+        .unwrap();
+        assert!(matches!(r, ContentRef::Staged { origin: None, .. }));
+        // And a blob without an origin serializes without the key.
+        let v = serde_json::to_value(Blob::new(vec![], "text/plain", None)).unwrap();
+        assert!(v.get("origin").is_none(), "{v}");
+    }
 
     #[test]
     fn id_stems_keep_folders_and_drop_the_extension() {

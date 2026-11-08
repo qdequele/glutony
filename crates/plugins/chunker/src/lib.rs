@@ -390,19 +390,17 @@ fn chunk_document(parent: &Document, cfg: &Config) -> Vec<Document> {
 ///
 /// Non-UTF-8 input is rejected rather than silently mangled: a binary file reaching
 /// the chunker means the pipeline is missing an extractor step.
-fn document_from_text(blob: meili_ingest_plugin_sdk::Blob) -> Result<Document, PluginError> {
-    let content = String::from_utf8(blob.data).map_err(|_| {
+fn document_from_text(mut blob: meili_ingest_plugin_sdk::Blob) -> Result<Document, PluginError> {
+    // `id_stem("")` is a fresh UUID when the blob has neither a filename nor an origin.
+    let id = blob.id_stem("");
+    let content = String::from_utf8(std::mem::take(&mut blob.data)).map_err(|_| {
         PluginError::InvalidInput(
             "chunker received bytes that are not valid UTF-8 text; add an extractor step \
              (pdf_extractor, docx_extractor, ...) before the chunker"
                 .to_string(),
         )
     })?;
-    let stem = meili_ingest_plugin_sdk::filename_id_stem(blob.filename.as_deref());
-    let mut doc = match stem {
-        Some(id) => Document::with_id(id, content),
-        None => Document::new(content),
-    };
+    let mut doc = Document::with_id(id, content);
     doc.meta.source = blob.filename.clone();
     doc.meta.filename = blob.filename;
     doc.meta.mime = Some(blob.mime);

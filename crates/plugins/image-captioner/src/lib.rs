@@ -353,7 +353,8 @@ impl Plugin for ImageCaptionerPlugin {
         ctx.record_usage(units);
 
         let mut doc = match blob.filename.as_deref() {
-            Some(name) if !name.is_empty() => Document::with_id(name, ""),
+            Some(name) if !name.is_empty() => Document::with_id(blob.tag_id(sanitize_id(name)), ""),
+            _ if blob.origin.is_some() => Document::with_id(blob.tag_id("image"), ""),
             _ => Document::new(""),
         };
         doc.meta.mime = Some(blob.mime.clone());

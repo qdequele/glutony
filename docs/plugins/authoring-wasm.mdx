@@ -31,6 +31,10 @@ extism plugin-input / plugin-output buffers.
 The host resolves `Ref` inputs before calling you and spills large outputs
 after, so the module only ever sees `bytes`, `documents`, `many` or `empty`.
 
+Fetched bytes (a URL, an object ref, a scheduled source) also carry an `origin`
+string. Generating ids from it keeps two fetched files of the same name apart:
+the Rust SDK's `Blob::id_stem` does it the way the built-in plugins do.
+
 Heartbeats: the host heartbeats on your behalf while the call runs. Keep
 single calls under the step's `timeout_secs`; for big inputs prefer
 `fan_out: "$.documents"` in the pipeline so each call handles one document.

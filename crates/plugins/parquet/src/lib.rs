@@ -291,7 +291,7 @@ impl Plugin for ParquetParserPlugin {
         let rows = run_blocking(move || decode_payload(data, &decode_cfg, &cancelled)).await??;
         ctx.heartbeat(format!("{NAME}: {} rows decoded", rows.len()));
 
-        let stem = id_stem(blob.filename.as_deref(), "parquet");
+        let stem = id_stem(&blob, "parquet");
         let meta = DocumentMeta {
             source: blob.filename.clone(),
             filename: blob.filename.clone(),

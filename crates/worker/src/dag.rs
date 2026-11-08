@@ -236,6 +236,7 @@ mod tests {
             uri: "jobs/x/y.json".into(),
             mime: None,
             filename: None,
+            origin: None,
         });
         assert!(matches!(
             fan_out_branches("$.documents", r, 10),

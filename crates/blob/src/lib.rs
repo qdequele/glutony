@@ -629,6 +629,10 @@ impl BlobStore {
     ///   extension. Refused refs (`file://`, the blob store's bucket, ...) are
     ///   [`BlobError::Blocked`].
     /// * [`ContentRef::Staged`] → read from this store.
+    ///
+    /// The blob's [`Blob::origin`] is the URL without its query string, the object
+    /// URI, or the staged ref's own `origin`, so generated document ids stay distinct
+    /// per origin and stable across re-ingests.
     pub async fn fetch_ref(
         &self,
         r: &ContentRef,
@@ -689,7 +693,7 @@ impl BlobStore {
                     .or(header_mime)
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name))
+                Ok(Blob::new(data.to_vec(), mime, name).with_origin(Some(url_origin(&parsed))))
             }
             ContentRef::S3 {
                 uri,
@@ -713,12 +717,13 @@ impl BlobStore {
                     .clone()
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name))
+                Ok(Blob::new(data.to_vec(), mime, name).with_origin(Some(uri.clone())))
             }
             ContentRef::Staged {
                 uri,
                 mime,
                 filename,
+                origin,
             } => {
                 let data = self.get(uri).await?;
                 let name = filename
@@ -728,7 +733,7 @@ impl BlobStore {
                     .clone()
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name))
+                Ok(Blob::new(data.to_vec(), mime, name).with_origin(origin.clone()))
             }
         }
     }
@@ -811,6 +816,7 @@ impl BlobStore {
             uri: key,
             mime: Some(SPILLED_OUTPUT_MIME.to_owned()),
             filename: None,
+            origin: None,
         }))
     }
 
@@ -855,6 +861,7 @@ impl BlobStore {
             data,
             mime,
             filename,
+            origin,
         } = blob;
         let object_name = filename
             .as_deref()
@@ -867,6 +874,7 @@ impl BlobStore {
             uri: key,
             mime: Some(mime),
             filename,
+            origin,
         }))
     }
 }
@@ -884,6 +892,20 @@ fn strip_mime_params(value: &str) -> Option<String> {
     } else {
         Some(essence)
     }
+}
+
+/// The [`Blob::origin`] of a fetched URL: the URL without its query string, fragment
+/// or credentials. Query strings of one-off URL ingests are mostly signatures and
+/// tokens (pre-signed links) that change on every request, and re-ingesting the same
+/// file must replace its documents, not duplicate them.
+fn url_origin(url: &Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    // Only fails for URLs that cannot carry credentials, which then have none.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 /// Last non-empty `/`-separated segment of a path or key.
@@ -1144,6 +1166,7 @@ mod tests {
                 uri: expected_key.clone(),
                 mime: Some("application/pdf".into()),
                 filename: Some("big.pdf".into()),
+                origin: None,
             })
         );
         assert_eq!(
@@ -1203,6 +1226,7 @@ mod tests {
                 uri: BlobStore::staged_key(job, "chunk-3.json"),
                 mime: Some(SPILLED_OUTPUT_MIME.into()),
                 filename: None,
+                origin: None,
             })
         );
         let hydrated = store.hydrate_output(spilled).await.unwrap();
@@ -1236,6 +1260,7 @@ mod tests {
             uri: "jobs/x/raw.bin".into(),
             mime: Some("application/pdf".into()),
             filename: None,
+            origin: None,
         });
         let many = PluginOutput::Many(vec![spilled, raw_ref.clone(), PluginOutput::Empty]);
         let hydrated = store.hydrate_output(many).await.unwrap();
@@ -1269,6 +1294,7 @@ mod tests {
             uri: "jobs/j/input/report.pdf".into(),
             mime: None,
             filename: None,
+            origin: None,
         });
         let resolved = store.resolve_input(input, &http).await.unwrap();
         assert_eq!(
@@ -1303,6 +1329,7 @@ mod tests {
             uri: staged_key,
             mime: Some("audio/wav".into()),
             filename: Some("a.wav".into()),
+            origin: None,
         });
 
         let plain = PluginOutput::Documents(docs(1));
@@ -1375,6 +1402,10 @@ mod tests {
         assert_eq!(blob.data, b"%PDF-1.4 fake".to_vec());
         assert_eq!(blob.mime, "application/pdf");
         assert_eq!(blob.filename.as_deref(), Some("report.pdf"));
+        // The origin is the URL without its query string: a pre-signed link fetched
+        // again with a new signature still names the same file.
+        let origin = format!("{}/files/report.pdf", server.uri());
+        assert_eq!(blob.origin.as_deref(), Some(origin.as_str()));
 
         // Hints win over the response headers / URL.
         let r = ContentRef::Url {
@@ -1385,6 +1416,7 @@ mod tests {
         let blob = store.fetch_ref(&r, &http).await.unwrap();
         assert_eq!(blob.mime, "application/x-custom");
         assert_eq!(blob.filename.as_deref(), Some("renamed.pdf"));
+        assert_eq!(blob.origin.as_deref(), Some(origin.as_str()));
 
         // Through resolve_input the ref becomes bytes.
         let input = PluginInput::Ref(ContentRef::Url {
@@ -1394,6 +1426,49 @@ mod tests {
         });
         let resolved = store.resolve_input(input, &http).await.unwrap();
         assert!(matches!(resolved, PluginInput::Bytes(b) if b.mime == "application/pdf"));
+    }
+
+    #[test]
+    fn url_origins_drop_the_query_fragment_and_credentials_only() {
+        let origin = |u: &str| url_origin(&Url::parse(u).unwrap());
+        assert_eq!(
+            origin("https://user:pw@A.example/export/data.json?sig=1#top"),
+            "https://a.example/export/data.json"
+        );
+        // Same filename, different host or path: different origins.
+        assert_ne!(
+            origin("https://a.example/export/data.json"),
+            origin("https://b.example/export/data.json")
+        );
+        assert_ne!(
+            origin("https://a.example/v1/data.json"),
+            origin("https://a.example/v2/data.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staged_blob_keeps_its_origin() {
+        // A source stages what it fetched; the worker reads it back before the first
+        // step, and the origin must survive the round trip for ids to be tagged.
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let blob = Blob::new(b"[]".to_vec(), "application/json", Some("data.json".into()))
+            .with_origin(Some("source:t1/products".into()));
+        let staged = store.stage_upload(Uuid::new_v4(), blob, 0).await.unwrap();
+        let PluginInput::Ref(r @ ContentRef::Staged { .. }) = &staged else {
+            panic!("expected a staged ref, got {staged:?}");
+        };
+        let back = store.fetch_ref(r, &http).await.unwrap();
+        assert_eq!(back.origin.as_deref(), Some("source:t1/products"));
+        assert_eq!(back.filename.as_deref(), Some("data.json"));
+
+        // An upload has none, staged or not.
+        let upload = Blob::new(b"[]".to_vec(), "application/json", Some("data.json".into()));
+        let staged = store.stage_upload(Uuid::new_v4(), upload, 0).await.unwrap();
+        let PluginInput::Ref(r) = &staged else {
+            panic!("expected a staged ref, got {staged:?}");
+        };
+        assert_eq!(store.fetch_ref(r, &http).await.unwrap().origin, None);
     }
 
     /// Non-success statuses and whether retrying the fetch could ever change them.
@@ -1506,6 +1581,7 @@ mod tests {
             uri: "jobs/nope".into(),
             mime: None,
             filename: None,
+            origin: None,
         };
         assert!(matches!(
             store.fetch_ref(&r, &http).await,
