@@ -128,7 +128,8 @@ curl -H "Authorization: Bearer masterKey" \
 ```
 
 Each indexed document looks like
-`{ id, title?, content, ...fields, _meta: { source, filename, mime, page, chunk_index, ... } }`.
+`{ id, title?, content, ...fields, _meta: { source, filename, mime, page, chunk_index, ... } }`
+(no `_meta` when the document has no metadata).
 
 ## 5. Add your own pipeline
 

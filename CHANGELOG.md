@@ -27,6 +27,9 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   stores is refused at boot.
 
 ### Fixed
+- `meili_indexer` no longer writes an empty `_meta: {}` into documents that carry no
+  metadata (JSON records, for instance): `_meta` is sent only when it has a value.
+  Documents already indexed keep their empty `_meta` until they are re-ingested.
 - The gateway's `TINYBIRD_READ_TOKEN` (and `TINYBIRD_USAGE_PIPE`), which `GET /usage`
   needs, is now documented in the environment variables reference and the usage page,
   passed to the gateway by the Kubernetes manifests (`k8s/gateway.yaml`, optional key of
