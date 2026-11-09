@@ -58,6 +58,14 @@ pub const DEFAULT_STORE_URL: &str = "file://./blobs";
 /// Fallback MIME type when nothing better is known.
 const OCTET_STREAM: &str = "application/octet-stream";
 
+/// `User-Agent` sent when fetching a URL ref. Several hosts (Wikimedia, some CDNs)
+/// answer `403` to a request that carries none, which reqwest sends by default.
+pub const FETCH_USER_AGENT: &str = concat!(
+    "meili-ingest/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/qdequele/glutony)"
+);
+
 /// Errors returned by [`BlobStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
@@ -357,6 +365,7 @@ impl FetchGuard {
             // redirects to without the check ever seeing it.
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .user_agent(FETCH_USER_AGENT)
                 .build()
                 .unwrap_or_default(),
             max_redirects: 5,
@@ -656,6 +665,7 @@ impl BlobStore {
                     Some(guard) => guard.get(&parsed).await?,
                     None => http
                         .get(parsed.clone())
+                        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
                         .send()
                         .await
                         .map_err(|e| BlobError::Http(format!("GET {url}: {e}")))?,
@@ -1027,6 +1037,39 @@ mod tests {
         assert!(
             forbidden.received_requests().await.unwrap().is_empty(),
             "the redirect target must never be requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn url_fetches_send_a_user_agent_guarded_or_not() {
+        // Wikimedia answers 403 to a request without one: the image pipeline failed on
+        // every upload.wikimedia.org URL.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::header("user-agent", FETCH_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let url = format!("{}/a.png", server.uri());
+        let guarded =
+            BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+                authority(&server),
+            ]))));
+        assert_eq!(
+            guarded
+                .fetch_ref(&url_ref(url.clone()), &reqwest::Client::new())
+                .await
+                .unwrap()
+                .data,
+            b"ok"
+        );
+        assert_eq!(
+            BlobStore::memory()
+                .fetch_ref(&url_ref(url), &reqwest::Client::new())
+                .await
+                .unwrap()
+                .data,
+            b"ok"
         );
     }
 

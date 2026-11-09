@@ -52,7 +52,6 @@ uuid.workspace = true
 chrono.workspace = true
 url.workspace = true
 subtle.workspace = true
-mime_guess.workspace = true
 
 # errors / logging
 anyhow.workspace = true

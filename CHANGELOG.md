@@ -27,6 +27,30 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   stores is refused at boot.
 
 ### Fixed
+- A batch item's `index` and `pipeline` are honoured. They were dropped without a
+  word, so `{"items": [{"url": …, "index": "pdfs"}]}` wrote into the default index
+  (`documents`, `datasets`, …) instead; the Lab's `pipelines_ingest_batch` tool
+  offers both per item. An item's own value wins over the batch's; the index of an
+  `/indexes/{index_uid}/…` path still wins over both.
+- A URL whose name says nothing about its type (`https://example.com/`,
+  `https://api.example.com/users`) can be ingested: it was refused with
+  `unsupported_media_type` (`application/octet-stream`). The gateway now reads a
+  `content_type` hint on `url` and `s3` refs (JSON key or multipart field, also per
+  batch item), and without one asks the URL's server (`HEAD`, falling back to a `GET`
+  whose body is not read, each hop under `SOURCE_FETCH_HOSTS`).
+- `jev_enricher` works on the Lab's hosted Gateway again: with `LAB_AI_GATEWAY` on it
+  posted to the Gateway's `/v1/systemone`, which LUMEN removed in 0.7.0
+  (`404 LM-1003`), so every Jev step of a Lab team failed. It now calls
+  `/v1/decisions`, which takes the same TypeSafe body and answers in it. A direct
+  TypeSafe API (`TYPESAFE_BASE_URL`) is still called on `/systemone`.
+- A URL or object ref ending in `.avro`, `.msgpack` / `.mpk` (or another extension
+  the router maps itself, such as `.m4a` → `audio/mp4`) routes to its built-in
+  pipeline. The gateway guessed a ref's type with `mime_guess` alone, which knows
+  neither, so `builtin.avro` and `builtin.msgpack` were unreachable by URL (`415`);
+  it now uses the router's extension table, the one uploads go through.
+- URL ingests and scheduled sources send a `User-Agent`
+  (`meili-ingest/<version> (+https://github.com/qdequele/glutony)`). Without one,
+  Wikimedia and several CDNs answer `403`, which failed the job's first step.
 - Documents fetched from two places whose last path segment matches no longer
   overwrite each other. Generated ids (the ones made when the content has no id of
   its own) were built from the filename alone, which for a URL ingest or a

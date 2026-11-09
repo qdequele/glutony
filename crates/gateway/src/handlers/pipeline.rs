@@ -142,6 +142,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_batch_item_naming_another_pipeline_is_refused_here() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines/p"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_pipeline("p", None)))
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"items": [
+            {"documents": [{"id": "1"}], "pipeline": "other"},
+            {"documents": [{"id": "2"}], "pipeline": "p"},
+            {"documents": [{"id": "3"}], "index": "own"}
+        ]});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest/pipeline/p",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let jobs = json_body(resp).await["jobs"].clone();
+        assert_eq!(jobs[0]["code"], "bad_request", "{jobs}");
+        assert_eq!(jobs[1]["pipeline_used"], "p", "{jobs}");
+        assert_eq!(jobs[2]["target_index"], "own", "{jobs}");
+        assert_eq!(starter.inputs().len(), 2);
+    }
+
+    #[tokio::test]
     async fn explicit_pipeline_skips_routing_and_applies_index_pattern() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

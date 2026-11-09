@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{QueryParams, query_param, read_payload};
 use crate::context::{require_destination, resolve_index, resolve_request_context};
 use crate::error::{ErrorBody, GatewayError};
-use crate::extract::{Extracted, IngestPayload};
+use crate::extract::{BatchItem, Extracted, IngestPayload};
 use crate::state::{AppState, JobRecord};
 
 /// Response of the ingest routes.
@@ -110,7 +110,7 @@ pub async fn submit_one(
     locked_index: Option<&str>,
 ) -> Result<IngestResponse, GatewayError> {
     let filename = payload.filename();
-    let mime = payload
+    let mut mime = payload
         .mime()
         .ok_or_else(|| GatewayError::BadRequest("nested batches are not supported".into()))?;
 
@@ -127,6 +127,19 @@ pub async fn submit_one(
             return Err(GatewayError::Unprocessable(format!(
                 "{e} (URL refs obey SOURCE_FETCH_HOSTS)"
             )));
+        }
+        // Neither the name (`https://example.com/`, `/api/users`) nor a `content_type`
+        // hint says what this is: ask the server, so it can be routed at all.
+        if mime == meili_ingest_router::OCTET_STREAM
+            && let Ok(Some(probed)) = meili_ingest_source::probe_content_type(
+                &state.probe_http,
+                Some(&state.fetch_policy),
+                &parsed,
+                &meili_ingest_source::UrlGuard::default(),
+            )
+            .await
+        {
+            mime = meili_ingest_router::canonical_mime(&probed).to_string();
         }
     }
     // `{"s3": …}` refs must name a cloud object store other than the blob store's bucket
@@ -243,12 +256,12 @@ pub async fn submit_one(
                 .stage_upload(job_id, blob, state.config.inline_max_bytes)
                 .await?
         }
-        IngestPayload::Url { url, filename } => PluginInput::Ref(ContentRef::Url {
+        IngestPayload::Url { url, filename, .. } => PluginInput::Ref(ContentRef::Url {
             url,
             mime: Some(mime.clone()).filter(|m| m != "application/octet-stream"),
             filename,
         }),
-        IngestPayload::S3 { uri, filename } => PluginInput::Ref(ContentRef::S3 {
+        IngestPayload::S3 { uri, filename, .. } => PluginInput::Ref(ContentRef::S3 {
             uri,
             mime: Some(mime.clone()).filter(|m| m != "application/octet-stream"),
             filename,
@@ -443,12 +456,12 @@ async fn submit_archive(
     let input = match payload {
         // Always staged, whatever its size: workflow history never holds the bytes.
         IngestPayload::File(blob) => state.blob.stage_upload(job_id, blob, 0).await?,
-        IngestPayload::Url { url, filename } => PluginInput::Ref(ContentRef::Url {
+        IngestPayload::Url { url, filename, .. } => PluginInput::Ref(ContentRef::Url {
             url,
             mime: Some(mime.to_string()),
             filename,
         }),
-        IngestPayload::S3 { uri, filename } => PluginInput::Ref(ContentRef::S3 {
+        IngestPayload::S3 { uri, filename, .. } => PluginInput::Ref(ContentRef::S3 {
             uri,
             mime: Some(mime.to_string()),
             filename,
@@ -507,14 +520,39 @@ async fn submit_archive(
 /// Submit every item of a batch, continuing past per-item failures.
 pub async fn submit_batch(
     state: &AppState,
-    items: Vec<IngestPayload>,
+    items: Vec<BatchItem>,
     ctx: &MeiliContext,
     selection: &PipelineSelection,
     locked_index: Option<&str>,
 ) -> BatchResponse {
     let mut jobs = Vec::with_capacity(items.len());
     for item in items {
-        match submit_one(state, item, ctx.clone(), selection, locked_index).await {
+        // An item's own `index` and `pipeline` win over the batch's for that item; a
+        // path index (`/indexes/{uid}/…`) still wins over every other.
+        let mut item_ctx = ctx.clone();
+        if let Some(index) = &item.index {
+            item_ctx.index = Some(index.clone());
+        }
+        let item_selection = match (&item.pipeline, selection) {
+            (None, _) => Ok(selection.clone()),
+            (Some(uid), PipelineSelection::Auto { .. }) => Ok(PipelineSelection::Auto {
+                explicit: Some(uid.clone()),
+            }),
+            (Some(uid), PipelineSelection::Explicit(def)) if *uid == def.uid => {
+                Ok(selection.clone())
+            }
+            (Some(uid), PipelineSelection::Explicit(def)) => {
+                Err(GatewayError::BadRequest(format!(
+                    "item names pipeline {uid:?}, but this route runs {:?}",
+                    def.uid
+                )))
+            }
+        };
+        let result = match item_selection {
+            Ok(sel) => submit_one(state, item.payload, item_ctx, &sel, locked_index).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(r) => jobs.push(BatchEntry::Job(r)),
             Err(e) => jobs.push(BatchEntry::Error(ErrorBody {
                 error: e.to_string(),
@@ -611,7 +649,7 @@ async fn ingest_batch_inner(
         .or(extracted.pipeline);
     let items = match extracted.payload {
         IngestPayload::Batch(items) => items,
-        single => vec![single],
+        single => vec![BatchItem::from(single)],
     };
     if items.is_empty() {
         return Err(GatewayError::BadRequest("`items` must not be empty".into()));
@@ -1369,6 +1407,172 @@ mod tests {
         assert_eq!(jobs[1]["code"], "unsupported_media_type");
         assert_eq!(jobs[2]["pipeline_used"], "builtin.pdf");
         assert_eq!(starter.inputs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_items_write_to_their_own_index() {
+        // The Lab's MCP tool offers `index` per item; it used to be dropped silently and
+        // every item landed in the default index.
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.json", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"items": [
+            {"documents": [{"id": "1"}], "index": "item-index"},
+            {"documents": [{"id": "2"}]}
+        ], "index": "batch-index"});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest/batch",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let jobs = json_body(resp).await["jobs"].clone();
+        assert_eq!(jobs[0]["target_index"], "item-index", "{jobs}");
+        assert_eq!(jobs[1]["target_index"], "batch-index", "{jobs}");
+        let inputs = starter.inputs();
+        assert_eq!(inputs[0].context.index.as_deref(), Some("item-index"));
+        assert_eq!(inputs[1].context.index.as_deref(), Some("batch-index"));
+    }
+
+    #[tokio::test]
+    async fn the_path_index_still_beats_an_item_index() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.json", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"items": [{"documents": [{"id": "1"}], "index": "elsewhere"}]});
+        let resp = app
+            .oneshot(standalone_request(
+                "/indexes/movies/ingest/batch",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json_body(resp).await["jobs"][0]["target_index"], "movies");
+        assert_eq!(starter.inputs()[0].context.index.as_deref(), Some("movies"));
+    }
+
+    #[tokio::test]
+    async fn batch_items_run_their_own_pipeline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .and(body_partial_json(json!({"pipeline": "item-pipeline"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"pipeline": sample_pipeline("item-pipeline", None)})),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_resolve(&server, "builtin.json", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, _starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"items": [
+            {"documents": [{"id": "1"}], "pipeline": "item-pipeline"},
+            {"documents": [{"id": "2"}]}
+        ]});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest/batch",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        let jobs = json_body(resp).await["jobs"].clone();
+        assert_eq!(jobs[0]["pipeline_used"], "item-pipeline", "{jobs}");
+        assert_eq!(jobs[1]["pipeline_used"], "builtin.json", "{jobs}");
+    }
+
+    #[tokio::test]
+    async fn a_content_type_hint_routes_an_extensionless_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .and(body_partial_json(json!({"mime": "text/html"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"pipeline": sample_pipeline("builtin.html", None)})),
+            )
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"url": "https://1.1.1.1/", "content_type": "text/html"});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let PluginInput::Ref(ContentRef::Url { mime, .. }) = &starter.inputs()[0].input else {
+            panic!("expected a URL ref");
+        };
+        assert_eq!(mime.as_deref(), Some("text/html"));
+    }
+
+    #[tokio::test]
+    async fn an_extensionless_url_is_routed_by_the_type_its_server_names() {
+        // `https://example.com/` used to be a 415: nothing in its name says HTML.
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .and(body_partial_json(json!({"mime": "text/html"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"pipeline": sample_pipeline("builtin.html", None)})),
+            )
+            .mount(&cp)
+            .await;
+        mount_jobs_ok(&cp).await;
+        let site = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8"),
+            )
+            .mount(&site)
+            .await;
+        let starter = std::sync::Arc::new(FakeStarter::default());
+        let config = GatewayConfig {
+            control_plane_url: cp.uri(),
+            ..GatewayConfig::default()
+        };
+        let mut state = AppState::new(
+            config,
+            starter.clone(),
+            meili_ingest_blob::BlobStore::memory(),
+            reqwest::Client::new(),
+        );
+        state.fetch_policy =
+            meili_ingest_source::HostPolicy::parse(site.uri().trim_start_matches("http://"))
+                .unwrap();
+        let app = crate::router(state);
+        let body = json!({"url": format!("{}/", site.uri())});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(resp).await["pipeline_used"], "builtin.html");
+        let PluginInput::Ref(ContentRef::Url { mime, .. }) = &starter.inputs()[0].input else {
+            panic!("expected a URL ref");
+        };
+        assert_eq!(mime.as_deref(), Some("text/html"));
     }
 
     #[tokio::test]

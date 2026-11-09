@@ -24,6 +24,8 @@ pub enum IngestPayload {
         url: String,
         /// Filename hint.
         filename: Option<String>,
+        /// `content_type` hint, used when the name says nothing.
+        content_type: Option<String>,
     },
     /// `s3://bucket/key` (or any object-store URI); the worker streams it.
     S3 {
@@ -31,11 +33,35 @@ pub enum IngestPayload {
         uri: String,
         /// Filename hint.
         filename: Option<String>,
+        /// `content_type` hint, used when the name says nothing.
+        content_type: Option<String>,
     },
     /// Inline documents, indexed without extraction.
     Documents(Vec<Document>),
     /// Several independent items (one job each).
-    Batch(Vec<IngestPayload>),
+    Batch(Vec<BatchItem>),
+}
+
+/// One item of an `items` batch: its payload plus the `index` and `pipeline` it names,
+/// which win over the batch's own for that item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchItem {
+    /// What to ingest.
+    pub payload: IngestPayload,
+    /// The item's own `index`.
+    pub index: Option<String>,
+    /// The item's own `pipeline`.
+    pub pipeline: Option<String>,
+}
+
+impl From<IngestPayload> for BatchItem {
+    fn from(payload: IngestPayload) -> Self {
+        Self {
+            payload,
+            index: None,
+            pipeline: None,
+        }
+    }
 }
 
 impl IngestPayload {
@@ -43,23 +69,29 @@ impl IngestPayload {
     pub fn filename(&self) -> Option<String> {
         match self {
             IngestPayload::File(b) => b.filename.clone(),
-            IngestPayload::Url { url, filename } => filename.clone().or_else(|| basename_of(url)),
-            IngestPayload::S3 { uri, filename } => filename.clone().or_else(|| basename_of(uri)),
+            IngestPayload::Url { url, filename, .. } => {
+                filename.clone().or_else(|| basename_of(url))
+            }
+            IngestPayload::S3 { uri, filename, .. } => {
+                filename.clone().or_else(|| basename_of(uri))
+            }
             IngestPayload::Documents(_) | IngestPayload::Batch(_) => None,
         }
     }
 
-    /// Best-effort MIME type: detected for files, guessed from the name for refs,
-    /// `application/json` for documents, `None` for batches.
+    /// Best-effort MIME type: detected for files, guessed from the name for refs (then
+    /// their `content_type` hint), `application/json` for documents, `None` for batches.
     pub fn mime(&self) -> Option<String> {
         match self {
             IngestPayload::File(b) => Some(b.mime.clone()),
-            IngestPayload::Url { .. } | IngestPayload::S3 { .. } => Some(
-                self.filename()
-                    .and_then(|n| mime_guess::from_path(&n).first_raw())
-                    .unwrap_or("application/octet-stream")
-                    .to_string(),
-            ),
+            IngestPayload::Url { content_type, .. } | IngestPayload::S3 { content_type, .. } => {
+                Some(
+                    self.filename()
+                        .and_then(|n| meili_ingest_router::mime_from_filename(&n))
+                        .or_else(|| content_type.as_deref().and_then(mime_hint))
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                )
+            }
             IngestPayload::Documents(_) => Some("application/json".into()),
             IngestPayload::Batch(_) => None,
         }
@@ -180,6 +212,7 @@ async fn extract_multipart(mut mp: Multipart) -> Result<Extracted, GatewayError>
     let mut index = None;
     let mut pipeline = None;
     let mut filename_override = None;
+    let mut content_type = None;
 
     while let Some(field) = mp.next_field().await? {
         let name = field.name().unwrap_or("").to_string();
@@ -196,6 +229,7 @@ async fn extract_multipart(mut mp: Multipart) -> Result<Extracted, GatewayError>
             "index" => index = non_empty(field.text().await?),
             "pipeline" => pipeline = non_empty(field.text().await?),
             "filename" => filename_override = non_empty(field.text().await?),
+            "content_type" => content_type = non_empty(field.text().await?),
             other => {
                 tracing::debug!(field = other, "ignoring unknown multipart field");
                 // Drain the field so the stream stays consistent.
@@ -211,11 +245,13 @@ async fn extract_multipart(mut mp: Multipart) -> Result<Extracted, GatewayError>
         IngestPayload::Url {
             url,
             filename: filename_override,
+            content_type,
         }
     } else if let Some(uri) = s3 {
         IngestPayload::S3 {
             uri,
             filename: filename_override,
+            content_type,
         }
     } else if let Some(text) = documents {
         let value: Value = serde_json::from_str(&text).map_err(|e| {
@@ -241,6 +277,14 @@ fn non_empty(s: String) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// A caller's `content_type` hint as a routable MIME: parameters dropped, aliases
+/// canonicalised, `application/octet-stream` (which says nothing) ignored.
+fn mime_hint(hint: &str) -> Option<String> {
+    let bare = hint.split(';').next()?.trim().to_ascii_lowercase();
+    let mime = meili_ingest_router::canonical_mime(&bare).to_string();
+    (!mime.is_empty() && mime != "application/octet-stream").then_some(mime)
 }
 
 fn str_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -269,14 +313,18 @@ pub fn payload_from_json(value: Value) -> Result<Extracted, GatewayError> {
                 };
                 let mut out = Vec::with_capacity(items.len());
                 for (i, item) in items.iter().enumerate() {
-                    let Value::Object(_) = item else {
+                    let Value::Object(fields) = item else {
                         return Err(GatewayError::BadRequest(format!(
                             "items[{i}] must be an object"
                         )));
                     };
-                    let inner = single_from_object(item.clone())
+                    let payload = single_from_object(item.clone())
                         .map_err(|e| GatewayError::BadRequest(format!("items[{i}]: {e}")))?;
-                    out.push(inner);
+                    out.push(BatchItem {
+                        payload,
+                        index: str_field(fields, "index"),
+                        pipeline: str_field(fields, "pipeline"),
+                    });
                 }
                 IngestPayload::Batch(out)
             } else {
@@ -300,11 +348,20 @@ fn single_from_object(value: Value) -> Result<IngestPayload, GatewayError> {
         return Err(GatewayError::BadRequest("expected a JSON object".into()));
     };
     let filename = str_field(&obj, "filename");
+    let content_type = str_field(&obj, "content_type");
     if let Some(url) = str_field(&obj, "url") {
-        return Ok(IngestPayload::Url { url, filename });
+        return Ok(IngestPayload::Url {
+            url,
+            filename,
+            content_type,
+        });
     }
     if let Some(uri) = str_field(&obj, "s3") {
-        return Ok(IngestPayload::S3 { uri, filename });
+        return Ok(IngestPayload::S3 {
+            uri,
+            filename,
+            content_type,
+        });
     }
     if let Some(docs) = obj.get("documents") {
         return Ok(IngestPayload::Documents(documents_from_json(docs.clone())?));
@@ -538,7 +595,8 @@ mod tests {
             e.payload,
             IngestPayload::Url {
                 url: "https://e.com/doc.pdf".into(),
-                filename: None
+                filename: None,
+                content_type: None
             }
         );
         assert_eq!(e.index.as_deref(), Some("contracts"));
@@ -554,7 +612,8 @@ mod tests {
             e.payload,
             IngestPayload::S3 {
                 uri: "s3://b/k".into(),
-                filename: Some("movie.mp4".into())
+                filename: Some("movie.mp4".into()),
+                content_type: None
             }
         );
         assert_eq!(e.payload.mime().as_deref(), Some("video/mp4"));
@@ -590,10 +649,71 @@ mod tests {
             panic!()
         };
         assert_eq!(items.len(), 3);
-        assert!(matches!(items[0], IngestPayload::Url { .. }));
-        assert!(matches!(items[1], IngestPayload::S3 { .. }));
-        assert!(matches!(items[2], IngestPayload::Documents(_)));
+        assert!(matches!(items[0].payload, IngestPayload::Url { .. }));
+        assert!(matches!(items[1].payload, IngestPayload::S3 { .. }));
+        assert!(matches!(items[2].payload, IngestPayload::Documents(_)));
         assert_eq!(e.index.as_deref(), Some("i"));
+    }
+
+    #[test]
+    fn json_items_carry_their_own_index_and_pipeline() {
+        let e = payload_from_json(json!({"items": [
+            {"url": "https://e.com/a.pdf", "index": "pdfs", "pipeline": "p"},
+            {"documents": [{"id": "1"}]}
+        ], "index": "batch"}))
+        .unwrap();
+        let IngestPayload::Batch(items) = e.payload else {
+            panic!()
+        };
+        assert_eq!(items[0].index.as_deref(), Some("pdfs"));
+        assert_eq!(items[0].pipeline.as_deref(), Some("p"));
+        assert_eq!(items[1].index, None);
+        assert_eq!(e.index.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn refs_route_by_the_router_s_extension_table() {
+        // `mime_guess` knows neither `.avro` nor `.msgpack`: URLs to them were a 415
+        // although `builtin.avro` and `builtin.msgpack` exist.
+        for (url, mime) in [
+            ("https://e.com/weather.avro", "application/vnd.apache.avro"),
+            ("https://e.com/cases.msgpack", "application/vnd.msgpack"),
+            ("https://e.com/talk.m4a", "audio/mp4"),
+        ] {
+            let e = payload_from_json(json!({ "url": url })).unwrap();
+            assert_eq!(e.payload.mime().as_deref(), Some(mime), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_content_type_hint_routes_a_ref_whose_name_says_nothing() {
+        let e = payload_from_json(
+            json!({"url": "https://example.com/", "content_type": "text/html; charset=utf-8"}),
+        )
+        .unwrap();
+        assert_eq!(e.payload.mime().as_deref(), Some("text/html"));
+        // The name's extension still wins over the hint.
+        let e =
+            payload_from_json(json!({"url": "https://e.com/a.pdf", "content_type": "text/html"}))
+                .unwrap();
+        assert_eq!(e.payload.mime().as_deref(), Some("application/pdf"));
+        // octet-stream is no hint at all.
+        let e = payload_from_json(
+            json!({"s3": "s3://b/k", "content_type": "application/octet-stream"}),
+        )
+        .unwrap();
+        assert_eq!(
+            e.payload.mime().as_deref(),
+            Some("application/octet-stream")
+        );
+        let e = payload_from_json(json!({"items": [
+            {"url": "https://e.com/api/users", "content_type": "application/json"}
+        ]}))
+        .unwrap();
+        let IngestPayload::Batch(items) = e.payload else {
+            panic!()
+        };
+        assert_eq!(items[0].payload.mime().as_deref(), Some("application/json"));
     }
 
     #[test]
@@ -759,7 +879,8 @@ mod tests {
             e.payload,
             IngestPayload::Url {
                 url: "https://e.com/a.pdf".into(),
-                filename: None
+                filename: None,
+                content_type: None
             }
         );
 
@@ -781,7 +902,8 @@ mod tests {
             e.payload,
             IngestPayload::S3 {
                 uri: "s3://b/k".into(),
-                filename: Some("k.mp4".into())
+                filename: Some("k.mp4".into()),
+                content_type: None
             }
         );
 

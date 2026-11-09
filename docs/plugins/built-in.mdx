@@ -270,7 +270,8 @@ generated text. The plugin sends the document's title and content as `state` to
 `POST {TYPESAFE_BASE_URL}/systemone` with the questions from your config, and
 writes each answer into `fields.<question key>`. Accepts `documents` and `many`;
 usually used with `fan_out: "$.documents"`. Queue: `workers-general`. Requires
-`TYPESAFE_API_KEY`.
+`TYPESAFE_API_KEY`, except for a Lab team with `LAB_AI_GATEWAY` on: the step then
+calls the team's Gateway on `POST /v1/decisions` (same TypeSafe body and answers).
 
 ```yaml
 - id: classify
