@@ -102,7 +102,7 @@ pub fn authorize_job_read(
     if !management_auth_enabled(config) {
         return resolve_tenant_id(headers, config);
     }
-    if bearer_token(headers).is_some_and(|token| management_principal(config, &token).is_some()) {
+    if bearer_token(headers).is_some_and(|token| is_management_token(config, &token)) {
         return Ok(authorize(headers, config)?.tenant_id);
     }
     match resolve_tenant_id(headers, config)? {
@@ -111,6 +111,12 @@ pub fn authorize_job_read(
             "missing or invalid management token, and no trusted edge tenant".into(),
         )),
     }
+}
+
+/// Whether `token` is one of the configured management secrets (`LAB_SERVICE_TOKEN`,
+/// `ADMIN_API_KEY`), and so not a Meilisearch key.
+pub(crate) fn is_management_token(config: &GatewayConfig, token: &str) -> bool {
+    management_principal(config, token).is_some()
 }
 
 /// The management principal a bearer token authenticates, if any.

@@ -7,7 +7,8 @@
 //! 3. `X-Meili-Tenant-Id`, else `X-Meili-Project-Id` → tenant_id
 //! 4. `X-Meili-Index` → index (starting point)
 //! 5. `?index=` query param → index (overrides the header)
-//! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback)
+//! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback). A bearer equal to
+//!    `LAB_SERVICE_TOKEN` or `ADMIN_API_KEY` is a management token, never the key.
 //! 7. `MEILI_URL` / `MEILI_API_KEY` env vars → host / api_key (self-hosted fallback, only
 //!    without a tenant)
 //!
@@ -168,9 +169,20 @@ pub fn resolve_request_context(
         index = Some(q.to_string());
     }
 
-    // 6: Authorization: Bearer fallback for the key.
+    // 6: Authorization: Bearer fallback for the key. A bearer that is one of the
+    // gateway's own management tokens authenticates a management route, it is not a
+    // Meilisearch key: it must never be sent to Meilisearch or stored in a workflow.
     if api_key.is_none() {
-        api_key = bearer_token(headers);
+        api_key = bearer_token(headers).filter(|token| {
+            let management = crate::auth::is_management_token(config, token);
+            if management {
+                tracing::debug!(
+                    "ignoring the Authorization bearer as a Meilisearch key: it is a \
+                     management token"
+                );
+            }
+            !management
+        });
     }
 
     // 7: env fallbacks, standalone only. A request that carries a tenant never falls
@@ -373,6 +385,55 @@ mod tests {
             resolve_context(&h, None, &cfg()),
             Err(GatewayError::MissingContext(_))
         ));
+    }
+
+    #[test]
+    fn a_management_token_is_never_the_meilisearch_key() {
+        // Operator mode: the admin key sent on an ingest route must not shadow
+        // `MEILI_API_KEY`, nor travel to Meilisearch or into workflow history.
+        let cfg = GatewayConfig {
+            admin_api_key: Some("adm".into()),
+            ..cfg_env()
+        };
+        let h = headers(&[("authorization", "Bearer adm")]);
+        let ctx = resolve_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key.as_deref(), Some("envKey"));
+        assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
+
+        // The Lab service token with a trusted host and no key: nothing supplies a key.
+        let cfg = GatewayConfig {
+            lab_service_token: Some("lab".into()),
+            ..Default::default()
+        };
+        let h = headers(&[(H_HOST, "http://h"), ("authorization", "Bearer lab")]);
+        let err = resolve_context(&h, None, &cfg).unwrap_err();
+        assert!(
+            matches!(&err, GatewayError::MissingContext(m) if m.contains("API key")),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("lab"), "{err}");
+        let ctx = resolve_request_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key, None);
+    }
+
+    #[test]
+    fn another_bearer_is_still_the_key_when_management_auth_is_on() {
+        let cfg = GatewayConfig {
+            admin_api_key: Some("adm".into()),
+            lab_service_token: Some("lab".into()),
+            ..cfg_env()
+        };
+        let h = headers(&[("authorization", "Bearer bearerKey")]);
+        let ctx = resolve_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key.as_deref(), Some("bearerKey"));
+        // A trusted `X-Meili-Api-Key` is used whatever the bearer is.
+        let h = headers(&[
+            (H_HOST, "http://h"),
+            (H_API_KEY, "envoyKey"),
+            ("authorization", "Bearer adm"),
+        ]);
+        let ctx = resolve_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key.as_deref(), Some("envoyKey"));
     }
 
     // --- step 7: env fallbacks ------------------------------------------------------

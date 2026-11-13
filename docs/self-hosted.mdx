@@ -18,6 +18,10 @@ The gateway resolves host and API key in this order (SPEC §3.2):
 If none yields both a host and a key the request is rejected with `400
 missing_context`.
 
+A bearer equal to `ADMIN_API_KEY` (or `LAB_SERVICE_TOKEN`) is a management token,
+not a Meilisearch key: on an ingest route it is ignored and step 3 applies. Use a
+different value for the management key and the Meilisearch key.
+
 <Tabs>
   <Tab title="Option A — env vars">
     Simplest. Every request targets the same instance.
