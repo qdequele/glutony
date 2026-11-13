@@ -46,6 +46,11 @@ Public HTTP API (port 8080). For each ingest request it:
 2. Parses the payload (multipart, JSON `url` / `s3` / `documents`, or raw body).
 3. Detects the MIME type: magic bytes (`infer`) → file extension → UTF-8 sniff →
    `application/octet-stream`. The `Content-Type` header is only a last-resort hint.
+   Magic bytes that only name a container or guess from the first characters are
+   refined by the extension: a zip or OLE file with an Office extension is that
+   Office format, and text that merely opens like HTML, XML or a script takes the
+   type of a text extension (a `README.md` starting with `<div align="center">` is
+   Markdown).
 4. Asks the control plane to resolve a pipeline (`POST /internal/resolve`) or
    loads the named one.
 5. Resolves the target index and writes it into the context.

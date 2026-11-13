@@ -3715,6 +3715,7 @@ dependencies = [
 name = "meili-ingest-router"
 version = "0.1.0"
 dependencies = [
+ "cfb",
  "infer",
  "meili-ingest-plugin-sdk",
  "mime_guess",

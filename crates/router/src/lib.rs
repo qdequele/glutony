@@ -344,8 +344,11 @@ pub fn plugin_task_queue(plugin: &str) -> &'static str {
 
 /// Detect the MIME type of `data` (SPEC §10).
 ///
-/// 1. Magic bytes (`infer`). A bare `application/zip` is refined with the
-///    extension when it names an Office document.
+/// 1. Magic bytes (`infer`). A signature that only names a container or guesses from
+///    the opening characters is refined with the extension: a bare `application/zip`
+///    or OLE compound file when the extension names an Office document, and text
+///    that merely opens like HTML, XML or a script when the extension names a text
+///    format (a `README.md` starting with `<div align="center">` is Markdown).
 /// 2. File extension of `filename` (`.md`/`.markdown` → `text/markdown`,
 ///    `.yaml`/`.yml` → `application/yaml`, the rest via `mime_guess`).
 /// 3. UTF-8 sniff of the first 512 bytes → `text/plain`, upgraded to
@@ -372,8 +375,9 @@ fn detect_mime_raw(data: &[u8], filename: Option<&str>, content_type_hint: Optio
 
     if let Some(kind) = infer::get(data) {
         let magic = kind.mime_type();
-        if magic == mime::ZIP
-            && let Some(ext) = from_ext.as_deref().filter(|m| is_zip_based_office(m))
+        if let Some(ext) = from_ext
+            .as_deref()
+            .filter(|ext| extension_refines(magic, ext))
         {
             return ext.to_owned();
         }
@@ -443,6 +447,39 @@ fn magic_record_format(data: &[u8]) -> Option<&'static str> {
         return Some(mime::AVRO);
     }
     None
+}
+
+/// What `infer` reports for an OLE compound file it cannot attribute to Word, Excel
+/// or PowerPoint (an installer, an Outlook message, or an Office file whose root
+/// CLSID is not one it knows).
+const OLE_STORAGE: &str = "application/x-ole-storage";
+
+/// Whether the extension's type `ext` should replace the signature's type `magic`.
+///
+/// Most signatures identify the format and beat a wrong extension. A few only name a
+/// container or guess from the opening characters, and the extension then knows
+/// better, as long as it agrees with what the signature did establish:
+///
+/// * a zip container, when the extension names a zip-based Office format;
+/// * an OLE compound file, when the extension names a legacy Office format;
+/// * text that opens like HTML (`<p …>`, `<div …>`, `<!-- …`), XML (`<?xml`) or a
+///   script (`#!`), when the extension names a text format. A Markdown README often
+///   opens with an HTML tag, and an XHTML or SVG file with an XML declaration.
+fn extension_refines(magic: &str, ext: &str) -> bool {
+    match magic {
+        mime::ZIP => is_zip_based_office(ext),
+        OLE_STORAGE => matches!(ext, mime::DOC | mime::XLS | mime::PPT),
+        mime::HTML | "text/xml" | "text/x-shellscript" => is_text_format(ext),
+        _ => false,
+    }
+}
+
+/// Formats that are text underneath, whatever their top-level type says.
+fn is_text_format(m: &str) -> bool {
+    m.starts_with("text/")
+        || m.ends_with("+xml")
+        || m.ends_with("+json")
+        || matches!(m, mime::JSON | mime::YAML | "application/xml")
 }
 
 /// Office formats that are zip containers underneath.
@@ -1546,6 +1583,124 @@ mod tests {
             detect_mime(GARBAGE, Some("legacy.doc"), None),
             "application/msword"
         );
+    }
+
+    /// A valid OLE compound file whose root CLSID is zero, as xlwt, POI and Word 95
+    /// write it: `infer` cannot tell Word from Excel and reports a generic container.
+    fn ole_without_clsid(stream: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut file = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        file.create_stream(stream)
+            .unwrap()
+            .write_all(&[0u8; 64])
+            .unwrap();
+        file.flush().unwrap();
+        file.into_inner().into_inner()
+    }
+
+    #[test]
+    fn extension_names_the_office_format_of_a_generic_ole_file() {
+        let workbook = ole_without_clsid("Workbook");
+        assert_eq!(
+            detect_mime_raw(&workbook, None, None),
+            OLE_STORAGE,
+            "the fixture must be the generic case"
+        );
+        assert_eq!(detect_mime(&workbook, Some("export.xls"), None), mime::XLS);
+        let document = ole_without_clsid("WordDocument");
+        assert_eq!(detect_mime(&document, Some("letter.doc"), None), mime::DOC);
+        assert_eq!(detect_mime(&document, Some("deck.ppt"), None), mime::PPT);
+
+        // A header `cfb` cannot open takes the same path.
+        let mut truncated = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        truncated.extend([0u8; 504]);
+        assert_eq!(detect_mime(&truncated, Some("export.xls"), None), mime::XLS);
+
+        // Only an Office extension refines it: an installer or an Outlook message is
+        // still a generic OLE file, and a text extension does not turn it into text.
+        for name in ["setup.msi", "mail.msg", "notes.txt", "report.pdf"] {
+            assert_eq!(
+                detect_mime(&workbook, Some(name), None),
+                OLE_STORAGE,
+                "{name}"
+            );
+        }
+
+        let router = PipelineRouter::new(builtin_pipelines());
+        for (data, filename, uid) in [
+            (&workbook, "export.xls", "builtin.excel"),
+            (&document, "letter.doc", "builtin.word"),
+        ] {
+            let mime = detect_mime(data, Some(filename), None);
+            let m = router
+                .resolve(RouteRequest {
+                    mime: &mime,
+                    filename: Some(filename),
+                    tenant_id: None,
+                })
+                .unwrap_or_else(|| panic!("no route for {filename} ({mime})"));
+            assert_eq!(m.pipeline.uid, uid);
+        }
+    }
+
+    #[test]
+    fn extension_beats_loose_text_signatures() {
+        // `infer` calls anything opening with a common tag HTML, anything opening with
+        // `<?xml` XML and anything opening with `#!` a shell script.
+        let cases: [(&[u8], &str, &str); 9] = [
+            (
+                b"<div align=\"center\">\n\n# Title\n",
+                "README.md",
+                mime::MARKDOWN,
+            ),
+            (
+                b"<p align=\"center\"><img src=\"logo.png\"></p>\n# T\n",
+                "README.md",
+                mime::MARKDOWN,
+            ),
+            (b"<!-- comment -->\n# T\n", "a.md", mime::MARKDOWN),
+            (b"<b>bold</b> opening\n", "notes.txt", mime::TEXT),
+            (b"<a href=\"x\">x</a>,1\n", "rows.csv", mime::CSV),
+            (b"#!/bin/sh\necho hi\n", "notes.txt", mime::TEXT),
+            (b"#!shebang-looking title\n", "post.md", mime::MARKDOWN),
+            (
+                b"<?xml version=\"1.0\"?>\n<html></html>",
+                "page.html",
+                mime::HTML,
+            ),
+            (
+                b"<?xml version=\"1.0\"?>\n<svg></svg>",
+                "logo.svg",
+                "image/svg+xml",
+            ),
+        ];
+        for (data, filename, want) in cases {
+            assert_eq!(
+                detect_mime(data, Some(filename), None),
+                want,
+                "{filename}: raw signature was {:?}",
+                detect_mime_raw(data, None, None)
+            );
+        }
+
+        // Without a name, or with one that says nothing about text, the signature stands.
+        let tagged = b"<div align=\"center\">\n\n# Title\n";
+        assert_eq!(detect_mime(tagged, None, None), mime::HTML);
+        assert_eq!(detect_mime(tagged, Some("noext"), None), mime::HTML);
+        assert_eq!(detect_mime(tagged, Some("photo.png"), None), mime::HTML);
+        // A signature that identifies the format still beats the extension.
+        assert_eq!(detect_mime(PDF_HEAD, Some("README.md"), None), mime::PDF);
+
+        let router = PipelineRouter::new(builtin_pipelines());
+        let mime = detect_mime(tagged, Some("README.md"), None);
+        let m = router
+            .resolve(RouteRequest {
+                mime: &mime,
+                filename: Some("README.md"),
+                tenant_id: None,
+            })
+            .unwrap();
+        assert_eq!(m.pipeline.uid, "builtin.markdown");
     }
 
     #[test]
