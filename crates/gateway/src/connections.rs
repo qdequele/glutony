@@ -125,8 +125,8 @@ struct ConnectionPatch<'a> {
 // Public API shapes.
 // ---------------------------------------------------------------------------
 
-/// `POST /connections` body.
-#[derive(Debug, Clone, Deserialize)]
+/// `POST /connections` body. `Debug` prints `<redacted>` in place of the key.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateConnection {
     /// Name an indexer step will reference.
@@ -140,8 +140,20 @@ pub struct CreateConnection {
     pub api_key: String,
 }
 
+impl std::fmt::Debug for CreateConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateConnection")
+            .field("uid", &self.uid)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// `PATCH /connections/{uid}` body. Omitting `api_key` keeps the stored one.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `Debug` prints `<redacted>` in place of the key.
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateConnection {
     /// New display name.
@@ -153,6 +165,16 @@ pub struct UpdateConnection {
     /// New plaintext key.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for UpdateConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateConnection")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// A connection as the API returns it: the key is always [`MASK`].
@@ -444,6 +466,27 @@ mod tests {
             Some(Arc::new(SecretKey::from_bytes([1; 32]))),
             HostPolicy::Any,
         )
+    }
+
+    #[test]
+    fn request_bodies_never_print_the_key_in_debug() {
+        let create: CreateConnection = serde_json::from_value(serde_json::json!({
+            "uid": "prod", "host": "https://ms.example", "api_key": "SECRET"
+        }))
+        .unwrap();
+        let shown = format!("{create:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(shown.contains("prod") && shown.contains("https://ms.example"));
+
+        let update = UpdateConnection {
+            api_key: Some("SECRET".into()),
+            ..Default::default()
+        };
+        let shown = format!("{update:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        // Whether the request rotates the key stays visible.
+        assert!(shown.contains(r#"api_key: Some("<redacted>")"#), "{shown}");
+        assert!(format!("{:?}", UpdateConnection::default()).contains("api_key: None"));
     }
 
     #[test]

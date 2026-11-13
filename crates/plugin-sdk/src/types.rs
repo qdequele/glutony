@@ -1,6 +1,7 @@
 //! Shared data types: tenant context, documents, plugin I/O, pipeline definitions
-//! and workflow payloads. Every public type derives `Debug`, `Clone`, `Serialize`,
-//! `Deserialize` so it can travel through Temporal payloads unchanged.
+//! and workflow payloads. Every public type is `Debug`, `Clone`, `Serialize` and
+//! `Deserialize` so it can travel through Temporal payloads unchanged. `Debug` is
+//! derived except on [`MeiliContext`], whose own impl redacts the API key.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -22,7 +23,10 @@ use crate::error::PluginError;
 /// a Meilisearch **connection** takes its destination from that connection, not from
 /// the request — and a scheduled source run has no request at all. The `Option`
 /// fields still deserialize the plain strings recorded in older workflow histories.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` prints `<redacted>` in place of the API key, here and in every type that
+/// carries a context.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeiliContext {
     /// Tenant id (from `X-Meili-Tenant-Id` or `X-Meili-Project-Id`).
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
@@ -39,6 +43,18 @@ pub struct MeiliContext {
     /// Region tag for observability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+}
+
+impl std::fmt::Debug for MeiliContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeiliContext")
+            .field("tenant_id", &self.tenant_id)
+            .field("host", &self.host)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("index", &self.index)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl MeiliContext {
@@ -2576,6 +2592,36 @@ steps:
         let v = d.to_index_json();
         assert!(v.get("_meta").is_none(), "{v}");
         assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        let ctx = MeiliContext {
+            host: Some("https://ms.example".into()),
+            api_key: Some("SECRET".into()),
+            index: Some("movies".into()),
+            ..Default::default()
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        // Everything else, and whether a key is set at all, stays visible.
+        assert!(shown.contains("https://ms.example") && shown.contains("movies"));
+        assert!(shown.contains(r#"api_key: Some("<redacted>")"#), "{shown}");
+        assert!(format!("{:?}", MeiliContext::default()).contains("api_key: None"));
+        assert!(!format!("{ctx:#?}").contains("SECRET"));
+
+        // The types that carry a context are covered by it.
+        let input = PipelineWorkflowInput {
+            job_id: Uuid::nil(),
+            pipeline: pipeline_with(vec![StepDefinition::new("i", INDEXER_PLUGIN)]),
+            input: PluginInput::Empty,
+            context: ctx.clone(),
+        };
+        assert!(!format!("{input:?}").contains("SECRET"));
+        let config: IndexerConfig =
+            serde_json::from_value(serde_json::to_value(&ctx).unwrap()).unwrap();
+        assert_eq!(config.meili.api_key.as_deref(), Some("SECRET"));
+        assert!(!format!("{config:?}").contains("SECRET"));
     }
 
     #[test]
