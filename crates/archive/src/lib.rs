@@ -25,7 +25,8 @@
 //!   which is reported as [`Event::Skipped`].
 //!
 //! `max_total_bytes` counts what decompression produces (zip entries and gzip
-//! streams). Tar entries are slices of data already counted, so they do not add to it.
+//! streams), including what was inflated for an entry that ends up skipped. Tar
+//! entries are slices of data already counted, so they do not add to it.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -277,7 +278,7 @@ impl Walker<'_> {
                     continue;
                 }
             };
-            let data = match self.read_counted(&mut file) {
+            let data = match self.read_counted(&mut file, Some(declared)) {
                 Ok(Some(d)) => d,
                 Ok(None) => {
                     self.skip(path, &self.too_large())?;
@@ -359,7 +360,7 @@ impl Walker<'_> {
         depth: usize,
     ) -> Result<(), ArchiveError> {
         let mut decoder = flate2::read::MultiGzDecoder::new(data);
-        let inner = match self.read_counted(&mut decoder) {
+        let inner = match self.read_counted(&mut decoder, None) {
             Ok(Some(d)) => d,
             Ok(None) => return Err(ArchiveError::FileTooLarge(self.limits.max_file_bytes)),
             Err(Read2::Io(message)) => {
@@ -425,28 +426,41 @@ impl Walker<'_> {
     }
 
     /// Read a decompressing reader to the end, counting what it produces against the
-    /// total. `Ok(None)` when the file alone is over [`Limits::max_file_bytes`].
-    fn read_counted(&mut self, reader: &mut dyn Read) -> Result<Option<Vec<u8>>, Read2> {
+    /// total, whether the file is kept or not. `Ok(None)` when the file alone is over
+    /// [`Limits::max_file_bytes`].
+    ///
+    /// `declared` is the size the container announces for the file, when it does. A
+    /// file that turns out larger is unreadable, and found so one byte past that size:
+    /// a forged entry cannot have the walk inflate up to the limit for nothing.
+    fn read_counted(
+        &mut self,
+        reader: &mut dyn Read,
+        declared: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, Read2> {
         let left = self
             .limits
             .max_total_bytes
             .saturating_sub(self.summary.decompressed_bytes);
         let cap = self.limits.max_file_bytes.min(left);
+        let bound = declared.map_or(cap, |d| d.min(cap));
         let mut out = Vec::new();
-        reader
-            .take(cap.saturating_add(1))
-            .read_to_end(&mut out)
-            .map_err(|e| Read2::Io(e.to_string()))?;
+        let read = reader.take(bound.saturating_add(1)).read_to_end(&mut out);
         let len = out.len() as u64;
+        // Counted before anything else: bytes inflated for a file that ends up
+        // skipped were produced all the same.
+        self.summary.decompressed_bytes = self.summary.decompressed_bytes.saturating_add(len);
+        read.map_err(|e| Read2::Io(e.to_string()))?;
+        if len > left {
+            return Err(Read2::Fatal(ArchiveError::TooLarge(
+                self.limits.max_total_bytes,
+            )));
+        }
         if len > cap {
-            if len > left {
-                return Err(Read2::Fatal(ArchiveError::TooLarge(
-                    self.limits.max_total_bytes,
-                )));
-            }
             return Ok(None);
         }
-        self.summary.decompressed_bytes += len;
+        if len > bound {
+            return Err(Read2::Io("larger than its declared size".into()));
+        }
         Ok(Some(out))
     }
 }
@@ -832,6 +846,60 @@ mod tests {
         let (r, events) = run(&data, Format::Gzip, Some("x.gz"), &limits);
         assert_eq!(r, Err(ArchiveError::FileTooLarge(1024 * 1024)));
         assert!(events.is_empty());
+    }
+
+    /// Rewrite every central-directory record of `zip` to declare `size` uncompressed
+    /// bytes, as a forged archive would.
+    fn declare_size(mut zip: Vec<u8>, size: u32) -> Vec<u8> {
+        let mut patched = 0;
+        let mut i = 0;
+        while i + 28 <= zip.len() {
+            if zip[i..].starts_with(b"PK\x01\x02") {
+                zip[i + 24..i + 28].copy_from_slice(&size.to_le_bytes());
+                patched += 1;
+                i += 28;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(patched > 0, "no central-directory record found");
+        zip
+    }
+
+    #[test]
+    fn skipped_oversized_gzip_members_count_toward_the_total() {
+        // Each member is tiny on the wire and inflates past the per-file limit: the
+        // bytes inflated before giving up on it are still decompression output.
+        let member = gz(&[0u8; 4096]);
+        let data = zip_of(&[("a.gz", &member), ("b.gz", &member), ("c.gz", &member)]);
+        let limits = Limits {
+            max_file_bytes: 1024,
+            max_total_bytes: 2500,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Zip, None, &limits);
+        assert_eq!(r, Err(ArchiveError::TooLarge(2500)), "{events:?}");
+        assert!(files(&events).is_empty());
+    }
+
+    #[test]
+    fn a_zip_entry_larger_than_it_declares_is_not_inflated() {
+        let big = [0u8; 4096];
+        let data = declare_size(zip_of(&[("a", &big), ("b", &big), ("c", &big)]), 1);
+        let limits = Limits {
+            max_file_bytes: 1024,
+            max_total_bytes: 2500,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Zip, None, &limits);
+        let summary = r.unwrap();
+        let reason = "unreadable: larger than its declared size";
+        assert_eq!(
+            skipped(&events),
+            vec![("a", reason), ("b", reason), ("c", reason)]
+        );
+        // One byte past the declared size is enough to know.
+        assert_eq!(summary.decompressed_bytes, 6);
     }
 
     #[test]

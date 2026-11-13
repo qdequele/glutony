@@ -116,7 +116,7 @@ running ones are cancelled.
 | Files over `ARCHIVE_MAX_FILE_MB` | `larger than … bytes` |
 | Archives nested deeper than `ARCHIVE_MAX_DEPTH` | `archive nested more than … levels deep` |
 | A nested archive that cannot be read | `not a readable … archive` |
-| Encrypted entries, or zip compression other than deflate | `unreadable: …` |
+| Encrypted entries, zip compression other than deflate, or a zip entry larger than the size it declares | `unreadable: …` |
 | Types no pipeline handles | `no pipeline handles …` |
 
 Files that cannot run as asked count as **failed**, not skipped: a pipeline that
@@ -127,7 +127,10 @@ another index than the `/indexes/{index_uid}/…` route.
 
 An archive is refused as a whole (the job fails, nothing is ingested) when it holds
 more than `ARCHIVE_MAX_FILES` files or decompression produces more than
-`ARCHIVE_MAX_UNPACKED_MB`: a small zip can expand to terabytes. The upload itself is
+`ARCHIVE_MAX_UNPACKED_MB`: a small zip can expand to terabytes. What was decompressed
+for an entry that ends up skipped counts toward `ARCHIVE_MAX_UNPACKED_MB` too, so an
+archive of entries that each expand past `ARCHIVE_MAX_FILE_MB` is refused instead of
+being decompressed in full. The upload itself is
 bounded by the gateway's `MAX_UPLOAD_MB`. The worker holds the archive in memory while
 it expands it, plus a few files at a time.
 
