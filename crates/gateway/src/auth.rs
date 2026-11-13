@@ -15,14 +15,12 @@
 //! and the Lab. [`authorize_job_read`] accepts either, and with auth on refuses a caller
 //! that is neither rather than showing it every tenant's jobs.
 
+use crate::context::{bearer_token, header, resolve_tenant_id, secret_eq};
+use crate::error::GatewayError;
+use crate::state::{AppState, GatewayConfig};
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
-use subtle::ConstantTimeEq;
-
-use crate::context::{bearer_token, header, resolve_tenant_id};
-use crate::error::GatewayError;
-use crate::state::{AppState, GatewayConfig};
 
 /// Header the Lab (or an operator) names the tenant with.
 pub const H_GLUTONY_TENANT_ID: &str = "x-glutony-tenant-id";
@@ -128,7 +126,7 @@ fn management_principal(config: &GatewayConfig, token: &str) -> Option<Principal
 
 /// Constant-time comparison against a configured secret.
 fn token_matches(expected: Option<&str>, got: &str) -> bool {
-    expected.is_some_and(|e| bool::from(e.as_bytes().ct_eq(got.as_bytes())))
+    expected.is_some_and(|e| secret_eq(e, got))
 }
 
 impl FromRequestParts<AppState> for Scope {

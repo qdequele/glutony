@@ -13,12 +13,13 @@
 //!
 //! Steps 1–4 (and `X-Meili-Region`) are only applied when the `X-Meili-*` headers are
 //! trusted: either `ENVOY_TRUSTED_HEADER` is unset (dev mode), or the request carries
-//! `X-Meili-Envoy-Secret` equal to it. Otherwise every `X-Meili-*` header is ignored and
-//! the request is treated as standalone.
+//! `X-Meili-Envoy-Secret` equal to it (compared in constant time). Otherwise every
+//! `X-Meili-*` header is ignored and the request is treated as standalone.
 
 use axum::http::HeaderMap;
 use meili_ingest_plugin_sdk::MeiliContext;
 use meili_ingest_router::mime_to_default_index;
+use subtle::ConstantTimeEq;
 
 use crate::error::GatewayError;
 use crate::state::GatewayConfig;
@@ -52,8 +53,14 @@ pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 pub fn envoy_headers_trusted(headers: &HeaderMap, config: &GatewayConfig) -> bool {
     match &config.envoy_trusted_header {
         None => true,
-        Some(secret) => header(headers, H_ENVOY_SECRET).as_deref() == Some(secret.as_str()),
+        Some(secret) => header(headers, H_ENVOY_SECRET).is_some_and(|got| secret_eq(secret, &got)),
     }
+}
+
+/// Compare a received credential with a configured secret in constant time, so the
+/// time a mismatch takes says nothing about how much of the secret was right.
+pub(crate) fn secret_eq(expected: &str, got: &str) -> bool {
+    bool::from(expected.as_bytes().ct_eq(got.as_bytes()))
 }
 
 /// Read an `X-Meili-*` header, but only when the request is trusted.
@@ -480,6 +487,27 @@ mod tests {
             resolve_context(&h, None, &cfg_secret()),
             Err(GatewayError::MissingContext(_))
         ));
+    }
+
+    #[test]
+    fn only_the_exact_secret_is_trusted() {
+        for (value, trusted) in [
+            ("s3cret", true),
+            ("  s3cret  ", true),
+            ("s3creT", false),
+            ("x3cret", false),
+            ("s3cre", false),
+            ("s3cret2", false),
+            ("s", false),
+        ] {
+            let mut h = envoy_headers();
+            h.insert(H_ENVOY_SECRET, HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                envoy_headers_trusted(&h, &cfg_secret()),
+                trusted,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
