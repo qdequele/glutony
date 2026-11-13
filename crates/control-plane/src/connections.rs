@@ -232,10 +232,11 @@ impl ConnectionRepo {
     ///
     /// For a tenant connection that is the tenant's pipelines plus global ones (a global
     /// pipeline run for that tenant resolves the name in its scope). For a global
-    /// connection it is every pipeline naming it, since any tenant without its own
-    /// connection of that name falls back to the global one. That can over-report a
-    /// pipeline whose tenant shadows the name, which is the safe direction for a "what
-    /// will this delete break" hint.
+    /// connection it is every pipeline naming it, in any scope. A tenant job never
+    /// falls back to the global row ([`ConnectionRepo::get_owned`]), so this over-reports
+    /// the tenant pipelines naming the uid: only global pipelines run by tenantless jobs
+    /// actually use it. Over-reporting is the safe direction for a "what will this
+    /// delete break" hint.
     pub async fn used_by(
         &self,
         uid: &str,
@@ -263,7 +264,8 @@ impl ConnectionRepo {
 // ---------------------------------------------------------------------------
 // `/internal/connections` handlers. Internal only: the gateway owns validation, sealing
 // and redaction, and the worker resolves an indexer step's connection through
-// `get_owned` (`scope=tenant`) for a tenant job, `get` for a global one.
+// `get_owned` (`scope=tenant`) for a job that has a tenant, whatever the scope of its
+// pipeline, and through `get` (the global row) for a tenantless job.
 // ---------------------------------------------------------------------------
 
 /// `GET /internal/connections?tenant_id=` → the tenant's plus global connections.

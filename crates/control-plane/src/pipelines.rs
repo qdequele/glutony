@@ -283,10 +283,15 @@ pub fn config_errors(def: &PipelineDefinition, manifests: &[PluginManifest]) -> 
 /// plugin's schema and indexer connections that do not exist for the tenant (both 422
 /// `validation`).
 ///
-/// The connection lookup is the one the worker does at run time: the tenant's own row for
+/// The connection lookup is keyed on the **pipeline's** scope: the tenant's own row for
 /// a tenant pipeline (a global connection is a template, never usable by a tenant), the
-/// global row for a global pipeline. A pipeline that passes here therefore does not fail
-/// later with "connection not found" unless the connection is deleted in between.
+/// global row for a global pipeline. The worker keys its lookup on the **job's** tenant
+/// instead (`scope=tenant`, the tenant's own row only). The two agree for a tenant
+/// pipeline and for a global pipeline run by a tenantless job, so such a pipeline that
+/// passes here does not fail later with "connection not found" unless the connection is
+/// deleted in between. They do not agree for a global pipeline run by a tenant job:
+/// that job needs the tenant's own connection of that name, which this check neither
+/// requires nor looks at.
 async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> Result<(), CpError> {
     let manifests = crate::plugins::registered_manifests(&state.pool).await?;
     let registered: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
