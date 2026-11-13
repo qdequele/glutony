@@ -124,6 +124,11 @@ the worker, not the gateway, under these rules:
   there.
 - With `OBJECT_REF_BUCKETS` set, a ref to any bucket outside the list is refused
   the same way.
+- An Azure ref names its container as the host (`az://container/key`,
+  `azure://container/key`) or as the user of an account URL
+  (`abfss://container@account.dfs.core.windows.net/key`). An `adl://` or
+  `azure://` ref with a user (`azure://name@container/key`) is refused the same
+  way: those schemes ignore it.
 - By default the object is read **anonymously** (unsigned requests), so only
   public objects can be ingested this way. For S3 the bucket's region is looked
   up first (an unsigned `HEAD` to `<bucket>.s3.amazonaws.com`), unless

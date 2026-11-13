@@ -103,7 +103,8 @@ pub enum BlobError {
 pub const OBJECT_REF_SCHEMES: &[&str] = &["s3", "s3a", "gs", "az", "adl", "azure", "abfs", "abfss"];
 
 /// Parse a tenant-supplied object-store URI (`{"s3": …}` ingest bodies) and refuse any
-/// scheme outside [`OBJECT_REF_SCHEMES`], or one without a bucket. A refusal is
+/// scheme outside [`OBJECT_REF_SCHEMES`], one without a bucket, or an `adl://` /
+/// `azure://` URI with userinfo. A refusal is
 /// [`BlobError::Blocked`]: permanent, retrying reads the same forbidden location.
 pub fn check_object_ref(uri: &str) -> Result<Url, BlobError> {
     let parsed = Url::parse(uri).map_err(|e| BlobError::Url(format!("{uri:?}: {e}")))?;
@@ -117,6 +118,17 @@ pub fn check_object_ref(uri: &str) -> Result<Url, BlobError> {
     if parsed.host_str().is_none_or(str::is_empty) {
         return Err(BlobError::Blocked(format!(
             "object ref {uri:?} names no bucket"
+        )));
+    }
+    // `adl://` and `azure://` name the container as the host and ignore the userinfo: one
+    // that carries any reads another container than the one it appears to name.
+    if matches!(parsed.scheme(), "adl" | "azure")
+        && (!parsed.username().is_empty() || parsed.password().is_some())
+    {
+        return Err(BlobError::Blocked(format!(
+            "object ref {uri:?} carries a user: {}:// names the container as the host \
+             (use abfss://<container>@<account>.dfs.core.windows.net/... to name both)",
+            parsed.scheme()
         )));
     }
     Ok(parsed)
@@ -206,11 +218,11 @@ fn bucket_of(url: &Url) -> Option<Bucket> {
     let (provider, name) = match url.scheme() {
         "s3" | "s3a" => (Provider::S3, host?),
         "gs" => (Provider::Gcs, host?),
-        // `abfs[s]://<container>@<account>.dfs.core.windows.net/...` names the container
-        // as the user; every other form names it as the host.
-        "az" | "adl" | "azure" | "abfs" | "abfss" if !url.username().is_empty() => {
-            (Provider::Azure, url.username())
-        }
+        // Same reading as object_store's Azure builder, which is what the request is
+        // built from: `abfs[s]://<container>@<account>.dfs.core.windows.net/...` (and the
+        // `az://` spelling of it) names the container as the user; `adl://` and
+        // `azure://` ignore the userinfo and name it as the host, like every other form.
+        "az" | "abfs" | "abfss" if !url.username().is_empty() => (Provider::Azure, url.username()),
         "az" | "adl" | "azure" | "abfs" | "abfss" => (Provider::Azure, host?),
         _ => return None,
     };
@@ -2037,6 +2049,73 @@ mod tests {
         ));
         assert!(matches!(
             store.authorize_object_ref("file:///etc/passwd"),
+            Err(BlobError::Blocked(_))
+        ));
+    }
+
+    #[test]
+    fn azure_refs_name_their_container_the_way_object_store_reads_it() {
+        // object_store takes the container of `adl://` and `azure://` from the host and
+        // ignores the userinfo; only `az` / `abfs[s]` read it from the user.
+        let b = |u: &str| bucket_of(&Url::parse(u).unwrap()).unwrap().name;
+        assert_eq!(b("azure://ctr/k"), "ctr");
+        assert_eq!(b("adl://ctr/k"), "ctr");
+        assert_eq!(b("azure://x@ctr/k"), "ctr");
+        assert_eq!(b("adl://x@ctr/k"), "ctr");
+        assert_eq!(b("abfs://ctr@acct.blob.core.windows.net/k"), "ctr");
+        assert_eq!(b("az://ctr@acct.dfs.fabric.microsoft.com/k"), "ctr");
+    }
+
+    #[test]
+    fn azure_userinfo_cannot_relabel_the_container() {
+        // The userinfo of `adl://` / `azure://` was taken as the container by the checks
+        // while the read went to the host: a free label that passed for any container.
+        let mut own = BlobStore::memory().with_object_ref_policy(ObjectRefPolicy {
+            ambient_credentials: true,
+            buckets: None,
+        });
+        own.own_bucket = bucket_of(&Url::parse("az://lab-blobs/glutony").unwrap());
+        let listed = BlobStore::memory()
+            .with_object_ref_policy(ObjectRefPolicy::parse(None, Some("exports")).unwrap());
+        for scheme in ["azure", "adl"] {
+            for uri in [
+                format!("{scheme}://exports@lab-blobs/glutony/jobs/x/input/secret.pdf"),
+                format!("{scheme}://lab-blobs/glutony/jobs/x/input/secret.pdf"),
+                format!("{scheme}://:pw@lab-blobs/k"),
+            ] {
+                assert!(
+                    matches!(own.authorize_object_ref(&uri), Err(BlobError::Blocked(_))),
+                    "{uri}"
+                );
+            }
+            let uri = format!("{scheme}://exports@private/k");
+            assert!(
+                matches!(
+                    listed.authorize_object_ref(&uri),
+                    Err(BlobError::Blocked(_))
+                ),
+                "{uri}"
+            );
+            assert!(matches!(check_object_ref(&uri), Err(BlobError::Blocked(_))));
+            // Without userinfo the host is the container, checked as such.
+            assert!(
+                listed
+                    .authorize_object_ref(&format!("{scheme}://exports/k"))
+                    .is_ok()
+            );
+            assert!(matches!(
+                listed.authorize_object_ref(&format!("{scheme}://private/k")),
+                Err(BlobError::Blocked(_))
+            ));
+        }
+        // The forms that do name the container as the user keep working.
+        assert!(
+            listed
+                .authorize_object_ref("abfss://exports@acct.dfs.core.windows.net/k")
+                .is_ok()
+        );
+        assert!(matches!(
+            own.authorize_object_ref("abfss://lab-blobs@acct.dfs.core.windows.net/k"),
             Err(BlobError::Blocked(_))
         ));
     }
