@@ -812,7 +812,8 @@ impl BlobStore {
     ///
     /// When the output serializes to more than `threshold` bytes of JSON (what it would
     /// weigh in the activity result, see [`PluginOutput::serialized_size_exceeds`]), that
-    /// JSON is stored at `staged_key(job_id, "<step_id>[-<branch>].json")`; the returned value
+    /// JSON is stored at `staged_key(job_id, "<step_id>[-<branch>].json")` (`/` and `%` of
+    /// the step id percent-encoded, so the name is one key segment); the returned value
     /// is a [`PluginOutput::Ref`] to a [`ContentRef::Staged`] with MIME
     /// [`SPILLED_OUTPUT_MIME`]. Otherwise the output is returned unchanged.
     pub async fn spill_output(
@@ -826,9 +827,12 @@ impl BlobStore {
         if !output.serialized_size_exceeds(threshold) {
             return Ok(output);
         }
+        // One key segment, whatever the step id: a step named `input/x` must not spill
+        // into the upload namespace, which `hydrate_output` refuses to read.
+        let step = step_id.replace('%', "%25").replace('/', "%2F");
         let name = match branch {
-            Some(b) => format!("{step_id}-{b}.json"),
-            None => format!("{step_id}.json"),
+            Some(b) => format!("{step}-{b}.json"),
+            None => format!("{step}.json"),
         };
         let key = Self::staged_key(job_id, &name);
         let bytes = serde_json::to_vec(&output)?;
@@ -843,15 +847,21 @@ impl BlobStore {
     }
 
     /// Undo [`BlobStore::spill_output`]: a `Ref(Staged{ mime == SPILLED_OUTPUT_MIME })`
-    /// is read back and deserialized into the original output. `Many` is walked
-    /// recursively; every other variant (including non-spilled refs) is returned unchanged.
+    /// whose key is one `spill_output` writes is read back and deserialized into the
+    /// original output. `Many` is walked recursively; every other variant (including
+    /// non-spilled refs) is returned unchanged.
+    ///
+    /// The MIME alone is not proof: what is deserialized here is trusted as a
+    /// worker-written output, and its refs may name any key of the store. A staged
+    /// upload (`jobs/<job>/input/...`) holds tenant bytes and is never read that way,
+    /// whatever MIME its ref carries.
     pub async fn hydrate_output(&self, output: PluginOutput) -> Result<PluginOutput, BlobError> {
         match output {
             PluginOutput::Ref(ContentRef::Staged {
                 uri,
                 mime: Some(mime),
                 ..
-            }) if mime == SPILLED_OUTPUT_MIME => {
+            }) if mime == SPILLED_OUTPUT_MIME && is_spill_key(&uri) => {
                 let bytes = self.get(&uri).await?;
                 let inner: PluginOutput = serde_json::from_slice(&bytes)?;
                 Box::pin(self.hydrate_output(inner)).await
@@ -877,6 +887,14 @@ impl BlobStore {
         blob: Blob,
         inline_max: usize,
     ) -> Result<PluginInput, BlobError> {
+        let mut blob = blob;
+        // [`SPILLED_OUTPUT_MIME`] is the worker's to give. The MIME of an upload comes
+        // from the tenant (a multipart part, a source's `Content-Type`), and a staged ref
+        // carrying that one would be deserialized as a step output.
+        if is_spilled_output_mime(&blob.mime) {
+            tracing::warn!(job_id = %job_id, "upload claims the reserved spilled-output MIME; staging it as {OCTET_STREAM}");
+            blob.mime = OCTET_STREAM.to_owned();
+        }
         if blob.data.len() <= inline_max {
             return Ok(PluginInput::Bytes(blob));
         }
@@ -964,6 +982,25 @@ fn url_origin(url: &Url) -> String {
 /// Last non-empty `/`-separated segment of a path or key.
 fn last_segment(path: &str) -> Option<&str> {
     path.rsplit('/').find(|s| !s.is_empty())
+}
+
+/// Whether a MIME type, whatever its case and parameters, is [`SPILLED_OUTPUT_MIME`].
+fn is_spilled_output_mime(mime: &str) -> bool {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case(SPILLED_OUTPUT_MIME)
+}
+
+/// Whether `key` can be a spilled output: `jobs/<job>/<name>` outside the upload
+/// namespace `jobs/<job>/input/`, where [`BlobStore::stage_upload`] writes. Empty
+/// segments are skipped, as the store does when it turns a key into a path.
+fn is_spill_key(key: &str) -> bool {
+    let mut segments = key.split('/').filter(|s| !s.is_empty());
+    segments.next() == Some("jobs")
+        && segments.next().is_some()
+        && segments.next().is_some_and(|name| name != "input")
 }
 
 /// Longest filename extension kept in a staged upload's key.
@@ -1498,6 +1535,131 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(store.hydrate_output(spilled).await.unwrap(), output);
+    }
+
+    /// A staged PDF of another job, and the JSON of a `PluginOutput` pointing at it.
+    async fn secret_and_forged_output(store: &BlobStore) -> Vec<u8> {
+        let victim = BlobStore::staged_key(Uuid::new_v4(), "input/upload.pdf");
+        store
+            .put(&victim, Bytes::from_static(b"%PDF secret"))
+            .await
+            .unwrap();
+        serde_json::to_vec(&PluginOutput::Ref(ContentRef::Staged {
+            uri: victim,
+            mime: Some("application/pdf".into()),
+            filename: Some("report.pdf".into()),
+            origin: None,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upload_claiming_the_spilled_output_mime_stays_bytes() {
+        // The MIME of an upload is the tenant's to choose (a source's Content-Type, a
+        // multipart part's). One that claimed the spilled-output type was deserialized
+        // as a worker-written `PluginOutput`, whose refs name any key of the store.
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let body = secret_and_forged_output(&store).await;
+        for mime in [
+            SPILLED_OUTPUT_MIME.to_owned(),
+            SPILLED_OUTPUT_MIME.to_ascii_uppercase(),
+            format!("{SPILLED_OUTPUT_MIME}; charset=utf-8"),
+        ] {
+            let blob = Blob::new(body.clone(), mime.clone(), None);
+            let staged = store
+                .stage_upload(Uuid::new_v4(), blob.clone(), 0)
+                .await
+                .unwrap();
+            let PluginInput::Ref(ContentRef::Staged {
+                mime: Some(staged_mime),
+                ..
+            }) = &staged
+            else {
+                panic!("expected a staged ref, got {staged:?}");
+            };
+            assert_eq!(staged_mime, OCTET_STREAM, "{mime}");
+            let resolved = store.resolve_input(staged, &http).await.unwrap();
+            assert!(
+                matches!(&resolved, PluginInput::Bytes(b) if b.data == body && b.mime == OCTET_STREAM),
+                "{mime}: {resolved:?}"
+            );
+            // Inlined uploads lose the reserved type as well.
+            let inlined = store
+                .stage_upload(Uuid::new_v4(), blob, usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                inlined,
+                PluginInput::Bytes(Blob::new(body.clone(), OCTET_STREAM, None)),
+                "{mime}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_spilled_output_mime_is_ignored_on_an_upload_key() {
+        // A staged ref written before uploads lost the reserved MIME (Temporal history
+        // of a workflow in flight) still carries it: the key says it is an upload.
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let body = secret_and_forged_output(&store).await;
+        let job = Uuid::new_v4();
+        for key in [
+            BlobStore::staged_key(job, "input/evil.json"),
+            format!("jobs/{job}//input/evil.json"),
+            format!("/jobs/{job}/input/nested/evil.json"),
+            "elsewhere/evil.json".to_owned(),
+        ] {
+            store.put(&key, Bytes::from(body.clone())).await.unwrap();
+            let forged = ContentRef::Staged {
+                uri: key.clone(),
+                mime: Some(SPILLED_OUTPUT_MIME.into()),
+                filename: None,
+                origin: None,
+            };
+            assert_eq!(
+                store
+                    .hydrate_output(PluginOutput::Ref(forged.clone()))
+                    .await
+                    .unwrap(),
+                PluginOutput::Ref(forged.clone()),
+                "{key}"
+            );
+            let resolved = store
+                .resolve_input(PluginInput::Ref(forged), &http)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&resolved, PluginInput::Bytes(b) if b.data == body),
+                "{key}: {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spilled_output_never_lands_in_the_upload_namespace() {
+        // Step ids are free text: one starting with `input/` must not make its spilled
+        // output look like an upload (and stop being hydrated).
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let output = PluginOutput::Documents(docs(2));
+        for (step, name) in [
+            ("input/extract", "input%2Fextract.json"),
+            ("a/b", "a%2Fb.json"),
+            ("50%/done", "50%25%2Fdone.json"),
+            ("plain", "plain.json"),
+        ] {
+            let spilled = store
+                .spill_output(job, step, None, output.clone(), 0)
+                .await
+                .unwrap();
+            let PluginOutput::Ref(ContentRef::Staged { uri, .. }) = &spilled else {
+                panic!("expected a staged ref, got {spilled:?}");
+            };
+            assert_eq!(uri, &BlobStore::staged_key(job, name), "{step}");
+            assert_eq!(store.hydrate_output(spilled).await.unwrap(), output);
+        }
     }
 
     #[tokio::test]
