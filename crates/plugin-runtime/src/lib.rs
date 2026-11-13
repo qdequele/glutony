@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 pub use error::RuntimeError;
 #[cfg(feature = "grpc")]
-pub use grpc::GrpcPlugin;
+pub use grpc::{GrpcConnectOptions, GrpcPlugin};
 #[cfg(feature = "wasm")]
 pub use wasm::{WasmLimits, WasmPlugin};
 
@@ -105,6 +105,9 @@ pub fn parse_env(value: &str) -> Vec<ExternalPluginSpec> {
 }
 
 /// Load one external plugin.
+///
+/// A gRPC plugin that cannot be reached or does not answer `GetManifest` yet is
+/// retried for thirty seconds (`grpc::LOAD_RETRY_FOR`) before the load fails.
 pub async fn load(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError> {
     match spec.kind {
         PluginKind::Wasm => load_wasm(spec),
@@ -131,8 +134,15 @@ fn load_wasm(_spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError
 
 #[cfg(feature = "grpc")]
 async fn load_grpc(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError> {
+    // The plugin container often starts alongside the worker: wait for it a little
+    // rather than leave the plugin missing until the worker restarts.
+    let options = grpc::GrpcConnectOptions {
+        retry_for: grpc::LOAD_RETRY_FOR,
+        ..grpc::GrpcConnectOptions::default()
+    };
     Ok(Arc::new(
-        GrpcPlugin::connect_with_manifest(spec.location.clone(), spec.manifest.clone()).await?,
+        GrpcPlugin::connect_with_options(spec.location.clone(), spec.manifest.clone(), options)
+            .await?,
     ))
 }
 

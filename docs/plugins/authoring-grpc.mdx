@@ -138,7 +138,12 @@ Sidecar (as above) is simplest; a separate Deployment + Service works too
 (`grpc:http://whisper.meili-ingest.svc:50051`) and is the better fit when the
 plugin needs a GPU, since only the plugin pods then land on GPU nodes. The
 worker calls `Manifest` at boot, registers the plugin under `manifest.name`,
-and publishes it to the control plane. Every name except `s3_downloader` routes
+and publishes it to the control plane. A plugin that is not up yet is retried
+for about 30 seconds, so a sidecar starting with the worker is found; the
+manifest call itself must answer within 10 seconds per attempt. Bind the port
+only once the plugin can answer: a plugin still unreachable after that wait
+stays unavailable until the worker restarts, and each such entry delays the
+worker's start by that long. Every name except `s3_downloader` routes
 to `workers-general`, so declare external plugins on that pool. A plugin gets
 its own pool only if you add its name to `plugin_task_queue` in
 `crates/router/src/lib.rs` and deploy a worker polling that queue.

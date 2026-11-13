@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use meili_ingest_plugin_runtime::grpc::proto::execute_response::Result as RpcResult;
 use meili_ingest_plugin_runtime::grpc::proto::plugin_service_server::{
@@ -12,7 +13,10 @@ use meili_ingest_plugin_runtime::grpc::proto::plugin_service_server::{
 use meili_ingest_plugin_runtime::grpc::proto::{
     ExecuteError, ExecuteRequest, ExecuteResponse, GetManifestRequest, GetManifestResponse,
 };
-use meili_ingest_plugin_runtime::{ExternalPluginSpec, GrpcPlugin, RuntimeError, load};
+
+use meili_ingest_plugin_runtime::{
+    ExternalPluginSpec, GrpcConnectOptions, GrpcPlugin, RuntimeError, load,
+};
 use meili_ingest_plugin_sdk::prelude::*;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -96,7 +100,10 @@ impl PluginService for EchoService {
 }
 
 async fn spawn_server() -> (String, Arc<AtomicBool>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve(TcpListener::bind("127.0.0.1:0").await.unwrap())
+}
+
+fn serve(listener: TcpListener) -> (String, Arc<AtomicBool>) {
     let addr = listener.local_addr().unwrap();
     let svc = EchoService::default();
     let calls = svc.calls.clone();
@@ -196,4 +203,95 @@ async fn unreachable_endpoint_is_a_transport_error() {
     assert!(matches!(err, RuntimeError::Transport(_)), "got {err:?}");
     let err = GrpcPlugin::connect("not a uri").await.err().unwrap();
     assert!(matches!(err, RuntimeError::Transport(_)), "got {err:?}");
+}
+
+/// A port nothing listens on yet, to start a server on later.
+async fn closed_port() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+#[tokio::test]
+async fn load_waits_for_a_plugin_container_that_starts_after_the_worker() {
+    // A sidecar that binds its port a moment after the worker dials it.
+    let addr = closed_port().await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        serve(TcpListener::bind(addr).await.unwrap());
+    });
+
+    let spec = ExternalPluginSpec::new(PluginKind::Grpc, format!("http://{addr}"));
+    let plugin = load(&spec)
+        .await
+        .expect("the plugin comes up within the wait");
+    assert_eq!(plugin.manifest().name, "echo");
+}
+
+#[tokio::test]
+async fn get_manifest_gives_up_on_a_peer_that_never_answers() {
+    // Accepts the connection, then says nothing: a port that is open before the
+    // plugin can serve, or one that speaks another protocol.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+
+    let options = GrpcConnectOptions {
+        manifest_timeout: Duration::from_millis(300),
+        ..GrpcConnectOptions::default()
+    };
+    let connected = tokio::time::timeout(
+        Duration::from_secs(20),
+        GrpcPlugin::connect_with_options(format!("http://{addr}"), None, options),
+    )
+    .await
+    .expect("connecting must not wait forever for the manifest");
+    let err = connected.expect_err("no manifest, no plugin");
+    assert!(
+        matches!(&err, RuntimeError::Rpc(m) if m.contains("GetManifest")),
+        "got {err:?}"
+    );
+
+    // The default has a deadline too.
+    assert!(GrpcConnectOptions::default().manifest_timeout <= Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn retrying_stops_once_the_wait_is_over() {
+    let addr = closed_port().await;
+    let options = GrpcConnectOptions {
+        retry_for: Duration::from_secs(1),
+        ..GrpcConnectOptions::default()
+    };
+    let started = std::time::Instant::now();
+    let err = GrpcPlugin::connect_with_options(format!("http://{addr}"), None, options)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, RuntimeError::Transport(_)), "got {err:?}");
+    // Several attempts were made, and the wait did not run far past its bound.
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(700), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(10), "waited {waited:?}");
+}
+
+#[tokio::test]
+async fn an_endpoint_that_can_never_work_is_not_retried() {
+    let options = GrpcConnectOptions {
+        retry_for: Duration::from_secs(60),
+        ..GrpcConnectOptions::default()
+    };
+    let started = std::time::Instant::now();
+    let err = GrpcPlugin::connect_with_options("not a uri", None, options)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, RuntimeError::Transport(_)), "got {err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
