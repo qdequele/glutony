@@ -164,9 +164,13 @@ a Lab account, the gateway calls `GET {LAB_URL}/internal/accounts/{account}` (ca
 inactive. When the Lab cannot answer and no cached answer is that recent, or before
 the Lab has confirmed the credentials at boot, it answers
 `503 {"code": "lab_unavailable"}` and starts nothing. After a failed call the gateway
-does not ask the Lab again for 10 s (for any account): requests in that window use a
-cached answer or get the `503` straight away, so a hung Lab costs one timeout, not one
-per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
+does not ask the Lab again for 10 s: requests in that window use a cached answer or
+get the `503` straight away, so a hung Lab costs one timeout, not one per request.
+That pause covers every account when the failure is the Lab's (unreachable or timed
+out, `401`, `403`, `429`, any `5xx`), and only the account that was asked about when
+the failure is its own (an answer the gateway cannot read, any other `4xx`): the other
+accounts are still checked. Tenants that are not Lab account ids (Cloud projects) are
+never checked.
 
 Scheduled source runs start from Temporal, not through the gateway, so they are
 checked at the start of each run instead: when the source's tenant is a Lab account

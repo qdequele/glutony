@@ -6,7 +6,8 @@
 //! entry up to [`STALE_FOR`] old is used, and past that the check fails closed
 //! ([`CreditDecision::Unavailable`]). After a failed fetch the cache does not ask the
 //! Lab again for [`FAILURE_BACKOFF`], so a hung Lab costs one timeout, not one per
-//! check.
+//! check. A failure that says the Lab is in trouble pauses every account; one that is
+//! about the account asked for pauses that account only.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -18,8 +19,80 @@ use crate::{AccountLookup, LabCredentials, LabError, fetch_account, is_lab_accou
 pub const FRESH_FOR: Duration = Duration::from_secs(30);
 /// A lookup younger than this is reused when the Lab cannot answer.
 pub const STALE_FOR: Duration = Duration::from_secs(300);
-/// After a failed fetch, the Lab is not asked again for this long (any account).
+/// After a failed fetch, the Lab is not asked again for this long: about any account
+/// when the failure is the Lab's, about that account when it is the account's.
 pub const FAILURE_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Does this failure say the Lab, or this engine's access to it, is in trouble? An
+/// unreachable Lab, refused credentials (401, 403), a rate limit (429) and a 5xx do.
+/// An unreadable body or another 4xx is about the account that was asked for.
+fn is_lab_wide(e: &LabError) -> bool {
+    match e {
+        LabError::Transport(_) | LabError::Unauthorized | LabError::WrongProduct(_) => true,
+        LabError::Status(code) => matches!(code, 403 | 429 | 500..),
+        LabError::Malformed(_) => false,
+    }
+}
+
+/// The failed Lab fetches of one cache, each remembered for [`FAILURE_BACKOFF`].
+#[derive(Default)]
+pub(crate) struct FailureBackoff {
+    /// When the Lab last failed as a whole; cleared by the next success.
+    lab: Mutex<Option<Instant>>,
+    /// When and how the Lab last failed for one account; cleared by that account's
+    /// next success, and pruned once older than [`FAILURE_BACKOFF`].
+    accounts: Mutex<HashMap<String, (Instant, LabError)>>,
+}
+
+impl FailureBackoff {
+    /// The failure to answer with instead of asking the Lab about `account_id`, when
+    /// one is younger than [`FAILURE_BACKOFF`].
+    pub(crate) fn blocked(&self, account_id: &str, now: Instant) -> Option<LabError> {
+        let recent = |at: Instant| now.saturating_duration_since(at) < FAILURE_BACKOFF;
+        if self
+            .lab
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(recent)
+        {
+            return Some(LabError::Transport(format!(
+                "not asked: the last Lab request failed less than {}s ago",
+                FAILURE_BACKOFF.as_secs()
+            )));
+        }
+        self.accounts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(account_id)
+            .filter(|(at, _)| recent(*at))
+            .map(|(_, e)| e.clone())
+    }
+
+    /// Remember what a fetch about `account_id` answered, seen at `now`. A success ends
+    /// the Lab-wide backoff and that account's; an account's failure leaves the
+    /// Lab-wide backoff as it is.
+    pub(crate) fn record<T>(&self, account_id: &str, fetched: &Result<T, LabError>, now: Instant) {
+        match fetched {
+            Ok(_) => {
+                *self.lab.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                self.accounts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(account_id);
+            }
+            Err(e) if is_lab_wide(e) => {
+                *self.lab.lock().unwrap_or_else(|p| p.into_inner()) = Some(now);
+            }
+            Err(e) => {
+                let mut accounts = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
+                // Keeps the map bounded by the accounts that failed in the last
+                // FAILURE_BACKOFF.
+                accounts.retain(|_, (at, _)| now.saturating_duration_since(*at) < FAILURE_BACKOFF);
+                accounts.insert(account_id.to_string(), (now, e.clone()));
+            }
+        }
+    }
+}
 
 /// What a credit check concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,8 +133,7 @@ pub struct AccountCreditCache {
     creds: LabCredentials,
     http: reqwest::Client,
     accounts: Mutex<HashMap<String, Cached>>,
-    /// When the last account fetch failed; cleared by the next success.
-    last_failure: Mutex<Option<Instant>>,
+    failures: FailureBackoff,
     /// Test-only offset added to the clock, so tests move the cache windows forward
     /// without waiting.
     #[cfg(test)]
@@ -84,7 +156,7 @@ impl AccountCreditCache {
             creds,
             http,
             accounts: Mutex::new(HashMap::new()),
-            last_failure: Mutex::new(None),
+            failures: FailureBackoff::default(),
             #[cfg(test)]
             skew: Mutex::new(Duration::ZERO),
         }
@@ -149,22 +221,13 @@ impl AccountCreditCache {
         {
             return Some(c.lookup);
         }
-        let backing_off = self
-            .last_failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some_and(|at| now.duration_since(at) < FAILURE_BACKOFF);
-        let fetched = if backing_off {
-            Err(LabError::Transport(format!(
-                "not asked: the last Lab request failed less than {}s ago",
-                FAILURE_BACKOFF.as_secs()
-            )))
+        let fetched = if let Some(e) = self.failures.blocked(account_id, now) {
+            Err(e)
         } else {
             let fetched = fetch_account(&self.http, &self.creds, account_id).await;
             // Timed from when the failure was seen, so a 5 s timeout still leaves the
             // full backoff before the next attempt.
-            *self.last_failure.lock().unwrap_or_else(|p| p.into_inner()) =
-                fetched.is_err().then(|| self.now());
+            self.failures.record(account_id, &fetched, self.now());
             fetched
         };
         match fetched {
@@ -183,14 +246,14 @@ impl AccountCreditCache {
             }
             Err(e) => match self.cached(account_id) {
                 Some(c) if now.duration_since(c.fetched_at) < STALE_FOR => {
-                    tracing::warn!(error = %e, account_id, "Lab unreachable; using a stale account lookup");
+                    tracing::warn!(error = %e, account_id, "the Lab could not answer; using a stale account lookup");
                     Some(c.lookup)
                 }
                 _ => {
                     tracing::error!(
                         error = %e,
                         account_id,
-                        "Lab unreachable and no usable cached lookup; refusing the work (fail closed)"
+                        "the Lab could not answer and no usable cached lookup; refusing the work (fail closed)"
                     );
                     None
                 }
@@ -377,5 +440,92 @@ mod tests {
         c.advance(Duration::from_secs(5));
         assert_eq!(c.check(ACCOUNT).await, CreditDecision::Allowed);
         lab.verify().await;
+    }
+
+    const OTHER: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62";
+
+    /// `OTHER` has credits; `ACCOUNT` gets `broken` from the Lab.
+    async fn mount_one_broken_account(lab: &MockServer, broken: ResponseTemplate, expect: u64) {
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{ACCOUNT}")))
+            .respond_with(broken)
+            .expect(expect)
+            .mount(lab)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{OTHER}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "account_id": OTHER, "tier": "pro",
+                "credits": {"balance": 10}, "cache_ttl": 30
+            })))
+            .expect(1)
+            .mount(lab)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn one_account_s_bad_answer_does_not_pause_the_other_accounts() {
+        // A body the contract does not allow (a fractional balance) and a 4xx are about
+        // that account, not about the Lab: the others are still asked.
+        let unreadable = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "active": true, "account_id": ACCOUNT, "credits": {"balance": 1.5}
+        }));
+        for broken in [unreadable, ResponseTemplate::new(422)] {
+            let lab = MockServer::start().await;
+            mount_one_broken_account(&lab, broken, 2).await;
+            let c = cache(&lab);
+            assert!(is_unavailable(&c.check(ACCOUNT).await));
+            assert_eq!(c.check(OTHER).await, CreditDecision::Allowed);
+            // The broken account itself is not asked about again for 10 s, even though
+            // another account's lookup succeeded meanwhile.
+            c.advance(Duration::from_secs(9));
+            assert!(is_unavailable(&c.check(ACCOUNT).await));
+            assert_eq!(lab.received_requests().await.unwrap().len(), 2);
+            c.advance(Duration::from_secs(2));
+            assert!(is_unavailable(&c.check(ACCOUNT).await));
+            lab.verify().await;
+        }
+    }
+
+    #[test]
+    fn an_account_s_failure_does_not_end_a_lab_wide_backoff() {
+        let b = FailureBackoff::default();
+        let t0 = Instant::now();
+        b.record::<()>(ACCOUNT, &Err(LabError::Transport("timeout".into())), t0);
+        b.record::<()>(ACCOUNT, &Err(LabError::Malformed("bad".into())), t0);
+        assert!(b.blocked(OTHER, t0 + Duration::from_secs(9)).is_some());
+        assert!(b.blocked(OTHER, t0 + FAILURE_BACKOFF).is_none());
+        // A success ends both.
+        b.record(ACCOUNT, &Ok(()), t0);
+        assert!(b.blocked(ACCOUNT, t0).is_none());
+        assert!(b.blocked(OTHER, t0).is_none());
+    }
+
+    #[test]
+    fn remembered_account_failures_are_pruned() {
+        let b = FailureBackoff::default();
+        let t0 = Instant::now();
+        b.record::<()>(ACCOUNT, &Err(LabError::Status(422)), t0);
+        assert_eq!(b.blocked(ACCOUNT, t0), Some(LabError::Status(422)));
+        b.record::<()>(OTHER, &Err(LabError::Status(422)), t0 + FAILURE_BACKOFF);
+        assert_eq!(b.accounts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lab_wide_failure_pauses_every_account() {
+        // 5xx, 429, 401 and 403 say the Lab (or this engine's access to it) is in
+        // trouble: no account is asked about for 10 s.
+        for status in [500, 503, 429, 401, 403] {
+            let lab = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&lab)
+                .await;
+            let c = cache(&lab);
+            assert!(is_unavailable(&c.check(ACCOUNT).await), "{status}");
+            assert!(is_unavailable(&c.check(OTHER).await), "{status}");
+            lab.verify().await;
+        }
     }
 }
