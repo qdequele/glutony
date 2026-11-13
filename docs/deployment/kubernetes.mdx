@@ -85,7 +85,11 @@ kubectl -n meili-ingest rollout restart deployment/meili-control-plane \
 cluster network.
 
 The control plane runs two replicas; its outbox sender leases rows with
-`SKIP LOCKED`, so both deliver without duplicates.
+`SKIP LOCKED`, so both deliver without duplicates. Each replica keeps its own
+copy of the pipeline list for 5 seconds to route uploads: the replica that
+handles a pipeline create, update or delete uses it at once, the other one up
+to 5 seconds later. An upload sent right after the change can still be routed
+by the previous list.
 
 ### Optional: report to a Meilisearch Lab
 
