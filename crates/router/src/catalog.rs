@@ -498,14 +498,14 @@ fn workflows() -> Vec<WorkflowEntry> {
             "audio",
             "Audio",
             Media,
-            "Transcribe speech, chunk the transcript, index it.",
+            "Transcribe speech and index the transcript.",
             "Podcasts, calls and any recording where the words are the content.",
         ),
         builtin_workflow(
             "video",
             "Video",
             Media,
-            "Demux the audio, transcribe it, chunk and index.",
+            "Demux the audio, transcribe it, index the transcript.",
             "Recorded meetings and video libraries, searched by what is said in them.",
         ),
         builtin_workflow(
@@ -666,6 +666,25 @@ mod tests {
                     entry.uid,
                     step.id,
                     step.plugin
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_copy_only_mentions_chunking_when_the_pipeline_chunks() {
+        let builtins = crate::builtin_pipelines();
+        for entry in catalog().workflows {
+            let Some(def) = builtins.iter().find(|p| p.uid == entry.uid) else {
+                continue;
+            };
+            // Only the summary lists the steps; `when_to_use` may say why there is none.
+            if entry.summary.to_lowercase().contains("chunk") {
+                assert!(
+                    def.steps.iter().any(|s| s.plugin == "chunker"),
+                    "{} says it chunks ({:?}) but has no chunker step",
+                    entry.uid,
+                    entry.summary
                 );
             }
         }
