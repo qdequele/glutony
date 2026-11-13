@@ -1634,10 +1634,10 @@ components:
           type: array
           description: |
             Inline documents, routed as `application/json` (to `builtin.json` unless a
-            pipeline is named). Each must be a JSON object. `id` is optional: a missing
-            or `null` id gets a UUID, and ids are sanitised to `[A-Za-z0-9_-]`. The
-            content is taken from `content`, else `text`, else `body`, else every string
-            value joined.
+            pipeline is named). Each must be a JSON object. `id` is optional: a missing,
+            `null` or empty id gets a UUID, and ids, strings and numbers alike, are
+            sanitised to `[A-Za-z0-9_-]` (`1.5` becomes `1_5`). The content is taken
+            from `content`, else `text`, else `body`, else every string value joined.
           items:
             type: object
             additionalProperties: true

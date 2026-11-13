@@ -397,7 +397,8 @@ pub fn documents_from_json(value: Value) -> Result<Vec<Document>, GatewayError> 
         .collect()
 }
 
-/// One JSON object → [`Document`]: `id` from `id` (string or number) or generated;
+/// One JSON object → [`Document`]: `id` from `id` (string or number, sanitised to
+/// `[A-Za-z0-9_-]`) or generated when missing, `null` or blank;
 /// `title` from `title`; `content` from `content`/`text`/`body` (string) or all string
 /// values joined by a space; every other key goes into `fields`.
 pub fn document_from_json(value: Value) -> Result<Document, GatewayError> {
@@ -410,8 +411,10 @@ pub fn document_from_json(value: Value) -> Result<Document, GatewayError> {
         Some(Value::String(s)) if !s.trim().is_empty() => {
             meili_ingest_plugin_sdk::sanitize_id(s.trim())
         }
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Null) | None => Uuid::new_v4().to_string(),
+        // `1.5` or `1e3` print with characters Meilisearch refuses in a document id.
+        Some(Value::Number(n)) => meili_ingest_plugin_sdk::sanitize_id(&n.to_string()),
+        // A blank id is no id, as for an uploaded JSON file.
+        Some(Value::Null | Value::String(_)) | None => Uuid::new_v4().to_string(),
         Some(other) => {
             return Err(GatewayError::BadRequest(format!(
                 "`id` must be a string or number, got {other}"
@@ -571,6 +574,32 @@ mod tests {
         assert!(Uuid::parse_str(&d.id).is_ok());
         assert_eq!(d.content, "x y");
         assert_eq!(d.fields.len(), 3);
+    }
+
+    #[test]
+    fn document_from_json_sanitizes_a_non_integer_numeric_id() {
+        let d = document_from_json(json!({"id": 1.5})).unwrap();
+        assert_eq!(d.id, "1_5");
+        let v: Value = serde_json::from_str(r#"{"id":1e3}"#).unwrap();
+        let d = document_from_json(v).unwrap();
+        assert!(
+            !d.id.is_empty()
+                && d.id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "{:?}",
+            d.id
+        );
+        // Integers, negative ones included, are already valid ids.
+        assert_eq!(document_from_json(json!({"id": -7})).unwrap().id, "-7");
+    }
+
+    #[test]
+    fn document_from_json_generates_an_id_for_an_empty_one() {
+        for id in ["", "   "] {
+            let d = document_from_json(json!({"id": id, "title": "t"})).unwrap();
+            assert!(Uuid::parse_str(&d.id).is_ok(), "{id:?} -> {:?}", d.id);
+        }
     }
 
     #[test]
