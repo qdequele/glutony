@@ -829,6 +829,12 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/UsageResponse" }
+        "400":
+          description: A query parameter is missing or malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid query string: Failed to deserialize query string: missing field `date_from`", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "501": { $ref: "#/components/responses/NotEnabled" }
 
@@ -992,6 +998,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Source"
+        "400":
+          description: A query parameter is missing or malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid query string: Failed to deserialize query string: include_archived: provided string was not `true` or `false`", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "501":
           $ref: "#/components/responses/NotEnabled"
@@ -1235,6 +1247,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/SourceRun"
+        "400":
+          description: A query parameter is missing or malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid query string: Failed to deserialize query string: limit: invalid digit found in string", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
@@ -1437,7 +1455,7 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example: { "error": "upload exceeds 500 MiB", "code": "payload_too_large" }
+          example: { "error": "request body exceeds the configured size limit", "code": "payload_too_large" }
     NoPipelineMatches:
       description: No pipeline trigger matches the detected MIME type / filename.
       content:

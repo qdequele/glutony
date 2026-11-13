@@ -13,12 +13,38 @@ pub mod usage;
 use std::collections::HashMap;
 
 use axum::body::Bytes;
-use axum::extract::{FromRequest, Multipart, Request};
+use axum::extract::{FromRequest, FromRequestParts, Multipart, Request};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
+use serde::de::DeserializeOwned;
 
 use crate::error::GatewayError;
 use crate::extract::{Extracted, extract_payload, is_multipart};
+
+/// The query string, deserialized like [`axum::extract::Query`], but refused with the
+/// gateway's JSON `400 bad_request` rather than axum's plain-text rejection, so every
+/// error keeps the `{"error", "code"}` shape the API documents.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Query<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for Query<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = GatewayError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(GatewayError::BadRequest(format!(
+                "invalid query string: {}",
+                rejection.body_text()
+            ))),
+        }
+    }
+}
 
 /// Query parameters accepted by the ingest routes.
 pub type QueryParams = HashMap<String, String>;

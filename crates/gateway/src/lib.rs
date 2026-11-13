@@ -19,7 +19,10 @@ pub mod schedules;
 pub mod sources;
 pub mod state;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::header::CONTENT_LENGTH;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
@@ -95,6 +98,25 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
             .allow_methods(Any)
             .allow_headers(Any),
     )
+}
+
+/// Refuse a request whose declared `Content-Length` is over the upload limit, with the
+/// gateway's JSON `413 payload_too_large`.
+///
+/// [`RequestBodyLimitLayer`] makes the same check, but answers in plain text before any
+/// handler runs. This sits outside it so a client always reads the documented error
+/// shape; the layer stays as the guard for bodies that announce no length.
+async fn refuse_declared_oversize(limit: usize, req: Request, next: Next) -> Response {
+    let declared = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit as u64) {
+        return GatewayError::TooLarge("request body exceeds the configured size limit".into())
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Build the axum router with every route of SPEC §4 plus `GET /health`, the body
@@ -176,6 +198,9 @@ pub fn router(state: AppState) -> Router {
         .route("/usage", get(handlers::usage::get_usage))
         .layer(DefaultBodyLimit::max(limit))
         .layer(RequestBodyLimitLayer::new(limit))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| refuse_declared_oversize(limit, req, next),
+        ))
         .layer(TraceLayer::new_for_http());
     // Applied with a `match` rather than an `Option` layer so the gateway does not
     // need tower's `util` feature just for `option_layer`.
@@ -465,6 +490,62 @@ mod tests {
         // The UI reads these to render the tenant and to hide features that are off.
         assert_eq!(body["features"]["usage_analytics"], false);
         assert!(body["tenant_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_declared_oversized_body_is_a_json_413() {
+        let server = MockServer::start().await;
+        let cfg = GatewayConfig {
+            max_upload_mb: 1,
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, cfg).await;
+        let big = vec![b'a'; 1024 * 1024 + 10];
+        let mut req = standalone_request("/ingest", "text/plain", big);
+        // A client that announces the size is refused before the handler runs.
+        req.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(1024 * 1024 + 10),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "payload_too_large", "{body}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_query_string_is_a_json_400() {
+        let server = MockServer::start().await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        for uri in [
+            "/usage",
+            "/usage?date_from=2026-01-01",
+            "/sources?include_archived=yes",
+            "/sources/x/runs?limit=abc",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                resp.headers()[axum::http::header::CONTENT_TYPE],
+                "application/json",
+                "{uri}"
+            );
+            let body = json_body(resp).await;
+            assert_eq!(body["code"], "bad_request", "{uri}: {body}");
+            assert!(
+                body["error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{uri}: {body}"
+            );
+        }
     }
 
     #[tokio::test]

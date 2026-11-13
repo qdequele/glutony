@@ -10,11 +10,12 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Scope;
 use crate::error::GatewayError;
+use crate::handlers::Query;
 use crate::state::{AppState, UsageApiConfig};
 
 /// Query parameters accepted by [`get_usage`].

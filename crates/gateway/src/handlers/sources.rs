@@ -10,7 +10,7 @@
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use meili_ingest_source::{SecretKey, SourceRunInput, seal_json};
 use serde::Deserialize;
@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::auth::Scope;
 use crate::connections::valid_uid;
 use crate::error::GatewayError;
+use crate::handlers::Query;
 use crate::schedules::SourceSchedule;
 use crate::sources::{
     CreateSource, NewSource, RunRecord, SourcePatch, SourceRecord, SourceView, UpdateSource,

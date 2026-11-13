@@ -6,7 +6,7 @@
 //! knows the workflow.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::{Scope, authorize_job_read};
 use crate::error::GatewayError;
+use crate::handlers::Query;
 use crate::state::{AppState, JobRecord, JobUpdate};
 
 /// Response of `GET /jobs/{id}`.

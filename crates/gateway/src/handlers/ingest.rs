@@ -2,7 +2,7 @@
 //! shared with the explicit-pipeline route.
 
 use axum::Json;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use meili_ingest_plugin_sdk::{
@@ -12,7 +12,7 @@ use meili_ingest_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{QueryParams, query_param, read_payload};
+use super::{Query, QueryParams, query_param, read_payload};
 use crate::context::{require_destination, resolve_index, resolve_request_context};
 use crate::error::{ErrorBody, GatewayError};
 use crate::extract::{BatchItem, Extracted, IngestPayload};

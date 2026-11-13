@@ -2,14 +2,14 @@
 //! skipped; the pipeline trigger's `index_pattern` still applies.
 
 use axum::Json;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 
 use super::ingest::{
     BatchResponse, IngestResponse, PipelineSelection, context_for, path_index, submit_batch,
     submit_one,
 };
-use super::{QueryParams, check_pipeline_name, query_param, read_payload};
+use super::{Query, QueryParams, check_pipeline_name, query_param, read_payload};
 use crate::context::resolve_request_context;
 use crate::error::GatewayError;
 use crate::extract::IngestPayload;
