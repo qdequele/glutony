@@ -166,3 +166,74 @@ async fn deleting_a_missing_pipeline_reports_false() {
     assert!(!deleted);
     assert!(archived.is_empty());
 }
+
+#[tokio::test]
+async fn deleting_a_global_pipeline_archives_the_tenant_sources_that_fall_back_to_it() {
+    let Some(pool) = pool("casc-glob").await else {
+        return;
+    };
+    let pipelines = PipelineRepo::new(pool.clone());
+    let sources = SourceRepo::new(pool.clone());
+    let (falls_back, shadows) = ("casc-glob-proj-a", "casc-glob-proj-b");
+
+    // A global pipeline, and tenant B's own pipeline of the same uid.
+    let mut global = pipeline("casc-glob-feed", "unused");
+    global.tenant_id = None;
+    pipelines.upsert(&global).await.expect("create global");
+    pipelines
+        .upsert(&pipeline("casc-glob-feed", shadows))
+        .await
+        .expect("create tenant copy");
+
+    // A global source, tenant A's source (resolves to the global pipeline by
+    // fallback) and tenant B's source (resolves to B's own pipeline).
+    let mut global_source = source("casc-glob-s-global", "casc-glob-feed", "unused");
+    global_source.tenant_id = None;
+    let fallback_source = source("casc-glob-s-a", "casc-glob-feed", falls_back);
+    let shadowed_source = source("casc-glob-s-b", "casc-glob-feed", shadows);
+    for s in [&global_source, &fallback_source, &shadowed_source] {
+        sources.insert(s).await.expect("insert");
+        // A source starts paused; these are running, as after the gateway created
+        // their schedules.
+        assert!(sources.set_paused(s.id, false).await.expect("unpause"));
+    }
+
+    let (deleted, mut archived) = pipelines
+        .delete_cascading("casc-glob-feed", None)
+        .await
+        .expect("delete");
+    assert!(deleted);
+    archived.sort();
+    let mut expected = vec![global_source.id, fallback_source.id];
+    expected.sort();
+    assert_eq!(
+        archived, expected,
+        "the global source and the tenant source without a pipeline of its own are \
+         archived, so the gateway deletes both schedules"
+    );
+
+    let a = sources
+        .get("casc-glob-s-a", Some(falls_back))
+        .await
+        .expect("get")
+        .expect("still exists");
+    assert!(a.definition.archived_at.is_some());
+    assert!(a.definition.paused, "an archived source must not fire");
+
+    // Tenant B's pipeline still exists, so its source keeps running.
+    let b = sources
+        .get("casc-glob-s-b", Some(shadows))
+        .await
+        .expect("get")
+        .expect("still exists");
+    assert!(b.definition.archived_at.is_none());
+    assert!(!b.definition.paused);
+    assert!(
+        pipelines
+            .get("casc-glob-feed", Some(shadows))
+            .await
+            .expect("get")
+            .is_some(),
+        "the tenant's own pipeline is untouched by the global delete"
+    );
+}

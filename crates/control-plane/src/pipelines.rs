@@ -139,6 +139,12 @@ impl PipelineRepo {
     /// rather than cascade-deleting the sources keeps the credentials a tenant supplied
     /// by hand: destroying those as a side effect of an unrelated delete is not
     /// recoverable, whereas an archived source can be repointed and unarchived.
+    ///
+    /// A source resolves its pipeline like [`PipelineRepo::get`]: the tenant's own row,
+    /// then the global one. Deleting a **global** pipeline therefore also archives the
+    /// sources of every tenant that has no pipeline of that uid of its own, since they
+    /// were running on the row being deleted. A tenant that shadows the uid keeps its
+    /// sources. Deleting a tenant's pipeline archives that tenant's sources only.
     pub async fn delete_cascading(
         &self,
         uid: &str,
@@ -149,8 +155,11 @@ impl PipelineRepo {
         let archived: Vec<(uuid::Uuid,)> = sqlx::query_as(
             "UPDATE sources SET archived_at = now(), paused = true, updated_at = now() \
              WHERE pipeline_uid = $1 \
-               AND COALESCE(tenant_id, '') = COALESCE($2, '') \
                AND archived_at IS NULL \
+               AND (COALESCE(tenant_id, '') = COALESCE($2, '') \
+                    OR ($2::text IS NULL \
+                        AND NOT EXISTS (SELECT 1 FROM pipelines p \
+                                        WHERE p.uid = $1 AND p.tenant_id = sources.tenant_id))) \
              RETURNING id",
         )
         .bind(uid)
