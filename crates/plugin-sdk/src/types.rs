@@ -1714,7 +1714,7 @@ pub fn pinned_connection(config: &serde_json::Value) -> Option<&str> {
 ///   step set — exactly the behaviour pipelines relied on before connections existed.
 ///
 /// Every other key (`tenant_id`, `index`, `region`) only fills what the step left
-/// unset, in both cases.
+/// unset (absent, `null` or a blank string), in both cases.
 pub fn inject_meili_context(config: &mut serde_json::Value, ctx: &MeiliContext) {
     if !config.is_object() {
         *config = serde_json::Value::Object(Default::default());
@@ -1732,9 +1732,20 @@ pub fn inject_meili_context(config: &mut serde_json::Value, ctx: &MeiliContext) 
         if destination && pinned {
             continue;
         }
-        if destination || !obj.contains_key(&k) {
+        if destination || obj.get(&k).is_none_or(is_unset) {
             obj.insert(k, v);
         }
+    }
+}
+
+/// Whether a step-config value counts as not set: `null` or a blank string. The same
+/// rule as [`PipelineDefinition::step_indexes`] and [`pinned_connection`], so the
+/// gateway and the workflow agree on which index a step names.
+fn is_unset(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        _ => false,
     }
 }
 
@@ -2290,6 +2301,30 @@ steps:
         let mut config = serde_json::json!({ "connection": "prod-movies", "index": "movies" });
         inject_meili_context(&mut config, &request_ctx());
         assert_eq!(config["index"], "movies", "step index beats the request's");
+    }
+
+    #[test]
+    fn a_blank_or_null_step_index_is_filled_from_the_request() {
+        // `step_indexes` (the gateway's view) ignores these, so the request's index was
+        // accepted up front: it has to reach the indexer.
+        for blank in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::Value::Null,
+        ] {
+            let mut config = serde_json::json!({ "index": blank, "region": blank });
+            inject_meili_context(&mut config, &request_ctx());
+            assert_eq!(config["index"], "from-request", "index was {blank:?}");
+            assert_eq!(config["region"], "eu", "region was {blank:?}");
+
+            let mut pinned = serde_json::json!({ "connection": "prod", "index": blank });
+            inject_meili_context(&mut pinned, &request_ctx());
+            assert_eq!(pinned["index"], "from-request", "index was {blank:?}");
+        }
+        // A blank the request cannot fill stays as the step wrote it.
+        let mut config = serde_json::json!({ "index": "" });
+        inject_meili_context(&mut config, &MeiliContext::default());
+        assert_eq!(config["index"], "");
     }
 
     #[test]
