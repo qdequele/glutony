@@ -12,7 +12,8 @@
 //! * [`plugin_task_queue`] — the Temporal task queue per plugin (SPEC §8.3).
 
 use meili_ingest_plugin_sdk::{
-    INDEXER_PLUGIN, PipelineDefinition, PipelineTrigger, RetryConfig, StepDefinition,
+    INDEXER_PLUGIN, PipelineDefinition, PipelineTrigger, RetryConfig, StepDefinition, glob_match,
+    mime_matches,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,7 +93,11 @@ pub mod catalog;
 /// file as `audio/x-wav`, `mime_guess` maps `.m4a` to `audio/m4a`, and callers send
 /// `audio/mp3`. Pipelines declare one spelling in `trigger.content_types`, so without
 /// canonicalisation an ordinary `.wav` upload matches nothing and the gateway answers
-/// 415. Everything downstream sees the canonical name.
+/// 415. Everything downstream sees the canonical name, and a trigger may use any of
+/// the spellings: [`trigger_matches`] canonicalises it too.
+///
+/// Takes a bare, lower-case `type/subtype`; [`canonical_content_type`] accepts the
+/// rest.
 pub fn canonical_mime(mime: &str) -> &str {
     match mime {
         "audio/x-wav" | "audio/wave" | "audio/vnd.wave" | "audio/x-pn-wav" | "audio/wav-x" => {
@@ -124,6 +129,54 @@ pub fn canonical_mime(mime: &str) -> &str {
         "application/tar" => mime::TAR,
         other => other,
     }
+}
+
+/// A content type as it is compared everywhere: parameters dropped, trimmed,
+/// lower-cased, aliases collapsed by [`canonical_mime`]. Wildcards (`audio/*`, `*/*`)
+/// pass through unchanged.
+///
+/// Both sides of a trigger match go through this, so `audio/mp3` in a trigger and a
+/// detected `audio/mpeg` are the same type.
+pub fn canonical_content_type(content_type: &str) -> String {
+    canonical_mime(&mime_essence(content_type)).to_owned()
+}
+
+/// Whether `pipeline`'s trigger matches a MIME type / filename, alias spellings
+/// included on both sides.
+///
+/// Same rules as [`PipelineDefinition::trigger_matches`]: `type/*` and `*/*`
+/// wildcards, a `filename_pattern` that must match when set, and a trigger with
+/// neither content types nor a pattern matching nothing. The difference is that every
+/// `content_types` entry and `mime` are first passed through
+/// [`canonical_content_type`].
+pub fn trigger_matches(pipeline: &PipelineDefinition, mime: &str, filename: Option<&str>) -> bool {
+    let Some(trigger) = &pipeline.trigger else {
+        return false;
+    };
+    let mime = canonical_content_type(mime);
+    let mime_ok = trigger
+        .content_types
+        .iter()
+        .any(|ct| mime_matches(&canonical_content_type(ct), &mime));
+    if !mime_ok && !trigger.content_types.is_empty() {
+        return false;
+    }
+    match (&trigger.filename_pattern, filename) {
+        (Some(pattern), Some(name)) => glob_match(pattern, name),
+        (Some(_), None) => false,
+        (None, _) => mime_ok,
+    }
+}
+
+/// Whether `pipeline`'s trigger names `mime` itself, alias spellings included. A
+/// wildcard (`*/*`, `application/*`) does not count.
+pub fn trigger_names_type(pipeline: &PipelineDefinition, mime: &str) -> bool {
+    let mime = canonical_content_type(mime);
+    pipeline.trigger.as_ref().is_some_and(|t| {
+        t.content_types
+            .iter()
+            .any(|ct| canonical_content_type(ct) == mime)
+    })
 }
 
 /// Whether `mime` is an archive the gateway expands into one job per file (zip, tar,
@@ -201,12 +254,15 @@ impl PipelineRouter {
     /// Priority: tenant-scoped user pipeline > global user pipeline > builtin.
     /// Within a tier, a trigger with a matching `filename_pattern` beats a MIME-only
     /// trigger. Remaining ties go to the first pipeline in the list.
+    ///
+    /// Alias spellings are the same type on both sides ([`trigger_matches`]): a
+    /// trigger on `audio/mp3` matches a detected `audio/mpeg`.
     pub fn resolve(&self, req: RouteRequest<'_>) -> Option<RouteMatch<'_>> {
         self.pipelines
             .iter()
             .enumerate()
             .filter(|(_, p)| visible_to(p, req.tenant_id))
-            .filter(|(_, p)| p.trigger_matches(req.mime, req.filename))
+            .filter(|(_, p)| trigger_matches(p, req.mime, req.filename))
             .min_by_key(|(i, p)| {
                 let has_pattern = p
                     .trigger
@@ -1585,6 +1641,95 @@ mod tests {
                 .uid,
             "builtin.word"
         );
+    }
+
+    #[test]
+    fn alias_spelled_triggers_match_the_canonical_type() {
+        // Detection always yields the canonical spelling, so a trigger written with an
+        // alias has to be canonicalised too or the tenant's pipeline never fires.
+        let cases = [
+            ("audio/mp3", "a.mp3"),
+            ("audio/x-wav", "a.wav"),
+            ("image/jpg", "a.jpg"),
+            (" Audio/MP3 ", "a.mp3"),
+            ("application/x-parquet", "a.parquet"),
+            ("application/x-zip-compressed", "a.zip"),
+        ];
+        for (alias, filename) in cases {
+            let mut pipelines = builtin_pipelines();
+            pipelines.push(user_pipeline("mine", Some("t1"), &[alias], None));
+            let router = PipelineRouter::new(pipelines);
+            let mime = detect_mime(b"", Some(filename), None);
+            let m = router
+                .resolve(RouteRequest {
+                    mime: &mime,
+                    filename: Some(filename),
+                    tenant_id: Some("t1"),
+                })
+                .unwrap_or_else(|| panic!("no route for {mime} (trigger {alias})"));
+            assert_eq!(m.pipeline.uid, "mine", "trigger {alias}, detected {mime}");
+        }
+    }
+
+    #[test]
+    fn an_alias_spelled_request_mime_is_canonicalised() {
+        // `POST /internal/resolve` takes the MIME as given: a caller other than the
+        // gateway may send an alias, with parameters or in upper case.
+        let router = PipelineRouter::new(builtin_pipelines());
+        for mime in ["audio/mp3", "Audio/X-WAV; rate=44100", "image/jpg"] {
+            let m = router
+                .resolve(RouteRequest {
+                    mime,
+                    filename: None,
+                    tenant_id: None,
+                })
+                .unwrap_or_else(|| panic!("no route for {mime}"));
+            assert!(
+                ["builtin.audio", "builtin.image"].contains(&m.pipeline.uid.as_str()),
+                "{mime} routed to {}",
+                m.pipeline.uid
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_matching_keeps_wildcards_and_filename_rules() {
+        let wild = user_pipeline("wild", None, &["audio/*"], None);
+        assert!(trigger_matches(&wild, "audio/mp3", None));
+        assert!(!trigger_matches(&wild, "video/mp4", None));
+        let any = user_pipeline("any", None, &["*/*"], None);
+        assert!(trigger_matches(&any, "application/x-custom", None));
+        // A filename pattern alone, and a pattern with no filename to test.
+        let by_name = user_pipeline("by-name", None, &[], Some("*.log"));
+        assert!(trigger_matches(&by_name, "text/plain", Some("app.LOG")));
+        assert!(!trigger_matches(&by_name, "text/plain", Some("app.txt")));
+        assert!(!trigger_matches(&by_name, "text/plain", None));
+        let both = user_pipeline("both", None, &["audio/mp3"], Some("call_*"));
+        assert!(trigger_matches(&both, "audio/mpeg", Some("call_1.mp3")));
+        assert!(!trigger_matches(&both, "audio/mpeg", Some("song.mp3")));
+        assert!(!trigger_matches(&both, "audio/wav", Some("call_1.wav")));
+        // No trigger, or an empty one, never matches.
+        let mut none = user_pipeline("none", None, &[], None);
+        assert!(!trigger_matches(&none, "text/plain", Some("a.txt")));
+        none.trigger = None;
+        assert!(!trigger_matches(&none, "text/plain", Some("a.txt")));
+    }
+
+    #[test]
+    fn content_types_are_normalised_before_comparison() {
+        assert_eq!(
+            canonical_content_type(" Audio/MP3; rate=44100 "),
+            "audio/mpeg"
+        );
+        assert_eq!(canonical_content_type("application/pdf"), "application/pdf");
+        assert_eq!(canonical_content_type("audio/*"), "audio/*");
+
+        // Naming a type is stricter than matching it: a wildcard does not count.
+        let zip = user_pipeline("zip", None, &["Application/X-Zip-Compressed"], None);
+        assert!(trigger_names_type(&zip, mime::ZIP));
+        assert!(!trigger_names_type(&zip, mime::GZIP));
+        let wild = user_pipeline("wild", None, &["application/*", "*/*"], None);
+        assert!(!trigger_names_type(&wild, mime::ZIP));
     }
 
     #[test]

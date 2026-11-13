@@ -53,7 +53,7 @@ steps:
 | `uid` | yes | Stable id used in URLs and `pipeline_used`. |
 | `name`, `description` | no | Display metadata. `name` defaults to `uid`. |
 | `version` | no | Managed by the control plane. |
-| `trigger` | no | Without a trigger the pipeline is only reachable via `POST /ingest/pipeline/:uid`. |
+| `trigger` | no | Without a trigger the pipeline is only reachable via `POST /ingest/pipeline/:uid`. `content_types` entries are compared case-insensitively and alias spellings are the same type: `audio/mp3` matches an upload detected as `audio/mpeg`, `image/jpg` matches `image/jpeg`, `application/x-zip-compressed` matches `application/zip`. |
 | `steps[]` | yes, ≥ 1 | The DAG. |
 | `steps[].id` | yes | Unique within the pipeline. |
 | `steps[].plugin` | yes | A registered plugin name; unknown → `422`. |

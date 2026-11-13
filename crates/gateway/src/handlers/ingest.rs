@@ -404,11 +404,7 @@ enum ArchivePlan {
 /// Whether `pipeline` asks for `mime` by name. A wildcard (`*/*`, `application/*`)
 /// does not count: a catch-all pipeline was not written for archives.
 fn takes_archive_whole(pipeline: &PipelineDefinition, mime: &str) -> bool {
-    pipeline.trigger.as_ref().is_some_and(|t| {
-        t.content_types
-            .iter()
-            .any(|ct| meili_ingest_router::canonical_mime(ct.trim()).eq_ignore_ascii_case(mime))
-    })
+    meili_ingest_router::trigger_names_type(pipeline, mime)
 }
 
 /// Decide how an archive upload runs. A forced pipeline (`?pipeline=`, or the
