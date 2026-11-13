@@ -151,11 +151,18 @@ impl SourceConnector for UrlConnector {
             return Ok(Resolution::Unchanged);
         }
 
+        // Inflating and sniffing up to `max_bytes` is seconds of CPU: off the async
+        // worker threads, which the worker's other activities share.
         let filename = last_segment(parsed.path());
-        let (bytes, filename) = maybe_gunzip(body, filename, max_bytes)?;
-        let mime = header_mime
-            .or_else(|| detect_mime(&bytes, filename.as_deref()))
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let (bytes, filename, mime) = tokio::task::spawn_blocking(move || {
+            let (bytes, filename) = maybe_gunzip(body, filename, max_bytes)?;
+            let mime = header_mime
+                .or_else(|| detect_mime(&bytes, filename.as_deref()))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            Ok::<_, SourceError>((bytes, filename, mime))
+        })
+        .await
+        .map_err(|e| SourceError::Fetch(format!("decoding {parsed}: {e}")))??;
 
         Ok(Resolution::Items {
             items: vec![ResolvedItem {
@@ -304,24 +311,28 @@ fn detect_mime(bytes: &[u8], filename: Option<&str>) -> Option<String> {
     by_ext
 }
 
-/// Whether `bytes` look like newline-delimited JSON: at least two non-empty lines, each
-/// of which parses as a standalone JSON value.
+/// Whether `bytes` look like newline-delimited JSON: at least two non-empty lines, the
+/// first five of which each parse as a standalone JSON value.
 ///
 /// A JSON array or a single pretty-printed object must NOT match — those are ordinary
 /// JSON and the json plugin handles them as one document.
+///
+/// The body can be hundreds of MiB, so nothing here is proportional to it in memory. A
+/// second line is looked for before anything is parsed: a minified document is one
+/// line, and parsing it to learn that it is not NDJSON would build its whole tree. The
+/// lines that are checked are validated without being materialised.
 fn sniff_ndjson(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
+    let mut lines = bytes
+        .split(|b| *b == b'\n')
+        .map(<[u8]>::trim_ascii)
+        .filter(|line| !line.is_empty());
+    let (Some(first), Some(second)) = (lines.next(), lines.next()) else {
         return false;
     };
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let mut seen = 0usize;
-    for line in lines.by_ref().take(5) {
-        if serde_json::from_str::<serde_json::Value>(line.trim()).is_err() {
-            return false;
-        }
-        seen += 1;
-    }
-    seen >= 2
+    [first, second]
+        .into_iter()
+        .chain(lines.take(3))
+        .all(|line| serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok())
 }
 
 /// Minimal extension → MIME map for the formats a source realistically serves.
@@ -791,6 +802,44 @@ mod tests {
         );
         assert!(!sniff_ndjson(b""), "empty input is not ndjson");
         assert!(!sniff_ndjson(&[0xff, 0xfe]), "non-utf8 is not ndjson");
+    }
+
+    #[test]
+    fn a_single_line_document_is_not_ndjson_whatever_its_size() {
+        // A minified export: one line, with or without a trailing newline.
+        let mut doc = String::from("[");
+        for i in 0..50_000 {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push_str(&format!("{{\"id\":{i},\"title\":\"movie {i}\"}}"));
+        }
+        doc.push(']');
+        assert!(!sniff_ndjson(doc.as_bytes()));
+        assert!(!sniff_ndjson(format!("{doc}\n").as_bytes()));
+        assert!(!sniff_ndjson(format!("\n\n{doc}\r\n\n").as_bytes()));
+    }
+
+    #[test]
+    fn ndjson_with_very_long_records_is_still_ndjson() {
+        // Records carrying embeddings or long text run to megabytes per line.
+        let record = format!("{{\"id\":1,\"text\":\"{}\"}}", "x".repeat(2 << 20));
+        let body = format!("{record}\n{record}\n");
+        assert!(sniff_ndjson(body.as_bytes()));
+        assert_eq!(
+            detect_mime(body.as_bytes(), Some("export.json")).as_deref(),
+            Some("application/x-ndjson"),
+        );
+    }
+
+    #[test]
+    fn ndjson_sniffing_tolerates_crlf_and_blank_lines() {
+        assert!(sniff_ndjson(b"{\"a\":1}\r\n\r\n{\"a\":2}\r\n"));
+        assert!(!sniff_ndjson(b"{\"a\":1}\nnot json\n"));
+        assert!(
+            sniff_ndjson(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n{\"a\":4}\n{\"a\":5}\nnot json\n"),
+            "only the first five lines are inspected"
+        );
     }
 
     #[test]
