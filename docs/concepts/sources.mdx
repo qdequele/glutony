@@ -212,6 +212,12 @@ forgery unless it is restricted. meili-ingest restricts it by default.
   | `any` | any `http`/`https` host |
   | `files.internal,feeds.example.com:8443` | exactly those hosts |
 
+  A public address is one routable on the internet: not loopback, private
+  (RFC 1918), link-local, carrier-grade NAT, unique-local, multicast, or a
+  reserved, benchmarking or documentation range (`0.0.0.0/8`, `198.18.0.0/15`,
+  `240.0.0.0/4`…). An IPv4 address carried inside an IPv6 one (IPv4-mapped,
+  NAT64 `64:ff9b::/96`, 6to4) is judged as that IPv4 address.
+
   The policy is checked when the source is saved, at every fetch, and at every
   redirect hop (at most 5). The same policy governs `{"url": …}` bodies sent to
   the ingest routes: refused at the gateway with a `422`, and re-checked by the
