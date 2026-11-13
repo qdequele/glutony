@@ -9,7 +9,7 @@ use super::ingest::{
     BatchResponse, IngestResponse, PipelineSelection, context_for, path_index, submit_batch,
     submit_one,
 };
-use super::{QueryParams, query_param, read_payload};
+use super::{QueryParams, check_pipeline_name, query_param, read_payload};
 use crate::context::resolve_request_context;
 use crate::error::GatewayError;
 use crate::extract::IngestPayload;
@@ -58,6 +58,7 @@ async fn ingest_with_pipeline_inner(
     req: Request,
     locked_index: Option<&str>,
 ) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
+    check_pipeline_name(&name)?;
     // Only the tenant scope is needed here; the destination is checked once the
     // pipeline is known, since one pinned to a connection needs none.
     let pre = resolve_request_context(&headers, query_param(&query, "index"), &state.config)?;
@@ -139,6 +140,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(resp).await["code"], "missing_context");
         assert_eq!(starter.inputs().len(), 1, "no second workflow");
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_name_cannot_rewrite_the_control_plane_request() {
+        let server = MockServer::start().await;
+        // Whatever the control plane would answer, it must never be asked.
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_pipeline("secret", None)))
+            .mount(&server)
+            .await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        for uri in [
+            // `?tenant_id=victim` smuggled into the control-plane query.
+            "/ingest/pipeline/secret%3Ftenant_id%3Dvictim",
+            "/ingest/pipeline/secret%23frag",
+            // Dot segments aimed at another control-plane route.
+            "/ingest/pipeline/..%2Finternal%2Fjobs%2Fabc",
+            "/ingest/pipeline/..",
+            "/indexes/movies/ingest/pipeline/secret%3Ftenant_id%3Dvictim",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    uri,
+                    "application/json",
+                    r#"{"documents":[{"id":"1"}]}"#.into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(json_body(resp).await["code"], "bad_request", "{uri}");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the control plane was called"
+        );
+        assert!(starter.inputs().is_empty());
     }
 
     #[tokio::test]

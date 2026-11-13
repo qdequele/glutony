@@ -221,7 +221,8 @@ paths:
       description: |
         Same body formats as `POST /ingest`, but the pipeline is chosen by `name`
         (a pipeline `uid`, e.g. `builtin.pdf` or `my-pdf-with-enrichment`).
-        MIME detection still runs to fill document metadata.
+        MIME detection still runs to fill document metadata. A `name` that is not a
+        pipeline uid (`[a-zA-Z0-9._-]+`) is a `400 bad_request`.
 
         An archive is expanded and every file it holds runs through this pipeline,
         unless the pipeline's trigger names the archive type, in which case it gets
@@ -722,6 +723,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PipelineDefinition"
+        "400":
+          description: The uid is not a pipeline uid (`[a-zA-Z0-9._-]+`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid pipeline name \"a/b\": must be made of [a-zA-Z0-9._-]", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/PipelineNotFound"
@@ -744,6 +751,12 @@ paths:
       responses:
         "204":
           description: Deleted.
+        "400":
+          description: The uid is not a pipeline uid (`[a-zA-Z0-9._-]+`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid pipeline name \"a/b\": must be made of [a-zA-Z0-9._-]", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: Built-in pipelines cannot be deleted.

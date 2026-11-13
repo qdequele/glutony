@@ -205,8 +205,20 @@ impl ConnectionView {
 /// Whether `uid` is a usable connection name: the same `[a-zA-Z0-9._-]+` rule as
 /// pipeline uids, at most 128 bytes.
 pub fn valid_uid(uid: &str) -> bool {
+    uid.len() <= 128 && uid_charset(uid)
+}
+
+/// Whether `name` can be the uid of a pipeline: the `[a-zA-Z0-9._-]+` rule pipeline
+/// definitions are validated with, minus the dot segments `.` and `..`, which no URL
+/// path can address. Unlike [`valid_uid`] it sets no length cap, since pipeline
+/// definitions have none.
+pub fn valid_pipeline_uid(name: &str) -> bool {
+    uid_charset(name) && !matches!(name, "." | "..")
+}
+
+/// Non-empty and made of `[a-zA-Z0-9._-]` only.
+fn uid_charset(uid: &str) -> bool {
     !uid.is_empty()
-        && uid.len() <= 128
         && uid
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -441,6 +453,26 @@ mod tests {
         }
         for bad in ["", "has space", "../x", "a/b", "é", &"x".repeat(129)] {
             assert!(!valid_uid(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pipeline_uids_are_one_addressable_path_segment() {
+        for ok in ["builtin.pdf", "my-pdf_v2", "a", "...", &"x".repeat(300)] {
+            assert!(valid_pipeline_uid(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a?tenant_id=b",
+            "a#b",
+            "has space",
+            "é",
+        ] {
+            assert!(!valid_pipeline_uid(bad), "{bad:?}");
         }
     }
 

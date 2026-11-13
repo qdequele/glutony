@@ -32,6 +32,18 @@ pub fn query_param<'a>(query: &'a QueryParams, name: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
+/// Refuse a `{name}` path parameter that cannot be a pipeline uid, before it is used to
+/// address the control plane.
+pub(crate) fn check_pipeline_name(name: &str) -> Result<(), GatewayError> {
+    if crate::connections::valid_pipeline_uid(name) {
+        Ok(())
+    } else {
+        Err(GatewayError::BadRequest(format!(
+            "invalid pipeline name {name:?}: must be made of [a-zA-Z0-9._-]"
+        )))
+    }
+}
+
 /// `filename` from a `Content-Disposition` header (`filename="x"` or `filename=x`).
 pub fn content_disposition_filename(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(CONTENT_DISPOSITION)?.to_str().ok()?;

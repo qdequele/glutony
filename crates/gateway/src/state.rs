@@ -656,6 +656,25 @@ impl ControlPlaneClient {
         format!("{}{}", self.base_url, path)
     }
 
+    /// `{base}/pipelines/{uid}`, with `uid` as one percent-encoded path segment, so a
+    /// name carrying `?`, `#` or `/` can never rewrite the query or the path of a
+    /// request sent with the control plane token. An empty name or a dot segment
+    /// addresses no pipeline and is a [`GatewayError::NotFound`] without a request.
+    fn pipeline_url(&self, uid: &str) -> Result<url::Url, GatewayError> {
+        if matches!(uid, "" | "." | "..") {
+            return Err(GatewayError::NotFound(format!(
+                "pipeline {uid:?} not found"
+            )));
+        }
+        let mut url = url::Url::parse(&self.url("/pipelines/"))
+            .map_err(|e| GatewayError::Internal(format!("control plane url: {e}")))?;
+        url.path_segments_mut()
+            .map_err(|()| GatewayError::Internal("control plane url cannot be a base".into()))?
+            .pop_if_empty()
+            .push(uid);
+        Ok(url)
+    }
+
     pub(crate) fn tenant_query(tenant_id: Option<&str>) -> Vec<(&'static str, String)> {
         tenant_id
             .map(|p| vec![("tenant_id", p.to_string())])
@@ -743,7 +762,7 @@ impl ControlPlaneClient {
     ) -> Result<PipelineDefinition, GatewayError> {
         self.send_json(
             self.http
-                .get(self.url(&format!("/pipelines/{uid}")))
+                .get(self.pipeline_url(uid)?)
                 .query(&Self::tenant_query(tenant_id)),
             "get pipeline",
         )
@@ -809,7 +828,7 @@ impl ControlPlaneClient {
         let resp = self
             .authed(
                 self.http
-                    .delete(self.url(&format!("/pipelines/{uid}")))
+                    .delete(self.pipeline_url(uid)?)
                     .query(&Self::tenant_query(tenant_id)),
             )
             .send()
@@ -1342,5 +1361,54 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{cfg:?}").contains("cp-token-value"));
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_uid_stays_one_path_segment() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new());
+        for (uid, encoded) in [
+            ("a?tenant_id=v", "/pipelines/a%3Ftenant_id=v"),
+            ("a#b", "/pipelines/a%23b"),
+            ("../metrics", "/pipelines/..%2Fmetrics"),
+            ("a/b", "/pipelines/a%2Fb"),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let _ = cp.get_pipeline(uid, None).await;
+            let _ = cp.delete_pipeline(uid, None).await;
+            let seen = server.received_requests().await.unwrap();
+            assert_eq!(seen.len(), 2, "{uid}");
+            for req in &seen {
+                assert_eq!(req.url.path(), encoded, "{uid}");
+                assert_eq!(req.url.query(), None, "{uid}");
+            }
+        }
+        // A dot segment names no pipeline at all: nothing is sent.
+        server.reset().await;
+        for uid in ["..", ".", ""] {
+            assert!(
+                matches!(
+                    cp.get_pipeline(uid, None).await,
+                    Err(GatewayError::NotFound(_))
+                ),
+                "{uid:?}"
+            );
+            assert!(
+                matches!(
+                    cp.delete_pipeline(uid, None).await,
+                    Err(GatewayError::NotFound(_))
+                ),
+                "{uid:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
