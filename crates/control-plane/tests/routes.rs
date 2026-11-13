@@ -131,6 +131,24 @@ async fn creating_in_builtin_namespace_is_forbidden() {
 }
 
 #[tokio::test]
+async fn the_uid_of_the_validate_route_is_refused() {
+    // `/pipelines/validate` shadows `/pipelines/{uid}`: such a pipeline could be
+    // stored but never fetched or deleted, so both the save and the dry run refuse it.
+    let def = pipeline("validate", &["pdf_extractor"]);
+    for uri in ["/pipelines", "/pipelines/validate"] {
+        let (status, body) = call(
+            app(state()),
+            post_json(uri, serde_json::to_vec(&def).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation", "{uri}");
+        assert!(err.error.contains("reserved"), "{uri}: {}", err.error);
+    }
+}
+
+#[tokio::test]
 async fn invalid_pipeline_is_422_with_pipeline_error_message() {
     // Empty steps.
     let def = pipeline("empty", &[]);

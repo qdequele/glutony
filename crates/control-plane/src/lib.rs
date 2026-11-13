@@ -246,8 +246,9 @@ pub fn app(state: AppState) -> Router {
             "/pipelines",
             get(pipelines::list_pipelines).post(pipelines::create_pipeline),
         )
-        // Registered before `/pipelines/{uid}` so the literal path wins over the
-        // wildcard and a pipeline can never be named "validate".
+        // The literal path wins over `/pipelines/{uid}`, so a pipeline named "validate"
+        // could not be fetched or deleted: `pipelines::prepare_definition` refuses
+        // that uid (`pipelines::RESERVED_UID`).
         .route("/pipelines/validate", post(pipelines::validate_pipeline))
         .route(
             "/pipelines/{uid}",

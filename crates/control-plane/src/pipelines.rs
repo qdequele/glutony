@@ -203,6 +203,12 @@ pub fn unknown_plugins(def: &PipelineDefinition, registered: &[String]) -> Vec<S
     out
 }
 
+/// The uid no pipeline may take: `/pipelines/validate` is a literal, POST-only route
+/// (here and on the gateway) that wins over `/pipelines/{uid}`, so a pipeline with
+/// this uid could be created and would route uploads, but could never be fetched or
+/// deleted.
+pub const RESERVED_UID: &str = "validate";
+
 /// Static checks shared by the handler and unit tests: reserved uid, normalization
 /// and structural validation. Mutates `def` (normalization) on success.
 pub fn prepare_definition(def: &mut PipelineDefinition) -> Result<(), CpError> {
@@ -210,6 +216,11 @@ pub fn prepare_definition(def: &mut PipelineDefinition) -> Result<(), CpError> {
         return Err(CpError::Builtin(format!(
             "pipeline uid {:?} is reserved: built-in pipelines cannot be created or overwritten",
             def.uid
+        )));
+    }
+    if def.uid == RESERVED_UID {
+        return Err(CpError::Validation(format!(
+            "pipeline uid {RESERVED_UID:?} is reserved: it is the path of the validation route"
         )));
     }
     def.normalize();
@@ -507,6 +518,27 @@ mod tests {
         let mut d = def("builtin.pdf", &["pdf_extractor"]);
         let err = prepare_definition(&mut d).err().map(|e| e.code());
         assert_eq!(err, Some("builtin"));
+    }
+
+    #[test]
+    fn prepare_rejects_the_uid_shadowed_by_the_validate_route() {
+        // `/pipelines/validate` is a literal POST-only route: a pipeline with that uid
+        // could be created but never fetched or deleted.
+        let mut d = def("validate", &["pdf_extractor"]);
+        let err = prepare_definition(&mut d)
+            .err()
+            .map(|e| (e.code(), e.to_string()));
+        assert_eq!(
+            err,
+            Some((
+                "validation",
+                "pipeline uid \"validate\" is reserved: it is the path of the validation route"
+                    .to_string()
+            ))
+        );
+        // Only the exact uid is reserved.
+        prepare_definition(&mut def("validate-pdf", &["pdf_extractor"])).unwrap();
+        prepare_definition(&mut def("Validate", &["pdf_extractor"])).unwrap();
     }
 
     #[test]

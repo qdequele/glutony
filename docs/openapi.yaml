@@ -609,8 +609,9 @@ paths:
         `config.connection` that is not one of the tenant's own connections, or
         for a global pipeline not a global connection → `422`) and upserted by `(uid, tenant_id)`;
         `version` is bumped on update. `uid`s starting with `builtin.` are
-        rejected with `403`. Behind Envoy the pipeline is scoped to the calling
-        project.
+        rejected with `403`, and the `uid` `validate` with `422` (it is the path
+        of `POST /pipelines/validate`). Behind Envoy the pipeline is scoped to
+        the calling project.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -1984,7 +1985,7 @@ components:
         uid:
           type: string
           pattern: "^[a-zA-Z0-9._-]+$"
-          description: Unique id. `builtin.*` is reserved.
+          description: Unique id. `builtin.*` and `validate` are reserved.
           example: my-pdf-with-enrichment
         name:
           type: string
