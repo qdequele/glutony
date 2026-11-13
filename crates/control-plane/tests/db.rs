@@ -658,6 +658,119 @@ async fn terminal_status_clears_the_current_step() {
 }
 
 #[tokio::test]
+async fn a_job_status_never_moves_backwards() {
+    // Three writers touch a row without any ordering between them: the gateway's
+    // insert at submit time, its write-through of a Temporal snapshot, and the
+    // worker's patches. A write that carries an older status than the stored one must
+    // not win, or the job list shows finished work as queued or running.
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let now = Utc::now();
+    let record = |id: Uuid, status: JobStatus| JobRecord {
+        job_id: id,
+        workflow_id: format!("ingest-{id}"),
+        pipeline_uid: "builtin.pdf".into(),
+        tenant_id: None,
+        index_name: Some("documents".into()),
+        status,
+        current_step: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+        source_id: None,
+        parent_job_id: None,
+    };
+    let insert = |job: JobRecord| {
+        let state = state.clone();
+        async move {
+            let (status, body) = call(app(state), req_json("POST", "/internal/jobs", &job)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            json::<JobRecord>(&body)
+        }
+    };
+    let patch = |id: Uuid, upd: JobUpdate| {
+        let state = state.clone();
+        async move {
+            let (status, body) = call(
+                app(state),
+                req_json("PATCH", &format!("/internal/jobs/{id}"), &upd),
+            )
+            .await;
+            // Always 200 with the stored row: the gateway uses it as its cached record.
+            assert_eq!(status, StatusCode::OK);
+            json::<JobRecord>(&body)
+        }
+    };
+    let status = |status: JobStatus, step: Option<&str>, error: Option<&str>| JobUpdate {
+        status: Some(status),
+        current_step: step.map(str::to_owned),
+        error: error.map(str::to_owned),
+        index_name: None,
+    };
+
+    // A repeated insert does not reset a finished row, its error or its start time.
+    let failed = Uuid::new_v4();
+    insert(record(failed, JobStatus::Queued)).await;
+    patch(failed, status(JobStatus::Running, Some("extract"), None)).await;
+    patch(failed, status(JobStatus::Failed, None, Some("boom"))).await;
+    let mut again = record(failed, JobStatus::Queued);
+    again.started_at = now + chrono::Duration::hours(1);
+    let stored = insert(again).await;
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.error.as_deref(), Some("boom"));
+    assert_eq!(stored.current_step.as_deref(), Some("extract"));
+    assert_eq!(
+        stored.started_at.timestamp_micros(),
+        now.timestamp_micros(),
+        "a stale insert must not move the job in the list"
+    );
+
+    // A stale `running` snapshot does not reopen a finished job or give it a step.
+    let done = Uuid::new_v4();
+    insert(record(done, JobStatus::Queued)).await;
+    patch(done, status(JobStatus::Succeeded, None, None)).await;
+    let stored = patch(done, status(JobStatus::Running, Some("extract"), Some("x"))).await;
+    assert_eq!(stored.status, JobStatus::Succeeded);
+    assert_eq!(stored.current_step, None);
+    assert_eq!(stored.error, None);
+    let stored = patch(done, status(JobStatus::Queued, None, None)).await;
+    assert_eq!(stored.status, JobStatus::Succeeded);
+
+    // `queued` does not replace `running`, by patch or by insert.
+    let running = Uuid::new_v4();
+    insert(record(running, JobStatus::Queued)).await;
+    patch(running, status(JobStatus::Running, Some("extract"), None)).await;
+    let stored = patch(running, status(JobStatus::Queued, None, None)).await;
+    assert_eq!(stored.status, JobStatus::Running);
+    let stored = insert(record(running, JobStatus::Queued)).await;
+    assert_eq!(stored.status, JobStatus::Running);
+    assert_eq!(stored.current_step.as_deref(), Some("extract"));
+
+    // Forward and sideways writes still apply: a running job moves to its next step,
+    // a field that is not about the status is written whatever the status, and a
+    // terminal status can replace another (a cancel that lands after a failure).
+    let stored = patch(running, status(JobStatus::Running, Some("index"), None)).await;
+    assert_eq!(stored.current_step.as_deref(), Some("index"));
+    let stored = patch(
+        failed,
+        JobUpdate {
+            status: Some(JobStatus::Running),
+            index_name: Some("renamed".into()),
+            ..JobUpdate::default()
+        },
+    )
+    .await;
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.index_name.as_deref(), Some("renamed"));
+    let stored = patch(failed, status(JobStatus::Cancelled, None, None)).await;
+    assert_eq!(stored.status, JobStatus::Cancelled);
+    let stored = insert(record(running, JobStatus::Succeeded)).await;
+    assert_eq!(stored.status, JobStatus::Succeeded);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
 async fn tenant_id_replaces_project_id() {
     let Some(t) = setup().await else { return };
 

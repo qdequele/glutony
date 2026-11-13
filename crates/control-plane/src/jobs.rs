@@ -123,7 +123,24 @@ impl TryFrom<JobRow> for JobRecord {
     }
 }
 
-/// Insert a job row (idempotent: a repeated insert of the same `job_id` overwrites).
+/// How far along a status is: `queued`, then `running`, then the terminal ones.
+///
+/// The row has several writers with no ordering between them (the gateway's insert at
+/// submit time, its write-through of a Temporal snapshot, the worker's patches), so
+/// the SQL below refuses a status that ranks below the stored one. The terminal
+/// statuses share a rank: one may replace another (a cancel landing after a failure).
+fn status_rank(status: JobStatus) -> i32 {
+    match status {
+        JobStatus::Queued => 0,
+        JobStatus::Running => 1,
+        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled => 2,
+    }
+}
+
+/// Insert a job row. Idempotent: a repeated insert of the same `job_id` overwrites,
+/// except that it never moves the status backwards. When the stored status is further
+/// along than the inserted one (see [`status_rank`]), the stored status, step, error
+/// and start time are kept.
 pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpError> {
     let row: JobRow = sqlx::query_as(
         "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
@@ -133,8 +150,19 @@ pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpE
          ON CONFLICT (job_id) DO UPDATE SET \
             workflow_id = EXCLUDED.workflow_id, pipeline_uid = EXCLUDED.pipeline_uid, \
             tenant_id = EXCLUDED.tenant_id, index_name = EXCLUDED.index_name, \
-            status = EXCLUDED.status, current_step = EXCLUDED.current_step, \
-            error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now(), \
+            status = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                       WHEN 'running' THEN 1 ELSE 2 END) \
+                          THEN jobs.status ELSE EXCLUDED.status END, \
+            current_step = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                             WHEN 'running' THEN 1 ELSE 2 END) \
+                                THEN jobs.current_step ELSE EXCLUDED.current_step END, \
+            error = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                      WHEN 'running' THEN 1 ELSE 2 END) \
+                         THEN jobs.error ELSE EXCLUDED.error END, \
+            started_at = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                           WHEN 'running' THEN 1 ELSE 2 END) \
+                              THEN jobs.started_at ELSE EXCLUDED.started_at END, \
+            updated_at = now(), \
             source_id = COALESCE(EXCLUDED.source_id, jobs.source_id), \
             parent_job_id = COALESCE(EXCLUDED.parent_job_id, jobs.parent_job_id) \
          RETURNING job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
@@ -152,12 +180,18 @@ pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpE
     .bind(job.updated_at)
     .bind(job.source_id)
     .bind(job.parent_job_id)
+    .bind(status_rank(job.status))
     .fetch_one(pool)
     .await?;
     JobRecord::try_from(row)
 }
 
 /// Apply a partial update; `None` when the job does not exist.
+///
+/// A status that ranks below the stored one (see [`status_rank`]) is a stale write:
+/// the stored status, step and error are kept, and the stored row is returned like
+/// any other, since the gateway uses the answer as its cached record. `index_name` is
+/// not about the status and is written either way.
 pub async fn update_job_row(
     pool: &PgPool,
     job_id: Uuid,
@@ -170,9 +204,17 @@ pub async fn update_job_row(
     let clear_step = upd.status == Some(JobStatus::Succeeded);
     let row: Option<JobRow> = sqlx::query_as(
         "UPDATE jobs SET \
-            status = COALESCE($2, status), \
-            current_step = CASE WHEN $6 THEN NULL ELSE COALESCE($3, current_step) END, \
-            error = COALESCE($4, error), \
+            status = CASE WHEN $7 < (CASE status WHEN 'queued' THEN 0 \
+                                                 WHEN 'running' THEN 1 ELSE 2 END) \
+                          THEN status ELSE COALESCE($2, status) END, \
+            current_step = CASE WHEN $7 < (CASE status WHEN 'queued' THEN 0 \
+                                                       WHEN 'running' THEN 1 ELSE 2 END) \
+                                THEN current_step \
+                                WHEN $6 THEN NULL \
+                                ELSE COALESCE($3, current_step) END, \
+            error = CASE WHEN $7 < (CASE status WHEN 'queued' THEN 0 \
+                                                WHEN 'running' THEN 1 ELSE 2 END) \
+                         THEN error ELSE COALESCE($4, error) END, \
             index_name = COALESCE($5, index_name), \
             updated_at = now() \
          WHERE job_id = $1 \
@@ -185,6 +227,8 @@ pub async fn update_job_row(
     .bind(upd.error.as_deref())
     .bind(upd.index_name.as_deref())
     .bind(clear_step)
+    // NULL without a status: the comparison is then NULL and nothing is refused.
+    .bind(upd.status.map(status_rank))
     .fetch_optional(pool)
     .await?;
     row.map(JobRecord::try_from).transpose()
