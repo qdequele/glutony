@@ -868,8 +868,9 @@ impl BlobStore {
     }
 
     /// Gateway helper: inline the upload when `blob.data.len() <= inline_max`,
-    /// otherwise stage it at `staged_key(job_id, "input/<filename or upload.bin>")`
-    /// and return a [`PluginInput::Ref`] carrying the blob's MIME and filename.
+    /// otherwise stage it at `staged_key(job_id, "input/upload.<ext>")` (`upload.bin`
+    /// without a short ASCII extension) and return a [`PluginInput::Ref`] carrying the
+    /// blob's MIME and filename. The filename is never part of the key.
     pub async fn stage_upload(
         &self,
         job_id: Uuid,
@@ -885,10 +886,7 @@ impl BlobStore {
             filename,
             origin,
         } = blob;
-        let object_name = filename
-            .as_deref()
-            .and_then(last_segment)
-            .unwrap_or("upload.bin");
+        let object_name = staged_object_name(filename.as_deref());
         let key = Self::staged_key(job_id, &format!("input/{object_name}"));
         tracing::debug!(job_id = %job_id, key = %key, size = data.len(), "staging upload in blob store");
         self.put(&key, Bytes::from(data)).await?;
@@ -966,6 +964,32 @@ fn url_origin(url: &Url) -> String {
 /// Last non-empty `/`-separated segment of a path or key.
 fn last_segment(path: &str) -> Option<&str> {
     path.rsplit('/').find(|s| !s.is_empty())
+}
+
+/// Longest filename extension kept in a staged upload's key.
+const STAGED_EXTENSION_MAX: usize = 16;
+
+/// Name of the object an upload is staged under: `upload.<ext>`, or `upload.bin` when
+/// the filename has no short ASCII alphanumeric extension.
+///
+/// The filename itself stays out of the key. object_store percent-encodes every
+/// non-ASCII byte of a key segment (three characters per byte), so a moderately long
+/// non-Latin name overflows the 255-byte file name limit of a `file://` store, and a
+/// longer one the 1024-byte key limit of S3. A job stages one upload, so the fixed
+/// name cannot collide; the extension is only there for whoever lists the store.
+fn staged_object_name(filename: Option<&str>) -> String {
+    let extension = filename
+        .and_then(last_segment)
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+        .filter(|ext| {
+            (1..=STAGED_EXTENSION_MAX).contains(&ext.len())
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    match extension {
+        Some(ext) => format!("upload.{}", ext.to_ascii_lowercase()),
+        None => "upload.bin".to_owned(),
+    }
 }
 
 /// MIME guessed from a filename's extension.
@@ -1247,7 +1271,7 @@ mod tests {
         let job = Uuid::new_v4();
         let blob = Blob::new(vec![7u8; 100], "application/pdf", Some("big.pdf".into()));
         let input = store.stage_upload(job, blob, 99).await.unwrap();
-        let expected_key = BlobStore::staged_key(job, "input/big.pdf");
+        let expected_key = BlobStore::staged_key(job, "input/upload.pdf");
         assert_eq!(
             input,
             PluginInput::Ref(ContentRef::Staged {
@@ -1325,6 +1349,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, PluginInput::Documents(documents));
+    }
+
+    #[tokio::test]
+    async fn stage_upload_takes_any_filename_on_a_file_store() {
+        // object_store percent-encodes every non-ASCII byte of a key segment, so a
+        // 30-character CJK name became a 270+ byte file name: ENAMETOOLONG on the
+        // default `file://` store, and a 500 for the upload.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::from_url(&format!("file://{}", dir.path().display())).unwrap();
+        let http = reqwest::Client::new();
+        for name in [
+            format!("{}.pdf", "日".repeat(30)),
+            format!("{}.pdf", "ж".repeat(60)),
+            format!("report.{}", "日".repeat(90)),
+            format!("{}.pdf", "a".repeat(300)),
+            "sub/dir/100% #1 ?.PDF".to_owned(),
+        ] {
+            let blob = Blob::new(vec![7u8; 16], "application/pdf", Some(name.clone()));
+            let input = store
+                .stage_upload(Uuid::new_v4(), blob.clone(), 0)
+                .await
+                .unwrap_or_else(|e| panic!("staging {name:?}: {e}"));
+            assert!(matches!(input, PluginInput::Ref(_)), "{name}");
+            // The name travels in the ref, not in the key.
+            let resolved = store.resolve_input(input, &http).await.unwrap();
+            assert_eq!(resolved, PluginInput::Bytes(blob), "{name}");
+        }
+    }
+
+    #[test]
+    fn staged_object_names_are_short_and_ascii() {
+        let n = |f: &str| staged_object_name(Some(f));
+        assert_eq!(n("big.pdf"), "upload.pdf");
+        assert_eq!(n("a/b/Report.final.DOCX"), "upload.docx");
+        assert_eq!(n("archive.tar.gz"), "upload.gz");
+        assert_eq!(n("README"), "upload.bin");
+        assert_eq!(n("trailing."), "upload.bin");
+        assert_eq!(n("dir/"), "upload.bin");
+        assert_eq!(n("x.日本"), "upload.bin");
+        assert_eq!(n("x.a%b"), "upload.bin");
+        assert_eq!(n(&format!("x.{}", "a".repeat(17))), "upload.bin");
+        assert_eq!(staged_object_name(None), "upload.bin");
     }
 
     #[tokio::test]
