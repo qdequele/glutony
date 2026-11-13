@@ -798,8 +798,9 @@ impl BlobStore {
 
     /// Spill an oversized step output to the store.
     ///
-    /// When `output.approx_size() > threshold`, the output is serialized to JSON and
-    /// stored at `staged_key(job_id, "<step_id>[-<branch>].json")`; the returned value
+    /// When the output serializes to more than `threshold` bytes of JSON (what it would
+    /// weigh in the activity result, see [`PluginOutput::serialized_size_exceeds`]), that
+    /// JSON is stored at `staged_key(job_id, "<step_id>[-<branch>].json")`; the returned value
     /// is a [`PluginOutput::Ref`] to a [`ContentRef::Staged`] with MIME
     /// [`SPILLED_OUTPUT_MIME`]. Otherwise the output is returned unchanged.
     pub async fn spill_output(
@@ -810,8 +811,7 @@ impl BlobStore {
         output: PluginOutput,
         threshold: usize,
     ) -> Result<PluginOutput, BlobError> {
-        let size = output.approx_size();
-        if size <= threshold {
+        if !output.serialized_size_exceeds(threshold) {
             return Ok(output);
         }
         let name = match branch {
@@ -820,7 +820,7 @@ impl BlobStore {
         };
         let key = Self::staged_key(job_id, &name);
         let bytes = serde_json::to_vec(&output)?;
-        tracing::debug!(job_id = %job_id, step_id = %step_id, ?branch, approx_size = size, key = %key, "spilling step output to blob store");
+        tracing::debug!(job_id = %job_id, step_id = %step_id, ?branch, size = bytes.len(), key = %key, "spilling step output to blob store");
         self.put(&key, Bytes::from(bytes)).await?;
         Ok(PluginOutput::Ref(ContentRef::Staged {
             uri: key,
@@ -1324,6 +1324,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same, output);
+    }
+
+    #[tokio::test]
+    async fn spill_decision_measures_the_serialized_output() {
+        // What must stay under Temporal's payload limit is the JSON the activity
+        // returns: metadata and escaping count, not only ids, content and fields.
+        const MIB: usize = 1024 * 1024;
+        let store = BlobStore::memory();
+        let is_spilled = |output: PluginOutput| {
+            let store = store.clone();
+            async move {
+                let serialized = serde_json::to_vec(&output).unwrap().len();
+                let out = store
+                    .spill_output(Uuid::new_v4(), "step", None, output, MIB)
+                    .await
+                    .unwrap();
+                (matches!(out, PluginOutput::Ref(_)), serialized)
+            }
+        };
+
+        // One document carrying 3 MiB of extra metadata (an external plugin's output).
+        let mut heavy = Document::with_id("a", "tiny");
+        heavy
+            .meta
+            .extra
+            .insert("raw".into(), serde_json::json!("x".repeat(3 * MIB)));
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(vec![heavy])).await;
+        assert!(spilled, "{serialized} bytes went inline");
+
+        // Chunker-shaped: many tiny chunks that each repeat a long path three times.
+        let path = "d/".repeat(150);
+        let chunks: Vec<Document> = (0..1700)
+            .map(|i| {
+                let mut doc = Document::with_id(format!("{path}_{i}"), "c".repeat(50));
+                doc.meta.source = Some(path.clone());
+                doc.meta.filename = Some(path.clone());
+                doc.meta.parent_id = Some(path.clone());
+                doc
+            })
+            .collect();
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(chunks)).await;
+        assert!(serialized > 2 * MIB, "{serialized}");
+        assert!(spilled, "{serialized} bytes went inline");
+
+        // Content that doubles once escaped.
+        let quotes = Document::with_id("q", "\"".repeat(600 * 1024));
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(vec![quotes])).await;
+        assert!(spilled, "{serialized} bytes went inline");
+
+        // And an output that does fit stays inline, however many documents it has.
+        let small: Vec<Document> = (0..5000)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(small)).await;
+        assert!(serialized < MIB, "{serialized}");
+        assert!(!spilled, "{serialized} bytes were spilled");
     }
 
     #[tokio::test]

@@ -480,7 +480,8 @@ impl PluginInput {
         }
     }
 
-    /// Approximate serialized size in bytes (used to decide spilling to blob storage).
+    /// Approximate size in bytes of the content carried: ids, titles, text and fields
+    /// (used for metering; document metadata and JSON escaping are not counted).
     pub fn approx_size(&self) -> usize {
         match self {
             PluginInput::Bytes(b) => b.data.len() * 4 / 3,
@@ -576,7 +577,10 @@ impl PluginOutput {
         }
     }
 
-    /// Approximate serialized size in bytes.
+    /// Approximate size in bytes of the content carried: ids, titles, text and fields.
+    /// Used for metering. It leaves out document metadata and JSON escaping, so it is
+    /// not the size of the serialized value: see
+    /// [`PluginOutput::serialized_size_exceeds`] for that.
     pub fn approx_size(&self) -> usize {
         match self {
             PluginOutput::Bytes(b) => b.data.len() * 4 / 3,
@@ -586,6 +590,54 @@ impl PluginOutput {
             PluginOutput::Indexed(_) => 128,
             PluginOutput::Empty => 8,
         }
+    }
+
+    /// Whether this output serializes to more than `limit` bytes of JSON, the form it
+    /// takes in a Temporal payload. Exact (metadata, escaping and nesting included),
+    /// without building the JSON, and it stops as soon as the limit is passed.
+    ///
+    /// An output that cannot be serialized at all also returns `true`: the caller's
+    /// own serialization then reports the error.
+    pub fn serialized_size_exceeds(&self, limit: usize) -> bool {
+        // Binary content is base64-encoded in one piece: rule out the large ones from
+        // their length alone, before any of it is encoded.
+        if self.base64_len() > limit {
+            return true;
+        }
+        serde_json::to_writer(LimitedCounter { left: limit }, self).is_err()
+    }
+
+    /// Bytes the base64 of every [`PluginOutput::Bytes`] in here takes once serialized.
+    fn base64_len(&self) -> usize {
+        match self {
+            PluginOutput::Bytes(b) => b.data.len().div_ceil(3).saturating_mul(4),
+            PluginOutput::Many(m) => m
+                .iter()
+                .map(PluginOutput::base64_len)
+                .fold(0, usize::saturating_add),
+            _ => 0,
+        }
+    }
+}
+
+/// A writer that keeps nothing and fails once more than `left` bytes went through.
+struct LimitedCounter {
+    left: usize,
+}
+
+impl std::io::Write for LimitedCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.left.checked_sub(buf.len()) {
+            Some(left) => {
+                self.left = left;
+                Ok(buf.len())
+            }
+            None => Err(std::io::Error::other("size limit exceeded")),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1930,6 +1982,47 @@ mod tests {
         assert_eq!(json_blob(None, None).tag_id("a b"), "a b");
         let tagged = json_blob(None, Some("source:/s")).tag_id(longest.clone());
         assert_eq!(tagged, format!("{longest}_{}", origin_tag("source:/s")));
+    }
+
+    #[test]
+    fn serialized_size_is_measured_exactly() {
+        let mut doc = Document::with_id("a\"b", "line\nbreak \u{1} é");
+        doc.title = Some("t".into());
+        doc.fields.insert("k".into(), serde_json::json!([1, "two"]));
+        doc.meta.source = Some("s3://bucket/key".into());
+        doc.meta
+            .extra
+            .insert("raw".into(), serde_json::json!({"nested": "x".repeat(100)}));
+        let outputs = [
+            PluginOutput::Empty,
+            PluginOutput::Documents(vec![]),
+            PluginOutput::Documents(vec![doc.clone(), doc.clone()]),
+            PluginOutput::Bytes(Blob::new(vec![7; 1000], "audio/wav", Some("a.wav".into()))),
+            PluginOutput::Many(vec![
+                PluginOutput::Documents(vec![doc]),
+                PluginOutput::Bytes(Blob::new(vec![7; 10], "audio/wav", None)),
+                PluginOutput::Indexed(IndexReport::default()),
+            ]),
+        ];
+        for out in outputs {
+            let exact = serde_json::to_vec(&out).unwrap().len();
+            assert!(!out.serialized_size_exceeds(exact), "{out:?}");
+            assert!(!out.serialized_size_exceeds(usize::MAX), "{out:?}");
+            assert!(out.serialized_size_exceeds(exact - 1), "{out:?}");
+            assert!(out.serialized_size_exceeds(0), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn serialized_size_counts_what_approx_size_leaves_out() {
+        // Metadata is not metered, but it is part of the payload.
+        let mut doc = Document::with_id("a", "tiny");
+        doc.meta
+            .extra
+            .insert("raw".into(), serde_json::json!("x".repeat(3_000_000)));
+        let out = PluginOutput::Documents(vec![doc]);
+        assert!(out.approx_size() < 1024);
+        assert!(out.serialized_size_exceeds(1024 * 1024));
     }
 
     #[test]
