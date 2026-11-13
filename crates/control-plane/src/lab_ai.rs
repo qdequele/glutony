@@ -2,9 +2,9 @@
 //!
 //! Workers hold no Lab credentials (`LAB_INSTANCE_SECRET` signs billing events), so just
 //! before an AI step they ask the control plane, which asks the Lab
-//! ([`meili_ingest_lab::AiTargetCache`], with the same short-lived caching and
-//! stale-on-error rules as the credit check). The answer carries the team's Gateway key,
-//! which the worker needs: the route sits behind `CONTROL_PLANE_TOKEN` like every
+//! ([`meili_ingest_lab::AiTargetCache`], with the same short-lived caching,
+//! stale-on-error and failure backoff rules as the credit check). The answer carries
+//! the team's Gateway key, which the worker needs: the route sits behind `CONTROL_PLANE_TOKEN` like every
 //! `/internal/*` route, and the key never reaches a log line, an error message or a
 //! `Debug` output. With the token disabled (`CONTROL_PLANE_TOKEN_DISABLED=true`) the
 //! route refuses (`403 token_required`) rather than hand team keys to anyone who can

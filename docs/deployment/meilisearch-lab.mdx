@@ -233,7 +233,13 @@ with a per-team key instead of the worker's own `LLM_API_KEY` / `TYPESAFE_API_KE
    plane replica keeps its own cache, so a retried step (attempt 2 and later) asks
    with `?refresh=true`: the replica then asks the Lab even when its cached answer is
    fresh, so a retry never reuses a key another replica saw rotated. When the Lab
-   cannot answer that refresh, the cached answer is still used, as above.
+   cannot answer that refresh, the cached answer is still used, as above. After a
+   failed call the control plane does not ask the Lab again for 10 s, with
+   `?refresh=true` too: lookups in that window get the cached answer or the `503`
+   straight away, so a hung Lab costs one timeout, not one per AI step. As for the
+   credit pre-check, the pause covers every account when the failure is the Lab's and
+   one account when it is that account's. A refused key (step 3) is reported to the
+   Lab regardless.
 2. The plugin calls the Gateway's URL with the team's key and models. The key stays
    in the worker's memory for that step: it is not part of the activity input, so it
    never reaches Temporal history, and no log line or error carries it.
