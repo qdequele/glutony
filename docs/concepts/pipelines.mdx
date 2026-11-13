@@ -18,7 +18,7 @@ version: 1                             # bumped automatically on update
 # Optional: auto-select this pipeline on POST /ingest
 trigger:
   content_types: [application/pdf]     # exact or type/* wildcards
-  filename_pattern: "contract_*.pdf"   # glob (* and ?), case-insensitive, optional
+  filename_pattern: "contract_*.pdf"   # glob (* and ?), case-insensitive, ≤ 256 characters, optional
   index_pattern: contracts             # target index, overrides header/query, optional
 
 steps:
@@ -100,7 +100,8 @@ steps:
   activities are cancelled, no new step starts, status becomes `cancelled`.
 - **Validation** at creation time (and by `POST /pipelines/validate`, which
   saves nothing): unique ids, known dependencies, no cycles (Kahn's algorithm),
-  `fan_out` arity/path, known plugins, each step's `config` against its plugin's
+  `fan_out` arity/path, a `trigger.filename_pattern` of at most 256 characters,
+  known plugins, each step's `config` against its plugin's
   `config_schema` from `GET /plugins` (unknown keys and wrong types are `422`),
   and each `meili_indexer` `connection` against the tenant's connections (its
   own, else a global one). A plugin that no worker has registered yet has no

@@ -936,7 +936,8 @@ pub struct PipelineTrigger {
     /// MIME types (exact match, or `type/*` wildcard).
     #[serde(default)]
     pub content_types: Vec<String>,
-    /// Glob on the filename (e.g. `contract_*.pdf`).
+    /// Glob on the filename (e.g. `contract_*.pdf`), at most
+    /// [`MAX_FILENAME_PATTERN_LEN`] characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename_pattern: Option<String>,
     /// Index to write to when this pipeline is selected (overrides header/query).
@@ -1011,6 +1012,14 @@ pub enum PipelineError {
         /// The path.
         path: String,
     },
+    /// `trigger.filename_pattern` is longer than [`MAX_FILENAME_PATTERN_LEN`].
+    #[error("trigger.filename_pattern is {len} characters long, the maximum is {max}")]
+    FilenamePatternTooLong {
+        /// Length of the pattern, in characters.
+        len: usize,
+        /// The maximum.
+        max: usize,
+    },
 }
 
 impl PipelineDefinition {
@@ -1056,7 +1065,8 @@ impl PipelineDefinition {
 
     /// Validate structure and return a topological order (Kahn's algorithm). Steps
     /// with no mutual dependency are ordered by their position in `steps` for
-    /// determinism.
+    /// determinism. Also rejects a `trigger.filename_pattern` longer than
+    /// [`MAX_FILENAME_PATTERN_LEN`].
     pub fn validate(&self) -> Result<Vec<String>, PipelineError> {
         if self.uid.is_empty()
             || !self
@@ -1068,6 +1078,19 @@ impl PipelineDefinition {
         }
         if self.steps.is_empty() {
             return Err(PipelineError::Empty);
+        }
+        if let Some(pattern) = self
+            .trigger
+            .as_ref()
+            .and_then(|t| t.filename_pattern.as_deref())
+        {
+            let len = pattern.chars().count();
+            if len > MAX_FILENAME_PATTERN_LEN {
+                return Err(PipelineError::FilenamePatternTooLong {
+                    len,
+                    max: MAX_FILENAME_PATTERN_LEN,
+                });
+            }
         }
         let mut ids = HashSet::new();
         for s in &self.steps {
@@ -1241,21 +1264,52 @@ pub fn mime_matches(pattern: &str, mime: &str) -> bool {
     pattern == mime
 }
 
+/// Longest `trigger.filename_pattern` a pipeline may be saved with, in characters.
+pub const MAX_FILENAME_PATTERN_LEN: usize = 256;
+
+/// Longest filename (its last path segment, in bytes) [`glob_match`] compares against a
+/// pattern. A longer name matches no pattern. Filesystems stop at 255 bytes; the
+/// filename of an ingest request is only bounded by the request body.
+pub const MAX_GLOB_NAME_BYTES: usize = 1024;
+
 /// Minimal glob: `*` (any run) and `?` (one char), case-insensitive on the basename.
+///
+/// Runs in `O(pattern x name)` time at worst and constant stack, whatever the number
+/// of `*`: both strings come from tenants. The name is bounded by
+/// [`MAX_GLOB_NAME_BYTES`], and [`PipelineDefinition::validate`] bounds the pattern.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if name.len() > MAX_GLOB_NAME_BYTES {
+        return false;
+    }
     let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some('*'), _) => rec(&p[1..], n) || (!n.is_empty() && rec(p, &n[1..])),
-            (Some('?'), Some(_)) => rec(&p[1..], &n[1..]),
-            (Some(a), Some(b)) if a == b => rec(&p[1..], &n[1..]),
-            _ => false,
+    let (mut pi, mut ni) = (0, 0);
+    // The last `*` seen, and the name position it is currently assumed to end at. A
+    // mismatch after it makes that `*` swallow one more character; an earlier `*`
+    // never needs revisiting, because the latest one can absorb anything it could.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        match p.get(pi) {
+            Some('*') => {
+                star = Some((pi, ni));
+                pi += 1;
+            }
+            Some(&c) if c == '?' || c == n[ni] => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((star_pi, star_ni)) => {
+                    star = Some((star_pi, star_ni + 1));
+                    pi = star_pi + 1;
+                    ni = star_ni + 1;
+                }
+                None => return false,
+            },
         }
     }
-    rec(&p, &n)
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2076,82 @@ steps:
         assert!(glob_match("*.csv", "data.csv"));
         assert!(glob_match("report_?.md", "report_1.md"));
         assert!(!glob_match("report_?.md", "report_10.md"));
+    }
+
+    #[test]
+    fn glob_matching_stays_fast_on_patterns_with_many_stars() {
+        // Backtracking over every star made this take ~C(100,12) steps: run it on a
+        // thread so a regression fails the test rather than hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let name = "a".repeat(100);
+            let miss = glob_match("*a*a*a*a*a*a*a*a*a*a*a*a*b", &name);
+            let hit = glob_match("*a*a*a*a*a*a*a*a*a*a*a*a*", &name);
+            let _ = tx.send((miss, hit));
+        });
+        let (miss, hit) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("glob_match must not take exponential time");
+        assert!(!miss);
+        assert!(hit);
+    }
+
+    #[test]
+    fn glob_matching_handles_stars_question_marks_and_edges() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("***", "anything.bin"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("a*b*c", "aXbXbXc"));
+        assert!(!glob_match("a*b*c", "aXbXbX"));
+        assert!(glob_match("*.tar.gz", "a.tar.tar.gz"));
+        assert!(!glob_match("*.tar.gz", "a.tar.gz.bak"));
+        assert!(glob_match("a?c*", "abc"));
+        assert!(!glob_match("a?c*", "ac"));
+        assert!(glob_match("*é?.txt", "cafés.txt"));
+        // Only the basename is matched, whichever separator the path uses.
+        assert!(glob_match("*.csv", "C:\\exports\\Data.CSV"));
+        assert!(!glob_match("exports*", "exports/data.csv"));
+    }
+
+    #[test]
+    fn glob_matching_never_matches_an_oversized_filename() {
+        // The filename is caller-sized (a JSON or multipart field): past the bound it
+        // matches no pattern, so the match time stays bounded.
+        let long = format!("{}.pdf", "a".repeat(MAX_GLOB_NAME_BYTES));
+        assert!(!glob_match("*.pdf", &long));
+        assert!(!glob_match("*", &long));
+        let at_limit = format!("{}.pdf", "a".repeat(MAX_GLOB_NAME_BYTES - 4));
+        assert!(glob_match("*.pdf", &at_limit));
+        // The bound is on the basename, not on the folders before it.
+        let nested = format!("{}/a.pdf", "d".repeat(MAX_GLOB_NAME_BYTES));
+        assert!(glob_match("*.pdf", &nested));
+    }
+
+    #[test]
+    fn validate_rejects_an_oversized_filename_pattern() {
+        let with_pattern = |pattern: String| {
+            let mut p = pipeline_with(vec![StepDefinition::new("p", "json_parser")]);
+            p.trigger = Some(PipelineTrigger {
+                filename_pattern: Some(pattern),
+                ..Default::default()
+            });
+            p
+        };
+        let at_limit = format!("*{}", "a".repeat(MAX_FILENAME_PATTERN_LEN - 1));
+        assert!(with_pattern(at_limit).validate().is_ok());
+        // Counted in characters, like the `maxLength` of the OpenAPI schema.
+        let multibyte = "é".repeat(MAX_FILENAME_PATTERN_LEN);
+        assert!(with_pattern(multibyte).validate().is_ok());
+        let too_long = format!("*{}", "a".repeat(MAX_FILENAME_PATTERN_LEN));
+        assert_eq!(
+            with_pattern(too_long).validate(),
+            Err(PipelineError::FilenamePatternTooLong {
+                len: MAX_FILENAME_PATTERN_LEN + 1,
+                max: MAX_FILENAME_PATTERN_LEN,
+            })
+        );
     }
 
     #[test]

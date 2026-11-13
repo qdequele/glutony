@@ -1972,7 +1972,8 @@ components:
           example: [application/pdf]
         filename_pattern:
           type: string
-          description: Glob on the filename (`*`, `?`), case-insensitive.
+          maxLength: 256
+          description: Glob on the filename (`*`, `?`), case-insensitive. At most 256 characters.
           example: "contract_*.pdf"
         index_pattern:
           type: string

@@ -556,6 +556,26 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_an_oversized_filename_pattern() {
+        use meili_ingest_plugin_sdk::{MAX_FILENAME_PATTERN_LEN, PipelineTrigger};
+        let mut d = def("globby", &["pdf_extractor", "meili_indexer"]);
+        d.trigger = Some(PipelineTrigger {
+            filename_pattern: Some("*a".repeat(MAX_FILENAME_PATTERN_LEN)),
+            ..Default::default()
+        });
+        let err = prepare_definition(&mut d)
+            .err()
+            .map(|e| (e.code(), e.to_string()));
+        assert_eq!(
+            err,
+            Some((
+                "validation",
+                "trigger.filename_pattern is 512 characters long, the maximum is 256".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn prepare_normalizes_and_validates() {
         let mut d = def("ok", &["pdf_extractor", "chunker", "meili_indexer"]);
         d.builtin = true; // clients cannot claim builtin status
