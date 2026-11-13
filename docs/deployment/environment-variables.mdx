@@ -54,6 +54,8 @@ inside plugins or workflow code.
 | `ARCHIVE_MAX_UNPACKED_MB` | `8192` | Most data decompressing one archive may produce (zip-bomb guard), skipped entries included. More fails the archive job. |
 | `ARCHIVE_MAX_DEPTH` | `3` | Archive layers opened, the uploaded one included. A deeper nested archive is skipped. `0` or a non-integer stops the worker at boot, as for the three above. |
 | `EXTERNAL_PLUGINS` | — | Comma-separated external plugins: `wasm:/path/plugin.wasm`, `grpc:http://host:50051`. |
+| `WASM_PLUGIN_TIMEOUT_SECS` | — (no ceiling) | Longest one call into a [WASM plugin](/plugins/authoring-wasm) may run, whatever the step's `timeout_secs`. A call that reaches it is interrupted and fails the step without a retry. |
+| `WASM_PLUGIN_MAX_MEMORY_MB` | — (4 GiB, the wasm limit) | Most memory one WASM plugin instance may allocate, its input and output buffers included. A call that needs more fails the step without a retry. For both variables, anything but a positive integer is logged at boot and leaves the WASM plugins unavailable. |
 | `LLM_API_KEY` | — | Required for `llm_enricher` / `image_captioner` (the `workers-general` pool). Without it those plugins register as unavailable. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
 | `LLM_MODEL` | `gpt-4o-mini` | Default model when a step's `config.model` is absent. |

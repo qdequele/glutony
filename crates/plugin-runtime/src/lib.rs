@@ -36,7 +36,7 @@ pub use error::RuntimeError;
 #[cfg(feature = "grpc")]
 pub use grpc::GrpcPlugin;
 #[cfg(feature = "wasm")]
-pub use wasm::WasmPlugin;
+pub use wasm::{WasmLimits, WasmPlugin};
 
 /// One entry of the `EXTERNAL_PLUGINS` list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,9 +115,10 @@ pub async fn load(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeE
 
 #[cfg(feature = "wasm")]
 fn load_wasm(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError> {
-    Ok(Arc::new(WasmPlugin::from_file(
+    Ok(Arc::new(WasmPlugin::from_file_with_limits(
         &spec.location,
         spec.manifest.clone(),
+        WasmLimits::from_env()?,
     )?))
 }
 

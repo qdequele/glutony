@@ -7,9 +7,11 @@
 //! `meili_ingest_plugin_sdk::wasm` would produce.
 #![cfg(feature = "wasm")]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use meili_ingest_plugin_runtime::{RuntimeError, WasmPlugin};
+use meili_ingest_plugin_runtime::{RuntimeError, WasmLimits, WasmPlugin};
 use meili_ingest_plugin_sdk::prelude::*;
 
 /// What `ExecuteReply::Ok` looks like on the wire (`meili_ingest_plugin_sdk::wasm`).
@@ -254,4 +256,242 @@ async fn module_without_execute_is_rejected() {
         matches!(&err, RuntimeError::Wasm(m) if m.contains("does not export `execute`")),
         "got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------
+// A guest that never returns
+// ---------------------------------------------------------------------------------
+
+/// A guest that spins forever when its input holds a `!`, and answers [`OK_REPLY`]
+/// otherwise.
+fn hangs_on_bang() -> Vec<u8> {
+    let replies = [OK_REPLY];
+    let body = format!(
+        r#"    (local $i i64) (local $n i64)
+    (local.set $n (call $input_length))
+    (block $scanned
+      (loop $scan
+        (br_if $scanned (i64.ge_u (local.get $i) (local.get $n)))
+        (if (i32.eq (call $input_load_u8 (local.get $i)) (i32.const 33))
+          (then (loop $spin (br $spin))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $scan)))
+    {ok}"#,
+        ok = emit(&replies, 0),
+    );
+    guest(Some(&manifest_json()), Some(&body), &replies)
+}
+
+/// The config that makes [`hangs_on_bang`] spin.
+fn hang() -> serde_json::Value {
+    serde_json::json!({"hang": "!"})
+}
+
+/// Run `f` on a runtime that is torn down without waiting for a guest call that never
+/// returns, so a regression fails the assertions instead of hanging the test binary.
+/// Assert on the returned value, not inside `f`.
+fn run<F: std::future::Future>(f: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = rt.block_on(f);
+    rt.shutdown_timeout(Duration::from_secs(5));
+    out
+}
+
+/// A context whose cancellation flag the test controls.
+fn cancellable() -> (ActivityContext, Arc<AtomicBool>) {
+    let flag = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = ActivityContext::new(uuid::Uuid::nil(), "hang", 1, tx, flag.clone());
+    (ctx, flag)
+}
+
+/// Flip `flag` after `after`.
+fn cancel_after(flag: Arc<AtomicBool>, after: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        flag.store(true, Ordering::Relaxed);
+    });
+}
+
+const PROMPT: Duration = Duration::from_secs(10);
+
+#[test]
+fn cancelling_the_activity_interrupts_a_guest_that_never_returns() {
+    let plugin = WasmPlugin::from_bytes(hangs_on_bang(), None).unwrap();
+    let (first, second) = run(async {
+        let (ctx, flag) = cancellable();
+        cancel_after(flag, Duration::from_millis(100));
+        let first =
+            tokio::time::timeout(PROMPT, plugin.execute(&ctx, PluginInput::Empty, hang())).await;
+        // The instance is free again: the next job is served.
+        let second = tokio::time::timeout(
+            PROMPT,
+            plugin.execute(
+                &ActivityContext::noop(),
+                PluginInput::Empty,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        (first, second)
+    });
+    assert!(
+        matches!(first, Ok(Err(PluginError::Cancelled))),
+        "got {first:?}"
+    );
+    assert!(matches!(second, Ok(Ok(_))), "got {second:?}");
+}
+
+#[test]
+fn an_abandoned_call_does_not_keep_the_instance() {
+    let plugin = WasmPlugin::from_bytes(hangs_on_bang(), None).unwrap();
+    let (first, second) = run(async {
+        let ctx = ActivityContext::noop();
+        // The worker gives up on a step by dropping its future (`abandon_after_cancel`).
+        let first = tokio::time::timeout(
+            Duration::from_millis(300),
+            plugin.execute(&ctx, PluginInput::Empty, hang()),
+        )
+        .await;
+        let second = tokio::time::timeout(
+            PROMPT,
+            plugin.execute(&ctx, PluginInput::Empty, serde_json::json!({})),
+        )
+        .await;
+        (first, second)
+    });
+    assert!(first.is_err(), "the guest should still be spinning");
+    assert!(matches!(second, Ok(Ok(_))), "got {second:?}");
+}
+
+#[test]
+fn a_call_waiting_for_the_instance_can_be_cancelled() {
+    let plugin = Arc::new(WasmPlugin::from_bytes(hangs_on_bang(), None).unwrap());
+    let (waiter, holder) = run(async {
+        let (holder_ctx, holder_flag) = cancellable();
+        let holder = tokio::spawn({
+            let plugin = plugin.clone();
+            async move {
+                plugin
+                    .execute(&holder_ctx, PluginInput::Empty, hang())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (ctx, flag) = cancellable();
+        cancel_after(flag, Duration::from_millis(100));
+        let waiter = tokio::time::timeout(
+            PROMPT,
+            plugin.execute(&ctx, PluginInput::Empty, serde_json::json!({})),
+        )
+        .await;
+
+        holder_flag.store(true, Ordering::Relaxed);
+        let holder = tokio::time::timeout(PROMPT, holder).await;
+        (waiter, holder)
+    });
+    assert!(
+        matches!(waiter, Ok(Err(PluginError::Cancelled))),
+        "got {waiter:?}"
+    );
+    assert!(
+        matches!(holder, Ok(Ok(Err(PluginError::Cancelled)))),
+        "got {holder:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------------
+
+#[test]
+fn a_call_that_outlives_the_timeout_fails_for_good_and_frees_the_instance() {
+    let limits = WasmLimits {
+        timeout: Some(Duration::from_secs(1)),
+        max_memory_pages: None,
+    };
+    let plugin = WasmPlugin::from_bytes_with_limits(hangs_on_bang(), None, limits).unwrap();
+    assert_eq!(plugin.limits(), limits);
+    let (first, second) = run(async {
+        let ctx = ActivityContext::noop();
+        let first =
+            tokio::time::timeout(PROMPT, plugin.execute(&ctx, PluginInput::Empty, hang())).await;
+        let second = tokio::time::timeout(
+            PROMPT,
+            plugin.execute(&ctx, PluginInput::Empty, serde_json::json!({})),
+        )
+        .await;
+        (first, second)
+    });
+    // Not retried: the same input would spin again.
+    assert!(
+        matches!(&first, Ok(Err(PluginError::NonRetryable(m)))
+            if m.contains("WASM_PLUGIN_TIMEOUT_SECS") && m.contains("1s")),
+        "got {first:?}"
+    );
+    assert!(matches!(second, Ok(Ok(_))), "got {second:?}");
+}
+
+/// A guest that asks for 16 MiB more memory when its input holds a `!`, traps if it is
+/// refused, and answers [`OK_REPLY`] otherwise.
+fn grows_on_bang() -> Vec<u8> {
+    let replies = [OK_REPLY];
+    let body = format!(
+        r#"    (local $i i64) (local $n i64)
+    (local.set $n (call $input_length))
+    (block $scanned
+      (loop $scan
+        (br_if $scanned (i64.ge_u (local.get $i) (local.get $n)))
+        (if (i32.eq (call $input_load_u8 (local.get $i)) (i32.const 33))
+          (then
+            (if (i32.eq (memory.grow (i32.const 256)) (i32.const -1))
+              (then (unreachable)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $scan)))
+    {ok}"#,
+        ok = emit(&replies, 0),
+    );
+    guest(Some(&manifest_json()), Some(&body), &replies)
+}
+
+#[tokio::test]
+async fn memory_is_unbounded_unless_a_limit_is_set() {
+    let plugin = WasmPlugin::from_bytes(grows_on_bang(), None).unwrap();
+    assert_eq!(plugin.limits(), WasmLimits::default());
+    let out = plugin
+        .execute(&ActivityContext::noop(), PluginInput::Empty, hang())
+        .await;
+    assert!(out.is_ok(), "got {out:?}");
+}
+
+#[tokio::test]
+async fn a_guest_asking_for_more_memory_than_allowed_fails_and_the_instance_recovers() {
+    // 4 MiB for the instance; the guest asks for 16 MiB more.
+    let limits = WasmLimits {
+        timeout: None,
+        max_memory_pages: Some(64),
+    };
+    let plugin = WasmPlugin::from_bytes_with_limits(grows_on_bang(), None, limits).unwrap();
+    let ctx = ActivityContext::noop();
+
+    let err = plugin
+        .execute(&ctx, PluginInput::Empty, hang())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PluginError::NonRetryable(m)
+            if m.contains("4 MiB") && m.contains("WASM_PLUGIN_MAX_MEMORY_MB")),
+        "got {err:?}"
+    );
+
+    // A call that stays within the limit still works afterwards.
+    let out = plugin
+        .execute(&ctx, PluginInput::Empty, serde_json::json!({}))
+        .await;
+    assert!(out.is_ok(), "got {out:?}");
 }

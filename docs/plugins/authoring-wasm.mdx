@@ -128,7 +128,19 @@ steps:
 
 - No network or filesystem unless you grant it through extism's manifest
   (`allowed_hosts`, `allowed_paths`) — the host runs modules with none by default.
-- Memory is bounded by the wasm linear memory; keep per-call inputs small
-  (fan out per document).
+- Memory is bounded by the wasm linear memory (4 GiB) unless the operator sets
+  `WASM_PLUGIN_MAX_MEMORY_MB` on the worker. The cap covers the module's own
+  memory plus the buffers holding its input and output, so set it well above
+  the largest input the plugin receives. A call that needs more fails the step
+  without a retry. Keep per-call inputs small (fan out per document).
+- One instance of the module runs one call at a time; other steps using the
+  plugin wait for it.
+- A call is interrupted when its activity is cancelled (the job is cancelled,
+  or Temporal reports the step timed out) or the worker stops waiting for it,
+  and the module starts the next call from a fresh instance,
+  so keep no state between calls. `WASM_PLUGIN_TIMEOUT_SECS` on the worker adds
+  a ceiling for every call whatever the step allows; a call that reaches it
+  fails the step without a retry. The interruption stops the module's code: a
+  module blocked inside a host or WASI call is stopped once that call returns.
 - The module runs on the worker's task queue; the name → queue table only
   knows the built-in names, so a WASM plugin runs wherever it is declared.
