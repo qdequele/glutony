@@ -161,11 +161,15 @@ impl Document {
 }
 
 /// The stem a document id is built from: the filename without its extension, with
-/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), sanitized by
+/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), sanitized like
 /// [`sanitize_id`]. Files of the same name in different folders of an archive thus get
 /// different ids, while a plain filename gives the stem it always did. A Windows
 /// path sent by an old browser (`C:\\docs\\a.pdf`) keeps only its last part.
 /// `None` when nothing is left.
+///
+/// A stem longer than 400 bytes (a deeply nested archive member) is cut and ends with
+/// a short hash of the whole path instead, so the `_<index>` / `_p<page>` suffix a
+/// plugin appends always fits in an id and two long paths never share a stem.
 pub fn filename_id_stem(filename: Option<&str>) -> Option<String> {
     let name = filename?;
     let name = name
@@ -187,7 +191,7 @@ pub fn filename_id_stem(filename: Option<&str>) -> Option<String> {
         (true, false) => stem.to_string(),
         (false, false) => format!("{dir}/{stem}"),
     };
-    Some(sanitize_id(&joined))
+    Some(bounded_stem(&joined))
 }
 
 /// Make an arbitrary string a valid Meilisearch document id
@@ -208,6 +212,25 @@ pub fn sanitize_id(raw: &str) -> String {
     }
     truncate_at_char_boundary(&mut out, 511);
     out
+}
+
+/// Longest stem of a generated id, so that an origin tag and the plugin's `_<index>` /
+/// `_p<page>` / `_<sheet>_r<row>` suffixes always fit in Meilisearch's 511 bytes.
+const MAX_STEM_LEN: usize = 400;
+
+/// `raw` sanitized like [`sanitize_id`] and at most [`MAX_STEM_LEN`] bytes long. A
+/// stem within the bound is returned as [`sanitize_id`] gives it; a longer one is cut
+/// and ends with a short hash of the whole of `raw`, so that long stems sharing a
+/// prefix stay distinct.
+fn bounded_stem(raw: &str) -> String {
+    let mut stem = sanitize_id(raw);
+    if stem.len() > MAX_STEM_LEN {
+        let hash = origin_tag(raw);
+        truncate_at_char_boundary(&mut stem, MAX_STEM_LEN - hash.len() - 1);
+        stem.push('_');
+        stem.push_str(&hash);
+    }
+    stem
 }
 
 /// Shorten `s` to at most `max` bytes. Sanitized ids are ASCII, so this never splits a
@@ -248,10 +271,6 @@ pub struct Blob {
     pub origin: Option<String>,
 }
 
-/// Longest filename stem kept in an id that also carries an origin tag, so the tag and
-/// the plugin's `_<index>` / `_p<page>` suffixes always fit in Meilisearch's 511 bytes.
-const MAX_TAGGED_STEM_LEN: usize = 400;
-
 /// Hex characters of the origin hash kept in ids (48 bits).
 const ORIGIN_TAG_LEN: usize = 12;
 
@@ -290,17 +309,15 @@ impl Blob {
     }
 
     /// `stem` with this blob's origin tag appended (`<stem>_<tag>`), or `stem` unchanged
-    /// when the blob has no origin. The stem is shortened first so the tag survives
-    /// [`sanitize_id`]'s 511-byte cap.
+    /// when the blob has no origin. A stem longer than 400 bytes is shortened first
+    /// (cut, and ended with a short hash of the whole stem), so the tag and the suffix
+    /// a plugin appends survive [`sanitize_id`]'s 511-byte cap.
     pub fn tag_id(&self, stem: impl Into<String>) -> String {
         let stem = stem.into();
         match self.origin_tag() {
+            None if stem.len() > MAX_STEM_LEN => bounded_stem(&stem),
             None => stem,
-            Some(tag) => {
-                let mut stem = sanitize_id(&stem);
-                truncate_at_char_boundary(&mut stem, MAX_TAGGED_STEM_LEN);
-                format!("{stem}_{tag}")
-            }
+            Some(tag) => format!("{}_{tag}", bounded_stem(&stem)),
         }
     }
 
@@ -1852,6 +1869,67 @@ mod tests {
         assert!(stem.len() <= 420, "{}", stem.len());
         let id = Document::with_id(format!("{stem}_123456"), "").id;
         assert!(id.ends_with("_123456"), "{id}");
+    }
+
+    #[test]
+    fn a_long_upload_path_keeps_the_per_record_suffix() {
+        // No origin: an archive member whose path is longer than an id can be.
+        let name = format!("{}a.pdf", "d/".repeat(300));
+        let blob = Blob::new(vec![], "application/pdf", Some(name));
+        let stem = blob.id_stem("");
+        assert!(stem.len() <= MAX_STEM_LEN, "{}", stem.len());
+        let id = |suffix: &str| Document::with_id(format!("{stem}{suffix}"), "").id;
+        assert!(id("_p1").ends_with("_p1"), "{}", id("_p1"));
+        assert_ne!(id("_p1"), id("_p2"));
+        assert_ne!(id("_p1"), id("_p10"));
+        // The longest suffix a plugin appends: an XLSX sheet name and row number.
+        let row = format!("_{}_r1048576", "s".repeat(31));
+        assert!(id(&row).ends_with(&row), "{}", id(&row));
+        // The same path gives the same stem on every run.
+        let again = Blob::new(vec![], "application/pdf", blob.filename.clone());
+        assert_eq!(stem, again.id_stem(""));
+    }
+
+    #[test]
+    fn long_paths_that_share_a_prefix_get_different_stems() {
+        let prefix = "d/".repeat(250);
+        let path = |leaf: &str| Some(format!("{prefix}{leaf}.json"));
+        for origin in [None, Some("https://a.example/export.zip")] {
+            let a = json_blob(path("january").as_deref(), origin).id_stem("json");
+            let b = json_blob(path("february").as_deref(), origin).id_stem("json");
+            assert_ne!(a, b, "origin {origin:?}");
+            let id = Document::with_id(format!("{a}_123456"), "").id;
+            assert!(id.ends_with("_123456"), "{id}");
+        }
+        // Stems built by a plugin itself and passed to `tag_id` are bounded the same way.
+        for origin in [None, Some("source:/s")] {
+            let blob = json_blob(None, origin);
+            let a = blob.tag_id(format!("{}_a", "x".repeat(500)));
+            let b = blob.tag_id(format!("{}_b", "x".repeat(500)));
+            assert_ne!(a, b, "origin {origin:?}");
+            let id = Document::with_id(format!("{a}_t10"), "").id;
+            assert!(id.ends_with("_t10"), "{id}");
+        }
+    }
+
+    #[test]
+    fn stems_within_the_bound_are_unchanged() {
+        // Ids already indexed are built from these: only a stem too long to leave room
+        // for a suffix is shortened.
+        let longest = "x".repeat(MAX_STEM_LEN);
+        assert_eq!(
+            filename_id_stem(Some(&format!("{longest}.pdf"))).as_deref(),
+            Some(longest.as_str())
+        );
+        // The bound is on the sanitized stem: 300 two-byte characters are 300 bytes of id.
+        assert_eq!(
+            filename_id_stem(Some(&format!("{}.pdf", "é".repeat(300)))),
+            Some("_".repeat(300))
+        );
+        assert_eq!(json_blob(None, None).tag_id(longest.clone()), longest);
+        assert_eq!(json_blob(None, None).tag_id("a b"), "a b");
+        let tagged = json_blob(None, Some("source:/s")).tag_id(longest.clone());
+        assert_eq!(tagged, format!("{longest}_{}", origin_tag("source:/s")));
     }
 
     #[test]

@@ -73,7 +73,10 @@ pub enum PluginOutput { Bytes(Blob), Ref(ContentRef), Documents(Vec<Document>), 
 ```
 
 When indexed it is flattened to `{ id, title?, content, ...fields, _meta: {...} }`; `_meta` is left out when the document has no metadata.
-Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes).
+Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes). The stem of a generated id
+(`Blob::id_stem`, the file path without its extension) is kept to 400 bytes: a
+longer one is cut and ends with a short hash of the whole path, so the
+`_<index>` or `_p<page>` suffix always fits and long paths stay distinct.
 
 ## ActivityContext
 
