@@ -28,13 +28,15 @@ impl Default for LabMetrics {
             "Age of the oldest undelivered Lab event",
         )
         .expect("valid metric");
-        let delivered_total =
-            IntCounter::new("glutony_lab_events_delivered_total", "Lab events delivered")
-                .expect("valid metric");
+        let delivered_total = IntCounter::new(
+            "glutony_lab_events_delivered_total",
+            "Lab events the Lab accepted and the outbox marked delivered",
+        )
+        .expect("valid metric");
         let failed_total = IntCounterVec::new(
             Opts::new(
                 "glutony_lab_events_failed_total",
-                "Lab event deliveries that failed",
+                "Lab events in a delivery attempt that failed (one per event and attempt)",
             ),
             &["reason"],
         )

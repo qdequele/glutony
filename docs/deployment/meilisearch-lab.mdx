@@ -191,9 +191,10 @@ The control plane serves `GET /metrics`:
 
 - `glutony_lab_events_pending`
 - `glutony_lab_events_oldest_pending_seconds`
-- `glutony_lab_events_delivered_total`
+- `glutony_lab_events_delivered_total`: events the Lab accepted and the outbox marked delivered
 - `glutony_lab_events_dropped_total`
-- `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`)
+- `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`):
+  events, not batches. A refused batch of 500 adds 500, and an event adds one each time it is tried again
 
 The pending gauges are refreshed on every scrape, so they are correct even when
 `LAB_URL` is unset and events are waiting in the outbox. The sender reads at most

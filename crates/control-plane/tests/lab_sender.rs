@@ -172,6 +172,96 @@ async fn partial_accept_leaves_the_rest_pending() {
 }
 
 #[tokio::test]
+async fn a_failed_batch_counts_every_event_it_held() {
+    // `failed_total` counts events for every reason, like `not_accepted` and the
+    // sibling `delivered_total` / `dropped_total`: a refused batch of two is two.
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&lab)
+        .await;
+    let (s, repo, metrics) = sender(&t, &lab).await;
+    repo.insert_many(&[event(Uuid::new_v4()), event(Uuid::new_v4())])
+        .await
+        .unwrap();
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Failed {
+            reason: "auth",
+            pending: 2
+        }
+    );
+    let text = render(&metrics);
+    assert!(
+        text.contains("glutony_lab_events_failed_total{reason=\"auth\"} 2"),
+        "{text}"
+    );
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn events_that_could_not_be_marked_delivered_are_not_counted() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(accept_all)
+        .mount(&lab)
+        .await;
+    let (s, repo, metrics) = sender(&t, &lab).await;
+    repo.insert_many(&[event(Uuid::new_v4())]).await.unwrap();
+
+    // Only `mark_delivered` writes `delivered_at`: make exactly that statement fail,
+    // as a pool timeout or a Postgres restart would.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_delivery() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'delivered_at is not writable'; END $$; \
+         CREATE TRIGGER refuse_delivery BEFORE UPDATE OF delivered_at ON lab_events \
+         FOR EACH ROW EXECUTE FUNCTION refuse_delivery();",
+    )
+    .execute(&t.pool)
+    .await
+    .unwrap();
+
+    // The Lab accepted it, so the batch result still says so (the drain loop relies
+    // on it), but the row is still pending and will be sent again: counting it now
+    // would count it twice.
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Sent {
+            delivered: 1,
+            pending: 0
+        }
+    );
+    assert_eq!(repo.stats().await.unwrap().pending, 1);
+    let text = render(&metrics);
+    assert!(
+        text.contains("glutony_lab_events_delivered_total 0"),
+        "{text}"
+    );
+
+    // Once the write works, the second delivery is the one that counts.
+    sqlx::raw_sql("DROP TRIGGER refuse_delivery ON lab_events")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE lab_events SET next_attempt = now()")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Sent {
+            delivered: 1,
+            pending: 0
+        }
+    );
+    assert_eq!(repo.stats().await.unwrap().pending, 0);
+    assert!(render(&metrics).contains("glutony_lab_events_delivered_total 1"));
+    t.drop_schema().await;
+}
+
+#[tokio::test]
 async fn failures_back_off_and_never_drop() {
     let Some(t) = setup().await else { return };
     let lab = MockServer::start().await;

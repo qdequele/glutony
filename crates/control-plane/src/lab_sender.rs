@@ -237,11 +237,14 @@ impl LabSender {
         let accepted: HashSet<Uuid> = ack.accepted.into_iter().collect();
         let (done, rest): (Vec<Uuid>, Vec<Uuid>) =
             ids.iter().copied().partition(|id| accepted.contains(id));
-        if let Err(e) = self.repo.mark_delivered(&done).await {
+        match self.repo.mark_delivered(&done).await {
+            // Count the rows this call marked, not the ids the Lab listed: a row that
+            // could not be marked is sent again and would otherwise be counted twice,
+            // and one another sender marked first was counted there.
+            Ok(marked) => self.metrics.delivered_total.inc_by(marked),
             // Not marked: they will be sent again and the Lab ignores the duplicates.
-            tracing::error!(error = %e, "cannot mark lab events delivered");
+            Err(e) => tracing::error!(error = %e, "cannot mark lab events delivered"),
         }
-        self.metrics.delivered_total.inc_by(done.len() as u64);
         if !rest.is_empty() {
             self.metrics
                 .failed_total
@@ -258,7 +261,11 @@ impl LabSender {
     }
 
     async fn fail(&self, ids: &[Uuid], reason: &'static str) -> Delivery {
-        self.metrics.failed_total.with_label_values(&[reason]).inc();
+        // One per event, the unit of `not_accepted` and of the sibling counters.
+        self.metrics
+            .failed_total
+            .with_label_values(&[reason])
+            .inc_by(ids.len() as u64);
         if let Err(e) = self.repo.reschedule(ids).await {
             // The lease still expires, so the rows come back anyway.
             tracing::error!(error = %e, "cannot back off lab events");
