@@ -27,13 +27,21 @@
 //! `max_total_bytes` counts what decompression produces (zip entries and gzip
 //! streams), including what was inflated for an entry that ends up skipped. Tar
 //! entries are slices of data already counted, so they do not add to it.
+//!
+//! A `.tar.gz` is read as a stream: each entry is checked against `max_file_bytes` on
+//! its own, and only the total bounds the tarball. A gzip stream that holds one file
+//! is that file, so `max_file_bytes` applies to it: over the limit, the walk fails
+//! with [`ArchiveError::FileTooLarge`] when the gzip is the archive itself, and the
+//! gzip is skipped when it sits inside another archive.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
 use std::path::{Component, Path};
+use std::rc::Rc;
 
 /// Canonical MIME type of a zip archive.
 pub const MIME_ZIP: &str = "application/zip";
@@ -203,16 +211,28 @@ pub fn walk(
     let mut walker = Walker {
         limits,
         sink,
-        summary: Summary::default(),
+        files: 0,
+        skipped: 0,
+        decompressed: Rc::new(Cell::new(0)),
     };
     walker.archive(data, format, "", name, 1)?;
-    Ok(walker.summary)
+    Ok(Summary {
+        files: walker.files,
+        skipped: walker.skipped,
+        decompressed_bytes: walker.decompressed.get(),
+    })
 }
 
 struct Walker<'a> {
     limits: &'a Limits,
     sink: &'a mut dyn FnMut(Event) -> Result<(), String>,
-    summary: Summary,
+    /// Files yielded so far.
+    files: usize,
+    /// Entries skipped so far.
+    skipped: usize,
+    /// Bytes decompression produced so far. Shared with the [`Metered`] reader of
+    /// every `.tar.gz` being streamed, which counts while the walker handles entries.
+    decompressed: Rc<Cell<u64>>,
 }
 
 impl Walker<'_> {
@@ -297,11 +317,26 @@ impl Walker<'_> {
     }
 
     fn tar(&mut self, data: &[u8], prefix: &str, depth: usize) -> Result<(), ArchiveError> {
-        let corrupt = |e: std::io::Error| ArchiveError::Corrupt {
-            format: Format::Tar,
-            message: e.to_string(),
+        self.tar_entries(Cursor::new(data), &RefCell::new(None), prefix, depth)
+    }
+
+    /// Walk the entries of the tar that `reader` yields. `fault` is where a reader
+    /// that decompresses leaves the reason it stopped: `tar` only reports an I/O
+    /// error, which would otherwise read as a corrupt tar.
+    fn tar_entries<R: Read>(
+        &mut self,
+        reader: R,
+        fault: &RefCell<Option<ArchiveError>>,
+        prefix: &str,
+        depth: usize,
+    ) -> Result<(), ArchiveError> {
+        let corrupt = |e: io::Error| {
+            fault.borrow_mut().take().unwrap_or(ArchiveError::Corrupt {
+                format: Format::Tar,
+                message: e.to_string(),
+            })
         };
-        let mut archive = tar::Archive::new(Cursor::new(data));
+        let mut archive = tar::Archive::new(reader);
         for entry in archive.entries().map_err(corrupt)? {
             let mut entry = entry.map_err(corrupt)?;
             let kind = entry.header().entry_type();
@@ -359,8 +394,35 @@ impl Walker<'_> {
         name: Option<&str>,
         depth: usize,
     ) -> Result<(), ArchiveError> {
+        let corrupt = |e: io::Error| ArchiveError::Corrupt {
+            format: Format::Gzip,
+            message: e.to_string(),
+        };
         let mut decoder = flate2::read::MultiGzDecoder::new(data);
-        let inner = match self.read_counted(&mut decoder, None) {
+        // One tar block is enough to tell a tarball from a lone file.
+        let mut head = Vec::with_capacity(TAR_BLOCK as usize);
+        (&mut decoder)
+            .take(TAR_BLOCK)
+            .read_to_end(&mut head)
+            .map_err(corrupt)?;
+        let is_tarball = is_tar(&head);
+        let mut stream = Cursor::new(head).chain(decoder);
+
+        // A .tar.gz is one archive, not two: its entries sit where the .tar.gz was.
+        // It is read as it inflates, so the tarball is bounded by the total alone and
+        // each entry by the per-file limit, as in a zip.
+        if is_tarball {
+            let fault = RefCell::new(None);
+            let metered = Metered {
+                inner: stream,
+                produced: Rc::clone(&self.decompressed),
+                max: self.limits.max_total_bytes,
+                fault: &fault,
+            };
+            return self.tar_entries(metered, &fault, prefix, depth);
+        }
+
+        let inner = match self.read_counted(&mut stream, None) {
             Ok(Some(d)) => d,
             Ok(None) => return Err(ArchiveError::FileTooLarge(self.limits.max_file_bytes)),
             Err(Read2::Io(message)) => {
@@ -371,10 +433,6 @@ impl Walker<'_> {
             }
             Err(Read2::Fatal(e)) => return Err(e),
         };
-        // A .tar.gz is one archive, not two: its entries sit where the .tar.gz was.
-        if is_tar(&inner) {
-            return self.tar(&inner, prefix, depth);
-        }
         let file_name = name.map(gunzipped_name).unwrap_or_else(|| "file".into());
         self.file(format!("{prefix}{file_name}"), inner, depth)
     }
@@ -405,15 +463,15 @@ impl Walker<'_> {
                 other => other,
             };
         }
-        if self.summary.files >= self.limits.max_files {
+        if self.files >= self.limits.max_files {
             return Err(ArchiveError::TooManyFiles(self.limits.max_files));
         }
-        self.summary.files += 1;
+        self.files += 1;
         (self.sink)(Event::File { path, data }).map_err(ArchiveError::Stopped)
     }
 
     fn skip(&mut self, path: String, reason: &str) -> Result<(), ArchiveError> {
-        self.summary.skipped += 1;
+        self.skipped += 1;
         (self.sink)(Event::Skipped {
             path,
             reason: reason.to_string(),
@@ -437,10 +495,8 @@ impl Walker<'_> {
         reader: &mut dyn Read,
         declared: Option<u64>,
     ) -> Result<Option<Vec<u8>>, Read2> {
-        let left = self
-            .limits
-            .max_total_bytes
-            .saturating_sub(self.summary.decompressed_bytes);
+        let produced = self.decompressed.get();
+        let left = self.limits.max_total_bytes.saturating_sub(produced);
         let cap = self.limits.max_file_bytes.min(left);
         let bound = declared.map_or(cap, |d| d.min(cap));
         let mut out = Vec::new();
@@ -448,7 +504,7 @@ impl Walker<'_> {
         let len = out.len() as u64;
         // Counted before anything else: bytes inflated for a file that ends up
         // skipped were produced all the same.
-        self.summary.decompressed_bytes = self.summary.decompressed_bytes.saturating_add(len);
+        self.decompressed.set(produced.saturating_add(len));
         read.map_err(|e| Read2::Io(e.to_string()))?;
         if len > left {
             return Err(Read2::Fatal(ArchiveError::TooLarge(
@@ -470,6 +526,50 @@ impl Walker<'_> {
 enum Read2 {
     Io(String),
     Fatal(ArchiveError),
+}
+
+/// Size of a tar block: the header of the first entry fills the first one.
+const TAR_BLOCK: u64 = 512;
+
+/// A decompressing reader whose output counts against [`Limits::max_total_bytes`]
+/// as it is read, for a stream too large to buffer whole.
+///
+/// It stops with an I/O error, and leaves the actual reason in `fault`: the total
+/// was exceeded, or the compressed stream is corrupt.
+struct Metered<'a, R> {
+    inner: R,
+    produced: Rc<Cell<u64>>,
+    max: u64,
+    fault: &'a RefCell<Option<ArchiveError>>,
+}
+
+impl<R: Read> Read for Metered<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let produced = self.produced.get();
+        // One byte past the limit is enough to know it is exceeded.
+        let allowed = self.max.saturating_sub(produced).saturating_add(1);
+        let want = buf
+            .len()
+            .min(usize::try_from(allowed).unwrap_or(usize::MAX));
+        let n = match self.inner.read(&mut buf[..want]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+            Err(e) => {
+                *self.fault.borrow_mut() = Some(ArchiveError::Corrupt {
+                    format: Format::Gzip,
+                    message: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+        let produced = produced.saturating_add(n as u64);
+        self.produced.set(produced);
+        if produced > self.max {
+            *self.fault.borrow_mut() = Some(ArchiveError::TooLarge(self.max));
+            return Err(io::Error::other("the archive expands past its limit"));
+        }
+        Ok(n)
+    }
 }
 
 fn unreadable(e: &str) -> String {
@@ -900,6 +1000,105 @@ mod tests {
         );
         // One byte past the declared size is enough to know.
         assert_eq!(summary.decompressed_bytes, 6);
+    }
+
+    #[test]
+    fn a_tar_gz_larger_than_the_file_limit_is_read_entry_by_entry() {
+        let (a, b, c) = ([b'a'; 700], [b'b'; 700], [b'c'; 700]);
+        let data = gz(&tar_of(&[("a.txt", &a), ("b.txt", &b), ("c.txt", &c)]));
+        let limits = Limits {
+            max_file_bytes: 1024,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Gzip, Some("logs.tar.gz"), &limits);
+        let summary = r.unwrap();
+        assert_eq!(
+            files(&events),
+            vec![
+                ("a.txt", a.as_slice()),
+                ("b.txt", b.as_slice()),
+                ("c.txt", c.as_slice())
+            ]
+        );
+        assert!(skipped(&events).is_empty(), "{events:?}");
+        assert_eq!(summary.files, 3);
+        // Three 512-byte headers and three 700-byte files padded to 1024.
+        assert!(
+            summary.decompressed_bytes >= 3 * (512 + 1024),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_entry_of_a_tar_gz_is_skipped_alone() {
+        let big = [b'x'; 4096];
+        let data = gz(&tar_of(&[
+            ("a.txt", b"alpha"),
+            ("big.bin", &big),
+            ("c.txt", b"gamma"),
+        ]));
+        let limits = Limits {
+            max_file_bytes: 1024,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Gzip, Some("logs.tgz"), &limits);
+        r.unwrap();
+        assert_eq!(
+            files(&events),
+            vec![
+                ("a.txt", b"alpha".as_slice()),
+                ("c.txt", b"gamma".as_slice())
+            ]
+        );
+        assert_eq!(
+            skipped(&events),
+            vec![("big.bin", "larger than 1024 bytes")]
+        );
+    }
+
+    #[test]
+    fn a_tar_gz_bomb_stops_at_the_total_limit() {
+        let mib = vec![0u8; 1024 * 1024];
+        let data = gz(&tar_of(&[("a", &mib), ("b", &mib), ("c", &mib)]));
+        assert!(data.len() < 64 * 1024);
+        let limits = Limits {
+            max_total_bytes: 2 * 1024 * 1024,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Gzip, Some("bomb.tar.gz"), &limits);
+        assert_eq!(r, Err(ArchiveError::TooLarge(2 * 1024 * 1024)));
+        assert_eq!(files(&events).len(), 1, "only the first fits");
+
+        // Nested, it still ends the walk: skipping it would let the next one start
+        // from a fresh budget. The entries it skips are inflated to be passed over,
+        // so they count too.
+        let limits = Limits {
+            max_file_bytes: 64 * 1024,
+            max_total_bytes: 2 * 1024 * 1024,
+            ..Limits::default()
+        };
+        let outer = zip_of(&[("inner.tar.gz", &data), ("after.txt", b"after")]);
+        let (r, events) = run(&outer, Format::Zip, None, &limits);
+        assert_eq!(r, Err(ArchiveError::TooLarge(2 * 1024 * 1024)));
+        assert!(files(&events).is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_truncated_tar_gz_is_a_corrupt_gzip() {
+        let body: Vec<u8> = (0..20_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut data = gz(&tar_of(&[("a.txt", b"alpha"), ("b.bin", &body)]));
+        data.truncate(data.len() / 2);
+        let (r, _) = run(&data, Format::Gzip, Some("cut.tar.gz"), &Limits::default());
+        assert!(
+            matches!(
+                r,
+                Err(ArchiveError::Corrupt {
+                    format: Format::Gzip,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
     }
 
     #[test]

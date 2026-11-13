@@ -114,6 +114,7 @@ running ones are cancelled.
 | Symbolic and hard links | `symbolic link` / `link` |
 | Empty files | `empty file` |
 | Files over `ARCHIVE_MAX_FILE_MB` | `larger than … bytes` |
+| A nested `.gz` whose single file is over `ARCHIVE_MAX_FILE_MB` | `the file expands to more than … bytes` |
 | Archives nested deeper than `ARCHIVE_MAX_DEPTH` | `archive nested more than … levels deep` |
 | A nested archive that cannot be read | `not a readable … archive` |
 | Encrypted entries, zip compression other than deflate, or a zip entry larger than the size it declares | `unreadable: …` |
@@ -130,8 +131,14 @@ more than `ARCHIVE_MAX_FILES` files or decompression produces more than
 `ARCHIVE_MAX_UNPACKED_MB`: a small zip can expand to terabytes. What was decompressed
 for an entry that ends up skipped counts toward `ARCHIVE_MAX_UNPACKED_MB` too, so an
 archive of entries that each expand past `ARCHIVE_MAX_FILE_MB` is refused instead of
-being decompressed in full. The upload itself is
-bounded by the gateway's `MAX_UPLOAD_MB`. The worker holds the archive in memory while
+being decompressed in full.
+
+`ARCHIVE_MAX_FILE_MB` applies to each file, never to a container: a `.tar.gz` whose
+tarball is larger is read entry by entry, like a zip, and only its oversized entries
+are skipped. A `.gz` holding a single file is that file: uploaded on its own and over
+the limit, its job fails with `the file expands to more than … bytes`.
+
+The upload itself is bounded by the gateway's `MAX_UPLOAD_MB`. The worker holds the archive in memory while
 it expands it, plus a few files at a time.
 
 | Variable (worker) | Default |
