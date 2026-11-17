@@ -12,6 +12,7 @@
 //! non-retryable and names the connection; transport and DNS trouble is retryable.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, PluginError, pinned_connection};
 use meili_ingest_source::{HostPolicy, SecretKey, SourceError};
@@ -37,6 +38,17 @@ struct ConnectionRow {
     api_key: Vec<u8>,
 }
 
+/// How long one control plane request may take, connection and body included.
+///
+/// The control plane answers from Postgres or, at worst, after its own 10 s call to
+/// the Lab. A request still pending after this is a control plane that accepted the
+/// connection and went silent (frozen pod, exhausted pool): fail the attempt as
+/// retryable instead of holding an activity slot for as long as it stays silent.
+/// Kept under the shortest start-to-close timeout of the activities that call it
+/// (30 s, `record_job_started`), so an attempt ends on its own before Temporal gives
+/// up on it.
+pub const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Where to reach the control plane, and how.
 pub struct ControlPlane<'a> {
     /// Shared HTTP client.
@@ -45,10 +57,24 @@ pub struct ControlPlane<'a> {
     pub base_url: Option<&'a str>,
     /// `CONTROL_PLANE_TOKEN`, presented as a bearer.
     pub token: Option<&'a str>,
+    /// Deadline of each request ([`CONTROL_PLANE_TIMEOUT`] outside tests).
+    pub timeout: Duration,
 }
 
-/// Present the control plane token, when there is one.
+/// Prepare a control plane request: present the token, when there is one, and bound
+/// the request by [`CONTROL_PLANE_TIMEOUT`]. Every control plane call of the worker
+/// goes through here or through [`authed_within`], so none can wait forever.
 pub fn authed(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    authed_within(req, token, CONTROL_PLANE_TIMEOUT)
+}
+
+/// [`authed`] with an explicit deadline.
+pub fn authed_within(
+    req: reqwest::RequestBuilder,
+    token: Option<&str>,
+    timeout: Duration,
+) -> reqwest::RequestBuilder {
+    let req = req.timeout(timeout);
     match token {
         Some(t) => req.bearer_auth(t),
         None => req,
@@ -82,14 +108,7 @@ pub async fn resolve_connection(
         .base_url
         .ok_or_else(|| fail("no control plane is configured on this worker".into()))?;
 
-    let row = fetch(
-        control_plane.http,
-        base,
-        control_plane.token,
-        &name,
-        tenant_id,
-    )
-    .await?;
+    let row = fetch(control_plane, base, &name, tenant_id).await?;
 
     let api_key = key.open(&row.api_key).map_err(|_| {
         fail(
@@ -116,9 +135,8 @@ pub async fn resolve_connection(
 }
 
 async fn fetch(
-    http: &reqwest::Client,
+    control_plane: &ControlPlane<'_>,
     base: &str,
-    token: Option<&str>,
     name: &str,
     tenant_id: Option<&str>,
 ) -> Result<ConnectionRow, PluginError> {
@@ -136,10 +154,14 @@ async fn fetch(
             .append_pair("scope", "tenant");
     }
 
-    let resp = authed(http.get(url), token)
-        .send()
-        .await
-        .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+    let resp = authed_within(
+        control_plane.http.get(url),
+        control_plane.token,
+        control_plane.timeout,
+    )
+    .send()
+    .await
+    .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(PluginError::NonRetryable(format!(
@@ -213,6 +235,7 @@ mod tests {
             http: &http,
             base_url: Some("http://unused.invalid"),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let s = settings(HostPolicy::Any);
         let cfg = serde_json::json!({ "connection": "prod-movies" });
@@ -238,6 +261,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let out = resolve_connection(
             &cp,
@@ -262,6 +286,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -288,6 +313,7 @@ mod tests {
             http: &http,
             base_url: Some("http://unused.invalid"),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -315,6 +341,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -345,6 +372,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -377,6 +405,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let _ = resolve_connection(
             &cp,
@@ -406,6 +435,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -437,6 +467,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: None,
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let _ = resolve_connection(
             &cp,
@@ -448,5 +479,23 @@ mod tests {
         .await;
         let req = &server.received_requests().await.unwrap()[0];
         assert!(req.url.query().is_none(), "{:?}", req.url);
+    }
+
+    #[test]
+    fn every_control_plane_request_has_a_deadline() {
+        // `authed` is what the source, archive and manifest calls go through.
+        let http = reqwest::Client::new();
+        let req = authed(http.get("http://cp.invalid/internal/plugins"), Some("t"))
+            .build()
+            .expect("request");
+        assert_eq!(req.timeout(), Some(&CONTROL_PLANE_TIMEOUT));
+        let req = authed_within(
+            http.get("http://cp.invalid/internal/plugins"),
+            None,
+            Duration::from_millis(100),
+        )
+        .build()
+        .expect("request");
+        assert_eq!(req.timeout(), Some(&Duration::from_millis(100)));
     }
 }

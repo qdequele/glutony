@@ -24,7 +24,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::ai_target::{LAB_AI_PLUGINS, fetch_ai_target};
-use crate::connection::{ConnectionSettings, ControlPlane, authed, resolve_connection};
+use crate::connection::{
+    CONTROL_PLANE_TIMEOUT, ConnectionSettings, ControlPlane, authed_within, resolve_connection,
+};
 use crate::registry::PluginRegistry;
 
 /// Interval at which the activity heartbeats on its own, independent of the plugin.
@@ -146,6 +148,8 @@ pub struct StepActivities {
     pub control_plane_url: Option<String>,
     /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
     pub control_plane_token: Option<String>,
+    /// Deadline of each control plane request ([`CONTROL_PLANE_TIMEOUT`]).
+    pub control_plane_timeout: Duration,
     /// Key and host policy for resolving an indexer step's Meilisearch connection.
     pub connections: ConnectionSettings,
     /// Post Lab billing events to the control plane (spec §5.3).
@@ -165,6 +169,7 @@ impl StepActivities {
             usage: None,
             control_plane_url: None,
             control_plane_token: None,
+            control_plane_timeout: CONTROL_PLANE_TIMEOUT,
             connections: ConnectionSettings::default(),
             lab_events: false,
             lab_ai_gateway: false,
@@ -214,6 +219,7 @@ impl StepActivities {
             http: &self.http,
             base_url: self.control_plane_url.as_deref(),
             token: self.control_plane_token.as_deref(),
+            timeout: self.control_plane_timeout,
         }
     }
 
@@ -338,9 +344,10 @@ impl StepActivities {
                 "LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL".into(),
             ));
         };
-        let resp = authed(
+        let resp = authed_within(
             self.http.post(format!("{base}/internal/lab-events")),
             self.control_plane_token.as_deref(),
+            self.control_plane_timeout,
         )
         .json(&serde_json::json!({ "events": events }))
         .send()
@@ -392,11 +399,15 @@ impl StepActivities {
         let body = serde_json::Value::Object(body);
         let mut missing_retries = JOB_ROW_MISSING_BACKOFF.iter();
         loop {
-            let resp = authed(self.http.patch(&url), self.control_plane_token.as_deref())
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+            let resp = authed_within(
+                self.http.patch(&url),
+                self.control_plane_token.as_deref(),
+                self.control_plane_timeout,
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 // The gateway inserts the row only after the workflow started, so a
                 // fast worker can get here first: wait a little for the row. When
@@ -1645,6 +1656,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
+    }
+
+    /// A control plane that accepts the request and then stays silent for `delay`.
+    async fn silent_control_plane(delay: Duration) -> MockServer {
+        let cp = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(delay),
+            )
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    const SILENCE: Duration = Duration::from_secs(5);
+
+    /// Activities whose control plane requests give up after 100 ms.
+    fn impatient(a: StepActivities) -> StepActivities {
+        StepActivities {
+            control_plane_timeout: Duration::from_millis(100),
+            ..a
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_the_job_status_write_as_retryable() {
+        let cp = silent_control_plane(SILENCE).await;
+        let a = impatient(acts_with(&cp, false));
+        let started = Instant::now();
+        let err = a
+            .patch_job(Uuid::new_v4(), JobStatus::Running, None, None)
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_the_usage_report_as_retryable() {
+        let cp = silent_control_plane(SILENCE).await;
+        let a = impatient(acts_with(&cp, true));
+        let started = Instant::now();
+        let err = a
+            .report_usage(&lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"))
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_the_lab_events_post_as_retryable() {
+        let cp = silent_control_plane(SILENCE).await;
+        let a = impatient(acts_with(&cp, true));
+        let started = Instant::now();
+        let err = a
+            .post_lab_events(&lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"))
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_a_step_as_retryable() {
+        use meili_ingest_source::{HostPolicy, SecretKey};
+        let cp = silent_control_plane(SILENCE).await;
+
+        // Resolving the indexer's connection.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let a = impatient(
+            acts(vec![Arc::new(CapturingIndexer(seen))])
+                .with_control_plane(Some(cp.uri()))
+                .with_connections(ConnectionSettings {
+                    key: Some(Arc::new(SecretKey::from_bytes([5u8; 32]))),
+                    policy: HostPolicy::Any,
+                }),
+        );
+        let mut input = step_input(meili_ingest_plugin_sdk::INDEXER_PLUGIN, PluginInput::Empty);
+        input.config = serde_json::json!({ "connection": "prod-movies", "index": "movies" });
+        let started = Instant::now();
+        let err = a
+            .run_step(&PluginContext::noop(), input)
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+
+        // Fetching a Lab tenant's Gateway target.
+        let a = impatient(ai_acts(&cp, Probe::new("llm_enricher"), true));
+        let started = Instant::now();
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
     }
 
     #[test]
