@@ -68,6 +68,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -202,6 +203,10 @@ struct LlmClient {
 #[derive(Clone)]
 pub struct LlmEnricherPlugin {
     client: Option<LlmClient>,
+    /// HTTP client for the Lab's target when there is no env client, built on first use
+    /// and shared by clones, so a keyless worker keeps one connection pool across steps.
+    /// The team key travels per request, so sharing the pool shares no credential.
+    lab_http: Arc<OnceLock<reqwest::Client>>,
 }
 
 impl std::fmt::Debug for LlmEnricherPlugin {
@@ -234,7 +239,10 @@ impl LlmEnricherPlugin {
 
     /// An instance whose `execute` always fails with `InvalidConfig("LLM_API_KEY not set")`.
     pub fn disabled() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            lab_http: Arc::default(),
+        }
     }
 
     /// Read `LLM_API_KEY` (required), `LLM_BASE_URL`, `LLM_MODEL` from the environment.
@@ -274,6 +282,7 @@ impl LlmEnricherPlugin {
                 http,
                 lab: None,
             }),
+            lab_http: Arc::default(),
         }
     }
 
@@ -288,12 +297,7 @@ impl LlmEnricherPlugin {
         if let Some(target) = ctx.ai_target() {
             let http = match &self.client {
                 Some(c) => c.http.clone(),
-                None => reqwest::Client::builder()
-                    .timeout(DEFAULT_TIMEOUT)
-                    .build()
-                    .map_err(|e| {
-                        PluginError::non_retryable(format!("cannot build HTTP client: {e}"))
-                    })?,
+                None => self.lab_http()?,
             };
             return Ok(LlmClient {
                 base_url: target.base_url.trim_end_matches('/').to_string(),
@@ -306,6 +310,19 @@ impl LlmEnricherPlugin {
         self.client
             .clone()
             .ok_or_else(|| PluginError::invalid_config("LLM_API_KEY not set"))
+    }
+
+    /// The shared client for the Lab's target (see `lab_http`), built on first use.
+    fn lab_http(&self) -> Result<reqwest::Client, PluginError> {
+        if let Some(http) = self.lab_http.get() {
+            return Ok(http.clone());
+        }
+        let built = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(|e| PluginError::non_retryable(format!("cannot build HTTP client: {e}")))?;
+        // Two first steps racing both build; one wins and both use the winner.
+        Ok(self.lab_http.get_or_init(|| built).clone())
     }
 }
 
@@ -674,7 +691,7 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -1285,6 +1302,83 @@ mod tests {
         let p = LlmEnricherPlugin::disabled();
         assert!(!p.is_enabled());
         run_with(&p, &ctx, serde_json::json!({})).await.unwrap();
+    }
+
+    /// A keep-alive HTTP/1.1 server that answers every request with `reply` and counts
+    /// the TCP connections it accepted. wiremock does not expose connection counts.
+    async fn counting_server(reply: serde_json::Value) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let body = reply.to_string();
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // One request: headers, then `Content-Length` bytes of body.
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        while buf.len() < head_end + len {
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        buf.drain(..head_end + len);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), accepted)
+    }
+
+    #[tokio::test]
+    async fn a_disabled_plugin_reuses_its_lab_connection_across_steps() {
+        let (base_url, accepted) = counting_server(chat_reply("{}")).await;
+        let target = AiTarget::new(
+            base_url,
+            "lab-key",
+            "key-1",
+            "lab-model",
+            "lab-vision",
+            None,
+        );
+        let p = LlmEnricherPlugin::disabled();
+        for _ in 0..2 {
+            // Each step gets a fresh context, as the worker builds one per activity.
+            run_with(&p, &ctx_with_target(target.clone()), serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "one pooled connection");
     }
 
     #[tokio::test]
