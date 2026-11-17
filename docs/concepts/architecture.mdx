@@ -99,7 +99,8 @@ A worker polls one task queue (`TASK_QUEUE`). The `execute_step` activity:
 2. Builds an `ActivityContext` forwarding heartbeats and cancellation.
 3. Dispatches to the plugin from the `PluginRegistry` (built-in, WASM or gRPC).
 4. Spills outputs larger than `PAYLOAD_SPILL_BYTES` back to the blob store so
-   they stay under Temporal's 2 MB payload limit.
+   they stay under Temporal's 2 MB payload limit. The branches of a fanned-out
+   step share that budget, so their merged output stays under it too.
 
 ### Blob store
 

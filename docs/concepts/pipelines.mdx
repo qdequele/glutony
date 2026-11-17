@@ -109,8 +109,13 @@ steps:
 Temporal payloads are capped at 2 MB, so meili-ingest never relies on them for
 content: uploads and inline `documents` above `INLINE_MAX_BYTES` (1 MiB) are
 staged in the blob store and step outputs above `PAYLOAD_SPILL_BYTES` (1 MiB)
-are spilled there. This is invisible to plugins and to pipeline authors: staged
-documents reach the first step as documents, exactly as inline ones do.
+are spilled there. A fanned-out step shares that budget: its branch inputs
+travel as one list and its branch outputs are merged into one input for the
+next step, so branches are spilled as needed to keep each of those under
+`PAYLOAD_SPILL_BYTES` as a whole (a branch output is spilled above
+`PAYLOAD_SPILL_BYTES` divided by the number of branches). This is invisible to
+plugins and to pipeline authors: staged documents reach the first step as
+documents, exactly as inline ones do.
 
 ## Built-in pipelines
 

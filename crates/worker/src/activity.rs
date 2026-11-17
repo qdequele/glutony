@@ -103,7 +103,8 @@ pub struct JobStartedInput {
 /// Output of the `expand_fan_out` activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FanOutActivityOutput {
-    /// One input per branch (large branches are spilled to the blob store).
+    /// One input per branch. Branches are spilled to the blob store as needed for the
+    /// whole list to fit the spill threshold.
     pub branches: Vec<PluginInput>,
 }
 
@@ -511,7 +512,7 @@ impl StepActivities {
                 &input.step_id,
                 input.branch,
                 output,
-                self.spill_threshold,
+                branch_spill_threshold(self.spill_threshold, input.branch_total),
             )
             .await
             .map_err(|e| PluginError::Retryable(format!("failed to spill step output: {e}")))?;
@@ -573,7 +574,13 @@ impl StepActivities {
                 )));
             }
         };
-        let mut out = Vec::with_capacity(branches.len());
+        // The whole branch list is one activity result, so it is the list that has to
+        // fit the budget, not each branch. Branches stay inline while there is room
+        // for them and for a reference to every branch still to come; the rest are
+        // spilled.
+        let total = branches.len();
+        let mut used = 0usize;
+        let mut out = Vec::with_capacity(total);
         for (i, branch) in branches.into_iter().enumerate() {
             let as_output = match branch {
                 PluginInput::Documents(d) => PluginOutput::Documents(d),
@@ -582,6 +589,12 @@ impl StepActivities {
                 PluginInput::Ref(r) => PluginOutput::Ref(r),
                 PluginInput::Empty => PluginOutput::Empty,
             };
+            let reserved = (total - i - 1).saturating_mul(SPILLED_REF_SIZE);
+            let room = self
+                .spill_threshold
+                .saturating_sub(used.saturating_add(reserved))
+                // Nothing gets smaller than the reference that would replace it.
+                .max(SPILLED_REF_SIZE);
             let spilled = self
                 .blob
                 .spill_output(
@@ -589,15 +602,34 @@ impl StepActivities {
                     &format!("{}-fanout", input.step_id),
                     Some(i),
                     as_output,
-                    self.spill_threshold,
+                    room,
                 )
                 .await
                 .map_err(|e| {
                     PluginError::Retryable(format!("failed to spill fan-out branch: {e}"))
                 })?;
+            used = used.saturating_add(spilled.approx_size());
             out.push(PluginInput::from(spilled));
         }
         Ok(FanOutActivityOutput { branches: out })
+    }
+}
+
+/// What a spilled output weighs once it is a reference
+/// ([`PluginOutput::approx_size`] of a `Ref`).
+const SPILLED_REF_SIZE: usize = 256;
+
+/// Spill threshold of one output of a step running as `branch_total` branches.
+///
+/// The workflow merges the branch outputs into one `Many`, which is the single input
+/// of the next step: it is their sum that has to stay under the threshold, and the
+/// branches run in parallel without knowing each other's size. So each gets an equal
+/// share of the budget. A step that is not fanned out keeps the whole of it.
+fn branch_spill_threshold(threshold: usize, branch_total: Option<usize>) -> usize {
+    match branch_total {
+        // Never below a reference: spilling something smaller would only grow it.
+        Some(total) if total > 1 => (threshold / total).max(SPILLED_REF_SIZE),
+        _ => threshold,
     }
 }
 
@@ -1325,6 +1357,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fan_out_branches_fit_the_payload_budget_together() {
+        // A spilled upstream well over Temporal's 2 MiB payload cap: the branch list
+        // is one activity result, so it must fit the budget as a whole.
+        let threshold = 1024 * 1024;
+        let a = StepActivities::new(
+            Arc::new(PluginRegistry::new()),
+            BlobStore::memory(),
+            threshold,
+        );
+        let job = Uuid::new_v4();
+        let docs: Vec<Document> = (0..3000)
+            .map(|i| Document::with_id(format!("d{i}"), "y".repeat(1024)))
+            .collect();
+        let upstream = PluginOutput::Documents(docs);
+        assert!(upstream.approx_size() > 2 * threshold);
+        let spilled = a
+            .blob
+            .spill_output(job, "chunk", None, upstream, threshold)
+            .await
+            .unwrap();
+        assert!(matches!(spilled, PluginOutput::Ref(_)));
+        let out = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: job,
+                step_id: "enrich".into(),
+                upstream: spilled,
+                path: "$.documents".into(),
+                max_branches: 500,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.branches.len(), 500);
+        let total: usize = out.branches.iter().map(PluginInput::approx_size).sum();
+        assert!(
+            total <= threshold,
+            "the branch list is {total} bytes, over the {threshold} byte budget"
+        );
+        // Small branches still travel inline: only the overflow is spilled.
+        assert!(matches!(out.branches[0], PluginInput::Documents(_)));
+        // Nothing is lost on the way.
+        let mut seen = 0;
+        for b in out.branches {
+            let resolved = a.blob.resolve_input(b, &a.http).await.unwrap();
+            seen += resolved.into_documents().unwrap().len();
+        }
+        assert_eq!(seen, 3000);
+    }
+
+    /// Run `total` branches of a fanned-out `upper` step, each over `content_len` bytes
+    /// of content, and return what the workflow merges: `Many` of the branch outputs.
+    async fn fan_in(a: &StepActivities, total: usize, content_len: usize) -> PluginOutput {
+        let job = Uuid::new_v4();
+        let mut outputs = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut input = step_input(
+                "upper",
+                PluginInput::Documents(vec![Document::with_id(
+                    format!("d{i}"),
+                    "y".repeat(content_len),
+                )]),
+            );
+            input.job_id = job;
+            input.branch = Some(i);
+            input.branch_total = Some(total);
+            let out = a.run_step(&PluginContext::noop(), input).await.unwrap();
+            outputs.push(out.output);
+        }
+        PluginOutput::Many(outputs)
+    }
+
+    fn upper_acts(threshold: usize) -> StepActivities {
+        let mut reg = PluginRegistry::new();
+        reg.register(Arc::new(Upper));
+        StepActivities::new(Arc::new(reg), BlobStore::memory(), threshold)
+    }
+
+    #[tokio::test]
+    async fn merged_branch_outputs_fit_the_payload_budget_together() {
+        let threshold = 64 * 1024;
+        let a = upper_acts(threshold);
+        // Each branch output is well under the threshold on its own, but the eight of
+        // them are merged into the single input of the next step.
+        let merged = fan_in(&a, 8, 16 * 1024).await;
+        assert!(
+            merged.approx_size() <= threshold,
+            "the merged output is {} bytes, over the {threshold} byte budget",
+            merged.approx_size()
+        );
+        let back = a.blob.hydrate_output(merged).await.unwrap();
+        assert_eq!(back.document_count(), 8);
+    }
+
+    #[tokio::test]
+    async fn small_branch_outputs_stay_inline() {
+        let a = upper_acts(64 * 1024);
+        let PluginOutput::Many(outputs) = fan_in(&a, 8, 100).await else {
+            panic!("fan_in returns Many");
+        };
+        assert!(
+            outputs
+                .iter()
+                .all(|o| matches!(o, PluginOutput::Documents(_))),
+            "{outputs:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fan_out_hydrates_spilled_outputs_nested_in_a_fan_in() {
         // The upstream is itself a fanned-out step: `Many` of branch outputs, one of
         // them spilled.
@@ -1824,6 +1963,26 @@ mod tests {
             .expect_err("the control plane never answered");
         assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
         assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_spilled_reference_weighs_what_the_budget_assumes() {
+        let spilled = PluginOutput::Ref(meili_ingest_plugin_sdk::ContentRef::Staged {
+            uri: "jobs/x/s-0.json".into(),
+            mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.to_owned()),
+            filename: None,
+            origin: None,
+        });
+        assert_eq!(spilled.approx_size(), SPILLED_REF_SIZE);
+    }
+
+    #[test]
+    fn a_fanned_out_step_shares_the_spill_budget_between_its_branches() {
+        assert_eq!(branch_spill_threshold(1 << 20, None), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, Some(1)), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, Some(4)), 1 << 18);
+        // Never below what a reference weighs.
+        assert_eq!(branch_spill_threshold(64, Some(500)), SPILLED_REF_SIZE);
     }
 
     #[test]
