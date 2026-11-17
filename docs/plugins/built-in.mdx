@@ -210,6 +210,7 @@ Accepts `documents` and `many`.
 | `chunk_size` | `512` | Target chunk size in characters. |
 | `overlap` | `64` | Characters shared between consecutive chunks. |
 | `min_chunk_size` | `32` | Trailing fragments shorter than this are merged into the previous chunk. |
+| `keep_parent_fields` | `true` | Copy the parent's `title`, `fields` and `meta` onto every chunk. With `false`, chunks carry only their text and the chunk metadata. |
 
 ### `document_script`
 
@@ -371,15 +372,22 @@ HTTP 429, 529 (overloaded) and 5xx are retried; 401/403 (bad key) and 400/422
 ### `meili_indexer`
 
 The only plugin that talks to Meilisearch (`meilisearch-sdk`). Accepts
-`documents` and `many`. Host, API key and index come from the `MeiliContext`
-the workflow injects — never from env vars and never from your config.
+`documents` and `many`. Host and API key come from the named
+[`connection`](/concepts/connections) when the step sets one, otherwise from the
+`MeiliContext` the workflow injects, and never from env vars or from keys you
+type. The index is the step's `index` when set, otherwise the one resolved for
+the request.
 
 | Key | Default | Description |
 |---|---|---|
 | `primary_key` | `"id"` | Primary key declared when creating the index, and sent as `?primaryKey` on additions while the index has none. An index that already has a primary key keeps its own. |
 | `auto_create_index` | `true` | Create the index when it does not exist. |
+| `connection` | none | Name of a Meilisearch [connection](/concepts/connections) to index into. It wins over the request's `MeiliContext`, and pipelines run by a scheduled source need one. |
+| `index` | resolved | Pin the target index uid. When unset it comes from the pipeline's `trigger.index_pattern`, then the request, then the deployment default. |
 | `batch_size` | `1000` | Documents per `addDocuments` request. |
+| `max_batch_bytes` | `52428800` (50 MiB) | Serialized bytes per request. A batch is cut at whichever of this and `batch_size` comes first. Keep it under Meilisearch's `http_payload_size_limit`. A single document larger than this fails the step. |
 | `wait_for_completion` | `true` | Wait for Meilisearch tasks before finishing the step. |
+| `task_timeout_secs` | `INDEXER_TASK_TIMEOUT_SECS`, else `120` | How long to wait for one Meilisearch task before the step is retried. Keep it below the step's `timeout_secs`. |
 
 If the target index already exists with a primary key (for example `uid` on an
 index a Scrapix crawl created), additions are sent without `?primaryKey` and
