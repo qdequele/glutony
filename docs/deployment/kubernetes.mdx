@@ -31,14 +31,16 @@ kubectl -n meili-ingest get pods
 - Prometheus scraping the Temporal server (for the default trigger), or KEDA ≥ 2.15 for the native `temporal` scaler.
 - A Postgres database for the control plane.
 - An object store bucket for the blob store (pods do not share a disk).
-- Temporal: Temporal Cloud or your own cluster. `temporal.yaml` is for dev/staging.
+- Temporal: your own cluster, reachable without TLS or authentication (see
+  [Temporal connection](/deployment/environment-variables#temporal-connection);
+  Temporal Cloud is not supported yet). `temporal.yaml` is for dev/staging.
 
 ## 1. Configure
 
 Edit the `ConfigMap` in `k8s/control-plane.yaml`:
 
 ```yaml
-TEMPORAL_URL: "http://temporal-frontend:7233"    # or your Temporal Cloud endpoint
+TEMPORAL_URL: "http://temporal-frontend:7233"    # or your own cluster's frontend
 TEMPORAL_NAMESPACE: "default"
 BLOB_STORE_URL: "s3://meili-ingest-blobs"        # gs:// and az:// work too
 LLM_BASE_URL: "https://api.openai.com/v1"
@@ -235,14 +237,15 @@ see [Authoring a gRPC plugin](/plugins/authoring-grpc).
 
 `temporal.yaml` deploys `temporalio/auto-setup` with a single Postgres
 `StatefulSet` and the Temporal UI. It exists so `kubectl apply -k` produces a
-working cluster; **it is not HA and not for production**. For production:
+working cluster; **it is not HA and not for production**. For production, run
+the [official Helm chart](https://github.com/temporalio/helm-charts) with
+Cassandra/Postgres and Elasticsearch, set `TEMPORAL_URL` to its frontend, and
+remove `temporal.yaml` from `kustomization.yaml`.
 
-- [Temporal Cloud](https://temporal.io/cloud): set `TEMPORAL_URL` to your
-  namespace endpoint and mount the mTLS client certificate.
-- Self-managed: the [official Helm chart](https://github.com/temporalio/helm-charts)
-  with Cassandra/Postgres and Elasticsearch.
-
-Then remove `temporal.yaml` from `kustomization.yaml`.
+The gateway and workers connect without TLS or authentication, so keep the
+frontend on the cluster network. Temporal Cloud, which requires mTLS or an API
+key, is not supported yet (see
+[Temporal connection](/deployment/environment-variables#temporal-connection)).
 
 ## 5. Verify
 

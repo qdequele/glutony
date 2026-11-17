@@ -19,8 +19,9 @@ metadata:
     app.kubernetes.io/name: meili-ingest
 data:
   RUST_LOG: "info"
-  # Temporal frontend. Use your Temporal Cloud endpoint in production
-  # (e.g. https://<namespace>.<account>.tmprl.cloud:7233) together with mTLS.
+  # Temporal frontend. In production, point it at your own cluster. The gateway
+  # and workers connect without TLS or authentication, so Temporal Cloud (mTLS
+  # or API key) is not supported yet.
   TEMPORAL_URL: "http://temporal-frontend:7233"
   TEMPORAL_NAMESPACE: "default"
   CONTROL_PLANE_URL: "http://meili-control-plane:9000"

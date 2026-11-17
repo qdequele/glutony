@@ -9,7 +9,8 @@
 #   kustomize edit set image ghcr.io/qdequele/glutony=ghcr.io/qdequele/glutony:0.1.0
 #
 # temporal.yaml is a non-production reference (single-pod auto-setup). Remove
-# it and point TEMPORAL_URL at Temporal Cloud / your own cluster in production.
+# it and point TEMPORAL_URL at your own cluster in production (no TLS or
+# authentication on the connection: Temporal Cloud is not supported yet).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

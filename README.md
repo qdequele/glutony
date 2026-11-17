@@ -282,7 +282,8 @@ self-hosted deployments need no analytics account.
 - **Local / dev:** `docker compose watch` (see [`compose.yaml`](compose.yaml)).
 - **Kubernetes:** `kubectl apply -k k8s/` — gateway (HPA + PDB), control plane,
   three worker pools with KEDA `ScaledObject`s on Temporal queue backlog, and a
-  reference Temporal deployment (use Temporal Cloud in production).
+  reference Temporal deployment (use your own Temporal cluster in production; the
+  connection has no TLS or authentication, so Temporal Cloud is not supported yet).
 - **Meilisearch Cloud:** deploy behind Envoy with `ENVOY_TRUSTED_HEADER` set;
   see `docs/deployment/meilisearch-cloud.mdx`.
 

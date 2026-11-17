@@ -141,14 +141,19 @@ the worker, not the gateway, under these rules:
 Private tenant data is better passed as a presigned `https://` URL in a
 `{"url": …}` body, which `SOURCE_FETCH_HOSTS` governs.
 
-## Temporal Cloud
+## Temporal connection
 
-Point `TEMPORAL_URL` at `https://<namespace>.<account>.tmprl.cloud:7233` and set
-`TEMPORAL_NAMESPACE=<namespace>.<account>`. Temporal Cloud requires mTLS (or an
-API key); the client certificate and key must be provided to the gateway and
-every worker. The exact variable names are those supported by the Temporal
-client configuration in `crates/gateway/src/main.rs` and
-`crates/worker/src/main.rs` in your build — check them before deploying.
+The gateway and the workers connect to `TEMPORAL_URL` in plaintext, with no TLS
+client certificate and no API key: no variable configures either. Use a Temporal
+frontend that accepts unauthenticated, non-TLS gRPC, such as a self-managed
+cluster (the [official Helm chart](https://github.com/temporalio/helm-charts))
+reachable only from the cluster network.
+
+<Warning>
+**Temporal Cloud is not supported yet.** It requires mTLS or an API key, so the
+gateway gives up after 10 connection attempts and the workers exit at boot. The
+same applies to a self-managed frontend with TLS or authorization enabled.
+</Warning>
 
 ## Where they are set
 

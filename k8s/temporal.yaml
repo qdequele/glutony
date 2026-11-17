@@ -5,10 +5,11 @@
 # Postgres pod, so the whole stack can be brought up on a dev/staging cluster
 # with `kubectl apply -k k8s/`.
 #
-# In production use Temporal Cloud (https://temporal.io/cloud) or the official
-# Helm chart (https://github.com/temporalio/helm-charts) with an HA database,
-# and set TEMPORAL_URL / TEMPORAL_NAMESPACE (+ mTLS certificates) in the
-# meili-ingest-config ConfigMap accordingly. Remove this file from
+# In production use the official Helm chart
+# (https://github.com/temporalio/helm-charts) with an HA database, and set
+# TEMPORAL_URL / TEMPORAL_NAMESPACE in the meili-ingest-config ConfigMap
+# accordingly. The gateway and workers connect without TLS or authentication,
+# so Temporal Cloud is not supported yet. Remove this file from
 # kustomization.yaml when you do.
 # ============================================================================
 ---
