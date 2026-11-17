@@ -415,6 +415,7 @@ impl PipelineWorkflow {
                 .await
                 .map_err(Self::map_activity_error)?;
             return Ok(StepOutcome {
+                documents: out.documents_out as usize,
                 metering: StepMetering {
                     branches: 1,
                     duration_ms: out.duration_ms,

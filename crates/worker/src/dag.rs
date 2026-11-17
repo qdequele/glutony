@@ -138,6 +138,9 @@ impl StepMetering {
 pub struct StepOutcome {
     /// The step's output (`Many` of the branch outputs when fanned out).
     pub output: PluginOutput,
+    /// Documents the step produced, counted by the activity before it spilled its
+    /// output: a spilled output reaches the workflow as a `Ref`, which counts none.
+    pub documents: usize,
     /// What it consumed.
     pub metering: StepMetering,
 }
@@ -178,6 +181,7 @@ pub fn merge_branches(
     let total = results.len();
     let mut outputs = Vec::with_capacity(total);
     let mut metering = StepMetering::none(total);
+    let mut documents = 0;
     let mut cancelled = false;
     let mut first_error: Option<String> = None;
     for result in results {
@@ -186,6 +190,7 @@ pub fn merge_branches(
                 metering.duration_ms += o.duration_ms;
                 metering.input_bytes += o.input_bytes;
                 metering.usage.merge(o.usage);
+                documents += o.documents_out as usize;
                 outputs.push(o.output);
             }
             Err(BranchError::Cancelled) => cancelled = true,
@@ -210,6 +215,7 @@ pub fn merge_branches(
     }
     Ok(StepOutcome {
         output: PluginOutput::Many(outputs),
+        documents,
         metering,
     })
 }
@@ -281,7 +287,7 @@ pub fn settle_round(
                 round.rows.push(step_row(
                     step,
                     JobStatus::Succeeded,
-                    outcome.output.document_count(),
+                    outcome.documents,
                     None,
                     outcome.metering,
                 ));
@@ -565,12 +571,29 @@ mod tests {
         let out = merge_branches(vec![Ok(branch_ok(10, 5, 100)), Ok(branch_ok(20, 7, 200))])
             .expect("both branches completed");
         assert_eq!(out.output.document_count(), 2);
+        assert_eq!(out.documents, 2);
         assert!(matches!(&out.output, PluginOutput::Many(o) if o.len() == 2));
         assert_eq!(out.metering.branches, 2);
         assert_eq!(out.metering.duration_ms, 12);
         assert_eq!(out.metering.input_bytes, 300);
         assert_eq!(out.metering.usage.llm_input_tokens, 30);
         assert_eq!(out.metering.usage.llm_requests, 2);
+    }
+
+    #[test]
+    fn a_fanned_out_step_counts_the_documents_of_its_spilled_branches() {
+        // Each branch spills its output under its share of the payload budget, so the
+        // workflow sees references; the row still counts what the branches produced.
+        let spilled = |documents_out| StepActivityOutput {
+            output: spilled_ref(),
+            documents_out,
+            ..branch_ok(1, 1, 1)
+        };
+        let outcome = merge_branches(vec![Ok(spilled(3)), Ok(spilled(4)), Ok(branch_ok(1, 1, 1))])
+            .expect("every branch completed");
+        assert_eq!(outcome.output.document_count(), 1, "only one branch inline");
+        let round = settle_round(&steps(&["enrich"]), vec![Ok(outcome)]);
+        assert_eq!(round.rows[0].document_count, 8);
     }
 
     #[test]
@@ -637,6 +660,7 @@ mod tests {
                 Document::with_id("a", "x"),
                 Document::with_id("b", "y"),
             ]),
+            documents: 2,
             metering: StepMetering {
                 branches: 1,
                 duration_ms: 40,
@@ -819,6 +843,7 @@ mod tests {
         };
         let indexed = |report: &IndexReport| StepOutcome {
             output: PluginOutput::Indexed(report.clone()),
+            documents: report.document_count,
             metering: StepMetering::none(1),
         };
         let ready = vec![
