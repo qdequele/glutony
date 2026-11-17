@@ -200,8 +200,8 @@ the document out. Accepts `documents` and `many`. Queue: `workers-general`.
 |---|---|---|
 | `script` | *required* | The script, run once per document. |
 | `on_error` | `"fail"` | What a per-document error does: `fail` the step, `skip` that document, or `keep` it untouched. |
-| `max_ops` | `100000` | Rhai operations one document may use before the script is aborted. |
-| `timeout_ms` | `1000` | Wall-clock milliseconds one document may use before the script is aborted. |
+| `max_ops` | `100000` | Rhai operations one document may use before the script is aborted. At most `100000000`; larger values are clamped. |
+| `timeout_ms` | `1000` | Wall-clock milliseconds one document may use before the script is aborted. At most `30000`; larger values are clamped. |
 
 The document is bound as `doc`:
 
@@ -239,7 +239,9 @@ output; any other result keeps it.
 
 A script that does not compile fails the step immediately with a config error,
 before any document is touched, whatever `on_error` says. A script that exceeds
-`max_ops` or `timeout_ms` is aborted and treated as a per-document error.
+`max_ops` or `timeout_ms` is aborted and treated as a per-document error. The
+whole step also has a one-hour budget: running past it, or the job being
+cancelled, stops the script mid-run and fails the step whatever `on_error` says.
 
 Float arithmetic that produces NaN or an infinity is also a per-document error.
 Rhai does not raise on `x / 0.0` the way it does on integer division by zero, and
