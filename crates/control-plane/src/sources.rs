@@ -390,8 +390,22 @@ impl SourceRepo {
             None => (false, None),
             Some(v) => (true, v.as_deref()),
         };
+        // The incremental state says "this content was already ingested", which holds
+        // only for the URL, credential, pipeline and index it was learned with. A real
+        // change to one of them forgets it, so the next run fetches in full and feeds
+        // the new destination. A field resent with its current value is not a change:
+        // compare with the row, not with "present in the patch". In an UPDATE the
+        // column names on the right-hand side are the old values.
+        let reset = "(($5 IS NOT NULL AND $5 IS DISTINCT FROM pipeline_uid) \
+                     OR ($6 IS NOT NULL AND $6 IS DISTINCT FROM location) \
+                     OR ($8 IS NOT NULL AND $8 IS DISTINCT FROM timezone) \
+                     OR ($13 AND $9 IS DISTINCT FROM index_name) \
+                     OR ($10 AND $11 IS DISTINCT FROM fetch_auth))";
         let sql = format!(
             "UPDATE sources SET \
+                last_etag = CASE WHEN {reset} THEN NULL ELSE last_etag END, \
+                last_modified = CASE WHEN {reset} THEN NULL ELSE last_modified END, \
+                last_hash = CASE WHEN {reset} THEN NULL ELSE last_hash END, \
                 name = COALESCE($3, name), \
                 description = COALESCE($4, description), \
                 pipeline_uid = COALESCE($5, pipeline_uid), \

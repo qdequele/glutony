@@ -215,6 +215,78 @@ async fn save_state_advances_the_incremental_state() {
 }
 
 #[tokio::test]
+async fn an_edit_to_what_is_fetched_or_where_it_goes_forgets_the_incremental_state() {
+    use meili_ingest_control_plane::sources::SourcePatch;
+    let Some(repo) = repo("tr-reset").await else {
+        return;
+    };
+    let new = new_source("tr-reset-1", Some("proj-9"), "builtin.json");
+    let id = new.id;
+    repo.insert(&new).await.expect("insert");
+    let learned = IncrementalState {
+        etag: Some("\"v1\"".into()),
+        last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".into()),
+        hash: Some("abc123".into()),
+    };
+    let state_after = |patch: serde_json::Value| {
+        let repo = repo.clone();
+        let learned = learned.clone();
+        async move {
+            repo.save_state(id, &learned).await.expect("save state");
+            let patch: SourcePatch = serde_json::from_value(patch).expect("patch");
+            repo.update("tr-reset-1", Some("proj-9"), &patch)
+                .await
+                .expect("update")
+                .expect("row");
+            repo.load_for_run(id)
+                .await
+                .expect("load")
+                .expect("exists")
+                .state
+        }
+    };
+
+    // The content was skipped as "unchanged" for the old index, pipeline or URL: the
+    // new one has never received it.
+    for changed in [
+        serde_json::json!({ "index_name": "films" }),
+        serde_json::json!({ "pipeline_uid": "other.pipeline" }),
+        serde_json::json!({ "location": {
+            "kind": "url", "url": "https://example.test/other.json"
+        } }),
+        serde_json::json!({ "timezone": "Europe/Paris" }),
+        serde_json::json!({ "fetch_auth": [4, 5, 6] }),
+    ] {
+        assert_eq!(
+            state_after(changed.clone()).await,
+            IncrementalState::default(),
+            "{changed}"
+        );
+    }
+
+    // Edits that change neither, and fields resent with the value they already have,
+    // keep what was learned.
+    let current = repo
+        .load_for_run(id)
+        .await
+        .expect("load")
+        .expect("exists")
+        .definition;
+    for unchanged in [
+        serde_json::json!({ "paused": true }),
+        serde_json::json!({ "name": "renamed", "cron": "0 * * * *" }),
+        serde_json::json!({
+            "index_name": current.index_name,
+            "pipeline_uid": current.pipeline_uid,
+            "location": current.location,
+            "timezone": current.timezone,
+        }),
+    ] {
+        assert_eq!(state_after(unchanged.clone()).await, learned, "{unchanged}");
+    }
+}
+
+#[tokio::test]
 async fn runs_are_recorded_and_listed_newest_first() {
     let Some(repo) = repo("tr-runs").await else {
         return;

@@ -179,7 +179,10 @@ without credits is `failed` before anything is fetched, and the next tick tries 
 A source remembers the last `ETag`, `Last-Modified` and content hash, and sends
 `If-None-Match` / `If-Modified-Since` on the next fetch. That state is saved
 **only** when a run succeeds, so a failed run is retried in full on the next
-tick. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
+tick. A `PATCH` that changes the `location`, `timezone`, `pipeline_uid`,
+`index_name` or `auth` forgets that state, so the next run fetches in full and
+ingests into the new destination even when the upstream file has not changed.
+An edit to the steps of the pipeline itself keeps it. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
 `GET /jobs/{id}`.
 
 Runs never overlap: if a run is still going when the next tick fires, that
