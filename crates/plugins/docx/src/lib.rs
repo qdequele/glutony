@@ -311,7 +311,7 @@ impl Plugin for DocxExtractorPlugin {
         let base = base_id(&blob);
         let meta = base_meta(&blob);
 
-        let data = blob.data.clone();
+        let data = blob.data;
         let docx = run_blocking(move || {
             zip_budget::check(&data, "docx", &LIMITS)?;
             docx_rs::read_docx(&data)

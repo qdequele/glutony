@@ -99,26 +99,27 @@ fn pages_text(
 }
 
 /// Extract the whole document's text off the async runtime, with the number of pages
-/// it came from (see [`count_pages`]).
+/// it came from (see [`whole_text_and_pages`]).
 async fn extract_whole(data: Vec<u8>) -> Result<(String, u64), PluginError> {
-    run_blocking(move || {
-        let text = pdf_extract::extract_text_from_mem(&data).map_err(pdf_error)?;
-        Ok((text, count_pages(&data)))
-    })
-    .await?
+    run_blocking(move || whole_text_and_pages(&data))
+        .await?
+        .map_err(pdf_error)
 }
 
-/// Number of pages in the document.
+/// The whole document's text and its number of pages, from one parse.
 ///
-/// Whole-document extraction returns one string with no page markers, so in that mode
-/// the count has to come from the page tree instead. This is a structural read of the
-/// same `lopdf` parser `pdf-extract` uses (it re-exports it), not a second text
-/// extraction. Returns 0 when the page tree cannot be read: the extracted text is
-/// still good, and reporting no pages is better than billing a guess.
-fn count_pages(data: &[u8]) -> u64 {
-    pdf_extract::Document::load_mem(data)
-        .map(|doc| doc.get_pages().len() as u64)
-        .unwrap_or(0)
+/// Does what `pdf_extract::extract_text_from_mem` does (load, decrypt with the empty
+/// password when encrypted, write every page as plain text), keeping the parsed
+/// document to read the page count from its page tree: whole-document text has no
+/// page markers.
+fn whole_text_and_pages(data: &[u8]) -> Result<(String, u64), pdf_extract::OutputError> {
+    let mut doc = pdf_extract::Document::load_mem(data)?;
+    if doc.is_encrypted() {
+        doc.decrypt("")?;
+    }
+    let mut text = String::new();
+    pdf_extract::output_doc(&doc, &mut pdf_extract::PlainTextOutput::new(&mut text))?;
+    Ok((text, doc.get_pages().len() as u64))
 }
 
 fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
@@ -210,7 +211,7 @@ impl Plugin for PdfExtractorPlugin {
         let meta = base_meta(&blob);
 
         if cfg.per_page {
-            let pages = extract_pages(blob.data.clone(), cfg.max_pages).await?;
+            let pages = extract_pages(blob.data, cfg.max_pages).await?;
             let mut docs = Vec::with_capacity(pages.len());
             // Pages whose text was extracted. Counted even when the page turns out to
             // be blank and produces no document: rendering it is the billable work.
@@ -242,7 +243,7 @@ impl Plugin for PdfExtractorPlugin {
         let text = match cfg.max_pages {
             // Whole-document mode with a page cap: read page by page and join.
             Some(max) => {
-                let pages = extract_pages(blob.data.clone(), Some(max)).await?;
+                let pages = extract_pages(blob.data, Some(max)).await?;
                 let mut parts = Vec::new();
                 let mut pages_read = 0u64;
                 for (idx, page) in pages.into_iter().enumerate() {
@@ -263,7 +264,7 @@ impl Plugin for PdfExtractorPlugin {
                 parts.join("\n\n")
             }
             None => {
-                let (text, pages) = extract_whole(blob.data.clone()).await?;
+                let (text, pages) = extract_whole(blob.data).await?;
                 ctx.record_usage(UsageUnits::pages(pages));
                 normalize_whitespace(&text)
             }
@@ -583,6 +584,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::NonRetryable(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn single_parse_matches_pdf_extract() {
+        let pdf = make_pdf(&["First page", "Second page", "Third page"]);
+        let (text, pages) = whole_text_and_pages(&pdf).unwrap();
+        assert_eq!(text, pdf_extract::extract_text_from_mem(&pdf).unwrap());
+        assert_eq!(pages, 3);
+        assert!(whole_text_and_pages(b"%PDF-1.4 not a pdf").is_err());
     }
 
     #[test]

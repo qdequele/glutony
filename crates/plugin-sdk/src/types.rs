@@ -151,18 +151,21 @@ impl Document {
 
     /// Flatten into the JSON object sent to Meilisearch.
     pub fn to_index_json(&self) -> serde_json::Value {
+        self.clone().into_index_json()
+    }
+
+    /// [`Document::to_index_json`], moving the document's strings and fields into the
+    /// result instead of copying them.
+    pub fn into_index_json(self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
-        obj.insert("id".into(), serde_json::Value::String(self.id.clone()));
-        if let Some(t) = &self.title {
-            obj.insert("title".into(), serde_json::Value::String(t.clone()));
+        obj.insert("id".into(), serde_json::Value::String(self.id));
+        if let Some(t) = self.title {
+            obj.insert("title".into(), serde_json::Value::String(t));
         }
-        obj.insert(
-            "content".into(),
-            serde_json::Value::String(self.content.clone()),
-        );
-        for (k, v) in &self.fields {
+        obj.insert("content".into(), serde_json::Value::String(self.content));
+        for (k, v) in self.fields {
             if k != "id" && k != "content" && k != "_meta" {
-                obj.insert(k.clone(), v.clone());
+                obj.insert(k, v);
             }
         }
         // No provenance at all (e.g. JSON records) → no `_meta` key, rather than an
@@ -2669,6 +2672,7 @@ steps:
         assert_eq!(v["content"], "hello");
         assert_eq!(v["price"], 3);
         assert_eq!(v["_meta"]["page"], 2);
+        assert_eq!(d.into_index_json(), v);
     }
 
     #[test]

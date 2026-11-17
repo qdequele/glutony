@@ -266,6 +266,25 @@ fn map_error(err: MeiliError, what: &str) -> PluginError {
     }
 }
 
+/// Bytes `payload` takes serialized, counted without building the serialization.
+fn serialized_len(payload: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, payload) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
 /// Non-retryable error for a task that Meilisearch processed and marked `failed`.
 fn task_failed(uid: u32, what: &str, err: &MeilisearchError) -> PluginError {
     PluginError::NonRetryable(format!(
@@ -535,18 +554,19 @@ impl Plugin for MeiliIndexerPlugin {
         }
 
         let index = client.index(index_uid.clone());
-        let payloads: Vec<Value> = docs.iter().map(Document::to_index_json).collect();
-        let sizes: Vec<usize> = payloads
-            .iter()
-            .map(|p| serde_json::to_vec(p).map(|b| b.len()).unwrap_or(usize::MAX))
-            .collect();
+        let document_count = docs.len();
+        // Consumes the documents: their strings move into the payloads, so the input
+        // is held once rather than twice while the batches are sent.
+        let payloads: Vec<Value> = docs.into_iter().map(Document::into_index_json).collect();
+        let sizes: Vec<usize> = payloads.iter().map(serialized_len).collect();
         let batches = plan_batches(&sizes, cfg.batch_size, cfg.max_batch_bytes).map_err(
             |OversizedDoc { index, bytes }| {
                 PluginError::NonRetryable(format!(
                     "{NAME}: document {:?} is {bytes} bytes serialized, over \
                      `max_batch_bytes` ({}); it cannot be sent in any batch. Raise \
                      `max_batch_bytes` or chunk the document upstream",
-                    docs[index].id, cfg.max_batch_bytes
+                    payloads[index]["id"].as_str().unwrap_or_default(),
+                    cfg.max_batch_bytes
                 ))
             },
         )?;
@@ -591,7 +611,7 @@ impl Plugin for MeiliIndexerPlugin {
 
         Ok(PluginOutput::Indexed(IndexReport {
             index: index_uid,
-            document_count: docs.len(),
+            document_count,
             task_uids: tasks.iter().map(|t| t.task_uid).collect(),
         }))
     }
@@ -862,6 +882,17 @@ mod tests {
             add < first_creation_poll,
             "documents must not wait for the creation: {order:?}"
         );
+    }
+
+    #[test]
+    fn serialized_len_matches_the_serialization() {
+        for doc in docs() {
+            let payload = doc.into_index_json();
+            assert_eq!(
+                serialized_len(&payload),
+                serde_json::to_vec(&payload).unwrap().len()
+            );
+        }
     }
 
     #[test]
