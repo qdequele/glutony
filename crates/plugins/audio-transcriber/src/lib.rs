@@ -816,6 +816,19 @@ mod tests {
         String::from_utf8_lossy(body).contains(&format!("name=\"{name}\""))
     }
 
+    #[test]
+    fn a_long_upload_path_keeps_segment_ids_apart() {
+        // No origin: an archive member whose path is longer than an id can be. The
+        // `_t<index>` suffix must survive, or every segment overwrites the previous one.
+        let name = format!("{}/{}.mp3", "d".repeat(300), "f".repeat(300));
+        let blob = Blob::new(vec![], "audio/mpeg", Some(name));
+        let base = base_id(&blob);
+        let first = Document::with_id(format!("{base}_t0"), "").id;
+        let second = Document::with_id(format!("{base}_t1"), "").id;
+        assert!(first.len() <= 511 && second.len() <= 511);
+        assert!(first.ends_with("_t0"), "{first}");
+        assert_ne!(first, second);
+    }
     #[tokio::test]
     async fn happy_path_uploads_multipart_and_uses_the_transcript() {
         let server = MockServer::start().await;
