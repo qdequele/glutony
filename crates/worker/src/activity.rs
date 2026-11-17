@@ -560,9 +560,17 @@ impl StepActivities {
         {
             crate::dag::FanOut::Branches(b) => b,
             crate::dag::FanOut::NeedsActivity(_) => {
-                return Err(PluginError::NonRetryable(
-                    "upstream output is still a reference after hydration".into(),
-                ));
+                return Err(PluginError::NonRetryable(format!(
+                    "fan_out {:?} of step {}: the upstream output is still a reference after \
+                     hydration",
+                    input.path, input.step_id
+                )));
+            }
+            crate::dag::FanOut::Invalid(why) => {
+                return Err(PluginError::InvalidInput(format!(
+                    "fan_out {:?} of step {} cannot split the upstream output: {why}",
+                    input.path, input.step_id
+                )));
             }
         };
         let mut out = Vec::with_capacity(branches.len());
@@ -1314,6 +1322,67 @@ mod tests {
             let resolved = a.blob.resolve_input(b, &a.http).await.unwrap();
             assert_eq!(resolved.into_documents().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn fan_out_hydrates_spilled_outputs_nested_in_a_fan_in() {
+        // The upstream is itself a fanned-out step: `Many` of branch outputs, one of
+        // them spilled.
+        let a = StepActivities::new(Arc::new(PluginRegistry::new()), BlobStore::memory(), 64);
+        let job = Uuid::new_v4();
+        let spilled = a
+            .blob
+            .spill_output(
+                job,
+                "prev",
+                Some(1),
+                PluginOutput::Documents(vec![
+                    Document::with_id("b", "y".repeat(100)),
+                    Document::with_id("c", "y".repeat(100)),
+                ]),
+                64,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(spilled, PluginOutput::Ref(_)));
+        let upstream = PluginOutput::Many(vec![
+            PluginOutput::Documents(vec![Document::with_id("a", "x")]),
+            spilled,
+        ]);
+        let out = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: job,
+                step_id: "enrich".into(),
+                upstream,
+                path: "$.documents".into(),
+                max_branches: 100,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.branches.len(), 3);
+        let mut ids = Vec::new();
+        for b in out.branches {
+            let resolved = a.blob.resolve_input(b, &a.http).await.unwrap();
+            ids.extend(resolved.into_documents().unwrap().into_iter().map(|d| d.id));
+        }
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn fan_out_over_an_output_without_documents_fails() {
+        let a = StepActivities::new(Arc::new(PluginRegistry::new()), BlobStore::memory(), 64);
+        let err = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: Uuid::new_v4(),
+                step_id: "enrich".into(),
+                upstream: PluginOutput::Bytes(Blob::new(vec![1], "application/pdf", None)),
+                path: "$.documents".into(),
+                max_branches: 100,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("enrich"), "{err}");
     }
 
     /// Hands its input straight back, whatever it is: shows what the step received.

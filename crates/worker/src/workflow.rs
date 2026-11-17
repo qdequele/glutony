@@ -477,6 +477,12 @@ impl PipelineWorkflow {
                     .map_err(Self::map_activity_error)?;
                 expanded.branches
             }
+            FanOut::Invalid(why) => {
+                return Err(StepFailure::Failed(format!(
+                    "fan_out {path:?} cannot split the output of step {}: {why}",
+                    step.depends_on.first().map_or("?", String::as_str)
+                )));
+            }
         };
         if branches.is_empty() {
             return Ok(StepOutcome {

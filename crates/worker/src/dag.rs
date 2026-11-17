@@ -45,13 +45,30 @@ pub fn resolve_input(
 pub enum FanOut {
     /// The upstream output was inline; here are the branch inputs.
     Branches(Vec<PluginInput>),
-    /// The upstream output is a spilled reference; an activity must expand it.
+    /// The upstream output is, or contains, a spilled reference; an activity must
+    /// expand it.
     NeedsActivity(PluginOutput),
+    /// The upstream output cannot be split along the path (a `$.documents` fan-out
+    /// over bytes, say): the step fails with this reason.
+    Invalid(String),
+}
+
+/// Whether `out` is a reference or holds one at any depth.
+fn contains_ref(out: &PluginOutput) -> bool {
+    match out {
+        PluginOutput::Ref(_) => true,
+        PluginOutput::Many(items) => items.iter().any(contains_ref),
+        _ => false,
+    }
 }
 
 /// Split the upstream output into fan-out branches according to `path`
 /// (`$.documents`, `$.many` or `$`). Documents are grouped so that at most
 /// `max_branches` activities are scheduled.
+///
+/// An upstream with no documents at all (`Empty`, `Indexed`, an empty list) is zero
+/// branches. One that is not documents is [`FanOut::Invalid`], never an empty split:
+/// that would report a job that dropped everything as succeeded.
 pub fn fan_out_branches(path: &str, upstream: PluginOutput, max_branches: usize) -> FanOut {
     let max_branches = max_branches.max(1);
     match (path, upstream) {
@@ -62,9 +79,12 @@ pub fn fan_out_branches(path: &str, upstream: PluginOutput, max_branches: usize)
             FanOut::Branches(items.into_iter().map(PluginInput::from).collect())
         }
         ("$.many", other) => FanOut::Branches(vec![PluginInput::from(other)]),
+        // `$.documents` over the output of a fanned-out step: a branch that was
+        // spilled sits as a `Ref` inside the `Many`, and only an activity can read it.
+        (_, out) if contains_ref(&out) => FanOut::NeedsActivity(out),
         (_, out) => match out.into_documents() {
             Ok(docs) => FanOut::Branches(group_documents(docs, max_branches)),
-            Err(_) => FanOut::Branches(vec![]),
+            Err(e) => FanOut::Invalid(e.to_string()),
         },
     }
 }
@@ -242,6 +262,75 @@ mod tests {
             fan_out_branches("$.documents", r, 10),
             FanOut::NeedsActivity(_)
         ));
+    }
+
+    fn spilled_ref() -> PluginOutput {
+        PluginOutput::Ref(meili_ingest_plugin_sdk::ContentRef::Staged {
+            uri: "jobs/x/b-1.json".into(),
+            mime: Some("application/vnd.meili-ingest.output+json".into()),
+            filename: None,
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn fan_out_documents_with_a_nested_ref_needs_activity() {
+        // The output of a fanned-out step whose second branch was spilled.
+        let upstream = PluginOutput::Many(vec![
+            PluginOutput::Documents(vec![Document::with_id("a", "x")]),
+            spilled_ref(),
+        ]);
+        assert_eq!(
+            fan_out_branches("$.documents", upstream.clone(), 10),
+            FanOut::NeedsActivity(upstream)
+        );
+        // Deeper nesting is found too.
+        let nested = PluginOutput::Many(vec![PluginOutput::Many(vec![spilled_ref()])]);
+        assert!(matches!(
+            fan_out_branches("$.documents", nested, 10),
+            FanOut::NeedsActivity(_)
+        ));
+    }
+
+    #[test]
+    fn fan_out_documents_over_bytes_is_invalid() {
+        let bytes = PluginOutput::Bytes(meili_ingest_plugin_sdk::Blob::new(
+            vec![1, 2, 3],
+            "application/pdf",
+            None,
+        ));
+        match fan_out_branches("$.documents", bytes, 10) {
+            FanOut::Invalid(why) => assert!(why.contains("expected documents"), "{why}"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fan_out_documents_over_nothing_is_zero_branches() {
+        // A legitimate empty result, not a mis-wired pipeline.
+        for upstream in [
+            PluginOutput::Empty,
+            PluginOutput::Documents(vec![]),
+            PluginOutput::Indexed(Default::default()),
+            PluginOutput::Many(vec![]),
+        ] {
+            assert_eq!(
+                fan_out_branches("$.documents", upstream, 10),
+                FanOut::Branches(vec![])
+            );
+        }
+    }
+
+    #[test]
+    fn fan_out_many_passes_nested_refs_through() {
+        let many = PluginOutput::Many(vec![spilled_ref(), PluginOutput::Empty]);
+        match fan_out_branches("$.many", many, 10) {
+            FanOut::Branches(b) => {
+                assert_eq!(b.len(), 2);
+                assert!(matches!(b[0], PluginInput::Ref(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

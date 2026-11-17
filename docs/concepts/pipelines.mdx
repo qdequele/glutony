@@ -84,6 +84,9 @@ steps:
   (useful to force the step to run on the raw output). Branch results are
   collected into a `Many` output; the next step receives it as its input
   (fan-in). Plugins that accept `documents` flatten `Many` automatically.
+  An upstream output with no documents runs zero branches and the step
+  succeeds with nothing; a `$.documents` fan-out over an output that is not
+  documents (raw bytes, when the steps are in the wrong order) fails the step.
 - **Routing.** Each activity is scheduled on the task queue of its plugin
   (`workers-general` / `workers-io`). AI steps call hosted APIs, so they run
   on `workers-general` with parsing; downloads run on `workers-io`.
