@@ -139,7 +139,8 @@ tarball is larger is read entry by entry, like a zip, and only its oversized ent
 are skipped. A `.gz` holding a single file is that file: uploaded on its own and over
 the limit, its job fails with `the file expands to more than … bytes`.
 
-The upload itself is bounded by the gateway's `MAX_UPLOAD_MB`. The worker holds the archive in memory while
+The upload itself is bounded by the gateway's `MAX_UPLOAD_MB`, and an archive named
+by URL or object ref by the workers' `REF_MAX_MB`. The worker holds the archive in memory while
 it expands it, plus a few files at a time.
 
 | Variable (worker) | Default |

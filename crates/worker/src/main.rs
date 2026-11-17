@@ -85,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
     .with_object_ref_policy(
         meili_ingest_blob::ObjectRefPolicy::from_env()
             .context("invalid OBJECT_REF_AMBIENT_CREDENTIALS or OBJECT_REF_BUCKETS")?,
-    );
+    )
+    // A URL or object ref is read into memory: larger ones fail the step.
+    .with_ref_max_bytes(meili_ingest_blob::ref_max_bytes_from_env()?);
     tracing::info!(policy = ?blob.object_ref_policy(), "object ref policy (s3://, gs://, az:// refs)");
 
     // Publish manifests to the control plane (best effort).

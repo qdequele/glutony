@@ -27,6 +27,11 @@
 //! accepted ([`check_object_ref`]): `file://` and `memory://` would otherwise read the
 //! worker's own filesystem or process memory.
 //!
+//! Both kinds of ref are held to a size cap ([`BlobStore::with_ref_max_bytes`],
+//! `REF_MAX_MB`, 512 MiB by default): the request that names one is a few bytes
+//! whatever it points at, and the content is read into the worker's memory. A guarded
+//! URL fetch also gives up on a server that stops sending ([`FETCH_READ_TIMEOUT`]).
+//!
 //! Supported store URLs: `file://<dir>` (created when missing), `memory://`,
 //! `s3://bucket/prefix`, `gs://bucket/prefix`, `az://container/prefix`. Cloud stores
 //! are configured from the provider's environment variables (`AWS_*`, `GOOGLE_*`,
@@ -36,6 +41,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use meili_ingest_plugin_sdk::{Blob, ContentRef, Document, PluginInput, PluginOutput};
@@ -66,6 +72,13 @@ pub const FETCH_USER_AGENT: &str = concat!(
     " (+https://github.com/qdequele/glutony)"
 );
 
+/// How long a guarded URL fetch waits for the connection to open.
+pub const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a guarded URL fetch waits for the next bytes of the response, headers
+/// included, before it gives up on a server that went silent.
+pub const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Errors returned by [`BlobStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
@@ -92,9 +105,38 @@ pub enum BlobError {
     #[error("blocked url: {0}")]
     Blocked(String),
     /// A URL fetch got a client error other than 408 / 429 (404, 403, 410, ...), on the
-    /// URL itself or on a redirect target. Permanent: the same request gets the same answer.
+    /// URL itself or on a redirect target, or a URL or object ref turned out larger than
+    /// the ref size cap ([`BlobStore::with_ref_max_bytes`]). Permanent: the same request
+    /// gets the same answer.
     #[error("rejected url: {0}")]
     Rejected(String),
+}
+
+/// Megabytes (MiB) a URL or object ref may weigh; larger ones fail the step.
+pub const REF_MAX_MB_ENV: &str = "REF_MAX_MB";
+
+/// Default cap on a URL or object ref: 512 MiB, the cap of a scheduled source.
+pub const DEFAULT_REF_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The ref size cap from [`REF_MAX_MB_ENV`], in bytes.
+pub fn ref_max_bytes_from_env() -> anyhow::Result<u64> {
+    ref_max_bytes(std::env::var(REF_MAX_MB_ENV).ok().as_deref())
+}
+
+/// Parse [`REF_MAX_MB_ENV`]: a positive integer of MiB, [`DEFAULT_REF_MAX_BYTES`] when
+/// unset or blank. Anything else is an error: a typo must not lift the cap.
+pub fn ref_max_bytes(value: Option<&str>) -> anyhow::Result<u64> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_REF_MAX_BYTES);
+    };
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|mb| *mb > 0)
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .ok_or_else(|| {
+            anyhow::anyhow!("{REF_MAX_MB_ENV} must be a positive integer, got {value:?}")
+        })
 }
 
 /// Schemes a [`ContentRef::S3`] ref may use: cloud object stores, each with a bucket or
@@ -367,6 +409,19 @@ impl fmt::Debug for FetchGuard {
     }
 }
 
+/// The guard's client: no redirects of its own, and timeouts on connecting and on each
+/// read. Not a total timeout, which would cut a large download from a slow but live
+/// server; a server that goes silent is dropped after `read`.
+fn guard_client(connect: Duration, read: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(FETCH_USER_AGENT)
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+        .unwrap_or_default()
+}
+
 impl FetchGuard {
     /// Guard every URL fetch with `check`, following at most 5 redirects.
     pub fn new(check: Arc<dyn UrlCheck>) -> Self {
@@ -375,13 +430,16 @@ impl FetchGuard {
             // Redirects are followed by `get` below, never by the client: a client that
             // followed them would fetch whatever internal address a public host
             // redirects to without the check ever seeing it.
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(FETCH_USER_AGENT)
-                .build()
-                .unwrap_or_default(),
+            http: guard_client(FETCH_CONNECT_TIMEOUT, FETCH_READ_TIMEOUT),
             max_redirects: 5,
         }
+    }
+
+    /// Replace the default timeouts ([`FETCH_CONNECT_TIMEOUT`], [`FETCH_READ_TIMEOUT`]).
+    /// `read` bounds each wait for data, headers included, not the whole download.
+    pub fn with_timeouts(mut self, connect: Duration, read: Duration) -> Self {
+        self.http = guard_client(connect, read);
+        self
     }
 
     /// GET `url`, checking it and every redirect target before requesting it.
@@ -444,6 +502,8 @@ pub struct BlobStore {
     url: String,
     fetch_guard: Option<FetchGuard>,
     object_refs: ObjectRefPolicy,
+    /// Largest URL or object ref [`BlobStore::fetch_ref`] reads, in bytes.
+    ref_max_bytes: u64,
     /// The bucket this store lives in, refused to tenant object refs.
     own_bucket: Option<Bucket>,
 }
@@ -480,6 +540,7 @@ impl BlobStore {
                 url: url.to_owned(),
                 fetch_guard: None,
                 object_refs: ObjectRefPolicy::default(),
+                ref_max_bytes: DEFAULT_REF_MAX_BYTES,
                 own_bucket: None,
             });
         }
@@ -494,6 +555,7 @@ impl BlobStore {
                 url: url.to_owned(),
                 fetch_guard: None,
                 object_refs: ObjectRefPolicy::default(),
+                ref_max_bytes: DEFAULT_REF_MAX_BYTES,
                 own_bucket: None,
             });
         }
@@ -531,12 +593,14 @@ impl BlobStore {
             url: url.to_owned(),
             fetch_guard: None,
             object_refs: ObjectRefPolicy::default(),
+            ref_max_bytes: DEFAULT_REF_MAX_BYTES,
             own_bucket,
         })
     }
 
     /// Fetch every [`ContentRef::Url`] through `guard`. Without one, URL refs are fetched
-    /// with the caller's client and its redirect policy, unchecked.
+    /// with the caller's client, its redirect policy and its timeouts (none by default),
+    /// unchecked. The size cap applies either way.
     pub fn with_fetch_guard(mut self, guard: FetchGuard) -> Self {
         self.fetch_guard = Some(guard);
         self
@@ -546,6 +610,14 @@ impl BlobStore {
     /// default policy applies: anonymous reads, any bucket but this store's.
     pub fn with_object_ref_policy(mut self, policy: ObjectRefPolicy) -> Self {
         self.object_refs = policy;
+        self
+    }
+
+    /// Refuse URL and object refs larger than `max_bytes` (default
+    /// [`DEFAULT_REF_MAX_BYTES`]). Staged objects are not held to it: the gateway
+    /// accepted them under its own upload limit.
+    pub fn with_ref_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.ref_max_bytes = max_bytes;
         self
     }
 
@@ -588,6 +660,7 @@ impl BlobStore {
             url: "memory://".to_owned(),
             fetch_guard: None,
             object_refs: ObjectRefPolicy::default(),
+            ref_max_bytes: DEFAULT_REF_MAX_BYTES,
             own_bucket: None,
         }
     }
@@ -651,6 +724,10 @@ impl BlobStore {
     ///   [`BlobError::Blocked`].
     /// * [`ContentRef::Staged`] → read from this store.
     ///
+    /// A URL or object ref larger than the cap ([`BlobStore::with_ref_max_bytes`]) is
+    /// [`BlobError::Rejected`]: the body is streamed and dropped as soon as it passes
+    /// the cap, never buffered whole. Staged objects are not capped.
+    ///
     /// The blob's [`Blob::origin`] is the URL without its query string, the object
     /// URI, or the staged ref's own `origin`, so generated document ids stay distinct
     /// per origin and stable across re-ingests.
@@ -703,10 +780,7 @@ impl BlobStore {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .and_then(strip_mime_params);
-                let data = response
-                    .bytes()
-                    .await
-                    .map_err(|e| BlobError::Http(format!("GET {url}: reading body: {e}")))?;
+                let data = read_capped_response(response, self.ref_max_bytes, url).await?;
                 let name = filename
                     .clone()
                     .or_else(|| last_segment(parsed.path()).map(str::to_owned));
@@ -715,7 +789,7 @@ impl BlobStore {
                     .or(header_mime)
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name).with_origin(Some(url_origin(&parsed))))
+                Ok(Blob::new(data, mime, name).with_origin(Some(url_origin(&parsed))))
             }
             ContentRef::S3 {
                 uri,
@@ -731,7 +805,7 @@ impl BlobStore {
                 )
                 .await?;
                 let result = store.get(&path).await.map_err(BlobError::from_store)?;
-                let data = result.bytes().await.map_err(BlobError::from_store)?;
+                let data = read_capped_object(result, self.ref_max_bytes, uri).await?;
                 let name = filename
                     .clone()
                     .or_else(|| last_segment(path.as_ref()).map(str::to_owned));
@@ -739,7 +813,7 @@ impl BlobStore {
                     .clone()
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name).with_origin(Some(uri.clone())))
+                Ok(Blob::new(data, mime, name).with_origin(Some(uri.clone())))
             }
             ContentRef::Staged {
                 uri,
@@ -755,7 +829,8 @@ impl BlobStore {
                     .clone()
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name).with_origin(origin.clone()))
+                // Not capped: the gateway accepted it under its own upload limit.
+                Ok(Blob::new(Vec::from(data), mime, name).with_origin(origin.clone()))
             }
         }
     }
@@ -1003,6 +1078,62 @@ fn is_spill_key(key: &str) -> bool {
         && segments.next().is_some_and(|name| name != "input")
 }
 
+/// The error for a ref larger than the cap. [`BlobError::Rejected`]: permanent, the
+/// next attempt would download the same content.
+fn over_cap(what: &str, size: Option<u64>, max_bytes: u64) -> BlobError {
+    let size = match size {
+        Some(size) => format!("is {size} bytes"),
+        None => "is larger".to_owned(),
+    };
+    BlobError::Rejected(format!(
+        "{what}: the content {size}, over the {max_bytes} byte cap ({REF_MAX_MB_ENV})"
+    ))
+}
+
+/// Read the body of a URL fetch, refusing more than `max_bytes`: up front when the
+/// server announces a larger `Content-Length`, and while streaming in any case, since a
+/// chunked response announces nothing and a length can lie.
+async fn read_capped_response(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    url: &str,
+) -> Result<Vec<u8>, BlobError> {
+    let what = format!("GET {url}");
+    let announced = response.content_length();
+    if announced.is_some_and(|len| len > max_bytes) {
+        return Err(over_cap(&what, announced, max_bytes));
+    }
+    // Reserved once when the length is known (and within the cap), so the body is not
+    // copied again and again as the buffer grows.
+    let mut body = Vec::with_capacity(announced.unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| BlobError::Http(format!("{what}: reading body: {e}")))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(over_cap(&what, None, max_bytes));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Read an object, refusing one larger than `max_bytes` before any of it is read: the
+/// store reports the size with the response headers, ahead of the body.
+async fn read_capped_object(
+    result: object_store::GetResult,
+    max_bytes: u64,
+    uri: &str,
+) -> Result<Vec<u8>, BlobError> {
+    let size = result.meta.size;
+    if size > max_bytes {
+        return Err(over_cap(uri, Some(size), max_bytes));
+    }
+    let data = result.bytes().await.map_err(BlobError::from_store)?;
+    Ok(Vec::from(data))
+}
+
 /// Longest filename extension kept in a staged upload's key.
 const STAGED_EXTENSION_MAX: usize = 16;
 
@@ -1205,6 +1336,177 @@ mod tests {
             .unwrap();
         assert_eq!(blob.data, b"hello");
         assert_eq!(blob.filename.as_deref(), Some("old"));
+    }
+
+    /// A server that answers every connection with `response`, then holds it open
+    /// without sending anything more.
+    async fn raw_server(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket.write_all(&response).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn guarded(base: &str) -> BlobStore {
+        BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+            base.trim_start_matches("http://").to_owned(),
+        ]))))
+    }
+
+    #[tokio::test]
+    async fn a_url_ref_over_the_size_cap_is_rejected_guarded_or_not() {
+        // A `{"url": …}` body is a few bytes whatever it points at: the whole body was
+        // buffered (twice) in the worker, with no limit.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 2000]))
+            .mount(&server)
+            .await;
+        let r = url_ref(format!("{}/big.bin", server.uri()));
+        let http = reqwest::Client::new();
+        for store in [BlobStore::memory(), guarded(&server.uri())] {
+            let err = store
+                .clone()
+                .with_ref_max_bytes(1999)
+                .fetch_ref(&r, &http)
+                .await
+                .map(|blob| blob.data.len())
+                .expect_err("over the cap");
+            // Permanent: the next attempt downloads the same body.
+            assert!(matches!(err, BlobError::Rejected(_)), "{err:?}");
+            assert!(err.to_string().contains("1999 byte cap"), "{err}");
+            // A body of exactly the cap passes.
+            let blob = store
+                .with_ref_max_bytes(2000)
+                .fetch_ref(&r, &http)
+                .await
+                .unwrap();
+            assert_eq!(blob.data, vec![7u8; 2000]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_url_ref_without_a_content_length_is_capped_while_streaming() {
+        let mut response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..64 {
+            response.extend_from_slice(b"400\r\n");
+            response.extend_from_slice(&[b'x'; 1024]);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let base = raw_server(response).await;
+        let r = url_ref(format!("{base}/stream"));
+        let http = reqwest::Client::new();
+        for store in [BlobStore::memory(), guarded(&base)] {
+            let err = store
+                .clone()
+                .with_ref_max_bytes(10 * 1024)
+                .fetch_ref(&r, &http)
+                .await
+                .map(|blob| blob.data.len())
+                .expect_err("over the cap");
+            assert!(matches!(err, BlobError::Rejected(_)), "{err:?}");
+            let blob = store
+                .with_ref_max_bytes(64 * 1024)
+                .fetch_ref(&r, &http)
+                .await
+                .unwrap();
+            assert_eq!(blob.data.len(), 64 * 1024);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_url_fetch_times_out() {
+        // No timeout at all: a server that accepted the connection and went silent held
+        // the activity until its start-to-close timeout, on every attempt.
+        use std::time::Duration;
+        for (what, response) in [
+            ("before the headers", Vec::new()),
+            (
+                "in the middle of the body",
+                b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc".to_vec(),
+            ),
+        ] {
+            let base = raw_server(response).await;
+            let store = BlobStore::memory().with_fetch_guard(
+                FetchGuard::new(Arc::new(AllowOnly(vec![
+                    base.trim_start_matches("http://").to_owned(),
+                ])))
+                .with_timeouts(Duration::from_secs(5), Duration::from_millis(200)),
+            );
+            let r = url_ref(format!("{base}/slow"));
+            let http = reqwest::Client::new();
+            let fetch = store.fetch_ref(&r, &http);
+            let err = tokio::time::timeout(Duration::from_secs(10), fetch)
+                .await
+                .unwrap_or_else(|_| panic!("stalled {what}: the fetch never gave up"))
+                .expect_err("stalled");
+            // Transient: the next attempt may find the server answering.
+            assert!(matches!(err, BlobError::Http(_)), "{what}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_object_over_the_size_cap_is_rejected_before_it_is_read() {
+        let store = InMemory::new();
+        let location = Path::from("exports/big.bin");
+        store
+            .put(&location, PutPayload::from(vec![7u8; 2000]))
+            .await
+            .unwrap();
+        let err = read_capped_object(
+            store.get(&location).await.unwrap(),
+            1999,
+            "s3://exports/big.bin",
+        )
+        .await
+        .map(|data| data.len())
+        .expect_err("over the cap");
+        assert!(matches!(err, BlobError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("s3://exports/big.bin"), "{err}");
+        let data = read_capped_object(store.get(&location).await.unwrap(), 2000, "s3://x/y")
+            .await
+            .unwrap();
+        assert_eq!(data, vec![7u8; 2000]);
+    }
+
+    #[tokio::test]
+    async fn staged_refs_are_not_held_to_the_ref_size_cap() {
+        // The gateway accepted the upload under its own limit; the worker must read it.
+        let store = BlobStore::memory().with_ref_max_bytes(10);
+        let blob = Blob::new(vec![1u8; 100], "application/pdf", Some("a.pdf".into()));
+        let staged = store
+            .stage_upload(Uuid::new_v4(), blob.clone(), 0)
+            .await
+            .unwrap();
+        let resolved = store
+            .resolve_input(staged, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(resolved, PluginInput::Bytes(blob));
+    }
+
+    #[test]
+    fn the_ref_size_cap_is_read_in_megabytes() {
+        assert_eq!(ref_max_bytes(None).unwrap(), DEFAULT_REF_MAX_BYTES);
+        assert_eq!(ref_max_bytes(Some(" ")).unwrap(), DEFAULT_REF_MAX_BYTES);
+        assert_eq!(DEFAULT_REF_MAX_BYTES, 512 * 1024 * 1024);
+        assert_eq!(ref_max_bytes(Some(" 2048 ")).unwrap(), 2048 * 1024 * 1024);
+        for bad in ["0", "-1", "1.5", "lots", "99999999999999999999"] {
+            assert!(ref_max_bytes(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(BlobStore::memory().ref_max_bytes, DEFAULT_REF_MAX_BYTES);
     }
 
     #[tokio::test]
