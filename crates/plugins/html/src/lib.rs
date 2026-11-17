@@ -145,6 +145,23 @@ fn first_text(doc: &Html, css: &str) -> Result<Option<String>, PluginError> {
         .find(|t| !t.is_empty()))
 }
 
+/// Elements matching `sel` that are still attached to the document, in document order.
+///
+/// [`Html::select`] walks every node of the arena, including the descendants of the
+/// subtrees [`remove_noise`] detached, so after removal it would still find an
+/// `<h1>` inside a dropped `<header>`. Selecting from the root element walks the
+/// live tree only.
+fn live_select<'a, 'b>(
+    doc: &'a Html,
+    sel: &'b Selector,
+) -> impl Iterator<Item = ElementRef<'a>> + use<'a, 'b> {
+    doc.tree
+        .root()
+        .children()
+        .filter_map(ElementRef::wrap)
+        .flat_map(move |root| root.select(sel))
+}
+
 /// `attr` of the first element matching `css`, trimmed; `None` when missing or blank.
 fn first_attr(doc: &Html, css: &str, attr: &str) -> Result<Option<String>, PluginError> {
     let sel = selector(css)?;
@@ -242,7 +259,7 @@ fn links_of(root: ElementRef<'_>) -> Result<Vec<String>, PluginError> {
 fn content_root(doc: &Html) -> Result<Option<ElementRef<'_>>, PluginError> {
     for css in ["main", "article", "body"] {
         let sel = selector(css)?;
-        if let Some(el) = doc.select(&sel).next() {
+        if let Some(el) = live_select(doc, &sel).next() {
             return Ok(Some(el));
         }
     }
@@ -314,7 +331,12 @@ impl Plugin for HtmlExtractorPlugin {
 
         let title = match title_tag {
             Some(t) => Some(t),
-            None => first_text(&doc, "h1")?,
+            None => {
+                let h1 = selector("h1")?;
+                live_select(&doc, &h1)
+                    .map(|e| collapse(&e.text().collect::<String>()))
+                    .find(|t| !t.is_empty())
+            }
         };
 
         let (content, links) = match content_root(&doc)? {
@@ -544,6 +566,38 @@ mod tests {
             .unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].content, "deep text");
+    }
+
+    async fn extract(html: &str) -> Document {
+        let out = HtmlExtractorPlugin::new()
+            .execute(&ActivityContext::noop(), input(html), serde_json::json!({}))
+            .await
+            .unwrap();
+        out.into_documents().unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn the_h1_title_fallback_ignores_removed_boilerplate() {
+        let doc = extract(
+            "<html><body><header><h1>Acme Corp</h1></header>\
+             <main><h1>Pricing</h1><p>Plans</p></main></body></html>",
+        )
+        .await;
+        assert_eq!(doc.title.as_deref(), Some("Pricing"));
+    }
+
+    #[tokio::test]
+    async fn the_content_root_ignores_removed_boilerplate() {
+        let doc = extract(
+            "<html><body><aside><article>Related teaser</article></aside>\
+             <article>Real post</article></body></html>",
+        )
+        .await;
+        assert_eq!(doc.content, "Real post");
+
+        let doc =
+            extract("<html><body><header><main>x</main></header><p>Body</p></body></html>").await;
+        assert_eq!(doc.content, "Body");
     }
 
     #[tokio::test]
