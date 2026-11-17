@@ -226,7 +226,7 @@ pub fn sanitize_id(raw: &str) -> String {
     if out.is_empty() {
         out = Uuid::new_v4().to_string();
     }
-    truncate_at_char_boundary(&mut out, 511);
+    truncate_at_char_boundary(&mut out, MAX_ID_LEN);
     out
 }
 
@@ -247,6 +247,32 @@ fn bounded_stem(raw: &str) -> String {
         stem.push_str(&hash);
     }
     stem
+}
+
+/// Meilisearch's limit on a document id, in bytes.
+const MAX_ID_LEN: usize = 511;
+
+/// `base` followed by `suffix` (`suffixed_id("report_p3", "_0")` → `report_p3_0`),
+/// always within Meilisearch's 511-byte id limit.
+///
+/// While the two fit, this is plain concatenation, so ids that were valid stay
+/// exactly as they were. When they do not, `base` is shortened and followed by a
+/// short hash of the whole of it (`<shortened base>_<hash><suffix>`), so the suffix
+/// is never cut off (which would give every `_<index>` the same id) and two long
+/// bases sharing a prefix still get different ids. Both parts are expected to be
+/// id-safe already (see [`sanitize_id`]).
+pub fn suffixed_id(base: &str, suffix: &str) -> String {
+    if base.len() + suffix.len() <= MAX_ID_LEN {
+        return format!("{base}{suffix}");
+    }
+    let mut short = base.to_owned();
+    truncate_at_char_boundary(
+        &mut short,
+        MAX_ID_LEN.saturating_sub(suffix.len() + 1 + ORIGIN_TAG_LEN),
+    );
+    let mut id = format!("{short}_{}{suffix}", origin_tag(base));
+    truncate_at_char_boundary(&mut id, MAX_ID_LEN);
+    id
 }
 
 /// Shorten `s` to at most `max` bytes. Sanitized ids are ASCII, so this never splits a
@@ -2070,6 +2096,24 @@ mod tests {
         // And a blob without an origin serializes without the key.
         let v = serde_json::to_value(Blob::new(vec![], "text/plain", None)).unwrap();
         assert!(v.get("origin").is_none(), "{v}");
+    }
+
+    #[test]
+    fn suffixed_ids_always_fit_and_stay_distinct() {
+        assert_eq!(suffixed_id("report_p1", "_0"), "report_p1_0");
+        let long = "a".repeat(511);
+        let ids: Vec<String> = (0..12)
+            .map(|i| suffixed_id(&long, &format!("_{i}")))
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert!(id.len() <= 511, "{}", id.len());
+            assert!(id.ends_with(&format!("_{i}")), "{id}");
+        }
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+        // Two long bases sharing a prefix do not collide once shortened.
+        let other = format!("{}b", "a".repeat(510));
+        assert_ne!(suffixed_id(&long, "_0"), suffixed_id(&other, "_0"));
     }
 
     #[test]

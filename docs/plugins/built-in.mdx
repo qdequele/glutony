@@ -201,7 +201,9 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 ### `chunker`
 
 Splits each document into overlapping chunks. Sets `meta.chunk_index`,
-`meta.chunk_total`, `meta.parent_id`; chunk id = `<parent_id>_<index>`.
+`meta.chunk_total`, `meta.parent_id`; chunk id = `<parent_id>_<index>`. When
+that would pass Meilisearch's 511-byte id limit, the parent id is shortened and
+followed by a short hash of it (`meta.parent_id` keeps it whole).
 Accepts `documents` and `many`.
 
 | Key | Default | Description |
