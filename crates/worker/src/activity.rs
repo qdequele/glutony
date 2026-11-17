@@ -35,6 +35,17 @@ const KEEPALIVE_HEARTBEAT: Duration = Duration::from_secs(20);
 /// cancellation. Plugins that poll the cancellation flag stop well within it.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
+/// Waits before trying a job-row patch again after a 404. The gateway inserts the row
+/// right after starting the workflow, so a worker that picks the job up quickly (or
+/// finishes a small one) can patch before the row exists. Bounded, because the insert
+/// is best effort: when it failed the row never appears, and the terminal patch gates
+/// the usage report, so it must not wait for long.
+const JOB_ROW_MISSING_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
 /// Run `work`, but once `cancelled` resolves give it only `grace` more before giving up
 /// with [`PluginError::Cancelled`]. Without this a plugin that never polls the flag
 /// would keep a shutting-down worker alive until it is killed, and Temporal would only
@@ -355,7 +366,8 @@ impl StepActivities {
     }
 
     /// Patch the cached job row. Returns `Ok(false)` when no control plane is
-    /// configured, and an error only when the request itself failed.
+    /// configured or the row never appeared (see [`JOB_ROW_MISSING_BACKOFF`]), and an
+    /// error only when the request itself failed.
     async fn patch_job(
         &self,
         job_id: Uuid,
@@ -377,24 +389,34 @@ impl StepActivities {
             let truncated: String = err.chars().take(1000).collect();
             body.insert("error".into(), serde_json::json!(truncated));
         }
-        let resp = authed(self.http.patch(&url), self.control_plane_token.as_deref())
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await
-            .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // The gateway failed to insert the row (best effort at submit time).
-            // Nothing to update and retrying will not create it.
-            tracing::warn!(job_id = %job_id, "no cached job row to update");
-            return Ok(false);
+        let body = serde_json::Value::Object(body);
+        let mut missing_retries = JOB_ROW_MISSING_BACKOFF.iter();
+        loop {
+            let resp = authed(self.http.patch(&url), self.control_plane_token.as_deref())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                // The gateway inserts the row only after the workflow started, so a
+                // fast worker can get here first: wait a little for the row. When
+                // it never shows up the gateway's best-effort insert failed, and
+                // there is nothing to update.
+                if let Some(delay) = missing_retries.next() {
+                    tokio::time::sleep(*delay).await;
+                    continue;
+                }
+                tracing::warn!(job_id = %job_id, "no cached job row to update");
+                return Ok(false);
+            }
+            if !resp.status().is_success() {
+                return Err(PluginError::Retryable(format!(
+                    "control plane rejected the job status update: {}",
+                    resp.status()
+                )));
+            }
+            return Ok(true);
         }
-        if !resp.status().is_success() {
-            return Err(PluginError::Retryable(format!(
-                "control plane rejected the job status update: {}",
-                resp.status()
-            )));
-        }
-        Ok(true)
     }
 
     /// Run one plugin invocation without Temporal (used by tests and the CLI).
@@ -1490,6 +1512,62 @@ mod tests {
             .mount(&cp)
             .await;
         cp
+    }
+
+    #[tokio::test]
+    async fn a_job_patch_that_beats_the_gateway_insert_is_tried_again() {
+        // The gateway starts the workflow, then inserts the cached row. A fast worker
+        // patches before that insert lands and gets a 404: the row is late, not
+        // missing, so the status must not be dropped.
+        let cp = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&cp)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&cp)
+            .await;
+        let patched = acts_with(&cp, false)
+            .patch_job(
+                Uuid::new_v4(),
+                JobStatus::Running,
+                Some("extract".into()),
+                None,
+            )
+            .await
+            .expect("patch");
+        assert!(patched, "the row that appeared was patched");
+        let requests = cp.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "running", "current_step": "extract"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_patch_gives_up_on_a_row_that_never_appears() {
+        // The gateway's insert is best effort: when it failed there is no row, and
+        // the patch must stay a no-op that neither fails nor holds the job for long.
+        let cp = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&cp)
+            .await;
+        let started = Instant::now();
+        let patched = acts_with(&cp, false)
+            .patch_job(Uuid::new_v4(), JobStatus::Succeeded, None, None)
+            .await
+            .expect("a missing row is not an error");
+        assert!(!patched);
+        assert_eq!(cp.received_requests().await.unwrap().len(), 4);
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     fn acts_with(cp: &MockServer, lab: bool) -> StepActivities {
