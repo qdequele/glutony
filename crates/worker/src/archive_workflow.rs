@@ -26,7 +26,8 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::workflows::join_all;
 use temporalio_sdk::{
     ActivityOptions, ApplicationFailure, ChildWorkflowOptions, ContinueAsNewOptions,
-    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    SyncWorkflowContext, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
+    WorkflowResult, WorkflowTermination,
 };
 use uuid::Uuid;
 
@@ -336,7 +337,7 @@ impl ArchiveWorkflow {
                     status,
                     error,
                 },
-                short_options(5),
+                finished_options(),
             )
             .await
         {
@@ -405,6 +406,17 @@ fn short_options(attempts: u32) -> ActivityOptions {
     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
         .task_queue("workers-general".to_string())
         .retry_policy(RetryPolicy::builder().maximum_attempts(attempts).build())
+        .build()
+}
+
+/// Writing the terminal status must outlive the job's cancellation: activities inherit
+/// workflow cancellation, so on a cancelled job this one would be cancelled before it
+/// ran and the job's row would stay `running`.
+fn finished_options() -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+        .task_queue("workers-general".to_string())
+        .cancellation_token(WorkflowCancellationToken::new())
+        .retry_policy(RetryPolicy::builder().maximum_attempts(5).build())
         .build()
 }
 
