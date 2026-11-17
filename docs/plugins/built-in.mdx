@@ -404,6 +404,11 @@ back to the slide's first non-empty line.
 | `skip_empty_slides` | `true` | Drop slides with no text and no notes. |
 | `max_slides` | `null` | Stop after this many slides. |
 
+A slide's speaker notes are the notes page its relationship part
+(`ppt/slides/_rels/slide<N>.xml.rels`) links to, since notes pages are numbered
+on their own: `notesSlide1.xml` can belong to slide 2. Only a slide without a
+relationship part is matched to the notes page with its own number.
+
 Decompression is bounded at 64 MiB per part and 256 MiB per deck. Uploads come
 from untrusted tenants and deflate reaches ~1000:1, so an unbounded read would
 let a small crafted file exhaust a worker.
