@@ -275,12 +275,15 @@ impl ClickHouseConfig {
     /// with the columns of Tinybird's `tenant_usage` endpoint. `FINAL` collapses
     /// redelivered rows before they are counted. Tenant and dates are bound as typed
     /// query parameters (`param_*`), never spliced into the SQL.
+    ///
+    /// Days are UTC whatever the server's time zone, as on Tinybird: `ts` is a zoneless
+    /// `DateTime64(3)`, so a bare `toDate(ts)` would follow the server's default zone.
     pub fn daily_usage_sql(&self) -> String {
         // Raw columns are qualified with `u.`: the output aliases reuse their names,
         // and an unqualified `documents_out` would resolve to the `sumIf(...)` alias.
         format!(
             "SELECT
-    toDate(u.ts) AS day,
+    toDate(u.ts, 'UTC') AS day,
     u.pipeline_uid AS pipeline_uid,
     u.plugin AS plugin,
     countIf(u.kind = 'step') AS steps,
@@ -300,8 +303,8 @@ impl ClickHouseConfig {
     sumIf(u.external_requests, u.kind = 'step') AS external_requests
 FROM {} AS u FINAL
 WHERE u.project_id = {{project_id:String}}
-  AND toDate(u.ts) >= {{date_from:Date}}
-  AND toDate(u.ts) <= {{date_to:Date}}
+  AND toDate(u.ts, 'UTC') >= {{date_from:Date}}
+  AND toDate(u.ts, 'UTC') <= {{date_to:Date}}
 GROUP BY day, pipeline_uid, plugin
 ORDER BY day ASC, pipeline_uid ASC, plugin ASC
 FORMAT JSON",
@@ -517,6 +520,17 @@ mod tests {
         assert!(sql.contains("PARTITION BY toYYYYMM(ts)"));
         assert!(sql.contains("INTERVAL 180 DAY"));
         assert!(sql.contains("`ts` DateTime64(3)"));
+    }
+
+    /// `ts` has no time zone, so a bare `toDate(ts)` follows the server's zone: a row
+    /// at 23:30Z would land on the next day on a `Europe/Paris` server. Days are UTC,
+    /// as on Tinybird, for the `day` column and both range bounds alike.
+    #[test]
+    fn daily_usage_buckets_days_in_utc() {
+        let sql = ClickHouseConfig::new("http://ch:8123", "glutony", "usage", "u", None)
+            .daily_usage_sql();
+        assert_eq!(sql.matches("toDate(u.ts, 'UTC')").count(), 3, "{sql}");
+        assert!(!sql.contains("toDate(u.ts)"), "{sql}");
     }
 
     #[test]

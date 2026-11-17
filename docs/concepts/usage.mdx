@@ -167,8 +167,9 @@ in Tinybird.
 
 `GET /usage` returns the same columns as `tenant_usage`, from one query over the raw
 table with `FINAL`: redelivered rows are collapsed before they are counted, and there is
-no hourly lag. The tenant and dates are bound as typed query parameters. Before the
-first row is written (no table yet) it answers an empty list.
+no hourly lag. The tenant and dates are bound as typed query parameters. Days are UTC,
+as on Tinybird, whatever the ClickHouse server's time zone. Before the first row is
+written (no table yet) it answers an empty list.
 
 With either store, usage is recorded when a job finishes, so only jobs that finish after
 the store is configured are counted. Nothing is backfilled: older jobs, succeeded or
