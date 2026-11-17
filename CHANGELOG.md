@@ -25,6 +25,13 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   as the Tinybird data source) and insert the same rows; `GET /usage` reads them back
   deduplicated, with the columns of `tenant_usage` and no hourly lag. Setting both
   stores is refused at boot.
+- `WASM_PLUGIN_TIMEOUT_SECS` and `WASM_PLUGIN_MAX_MEMORY_MB` cap how long one WASM
+  plugin call may run and how much memory an instance may allocate. Both are off unless
+  set; a call that hits either fails the step without a retry.
+- `image_captioner` takes `max_bytes` (default 20 MiB, OpenAI's image limit): a larger
+  image fails as invalid input before it is encoded or sent, instead of costing several
+  base64 copies of itself in worker memory and then being refused by the provider. The
+  request also holds one base64 copy of the image instead of three.
 
 ### Fixed
 - A batch item's `index` and `pipeline` are honoured. They were dropped without a
@@ -81,6 +88,250 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   version copy agrees, and `CHANGELOG.md` has the tag's section) before it builds or
   pushes an image, moves `latest`, creates the release or notifies the Lab. `v0.2.0`,
   created from the GitHub release form on a `0.1.0` tree, would have stopped there.
+- Inline JSON documents with a non-integer numeric `id` (`1.5`, `1e3`) get a sanitised
+  id (`1_5`, `1000_0`) instead of failing at the indexer after the job was accepted. An
+  empty `id` gets a generated one, like a missing or `null` id, instead of a misleading
+  400.
+- A body whose `Content-Length` exceeds `MAX_UPLOAD_MB` now gets the JSON `413
+  payload_too_large` error, and a missing or malformed query parameter on `GET /usage`,
+  `GET /sources` and `GET /sources/{uid}/runs` gets a JSON `400 bad_request`, instead of
+  plain-text bodies.
+- A JSON `documents` body (bare array, `{"documents": [...]}` or a batch item) larger
+  than `INLINE_MAX_BYTES` is staged in the blob store like a file upload. It went into
+  the Temporal workflow input whatever its size, so a body over Temporal's 2 MB payload
+  limit failed with `502 cannot start workflow`. The first step still receives the same
+  documents.
+- A source update or pause/resume whose control-plane write fails puts the Temporal
+  schedule back on the stored cron, timezone and paused state. Before, the schedule kept
+  firing on a cron that `GET /sources/{uid}` did not show.
+- `GET /jobs/{id}` reports a failed job's `error` and last `current_step` when the
+  workflow cannot answer the progress query (no worker polling, for example during a
+  deploy). It returned `status: failed` with no reason.
+- `GET /usage` answers `502` when Tinybird fails with a long error body containing
+  multi-byte characters. Truncating that body could panic and drop the connection.
+- An index named by `?index=`, the `index` field, `X-Meili-Index` or a batch item's
+  `index` must be a valid Meilisearch index uid when the job writes to it. A malformed
+  one is refused with `400 bad_request` (failing only that item in a batch) instead of a
+  queued job that fails at the indexer. Before, only the `/indexes/{index_uid}/...` path
+  was checked.
+- `POST /ingest/pipeline/{name}` refuses a body `pipeline` field or `?pipeline=` that
+  names another pipeline, with `400 bad_request`, as it already did for a batch item. It
+  ran the route's pipeline without a word.
+- An upload staged in the blob store (above `INLINE_MAX_BYTES`, or any archive) is
+  removed when its workflow cannot be started. It stayed in the bucket with nothing
+  referencing it, and each client retry staged another copy.
+- A pipeline can no longer be saved with the uid `validate`. It answers `422`, because
+  `/pipelines/validate` is the validation route and such a pipeline could not be fetched
+  or deleted.
+- Deleting a global pipeline now also archives the tenant sources that ran on it, and
+  removes their schedules. Before, these sources stayed active and failed on every run.
+  A tenant with its own pipeline of the same `uid` keeps its sources.
+- The job list no longer shows a finished job as queued or running. A late or repeated
+  status write can no longer move a job back, and the worker now waits briefly for a job
+  row that the gateway has not inserted yet.
+- Uploads sent right after a pipeline create, update or delete no longer risk being
+  routed with the previous pipeline list for a further 5 seconds on the same control
+  plane.
+- `glutony_lab_events_delivered_total` no longer counts events twice when marking them
+  delivered fails. `glutony_lab_events_failed_total` now counts events for every reason,
+  where some reasons counted batches before. Review any alert thresholds on the
+  `connect`, `timeout`, `auth`, `status` and `malformed` reasons.
+- Large fanned-out jobs no longer fail or hang: a fan-out's branch list and its merged
+  branch outputs are now kept under `PAYLOAD_SPILL_BYTES` as a whole, so a document
+  whose chunks total more than 2 MiB no longer exceeds Temporal's payload limit. A
+  step's document count in `GET /jobs/{id}` and in usage now includes outputs that were
+  moved to the blob store.
+- A `$.documents` fan-out over the output of another fanned-out step now reads the
+  branches that were spilled to the blob store instead of dropping them. A `$.documents`
+  fan-out over an output that is not documents (raw bytes) now fails the step instead of
+  succeeding with nothing indexed.
+- Usage of a failed or cancelled job now includes what was already spent: steps that ran
+  alongside the failed one, and the branches of a fanned-out step that completed before
+  another branch failed. Failed jobs can therefore bill slightly more step time than
+  before.
+- Each worker request to the control plane now gives up after 15 s and is retried,
+  instead of waiting forever on a control plane that accepted the connection and went
+  silent. This also stops a hung control plane from blocking worker start-up.
+- Archive uploads: bytes decompressed for an entry that ends up skipped now count toward
+  `ARCHIVE_MAX_UNPACKED_MB`, so an archive of entries that each expand past
+  `ARCHIVE_MAX_FILE_MB` (or that understate their size) is refused instead of
+  decompressed in full. A zip entry larger than the size it declares is skipped as
+  `unreadable: larger than its declared size`.
+- Archive uploads: a `.tar.gz` / `.tgz` whose tarball is larger than
+  `ARCHIVE_MAX_FILE_MB` is now read entry by entry, like a zip, instead of failing with
+  `the file expands to more than … bytes`; only its oversized entries are skipped.
+- Archive uploads: a cancelled archive job now records `cancelled` in its job row (the
+  jobs list showed it `running` with step `unpack`).
+- Archive uploads: an archive job cancelled while it unpacks or routes its files, or
+  cancelled from Temporal without `POST /jobs/{id}/cancel`, now ends `cancelled` instead
+  of `failed`, and the worker stops reading the archive.
+- Editing a source's `location`, `timezone`, `pipeline_uid`, `index_name` or `auth` now
+  forgets its saved `ETag`, `Last-Modified` and content hash, so the next run ingests
+  into the new destination. Before, the run was recorded `unchanged` and the new index
+  stayed empty until the upstream file changed. An edit to the pipeline's own steps
+  still keeps the state.
+- An invalid date format (`{{ date:%Q }}`, a trailing `%`) or an out-of-range offset in
+  a source URL template now returns `422` on `POST /sources` and `PATCH /sources/{uid}`.
+  Before, it panicked the handler and the client's connection was dropped.
+- Typing a large single-line `.json` source file served without a usable `Content-Type`
+  no longer parses the whole document into memory on the worker's async threads, and
+  decompression runs off those threads.
+- A retried source fetch no longer leaves a phantom `queued` job in the jobs list: a
+  retry reuses the job id, staged blob and job row of the attempt it replaces. Worker
+  calls to the control plane now time out after 20 s instead of holding the attempt.
+- A source fetch is no longer cut off after 300 s while data is still arriving. It now
+  has 10 minutes in total (redirects and body included) and is abandoned early only when
+  the body stops arriving for 60 s, so large exports on slower links can be ingested.
+- A `meili_indexer` step whose `index` is blank or `null` now uses the request's index
+  (header, query or default) instead of failing with `no target index resolved` after
+  every upstream step has run.
+- Files with very long paths (for example deeply nested archive members) no longer give
+  every page, row or record the same document id. A generated id's stem over 400 bytes
+  is now cut and ends with a short hash of the whole path. Shorter stems are unchanged.
+- The worker now decides whether to move a step output to blob storage based on its real
+  serialized size, metadata and JSON escaping included. Outputs that serialized past
+  Temporal's 2 MB payload limit no longer fail the step. Metered `input_bytes` are
+  unchanged.
+- A WASM plugin call that never returns no longer wedges the plugin and leaks worker
+  threads: the call is interrupted when its step is cancelled or abandoned, returns as
+  cancelled, and the next call gets a fresh instance.
+- A gRPC plugin that starts after the worker (a sidecar, for example) is no longer lost
+  until the worker restarts: the worker retries it for about 30 seconds at boot.
+  `GetManifest` now times out after 10 seconds instead of hanging worker startup.
+- An input too large for one gRPC message (64 MiB, about 48 MiB of raw bytes once
+  base64-encoded) now fails the step at once, without retries, with an error naming the
+  limit. Before, it was retried with an opaque h2 error. The encoding no longer blocks
+  the async runtime.
+- MIME detection lets the file extension refine signatures that only name a container or
+  guess from the first characters: a `README.md` starting with `<div align="center">` or
+  `<!-- -->` now runs `builtin.markdown` instead of `builtin.html`, a `.txt` starting
+  with `#!` is plain text, an `.html`/`.svg` starting with `<?xml` keeps its type, and
+  an `.xls` written without a known root CLSID (xlwt, Apache POI) routes to
+  `builtin.excel` instead of being refused with 415.
+- Newline-delimited JSON is detected and routed to `builtin.json`: `.ndjson`/`.jsonl`
+  files and bodies with one JSON object per line are `application/x-ndjson` (also
+  accepted as `application/jsonl`, `application/x-jsonlines`, `application/jsonlines`,
+  `application/ndjson`) and give one document per line, instead of being chunked as
+  plain text.
+- Pipeline triggers match alias spellings of a content type: a pipeline on `audio/mp3`,
+  `audio/x-wav`, `image/jpg`, `application/x-parquet` or `application/x-zip-compressed`
+  now fires for uploads detected as `audio/mpeg`, `audio/wav`, `image/jpeg`,
+  `application/vnd.apache.parquet` or `application/zip` instead of being skipped in
+  favour of the built-in.
+- Large uploads (over 1 MiB) and archive entries are type-detected off the gateway's and
+  worker's async threads, so a big JSON upload no longer stalls other requests while it
+  is sniffed.
+- `GET /catalog` no longer says the Audio and Video workflows chunk the transcript: they
+  index it as the transcriber emits it.
+- Uploads, archive entries and source items with long non-Latin filenames no longer fail
+  to stage (a 500 on the default `file://` store). The filename stays out of the storage
+  key and is still passed to the pipeline.
+- Usage: a job cancelled before its `meili_indexer` step no longer reports, or bills to
+  the Lab, the documents of the last step that ran. `documents_indexed` and the Lab
+  `documents` unit now count what the indexer steps wrote.
+- Usage on self-hosted ClickHouse: if the usage table is dropped while workers run, it
+  is created again. A table from an older release gets the missing columns (`ALTER TABLE
+  ... ADD COLUMN IF NOT EXISTS`, which needs the `ALTER ADD COLUMN` grant). Before,
+  usage rows were rejected until a restart or a manual fix.
+- Usage on self-hosted ClickHouse: `GET /usage` now counts days in UTC, as Tinybird
+  does, even when the ClickHouse server uses another time zone.
+- `llm_enricher`, `jev_enricher` and `image_captioner` retry a rate-limited (`429`),
+  failing (`5xx`) or dropped request on their own, up to 4 attempts with backoff and
+  jitter, honouring `Retry-After` up to 20 s and waiting at most 30 s per request,
+  before the step's retry policy takes over. One rate-limited document no longer fails
+  the whole batch and re-sends every document. A timed-out request and a Lab Gateway
+  `401` still go straight to the step's retry; failed attempts are not metered. See
+  [Jobs](docs/concepts/jobs.mdx).
+- `whisper_transcriber` measures a WAV upload without a provider duration from its
+  sample rate, channels and bits per sample, and from every byte after the `data`
+  header. It used the header's informational bytes-per-second field and declared data
+  length, so a forged header could bill a long transcription as almost zero seconds. A
+  header whose block align does not match counts the request only.
+- `llm_enricher` ignores a `title` or `language` in the model's reply that is not a
+  string (for example `null`). It was written into `fields` and replaced the document's
+  own title in the index, even under `merge_strategy: merge`.
+- `image_captioner` with `json: true` (the default) and a custom `prompt` that does not
+  mention JSON no longer fails every image with HTTP 400 from OpenAI: such a prompt gets
+  "Reply with a single JSON object." appended. Prompts that mention JSON, and `json:
+  false`, are sent unchanged.
+- `video_audio_extractor` now decodes, resamples and encodes in one streaming pass, so
+  its memory follows the input file and the WAV it writes rather than the decoded audio.
+  A long video no longer runs a worker out of memory. The output is unchanged.
+- `html_extractor` no longer crashes the worker on deeply nested HTML: the text walk is
+  iterative instead of recursing once per nesting level.
+- `html_extractor` takes the `<h1>` title fallback and the `<main>`/`<article>` content
+  from the page itself, not from removed boilerplate such as a site `<header>` or an
+  `<aside>` teaser.
+- `html_extractor` decodes pages in the charset their byte order mark or `<meta
+  charset>` declares (for example windows-1252, ISO-8859-1 or Shift_JIS), instead of
+  indexing them as replacement characters. Valid UTF-8 is still read as UTF-8.
+- `document_script` with `on_error: keep` now emits the document untouched when the
+  script's result cannot be read back, instead of a half-rewritten one.
+- `document_script` keeps integers above 9223372036854775807 in `fields` as integers
+  when the script does not touch them, instead of turning them into floats.
+- `document_script` no longer fails large documents with `Length of string too large`:
+  the string, array and map caps now limit what a script adds on top of the incoming
+  document.
+- A spreadsheet with a few cells far apart (a value in `A1` and one in `XFD1048576`, or
+  one stray value on the last row) no longer kills the worker: `xlsx_extractor` reads
+  `.xlsx`, `.xlsm` and `.xlsb` sheets cell by cell, so memory follows the cells a sheet
+  holds rather than the rectangle between its outermost cells. `.xls` and `.ods` sheets
+  are still loaded whole by `calamine`.
+- Large spreadsheets no longer block the worker's async runtime while they are parsed,
+  so other activities' heartbeats and cancellations keep running.
+- `xlsx_extractor` row mode no longer drops a column whose header repeats an earlier
+  one: later duplicates get the first free `_2`, `_3`, … suffix (`Name | Notes | Notes`
+  → `Name`, `Notes`, `Notes_2`). The first column with a header keeps its name.
+- `pdf_extractor` with `max_pages` stops reading at the cap: pages past it are no longer
+  rendered, so a capped step on a long PDF is fast and is not broken by an unreadable
+  later page. `max_pages` is now documented.
+- `pptx_extractor` attaches speaker notes to the right slide. Notes pages are numbered
+  on their own, so when an early slide had no notes, every later slide got its
+  neighbour's notes. Notes now follow the slide's relationship part. Decks already
+  indexed keep the old notes until they are re-ingested.
+- Chunk ids stay within Meilisearch's 511-byte limit: when `<parent_id>_<index>` would
+  be longer, the parent id is shortened and followed by a short hash of it, instead of
+  producing an id Meilisearch rejects and failing the whole batch. `meta.parent_id`
+  keeps the full parent id.
+- Uploaded files and members of uploaded archives whose folder path and name come to
+  more than 400 characters no longer give every page or section the same id, where each
+  overwrote the previous one. The id stem is shortened and ends with a short hash of the
+  full path. Ids of such long paths change, so re-ingesting one leaves its old documents
+  behind; shorter names keep their ids.
+- Avro decimals inside a named type that the schema uses a second time (by name, through
+  a `["null", "Money"]` union, or as array or map items) keep their scale. They were
+  indexed unscaled, so `2.80` came out as `280`.
+- The CSV delimiter is sniffed from the first records, ignoring quoted fields, as the
+  one that gives the most consistent number of fields. Before, a semicolon, tab or pipe
+  file whose header had as many commas as delimiters (a quoted `"Last, First"` or an
+  `Address, City` column) was split on commas and every row landed in one mangled
+  column.
+- `json_flattener` keeps a document's own `content` when it gets documents (inline JSON
+  documents, or the output of an earlier step) and `content_fields` is not set. Before,
+  any other string field, such as an `author`, replaced the body.
+- The OpenAPI contract describes what the gateway returns: - A batch entry can be an
+  `{error, code}` object. - `/ingest/pipeline/{name}` and
+  `/indexes/{index_uid}/ingest/pipeline/{name}` accept an `items` batch and answer
+  `{jobs: [...]}`. - On `GET /jobs/{id}`, `progress` can be `null` and `pipeline_used`
+  can be absent. - `POST /sources` answers `422` (not `404`) for an unknown pipeline. -
+  `?pipeline=`, `?filename=`, the `404` on `/ingest` for an unknown `?pipeline=`, and
+  the `version`, `tenant_id` and `features` fields of `/health` are declared.
+- Docs: - The deployment docs no longer tell operators to use Temporal Cloud with mTLS
+  or an API key. The gateway and workers connect to Temporal without TLS or
+  authentication, so Temporal Cloud is not supported yet. - The Kubernetes verify step
+  sends `X-Meili-Envoy-Secret`. - The "production image locally" example sets
+  `CONTROL_PLANE_TOKEN` and shares a blob volume. - `CORS_ALLOW_ORIGINS`, `LOG_FORMAT`
+  and `TINYBIRD_TIMEOUT_SECS` are documented.
+- The credit pre-check's 10 s pause after a failed Lab call no longer covers every
+  account when the failure is about one account. An answer the gateway cannot read, or a
+  `4xx` other than `401`, `403` and `429`, pauses lookups for that account only; the
+  other accounts were refused with `503 lab_unavailable` during that window. An
+  unreachable Lab, `401`, `403`, `429` and any `5xx` still pause every account.
+- AI steps on the team's Gateway no longer wait for the Lab's timeout on every lookup
+  while the Lab hangs. After a failed call the control plane does not ask the Lab for an
+  account's Gateway target again for 10 s, with `?refresh=true` too: lookups in that
+  window get the cached target or `503 lab_unavailable` straight away. A refused key
+  (`?rejected_key_id=`) is still reported to the Lab.
 
 ### Changed
 - Document ids built from a filename keep its folders: `reports/eu/q3.pdf` gives
@@ -99,6 +350,26 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   → `gpt-4o-mini` on `api.openai.com`, `typesafe/jev` → `jev` on `api.typesafe.ai`), so
   the same pipeline runs behind the Lab and standalone. Bare ids, and ids sent to any
   other host (a proxy, vLLM, a self-hosted Gateway), are unchanged.
+- The gateway holds a raw or multipart upload once in memory instead of twice, and no
+  longer deep-copies JSON `items`/`documents` while parsing them.
+- `POST /internal/resolve` no longer copies every tenant's pipelines on each upload, and
+  an expired pipeline cache is reloaded with one query instead of one per in-flight
+  upload.
+- On a worker without `LLM_API_KEY` / `TYPESAFE_API_KEY` that serves Lab teams,
+  `llm_enricher`, `jev_enricher` and `image_captioner` reuse one HTTP connection pool to
+  the Lab Gateway across steps, instead of a new client and TLS handshake per step.
+- `meili_indexer`, `pdf_extractor`, `docx_extractor` and `xlsx_extractor` no longer copy
+  the whole input in memory before processing it, and `pdf_extractor` with `per_page:
+  false` parses the file once instead of twice. The output is unchanged.
+- The CSV and JSON parsers run off the worker's async runtime. A large upload no longer
+  stalls other activities or the activity keepalive. The Avro, MessagePack and Parquet
+  parsers no longer copy the whole payload before decoding it.
+- Kubernetes: the `meili-gateway` and `workers-general` Deployments no longer set
+  `replicas`; the HPA and the KEDA `ScaledObject` own the count, so `kubectl apply -k
+  k8s/` no longer scales them back to 2 and 1. On a cluster first deployed with
+  `replicas`, remove it from the last applied configuration before the first apply
+  (`kubectl apply edit-last-applied`), or expect a one-off dip to one pod. See
+  [Kubernetes](docs/deployment/kubernetes.mdx), "Upgrades".
 
 ### Added
 - Automated releases: `scripts/prepare-release.sh` bumps the crate version
@@ -173,6 +444,55 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   `features.embedded_ui` field of `GET /health`. The Meilisearch Lab console is
   glutony's UI; the gateway is API-only. The image no longer has a Node build stage,
   and the dev stack no longer runs a `ui` service or sets `CORS_ALLOW_ORIGINS`.
+
+### Security
+- The gateway refuses a pipeline name that is not a pipeline uid (`[a-zA-Z0-9._-]+`) on
+  `POST /ingest/pipeline/{name}`, its `/indexes/{index_uid}/...` alias and `GET`/`DELETE
+  /pipelines/{uid}` with `400 bad_request`, and always sends the name to the control
+  plane as one encoded path segment. A percent-encoded `?`, `#` or `../` could rewrite
+  the tenant scope or the path of the authenticated control-plane request.
+- `X-Meili-Envoy-Secret` is compared with `ENVOY_TRUSTED_HEADER` in constant time, like
+  the management tokens.
+- A bearer equal to `ADMIN_API_KEY` or `LAB_SERVICE_TOKEN` on an ingest route is no
+  longer used as the Meilisearch API key, so it is not sent to Meilisearch or stored in
+  the workflow input. `MEILI_API_KEY` (or `400 missing_context`) applies instead. If you
+  used the same value for `ADMIN_API_KEY` and your Meilisearch key and relied on the
+  bearer, set `MEILI_API_KEY` or send `X-Meili-Api-Key`.
+- A Meilisearch key sent with a request to a pipeline pinned to a connection is dropped
+  before the job starts, so it is no longer written to Temporal history. This includes
+  archives forced through such a pipeline and, file by file, archives routed by type.
+- The default `public` fetch host policy now refuses reserved, benchmarking and
+  documentation ranges (`0.0.0.0/8`, `192.0.0.0/24`, `198.18.0.0/15`, `240.0.0.0/4`, …).
+  It judges an IPv4 address inside an IPv6 one (NAT64 `64:ff9b::/96`, 6to4,
+  IPv4-compatible) as that IPv4 address, and it classifies IPv6 literal URLs instead of
+  failing them as DNS errors. Use `SOURCE_FETCH_HOSTS` to allow such a range on purpose.
+- A pipeline's `trigger.filename_pattern` is now matched in linear time, so a pattern
+  with many `*` can no longer stall routing on the control plane. Creating or updating a
+  pipeline with a pattern over 256 characters is rejected with a validation error
+  (`422`). A pipeline already stored over that limit keeps routing and running jobs, but
+  its next edit must shorten the pattern. A filename over 1024 bytes matches no
+  `filename_pattern`.
+- A staged upload is never read back as a step output, whatever MIME its source or
+  multipart part claims. An upload labelled `application/vnd.meili-ingest.output+json`
+  could make a worker read other blob-store keys or load one large object many times
+  over.
+- `{"url": …}` and `{"s3": …}` ingest bodies are capped by the workers' new `REF_MAX_MB`
+  (default 512 MiB). A larger target now fails the step as non-retryable instead of
+  exhausting the worker's memory. URL fetches also give up, retryably, after 30 s
+  without a connection or 60 s without data.
+- An `adl://` or `azure://` object ref with a user (`azure://name@container/key`) is
+  refused with a 422. Those schemes read the container from the host, so the user label
+  slipped past `OBJECT_REF_BUCKETS` and the refusal of the blob store's own container.
+- `document_script` discards `print` and `debug` output instead of writing tenant text
+  to the worker's stdout.
+- `document_script` budgets are bounded: `max_ops` is clamped to 100,000,000,
+  `timeout_ms` to 30,000, and the step has a one-hour budget. Scripts run off the async
+  runtime and stop mid-run when the job is cancelled.
+- `docx_extractor` and `xlsx_extractor` refuse zip bombs. A `.docx` is limited to 64 MiB
+  per decompressed XML part and 256 MiB per file (images included). A zipped workbook
+  (`.xlsx`, `.xlsm`, `.xlsb`, `.ods`) is limited to 256 MiB per part and 512 MiB per
+  file. A file past either limit fails the step without a retry, instead of exhausting
+  the worker.
 
 ## [0.1.0] - 2026-10-11
 
