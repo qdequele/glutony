@@ -164,8 +164,11 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | Key | Default | Description |
 |---|---|---|
 | `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Vision-capable chat model. |
-| `prompt` | built-in caption prompt | Instruction sent with the image. |
+| `prompt` | built-in caption prompt | Instruction sent with the image. With `json: true`, a prompt that does not mention JSON gets "Reply with a single JSON object." appended, since OpenAI refuses JSON mode otherwise. |
 | `detail` | `"auto"` | Image detail hint (`low`, `high`, `auto`). |
+| `max_tokens` | `400` | `max_tokens` of the completion. |
+| `json` | `true` | JSON mode: `caption` → `content`, `tags` → `fields.tags`, `text_in_image` → `fields.ocr_text`, other keys → `fields`. With `false` the whole text reply is the `content`. |
+| `max_bytes` | `20971520` (20 MiB) | Largest image accepted, in bytes. A larger one fails as invalid input before it is encoded or sent. |
 
 ## Transformers (documents → documents)
 

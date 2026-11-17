@@ -66,6 +66,9 @@ pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_PROMPT: &str = "Describe this image in detail for search indexing. Reply with JSON: {\"caption\": ..., \"tags\": [...], \"text_in_image\": ...}";
 /// HTTP timeout of the default client built by [`ImageCaptionerPlugin::from_env`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default `max_bytes`: 20 MiB, OpenAI's limit for one image. A larger image would be
+/// refused by the provider anyway, after costing several base64 copies of itself.
+pub const DEFAULT_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -103,6 +106,10 @@ pub struct ImageCaptionerConfig {
     /// the raw text reply becomes the document content.
     #[serde(default = "default_true")]
     pub json: bool,
+    /// Largest image accepted, in bytes; a larger one fails as invalid input before
+    /// anything is encoded or sent.
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: usize,
 }
 
 fn default_prompt() -> String {
@@ -114,6 +121,9 @@ fn default_max_tokens() -> u32 {
 fn default_true() -> bool {
     true
 }
+fn default_max_bytes() -> usize {
+    DEFAULT_MAX_BYTES
+}
 
 impl Default for ImageCaptionerConfig {
     fn default() -> Self {
@@ -123,6 +133,7 @@ impl Default for ImageCaptionerConfig {
             detail: Detail::Auto,
             max_tokens: default_max_tokens(),
             json: true,
+            max_bytes: DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -270,7 +281,8 @@ impl Plugin for ImageCaptionerPlugin {
                     "prompt": { "type": "string", "default": DEFAULT_PROMPT },
                     "detail": { "type": "string", "enum": ["low", "high", "auto"], "default": "auto" },
                     "max_tokens": { "type": "integer", "minimum": 1, "default": 400 },
-                    "json": { "type": "boolean", "default": true }
+                    "json": { "type": "boolean", "default": true },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": DEFAULT_MAX_BYTES }
                 }
             }))
     }
@@ -286,9 +298,12 @@ impl Plugin for ImageCaptionerPlugin {
         if cfg.max_tokens == 0 {
             return Err(PluginError::invalid_config("max_tokens must be >= 1"));
         }
+        if cfg.max_bytes == 0 {
+            return Err(PluginError::invalid_config("max_bytes must be >= 1"));
+        }
         let client = self.client_for(ctx)?;
 
-        let blob = input.into_bytes()?;
+        let mut blob = input.into_bytes()?;
         let mime = blob
             .mime
             .split(';')
@@ -305,16 +320,30 @@ impl Plugin for ImageCaptionerPlugin {
         if blob.data.is_empty() {
             return Err(PluginError::invalid_input("empty image"));
         }
+        if blob.data.len() > cfg.max_bytes {
+            return Err(PluginError::invalid_input(format!(
+                "image is {} bytes, over max_bytes ({})",
+                blob.data.len(),
+                cfg.max_bytes
+            )));
+        }
         ctx.check_cancelled()?;
         ctx.heartbeat(format!(
             "{NAME}: sending {} bytes to the vision model",
             blob.data.len()
         ));
 
-        let data_url = format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(&blob.data)
-        );
+        // The data URL is the one base64 copy of the image: encoded straight into a
+        // String sized for it, the raw bytes dropped right after, and the String moved
+        // (not cloned) into the request body below.
+        let data_url = {
+            let data = std::mem::take(&mut blob.data);
+            let prefix = format!("data:{mime};base64,");
+            let mut url = String::with_capacity(prefix.len() + data.len().div_ceil(3) * 4);
+            url.push_str(&prefix);
+            base64::engine::general_purpose::STANDARD.encode_string(&data, &mut url);
+            url
+        };
         let model = cfg.model.as_deref().unwrap_or(&client.default_model);
         // The Lab's Gateway takes the id as written; a vendor called directly gets it
         // without its own `<provider>/` prefix.
@@ -329,11 +358,13 @@ impl Plugin for ImageCaptionerPlugin {
             "messages": [{
                 "role": "user",
                 "content": [
-                    { "type": "text", "text": cfg.prompt },
-                    { "type": "image_url", "image_url": { "url": data_url, "detail": cfg.detail } }
+                    { "type": "text", "text": prompt_text(&cfg) },
+                    { "type": "image_url", "image_url": { "url": "", "detail": cfg.detail } }
                 ]
             }],
         });
+        // Assigned rather than interpolated: `json!` would clone the whole data URL.
+        body["messages"][0]["content"][1]["image_url"]["url"] = serde_json::Value::String(data_url);
         if cfg.json {
             body["response_format"] = serde_json::json!({ "type": "json_object" });
         }
@@ -364,6 +395,20 @@ impl Plugin for ImageCaptionerPlugin {
 
         tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, id = %doc.id, "captioned image");
         Ok(PluginOutput::Documents(vec![doc]))
+    }
+}
+
+/// Sentence appended to a JSON-mode prompt that does not mention JSON.
+const JSON_REPLY_HINT: &str = "Reply with a single JSON object.";
+
+/// The text part sent with the image. OpenAI refuses `response_format: json_object`
+/// unless a message names JSON, so in JSON mode a prompt that does not gets
+/// [`JSON_REPLY_HINT`] appended; any other prompt goes out exactly as configured.
+fn prompt_text(cfg: &ImageCaptionerConfig) -> String {
+    if cfg.json && !cfg.prompt.to_ascii_lowercase().contains("json") {
+        format!("{}\n\n{JSON_REPLY_HINT}", cfg.prompt.trim_end())
+    } else {
+        cfg.prompt.clone()
     }
 }
 
@@ -705,6 +750,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn an_image_over_max_bytes_is_rejected_without_calling_the_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let p = plugin(&server);
+        let five_bytes = || PluginInput::Bytes(Blob::new(vec![1; 5], "image/png", None));
+        let err = p
+            .execute(
+                &ActivityContext::noop(),
+                five_bytes(),
+                serde_json::json!({"max_bytes": 4}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("max_bytes")),
+            "{err:?}"
+        );
+        let err = p
+            .execute(
+                &ActivityContext::noop(),
+                five_bytes(),
+                serde_json::json!({"max_bytes": 0}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidConfig(_)), "{err:?}");
+        assert_eq!(ImageCaptionerConfig::default().max_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(
+            p.manifest().config_schema["properties"]["max_bytes"]["default"],
+            DEFAULT_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_at_max_bytes_is_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        plugin(&server)
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(Blob::new(vec![1; 5], "image/png", None)),
+                serde_json::json!({"max_bytes": 5}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_mode_names_json_even_when_the_prompt_does_not() {
+        // OpenAI rejects `response_format: json_object` unless a message mentions JSON.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A shoe"}"#)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let p = plugin(&server);
+        let prompt = "Describe the product shown in this photo.";
+        p.execute(
+            &ActivityContext::noop(),
+            image(),
+            serde_json::json!({ "prompt": prompt }),
+        )
+        .await
+        .unwrap();
+        p.execute(
+            &ActivityContext::noop(),
+            image(),
+            serde_json::json!({ "prompt": prompt, "json": false }),
+        )
+        .await
+        .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let text = |i: usize| -> (serde_json::Value, String) {
+            let body: serde_json::Value = serde_json::from_slice(&reqs[i].body).unwrap();
+            let text = body["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            (body, text)
+        };
+        let (body, sent) = text(0);
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(sent.starts_with(prompt), "{sent}");
+        assert!(sent.to_ascii_lowercase().contains("json"), "{sent}");
+        // Without JSON mode the operator's prompt goes out untouched.
+        let (body, sent) = text(1);
+        assert!(body.get("response_format").is_none());
+        assert_eq!(sent, prompt);
     }
 
     #[tokio::test]
