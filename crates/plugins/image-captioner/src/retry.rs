@@ -150,6 +150,8 @@ fn jitter() -> f64 {
 }
 
 /// The delay in a `Retry-After` header given in seconds (the HTTP-date form is ignored).
+/// A value too large for a `Duration` saturates to `Duration::MAX`: the header is
+/// untrusted, and such a delay is simply beyond any cap, so it goes to the activity retry.
 pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let secs: f64 = headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -158,7 +160,8 @@ pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Durati
         .trim()
         .parse()
         .ok()?;
-    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+    (secs.is_finite() && secs >= 0.0)
+        .then(|| Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX))
 }
 
 #[cfg(test)]
@@ -203,6 +206,15 @@ mod tests {
             reqwest::header::RETRY_AFTER,
             "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
         );
+        assert_eq!(retry_after(&h), None);
+        // Too big for a `Duration`: saturates (beyond any cap) instead of panicking.
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "100000000000000000000".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), Some(Duration::MAX));
+        assert_eq!(RetryPolicy::DEFAULT.delay(1, retry_after(&h), 0.5), None);
+        h.insert(reqwest::header::RETRY_AFTER, "-1".parse().unwrap());
         assert_eq!(retry_after(&h), None);
     }
 }
