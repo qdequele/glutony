@@ -1731,6 +1731,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_matches_openapi("POST", "/ingest", 404, &json_body(resp).await);
+        let params = &openapi_spec()["paths"]["/ingest"]["post"]["parameters"];
+        for name in ["PipelineQuery", "FilenameQuery"] {
+            let reference = format!("#/components/parameters/{name}");
+            assert!(
+                params
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["$ref"] == reference.as_str()),
+                "POST /ingest reads it; docs/openapi.yaml must declare {name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1836,6 +1849,7 @@ mod tests {
         assert_eq!(jobs[1]["code"], "unsupported_media_type");
         assert_eq!(jobs[2]["pipeline_used"], "builtin.pdf");
         assert_eq!(starter.inputs().len(), 2);
+        assert_matches_openapi("POST", "/ingest/batch", 202, &json);
     }
 
     #[tokio::test]

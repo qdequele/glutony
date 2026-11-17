@@ -218,7 +218,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        let jobs = json_body(resp).await["jobs"].clone();
+        let json = json_body(resp).await;
+        assert_matches_openapi("POST", "/ingest/pipeline/{name}", 202, &json);
+        let jobs = json["jobs"].clone();
         assert_eq!(jobs[0]["code"], "bad_request", "{jobs}");
         assert_eq!(jobs[1]["pipeline_used"], "p", "{jobs}");
         assert_eq!(jobs[2]["target_index"], "own", "{jobs}");

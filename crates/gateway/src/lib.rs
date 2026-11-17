@@ -457,6 +457,57 @@ pub mod test_support {
             .unwrap()
     }
 
+    /// `docs/openapi.yaml` as JSON.
+    pub fn openapi_spec() -> serde_json::Value {
+        serde_yaml::from_str(include_str!("../../../docs/openapi.yaml")).unwrap()
+    }
+
+    /// Whether `docs/openapi.yaml` declares a `status` response for `method path`.
+    pub fn openapi_declares(method: &str, path: &str, status: u16) -> bool {
+        let spec = openapi_spec();
+        let operation = &spec["paths"][path][method.to_lowercase()];
+        assert!(
+            operation.is_object(),
+            "docs/openapi.yaml has no {method} {path}"
+        );
+        operation["responses"][status.to_string()].is_object()
+    }
+
+    /// Assert that `docs/openapi.yaml` declares `status` for `method path` (`path` as
+    /// written in the spec, e.g. `/jobs/{job_id}`) and that `body` validates against
+    /// that response's `application/json` schema.
+    pub fn assert_matches_openapi(method: &str, path: &str, status: u16, body: &serde_json::Value) {
+        let spec = openapi_spec();
+        assert!(
+            openapi_declares(method, path, status),
+            "docs/openapi.yaml: {method} {path} does not declare a {status} response"
+        );
+        let mut response =
+            &spec["paths"][path][method.to_lowercase()]["responses"][status.to_string()];
+        if let Some(reference) = response["$ref"].as_str() {
+            let name = reference.trim_start_matches("#/components/responses/");
+            response = &spec["components"]["responses"][name];
+        }
+        let schema = &response["content"]["application/json"]["schema"];
+        assert!(
+            schema.is_object(),
+            "docs/openapi.yaml: {method} {path} {status} has no application/json schema"
+        );
+        // The schema's `#/components/...` references resolve against this root.
+        let mut root = schema.clone();
+        root["components"] = spec["components"].clone();
+        let validator = jsonschema::validator_for(&root)
+            .unwrap_or_else(|e| panic!("{method} {path} {status}: invalid schema: {e}"));
+        let errors: Vec<String> = validator
+            .iter_errors(body)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{method} {path} {status}: the body does not match docs/openapi.yaml: {errors:#?}\nbody: {body:#}"
+        );
+    }
+
     /// Read a JSON response body.
     pub async fn json_body(resp: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
@@ -497,6 +548,15 @@ mod tests {
         // The UI reads these to render the tenant and to hide features that are off.
         assert_eq!(body["features"]["usage_analytics"], false);
         assert!(body["tenant_id"].is_null());
+        assert_matches_openapi("GET", "/health", 200, &body);
+        let documented = &openapi_spec()["paths"]["/health"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["properties"];
+        for field in ["version", "tenant_id", "features"] {
+            assert!(
+                documented[field].is_object(),
+                "/health returns `{field}`; docs/openapi.yaml must declare it"
+            );
+        }
     }
 
     #[tokio::test]

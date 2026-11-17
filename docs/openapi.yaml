@@ -86,12 +86,25 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status]
+                required: [status, version, tenant_id, features]
                 properties:
                   status:
                     type: string
                     const: ok
-              example: { "status": "ok" }
+                  version:
+                    type: string
+                    description: Version of the gateway binary.
+                  tenant_id:
+                    type: [string, "null"]
+                    description: Tenant the request resolves to (trusted edge headers), or `null`.
+                  features:
+                    type: object
+                    required: [usage_analytics]
+                    properties:
+                      usage_analytics:
+                        type: boolean
+                        description: "`GET /usage` is configured (otherwise it answers `501`)."
+              example: { "status": "ok", "version": "1.2.3", "tenant_id": null, "features": { "usage_analytics": false } }
 
   /ingest:
     post:
@@ -114,6 +127,8 @@ paths:
         names the archive type itself (`application/zip`, …) takes the archive whole.
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -159,6 +174,8 @@ paths:
           $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
         "422":
           $ref: "#/components/responses/Unprocessable"
         "413":
@@ -178,6 +195,8 @@ paths:
       security: [{ MeiliKey: [] }, {}]
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -229,6 +248,10 @@ paths:
         `400 bad_request` (in an `items` batch, an item naming another one fails
         alone). Naming the same pipeline is accepted.
 
+        A JSON body with `items` (a `BatchIngestRequest`) runs every item through this
+        pipeline and is answered like `POST /ingest/batch`: `{jobs: [...]}`, one
+        entry per item, a failing item being an `{error, code}` entry.
+
         An archive is expanded and every file it holds runs through this pipeline,
         unless the pipeline's trigger names the archive type, in which case it gets
         the archive whole.
@@ -242,6 +265,7 @@ paths:
             pattern: "^[a-zA-Z0-9._-]+$"
           example: my-pdf-with-enrichment
         - $ref: "#/components/parameters/IndexQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -257,14 +281,16 @@ paths:
               $ref: "#/components/schemas/MultipartIngest"
           application/json:
             schema:
-              $ref: "#/components/schemas/JsonIngest"
+              anyOf:
+                - $ref: "#/components/schemas/JsonIngest"
+                - $ref: "#/components/schemas/BatchIngestRequest"
           "*/*":
             schema:
               type: string
               format: binary
       responses:
         "202":
-          $ref: "#/components/responses/IngestAccepted"
+          $ref: "#/components/responses/PipelineIngestAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -300,6 +326,8 @@ paths:
         that step would write there, not to the path's index.
       parameters:
         - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -330,6 +358,8 @@ paths:
           $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
         "422":
           $ref: "#/components/responses/Unprocessable"
         "413":
@@ -350,6 +380,8 @@ paths:
       description: Like `POST /ingest/batch`; every item goes to the path's index.
       parameters:
         - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -392,6 +424,7 @@ paths:
             type: string
             pattern: "^[a-zA-Z0-9._-]+$"
         - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -406,14 +439,16 @@ paths:
               $ref: "#/components/schemas/MultipartIngest"
           application/json:
             schema:
-              $ref: "#/components/schemas/JsonIngest"
+              anyOf:
+                - $ref: "#/components/schemas/JsonIngest"
+                - $ref: "#/components/schemas/BatchIngestRequest"
           "*/*":
             schema:
               type: string
               format: binary
       responses:
         "202":
-          $ref: "#/components/responses/IngestAccepted"
+          $ref: "#/components/responses/PipelineIngestAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1060,8 +1095,6 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "404":
-          $ref: "#/components/responses/PipelineNotFound"
         "422":
           $ref: "#/components/responses/Unprocessable"
         "501":
@@ -1309,6 +1342,25 @@ components:
       schema:
         type: string
       example: contracts
+    PipelineQuery:
+      name: pipeline
+      in: query
+      required: false
+      description: |
+        Pipeline `uid` to run instead of routing by content type; wins over the body's
+        `pipeline` field. An unknown one is a `404` (on a batch route, an
+        `{error, code}` entry for each item).
+      schema:
+        type: string
+      example: my-pdf-with-enrichment
+    FilenameQuery:
+      name: filename
+      in: query
+      required: false
+      description: Filename hint for MIME detection and `_meta.filename`, for a raw body. Wins over `Content-Disposition`.
+      schema:
+        type: string
+      example: report.pdf
     JobId:
       name: job_id
       in: path
@@ -1437,6 +1489,19 @@ components:
           example:
             job_id: 550e8400-e29b-41d4-a716-446655440000
             pipeline_used: builtin.pdf
+            target_index: documents
+            status: queued
+    PipelineIngestAccepted:
+      description: Job accepted and queued; for an `items` body, one entry per item, in input order (as `POST /ingest/batch`).
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/IngestResponse"
+              - $ref: "#/components/schemas/BatchIngestResponse"
+          example:
+            job_id: 550e8400-e29b-41d4-a716-446655440000
+            pipeline_used: my-pdf-with-enrichment
             target_index: documents
             status: queued
     BadRequest:
@@ -1770,8 +1835,11 @@ components:
       properties:
         jobs:
           type: array
+          description: One entry per item, in input order; an item that could not be queued is an `{error, code}` entry.
           items:
-            $ref: "#/components/schemas/IngestResponse"
+            anyOf:
+              - $ref: "#/components/schemas/IngestResponse"
+              - $ref: "#/components/schemas/Error"
 
     StepResult:
       type: object
@@ -1890,7 +1958,7 @@ components:
           const: cancelling
     JobStatusResponse:
       type: object
-      required: [job_id, status, progress, pipeline_used]
+      required: [job_id, status, progress]
       properties:
         job_id:
           type: string
@@ -1900,9 +1968,16 @@ components:
         current_step:
           type: [string, "null"]
         progress:
-          $ref: "#/components/schemas/WorkflowProgress"
+          description: |
+            The workflow's progress, or `null` when it is not available (the workflow
+            is no longer known to Temporal and the status comes from the job cache, or
+            it has not reported progress yet).
+          oneOf:
+            - $ref: "#/components/schemas/WorkflowProgress"
+            - type: "null"
         pipeline_used:
           type: string
+          description: From the control plane's job cache; absent when that cache could not be updated during this request.
         target_index:
           type: [string, "null"]
         error:

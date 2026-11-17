@@ -445,6 +445,7 @@ mod tests {
         assert_eq!(json["status"], "succeeded");
         assert!(json["progress"].is_null());
         assert!(json.get("pipeline_used").is_none());
+        assert_matches_openapi("GET", "/jobs/{job_id}", 200, &json);
     }
 
     #[tokio::test]

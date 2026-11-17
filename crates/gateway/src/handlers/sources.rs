@@ -508,7 +508,9 @@ mod tests {
     use crate::error::GatewayError;
     use crate::schedules::{ScheduleClient, ScheduleInfo, SourceSchedule};
     use crate::state::{AppState, GatewayConfig};
-    use crate::test_support::{FakeStarter, sample_pipeline};
+    use crate::test_support::{
+        FakeStarter, assert_matches_openapi, openapi_declares, sample_pipeline,
+    };
 
     /// Records every call; `reject_create` makes `create` fail like a bad cron would.
     #[derive(Default)]
@@ -738,6 +740,40 @@ mod tests {
             "{body}"
         );
         assert!(schedules.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pipeline_is_422_and_nothing_is_created() {
+        let cp = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines/movies"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error": "pipeline movies not found"})),
+            )
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sources"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let (status, body) = call(
+            &app(&cp, schedules.clone(), true),
+            req("POST", "/sources", create_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "validation", "{body}");
+        assert!(schedules.calls().is_empty());
+        assert_matches_openapi("POST", "/sources", 422, &body);
+        // An unknown pipeline was the only 404 the spec documented for this route.
+        assert!(
+            !openapi_declares("POST", "/sources", 404),
+            "POST /sources never answers 404; docs/openapi.yaml must not declare one"
+        );
     }
 
     #[tokio::test]

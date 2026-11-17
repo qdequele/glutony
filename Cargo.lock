@@ -3357,6 +3357,7 @@ dependencies = [
  "bytes",
  "chrono",
  "http-body-util",
+ "jsonschema",
  "meili-ingest-blob",
  "meili-ingest-lab",
  "meili-ingest-plugin-sdk",
