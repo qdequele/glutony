@@ -6,7 +6,8 @@
 //! * `per_page: true` (default) → one document per non-empty page, `meta.page` set
 //!   to the 1-based page number and id `<filename_stem>_p<page>`.
 //! * `per_page: false` → a single document with the whole text, id `<filename_stem>`.
-//! * `max_pages` caps the number of pages that are read (in both modes).
+//! * `max_pages` caps the number of pages that are read (in both modes): pages past
+//!   the cap are never rendered.
 //!
 //! Extracted text is whitespace-normalised: runs of blanks collapse into one space,
 //! lines are trimmed and at most one blank line separates blocks.
@@ -56,10 +57,45 @@ impl Default for Config {
 
 /// Extract per-page text off the async runtime (`pdf-extract` is synchronous and
 /// CPU-bound; running it inline would block a worker thread and stall heartbeats).
-async fn extract_pages(data: Vec<u8>) -> Result<Vec<String>, PluginError> {
-    run_blocking(move || pdf_extract::extract_text_from_mem_by_pages(&data))
+///
+/// With `max_pages`, pages past the cap are never rendered.
+async fn extract_pages(data: Vec<u8>, max_pages: Option<u32>) -> Result<Vec<String>, PluginError> {
+    run_blocking(move || pages_text(&data, max_pages))
         .await?
         .map_err(pdf_error)
+}
+
+/// The text of the first `max_pages` pages (all pages when unset).
+///
+/// This is `pdf_extract::extract_text_from_mem_by_pages` with an early stop: that
+/// function renders every page before returning, so a cap applied afterwards bounds
+/// the output but not the work. Same behaviour otherwise: an encrypted document is
+/// opened with the empty password, and reading stops quietly at the first page that
+/// cannot be rendered, keeping the pages before it.
+fn pages_text(
+    data: &[u8],
+    max_pages: Option<u32>,
+) -> Result<Vec<String>, pdf_extract::OutputError> {
+    let mut doc = pdf_extract::Document::load_mem(data)?;
+    if doc.is_encrypted() {
+        doc.decrypt("")
+            .map_err(pdf_extract::OutputError::PdfError)?;
+    }
+    let mut pages = Vec::new();
+    let mut page_num = 1;
+    while max_pages.is_none_or(|max| page_num <= max) {
+        let mut text = String::new();
+        let rendered = {
+            let mut output = pdf_extract::PlainTextOutput::new(&mut text);
+            pdf_extract::output_doc_page(&doc, &mut output, page_num)
+        };
+        if rendered.is_err() {
+            break;
+        }
+        pages.push(text);
+        page_num += 1;
+    }
+    Ok(pages)
 }
 
 /// Extract the whole document's text off the async runtime, with the number of pages
@@ -174,7 +210,7 @@ impl Plugin for PdfExtractorPlugin {
         let meta = base_meta(&blob);
 
         if cfg.per_page {
-            let pages = extract_pages(blob.data.clone()).await?;
+            let pages = extract_pages(blob.data.clone(), cfg.max_pages).await?;
             let mut docs = Vec::with_capacity(pages.len());
             // Pages whose text was extracted. Counted even when the page turns out to
             // be blank and produces no document: rendering it is the billable work.
@@ -206,7 +242,7 @@ impl Plugin for PdfExtractorPlugin {
         let text = match cfg.max_pages {
             // Whole-document mode with a page cap: read page by page and join.
             Some(max) => {
-                let pages = extract_pages(blob.data.clone()).await?;
+                let pages = extract_pages(blob.data.clone(), Some(max)).await?;
                 let mut parts = Vec::new();
                 let mut pages_read = 0u64;
                 for (idx, page) in pages.into_iter().enumerate() {
@@ -250,6 +286,12 @@ mod tests {
 
     /// Build a small valid PDF with one page per entry of `pages`, each containing the text.
     fn make_pdf(pages: &[&str]) -> Vec<u8> {
+        make_pdf_with(pages, usize::MAX)
+    }
+
+    /// [`make_pdf`], except that page `broken` (0-based) has no `MediaBox`, which makes
+    /// `pdf-extract` panic when it renders that page.
+    fn make_pdf_with(pages: &[&str], broken: usize) -> Vec<u8> {
         let mut doc = PdfDocument::with_version("1.5");
         let pages_id = doc.new_object_id();
         let font_id = doc.add_object(dictionary! {
@@ -261,7 +303,7 @@ mod tests {
             "Font" => dictionary! { "F1" => font_id },
         });
         let mut kids = Vec::new();
-        for text in pages {
+        for (index, text) in pages.iter().enumerate() {
             let content = Content {
                 operations: vec![
                     Operation::new("BT", vec![]),
@@ -272,13 +314,16 @@ mod tests {
                 ],
             };
             let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-            let page_id = doc.add_object(dictionary! {
+            let mut page = dictionary! {
                 "Type" => "Page",
                 "Parent" => pages_id,
                 "Contents" => content_id,
                 "Resources" => resources_id,
-                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-            });
+            };
+            if index != broken {
+                page.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+            }
+            let page_id = doc.add_object(page);
             kids.push(page_id.into());
         }
         let count = kids.len() as i64;
@@ -393,6 +438,37 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert!(docs[0].content.contains("Alpha"));
         assert!(!docs[0].content.contains("Beta"));
+    }
+
+    /// `max_pages` bounds the work, not just the output: pages past the cap are never
+    /// rendered, so a page that would make `pdf-extract` fail is not reached.
+    #[tokio::test]
+    async fn pages_past_max_pages_are_not_read() {
+        let pdf = make_pdf_with(&["Alpha page", "Beta page", "Gamma page"], 2);
+        let plugin = PdfExtractorPlugin::new();
+
+        let ctx = ActivityContext::noop();
+        let out = plugin
+            .execute(
+                &ctx,
+                input(pdf.clone()),
+                serde_json::json!({"max_pages": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.document_count(), 2);
+        assert_eq!(ctx.usage().pages, 2);
+
+        let out = plugin
+            .execute(
+                &ActivityContext::noop(),
+                input(pdf),
+                serde_json::json!({"per_page": false, "max_pages": 2}),
+            )
+            .await
+            .unwrap();
+        let docs = out.into_documents().unwrap();
+        assert!(docs[0].content.contains("Beta"), "{:?}", docs[0].content);
     }
 
     #[tokio::test]
