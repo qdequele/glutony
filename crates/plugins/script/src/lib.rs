@@ -377,6 +377,13 @@ fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
         None => Default::default(),
     };
 
+    let mut fields = fields;
+    for (key, value) in fields.iter_mut() {
+        if let Some(original) = doc.fields.get(key) {
+            restore_large_integers(value, original);
+        }
+    }
+
     if let Some(id) = id {
         doc.id = id;
     }
@@ -386,6 +393,41 @@ fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
     }
     doc.fields = fields;
     Ok(())
+}
+
+/// Put back the integers above `i64::MAX` the script left alone.
+///
+/// Rhai integers are i64, so such a u64 reaches the script as a float and would be
+/// written back as one (`18446744073709551615` becoming `1.8446744073709552e19`)
+/// even when the script never touched it. Wherever the original held such an
+/// integer at the same path and the result is the float it was converted to, the
+/// original number is restored. A value the script moved to another key, or
+/// computed with, stays the float rhai produced.
+fn restore_large_integers(new: &mut Value, original: &Value) {
+    match (new, original) {
+        (Value::Number(n), Value::Number(o)) => {
+            if let Some(big) = o.as_u64()
+                && big > i64::MAX as u64
+                && n.is_f64()
+                && n.as_f64() == Some(big as f64)
+            {
+                *n = o.clone();
+            }
+        }
+        (Value::Object(n), Value::Object(o)) => {
+            for (key, value) in n.iter_mut() {
+                if let Some(orig) = o.get(key) {
+                    restore_large_integers(value, orig);
+                }
+            }
+        }
+        (Value::Array(n), Value::Array(o)) => {
+            for (value, orig) in n.iter_mut().zip(o) {
+                restore_large_integers(value, orig);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// What the script decided about one document.
@@ -963,6 +1005,41 @@ mod tests {
             !stdout.contains(PRINT_MARKER),
             "script output reached stdout: {stdout}"
         );
+    }
+
+    /// Rhai integers are i64, so a u64 above `i64::MAX` reaches the script as a
+    /// float. One the script never touched must still come back as the same integer.
+    #[tokio::test]
+    async fn untouched_integers_above_i64_max_round_trip() {
+        let big = json!(18446744073709551615u64);
+        let mut d = doc("a", "x");
+        d.fields.insert("snowflake".into(), big.clone());
+        d.fields.insert(
+            "nested".into(),
+            json!({"b": big.clone(), "list": [1, big.clone()]}),
+        );
+
+        let out = run(
+            vec![d],
+            script("doc.fields.seen = true; doc.fields.nested.c = 1;"),
+        )
+        .await;
+
+        assert_eq!(out[0].fields.get("snowflake"), Some(&big));
+        assert_eq!(out[0].fields["nested"]["b"], big);
+        assert_eq!(out[0].fields["nested"]["list"], json!([1, big.clone()]));
+        assert_eq!(out[0].fields["nested"]["c"], json!(1));
+        assert_eq!(out[0].fields["seen"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_large_integer_the_script_rewrites_is_not_restored() {
+        let mut d = doc("a", "x");
+        d.fields.insert("n".into(), json!(18446744073709551615u64));
+
+        let out = run(vec![d], script("doc.fields.n = 2.5;")).await;
+
+        assert_eq!(out[0].fields["n"], json!(2.5));
     }
 
     #[tokio::test]

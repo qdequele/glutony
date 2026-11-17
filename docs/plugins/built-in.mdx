@@ -246,6 +246,11 @@ Rhai does not raise on `x / 0.0` the way it does on integer division by zero, an
 JSON has no way to spell those values — without the check they would be indexed as
 `null` and the job would report success.
 
+Rhai integers are 64-bit signed, so a field holding an integer above
+9223372036854775807 reaches the script as a float. Left untouched it is written
+back as the original integer; read into another field or used in arithmetic, it
+stays a float.
+
 **Sandbox.** Pipeline configs are tenant-authored, so the engine is built with
 `no_module` (no `import`/`export`), `no_custom_syntax` and `no_time`; rhai has no
 file, network or process API, so a script can only reach `doc`. `print` and
