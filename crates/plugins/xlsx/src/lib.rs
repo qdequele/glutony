@@ -22,11 +22,39 @@ use calamine::{Data, DataRef, Reader, Sheets};
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 
+mod zip_budget;
+
 /// Plugin name, as referenced by `steps[].plugin`.
 pub const NAME: &str = "xlsx_extractor";
 
 /// Number of rows between two heartbeats.
 const HEARTBEAT_EVERY: usize = 100;
+
+/// Largest decompressed size accepted for one part of a zipped workbook.
+///
+/// Uploads arrive from untrusted tenants and deflate reaches ratios of ~1000:1, so a
+/// small workbook can expand to gigabytes ("zip bomb") and exhaust a worker. Sheet
+/// and shared-strings XML of a real million-row workbook reaches a few hundred MB,
+/// hence a larger limit than for `.docx` or `.pptx`.
+pub const MAX_PART_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Largest total decompressed size accepted for one zipped workbook.
+pub const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Images (`xl/media/`, `.ods` `Pictures/`) are not parsed: only the total bounds them.
+fn classify_part(name: &str) -> zip_budget::Part {
+    if name.starts_with("xl/media/") || name.starts_with("Pictures/") {
+        zip_budget::Part::Copied
+    } else {
+        zip_budget::Part::Parsed
+    }
+}
+
+const LIMITS: zip_budget::Limits = zip_budget::Limits {
+    part: MAX_PART_BYTES,
+    total: MAX_TOTAL_BYTES,
+    classify: classify_part,
+};
 
 /// The spreadsheet extractor plugin. Stateless; construct with [`XlsxExtractorPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -398,6 +426,8 @@ fn extract(ctx: &ActivityContext, blob: Blob, cfg: &Config) -> Result<Vec<Docume
     let base = base_id(&blob);
     let meta = base_meta(&blob);
 
+    // `.xls` is not a zip and passes through; calamine bounds it by the BIFF format.
+    zip_budget::check(&blob.data, "spreadsheet", &LIMITS)?;
     let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(blob.data))
         .map_err(|e| PluginError::NonRetryable(format!("failed to open spreadsheet: {e}")))?;
 
@@ -759,6 +789,58 @@ mod tests {
         // Wider than the header row: the fallback name is free here.
         assert_eq!(fields["col_7"], "sixth");
         assert_eq!(fields.len(), 8, "{fields:#?}");
+    }
+
+    /// A zipped workbook whose extra part declares more than [`MAX_PART_BYTES`] is
+    /// refused before calamine opens it. (The declared size is forged on a small part
+    /// so the fixture stays cheap; `zip_budget` tests cover parts that really inflate
+    /// past the limit, with or without an honest header.)
+    #[tokio::test]
+    async fn rejects_a_zip_bomb_instead_of_decompressing_it() {
+        use std::io::Write;
+        let mut source = zip::ZipArchive::new(Cursor::new(make_xlsx())).unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..source.len() {
+            writer.raw_copy_file(source.by_index(i).unwrap()).unwrap();
+        }
+        writer
+            .start_file("xl/bomb.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"<bomb/>").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+
+        // Rewrite the uncompressed size of `xl/bomb.xml` in its local header and its
+        // central directory entry.
+        let declared = u32::try_from(MAX_PART_BYTES + 1).unwrap().to_le_bytes();
+        let mut patched = 0;
+        for at in 0..bytes.len() - 4 {
+            let (offset, name_at) = match &bytes[at..at + 4] {
+                [0x50, 0x4b, 0x03, 0x04] => (22, 30),
+                [0x50, 0x4b, 0x01, 0x02] => (24, 46),
+                _ => continue,
+            };
+            if bytes[at + name_at..].starts_with(b"xl/bomb.xml") {
+                bytes[at + offset..at + offset + 4].copy_from_slice(&declared);
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 2);
+
+        let err = XlsxExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                input(bytes),
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("a zip bomb must be rejected");
+        match err {
+            PluginError::NonRetryable(m) => assert!(
+                m.contains("xl/bomb.xml") && m.contains("zip bomb"),
+                "unexpected message: {m}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]

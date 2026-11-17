@@ -43,6 +43,11 @@ Text extraction from PDF (`pdf-extract`). Queue: `workers-general`.
 Word `.docx` (`docx-rs`). One document; paragraphs joined by `\n\n`, tables
 rendered as tab-separated rows. No config keys.
 
+Decompression is bounded at 64 MiB per XML part and 256 MiB per file, images
+included: a file past either limit fails the step without a retry. Uploads come
+from untrusted tenants and deflate reaches ~1000:1, so an unbounded read would let
+a small crafted file exhaust a worker.
+
 ### `xlsx_extractor`
 
 Excel `.xlsx` / `.xls` (`calamine`).
@@ -56,6 +61,10 @@ the header is empty. Field names are unique: a repeated header keeps its name on
 its first column and gets the first free `_2`, `_3`, … suffix on the later ones
 (`Name | Notes | Notes` → `Name`, `Notes`, `Notes_2`), so no column overwrites
 another.
+
+Zipped workbooks (`.xlsx`, `.xlsm`, `.xlsb`, `.ods`) are bounded at 256 MiB per
+decompressed part and 512 MiB per file: a workbook past either limit fails the
+step without a retry, for the same zip-bomb reason as `docx_extractor`.
 
 `.xlsx`, `.xlsm` and `.xlsb` sheets are read cell by cell, so memory follows the
 cells a sheet holds, not the rectangle between its outermost cells: a stray value

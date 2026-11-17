@@ -3463,6 +3463,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -3710,6 +3711,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
