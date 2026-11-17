@@ -290,7 +290,15 @@ pub async fn submit_one(
             mime: Some(mime.clone()).filter(|m| m != "application/octet-stream"),
             filename,
         }),
-        IngestPayload::Documents(docs) => PluginInput::Documents(docs),
+        // Like an upload, documents above the inline limit go to the blob store:
+        // Temporal refuses a workflow input over 2 MB. The worker reads them back as
+        // the same documents.
+        IngestPayload::Documents(docs) => {
+            state
+                .blob
+                .stage_documents(job_id, docs, state.config.inline_max_bytes)
+                .await?
+        }
         IngestPayload::Batch(_) => {
             return Err(GatewayError::BadRequest(
                 "nested batches are not supported".into(),
@@ -1251,6 +1259,107 @@ mod tests {
             }
             other => panic!("expected staged ref, got {other:?}"),
         }
+    }
+
+    /// Like `test_app`, also handing back the blob store the gateway stages into.
+    fn app_with_blob(
+        server: &MockServer,
+        mut config: GatewayConfig,
+    ) -> (
+        axum::Router,
+        std::sync::Arc<FakeStarter>,
+        meili_ingest_blob::BlobStore,
+    ) {
+        config.control_plane_url = server.uri();
+        let starter = std::sync::Arc::new(FakeStarter::default());
+        let blob = meili_ingest_blob::BlobStore::memory();
+        let app = crate::router(AppState::new(
+            config,
+            starter.clone(),
+            blob.clone(),
+            reqwest::Client::new(),
+        ));
+        (app, starter, blob)
+    }
+
+    #[tokio::test]
+    async fn large_inline_documents_are_staged_as_a_ref() {
+        // Temporal refuses payloads over 2 MB, so documents above INLINE_MAX_BYTES go
+        // to the blob store like a file upload does, and come back as documents.
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.json", None).await;
+        mount_jobs_ok(&server).await;
+        let cfg = GatewayConfig {
+            inline_max_bytes: 16,
+            ..GatewayConfig::default()
+        };
+        let (app, starter, blob) = app_with_blob(&server, cfg);
+
+        let single = json!({"documents": [
+            {"id": "1", "title": "Hello", "content": "world", "year": 1999},
+            {"id": "2", "content": "again"}
+        ]});
+        let resp = app
+            .clone()
+            .oneshot(standalone_request(
+                "/ingest",
+                "application/json",
+                single.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let batch = json!({"items": [{"documents": [{"id": "3", "content": "item"}]}]});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest/batch",
+                "application/json",
+                batch.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let inputs = starter.inputs();
+        assert_eq!(inputs.len(), 2);
+        let mut ids = Vec::new();
+        for wf in &inputs {
+            match &wf.input {
+                PluginInput::Ref(ContentRef::Staged {
+                    uri,
+                    mime,
+                    filename,
+                    origin,
+                }) => {
+                    assert_eq!(
+                        uri,
+                        &format!("jobs/{}/input/documents.json", wf.job_id),
+                        "under input/, where no step output can collide"
+                    );
+                    assert_eq!(
+                        mime.as_deref(),
+                        Some(meili_ingest_blob::SPILLED_OUTPUT_MIME)
+                    );
+                    assert_eq!((filename, origin), (&None, &None));
+                }
+                other => panic!("expected a staged ref, got {other:?}"),
+            }
+            // What the worker's first step receives: the documents, not JSON bytes.
+            let resolved = blob
+                .resolve_input(wf.input.clone(), &reqwest::Client::new())
+                .await
+                .unwrap();
+            let PluginInput::Documents(docs) = resolved else {
+                panic!("expected documents, got {resolved:?}");
+            };
+            ids.extend(docs.iter().map(|d| d.id.clone()));
+            if docs[0].id == "1" {
+                assert_eq!(docs[0].title.as_deref(), Some("Hello"));
+                assert_eq!(docs[0].content, "world");
+                assert_eq!(docs[0].fields["year"], 1999);
+            }
+        }
+        assert_eq!(ids, ["1", "2", "3"]);
     }
 
     #[tokio::test]

@@ -268,10 +268,14 @@ pub(crate) fn to_utc(time: Option<SystemTime>) -> DateTime<Utc> {
         .unwrap_or_else(|| DateTime::<Utc>::from(UNIX_EPOCH))
 }
 
-/// MIME of the job's original input, when it is known.
+/// MIME of the job's original input, when it is known. Documents are JSON whether
+/// the gateway sent them inline or staged them in the blob store.
 fn initial_mime(input: &PluginInput) -> String {
     match input {
         PluginInput::Bytes(b) => b.mime.clone(),
+        PluginInput::Ref(r) if r.mime() == Some(meili_ingest_blob::SPILLED_OUTPUT_MIME) => {
+            "application/json".to_string()
+        }
         PluginInput::Ref(r) => r.mime().unwrap_or("").to_string(),
         PluginInput::Documents(_) => "application/json".to_string(),
         _ => String::new(),
@@ -549,6 +553,31 @@ mod tests {
             cause: cause.map(Box::new),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn documents_report_the_same_input_mime_inline_or_staged() {
+        use meili_ingest_plugin_sdk::{Blob, ContentRef, Document, PluginInput};
+        let inline = PluginInput::Documents(vec![Document::with_id("1", "x")]);
+        // What the gateway sends for documents above INLINE_MAX_BYTES.
+        let staged = PluginInput::Ref(ContentRef::Staged {
+            uri: "jobs/j/input/documents.json".into(),
+            mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.into()),
+            filename: None,
+            origin: None,
+        });
+        assert_eq!(super::initial_mime(&inline), "application/json");
+        assert_eq!(super::initial_mime(&staged), "application/json");
+        // Every other input keeps its own type.
+        let upload = PluginInput::Ref(ContentRef::Staged {
+            uri: "jobs/j/input/a.pdf".into(),
+            mime: Some("application/pdf".into()),
+            filename: Some("a.pdf".into()),
+            origin: None,
+        });
+        assert_eq!(super::initial_mime(&upload), "application/pdf");
+        let bytes = PluginInput::Bytes(Blob::new(vec![1], "text/csv", None));
+        assert_eq!(super::initial_mime(&bytes), "text/csv");
     }
 
     #[test]

@@ -21,8 +21,8 @@ inside plugins or workflow code.
 | `MAX_UPLOAD_MB` | `500` | Maximum request body; larger → `413`. |
 | `ENVOY_TRUSTED_HEADER` | — | Shared secret. When set, `X-Meili-*` headers are honoured only if `X-Meili-Envoy-Secret` matches. Unset = trust headers (dev mode, warned at startup). Required with `LAB_SERVICE_TOKEN` or `LAB_INSTANCE_*`. `CHANGE_ME` is refused at boot. |
 | `WRITE_PREFLIGHT` | `false` | Before queueing a job, check the request's Meilisearch key can add documents to (and read) the target index; answer `401`/`403` instead of a job that fails at `meili_indexer`. Skipped for pipelines pinned to a connection. Side-effect free: see `crates/gateway/src/preflight.rs`. |
-| `BLOB_STORE_URL` | `file://./blobs` | Where uploads above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
-| `INLINE_MAX_BYTES` | `1048576` | Uploads up to this size travel inside the Temporal payload; larger ones are staged. |
+| `BLOB_STORE_URL` | `file://./blobs` | Where uploads and inline `documents` above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
+| `INLINE_MAX_BYTES` | `1048576` | Uploads and inline `documents` up to this size travel inside the Temporal payload; larger ones are staged. Keep it well under Temporal's 2 MB payload limit. |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
 | `SOURCE_SECRET_KEY` | — | 32 bytes, base64 (`openssl rand -base64 32`). Seals [connection](/concepts/connections) keys and [source](/concepts/sources) credentials. Unset = `/connections` and `/sources` answer `501`. Must match the workers'. Rotating it makes stored secrets unreadable. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Where connections may point: `public` (https, public addresses only), `any`, or a comma list of `host[:port]`. |

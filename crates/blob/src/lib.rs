@@ -38,7 +38,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use meili_ingest_plugin_sdk::{Blob, ContentRef, PluginInput, PluginOutput};
+use meili_ingest_plugin_sdk::{Blob, ContentRef, Document, PluginInput, PluginOutput};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -887,6 +887,39 @@ impl BlobStore {
             origin,
         }))
     }
+
+    /// Gateway helper for inline documents: keep them in the workflow input when they
+    /// serialize to at most `inline_max` bytes, otherwise store them at
+    /// `staged_key(job_id, "input/documents.json")` and return a [`PluginInput::Ref`]
+    /// with MIME [`SPILLED_OUTPUT_MIME`].
+    ///
+    /// The object is the JSON of a [`PluginOutput::Documents`], the encoding of a
+    /// spilled step output, so [`BlobStore::resolve_input`] hands the first step the
+    /// same documents it would have received inline, not a blob of JSON bytes. It
+    /// lives under `input/`, where no step output is written.
+    pub async fn stage_documents(
+        &self,
+        job_id: Uuid,
+        documents: Vec<Document>,
+        inline_max: usize,
+    ) -> Result<PluginInput, BlobError> {
+        let output = PluginOutput::Documents(documents);
+        // The exact size, not `approx_size`: what is kept inline goes into a Temporal
+        // payload, which has a hard limit.
+        let bytes = serde_json::to_vec(&output)?;
+        if bytes.len() <= inline_max {
+            return Ok(PluginInput::from(output));
+        }
+        let key = Self::staged_key(job_id, "input/documents.json");
+        tracing::debug!(job_id = %job_id, key = %key, size = bytes.len(), "staging inline documents in blob store");
+        self.put(&key, Bytes::from(bytes)).await?;
+        Ok(PluginInput::Ref(ContentRef::Staged {
+            uri: key,
+            mime: Some(SPILLED_OUTPUT_MIME.to_owned()),
+            filename: None,
+            origin: None,
+        }))
+    }
 }
 
 /// `type/subtype; params` → `type/subtype` (lower-cased); `None` when empty.
@@ -1237,6 +1270,49 @@ mod tests {
             }
             other => panic!("expected staged ref, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn staged_documents_resolve_back_to_the_same_documents() {
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let mut documents = docs(3);
+        documents[0].title = Some("a title".into());
+        documents[0]
+            .fields
+            .insert("year".into(), serde_json::json!(1999));
+        let exact = serde_json::to_vec(&PluginOutput::Documents(documents.clone()))
+            .unwrap()
+            .len();
+
+        // At the limit they stay inline, and nothing is written.
+        let inline = store
+            .stage_documents(job, documents.clone(), exact)
+            .await
+            .unwrap();
+        assert_eq!(inline, PluginInput::Documents(documents.clone()));
+        let key = BlobStore::staged_key(job, "input/documents.json");
+        assert!(matches!(store.get(&key).await, Err(BlobError::NotFound(_))));
+
+        // One byte over, they are staged, and the worker reads the same documents.
+        let staged = store
+            .stage_documents(job, documents.clone(), exact - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            staged,
+            PluginInput::Ref(ContentRef::Staged {
+                uri: key,
+                mime: Some(SPILLED_OUTPUT_MIME.into()),
+                filename: None,
+                origin: None,
+            })
+        );
+        let resolved = store
+            .resolve_input(staged, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(resolved, PluginInput::Documents(documents));
     }
 
     #[tokio::test]

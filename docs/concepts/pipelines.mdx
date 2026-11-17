@@ -104,9 +104,10 @@ steps:
 ## Payload sizes
 
 Temporal payloads are capped at 2 MB, so meili-ingest never relies on them for
-content: uploads above `INLINE_MAX_BYTES` (1 MiB) are staged in the blob store
-and step outputs above `PAYLOAD_SPILL_BYTES` (1 MiB) are spilled there. This is
-invisible to plugins and to pipeline authors.
+content: uploads and inline `documents` above `INLINE_MAX_BYTES` (1 MiB) are
+staged in the blob store and step outputs above `PAYLOAD_SPILL_BYTES` (1 MiB)
+are spilled there. This is invisible to plugins and to pipeline authors: staged
+documents reach the first step as documents, exactly as inline ones do.
 
 ## Built-in pipelines
 
