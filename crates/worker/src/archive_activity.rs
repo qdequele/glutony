@@ -159,6 +159,33 @@ struct ResolveResponse {
     index_pattern: Option<String>,
 }
 
+/// An archive [`Event`] as it crosses from the blocking walker to the async activity:
+/// a file already carries its detected MIME.
+#[derive(Debug, PartialEq)]
+enum Walked {
+    /// A file to ingest, with its MIME.
+    File {
+        path: String,
+        data: Vec<u8>,
+        mime: String,
+    },
+    /// An entry that will not be ingested, and why.
+    Skipped { path: String, reason: String },
+}
+
+impl Walked {
+    /// Detect the MIME of a walked file. Call it on the walker's thread.
+    fn detect(event: Event) -> Self {
+        match event {
+            Event::File { path, data } => {
+                let mime = detect_mime(&data, Some(&path), None);
+                Self::File { path, data, mime }
+            }
+            Event::Skipped { path, reason } => Self::Skipped { path, reason },
+        }
+    }
+}
+
 /// The job id of the `ordinal`-th file of archive `job_id`: stable across retries.
 pub fn file_job_id(job_id: Uuid, ordinal: usize) -> Uuid {
     Uuid::new_v5(&job_id, format!("archive-file-{ordinal}").as_bytes())
@@ -264,10 +291,13 @@ impl ArchiveActivities {
         let limits = self.limits.clone();
         // Small buffer: at most a few files are held in memory between the walk and
         // the blob store.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Walked>(4);
         let walker = tokio::task::spawn_blocking(move || {
             meili_ingest_archive::walk(&data, format, filename.as_deref(), &limits, &mut |e| {
-                tx.blocking_send(e)
+                // Detection can read a whole file (a JSON sniff parses it), so it runs
+                // here, on the blocking thread that walks the archive, and never on
+                // the async threads that receive the files.
+                tx.blocking_send(Walked::detect(e))
                     .map_err(|_| "the archive expansion was abandoned".to_string())
             })
         });
@@ -277,9 +307,8 @@ impl ArchiveActivities {
         let mut skipped_samples = Vec::new();
         while let Some(event) = rx.recv().await {
             match event {
-                Event::File { path, data } => {
+                Walked::File { path, data, mime } => {
                     let job_id = file_job_id(input.job_id, entries.len());
-                    let mime = detect_mime(&data, Some(&path), None);
                     // Always staged: bytes never enter workflow history. The full path
                     // is the filename, so documents keep their folder and two `a.pdf`
                     // in different folders get different ids.
@@ -302,7 +331,7 @@ impl ArchiveActivities {
                         input: staged,
                     });
                 }
-                Event::Skipped { path, reason } => {
+                Walked::Skipped { path, reason } => {
                     skipped += 1;
                     if skipped_samples.len() < ARCHIVE_ISSUES_KEPT {
                         skipped_samples.push(issue(&path, reason, None));
@@ -658,6 +687,45 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn walked_files_carry_their_mime_from_the_walker() {
+        // The MIME is settled where the event is built (the blocking walker), so the
+        // async loop never parses a file to find its type.
+        let walked = Walked::detect(Event::File {
+            path: "data/rows".into(),
+            data: b"[{\"id\":1},{\"id\":2}]".to_vec(),
+        });
+        assert_eq!(
+            walked,
+            Walked::File {
+                path: "data/rows".into(),
+                data: b"[{\"id\":1},{\"id\":2}]".to_vec(),
+                mime: "application/json".into(),
+            }
+        );
+        assert_eq!(
+            Walked::detect(Event::File {
+                path: "docs/README.md".into(),
+                data: b"<div align=\"center\">\n# T\n".to_vec(),
+            }),
+            Walked::File {
+                path: "docs/README.md".into(),
+                data: b"<div align=\"center\">\n# T\n".to_vec(),
+                mime: "text/markdown".into(),
+            }
+        );
+        assert_eq!(
+            Walked::detect(Event::Skipped {
+                path: "a".into(),
+                reason: "empty".into(),
+            }),
+            Walked::Skipped {
+                path: "a".into(),
+                reason: "empty".into(),
+            }
+        );
     }
 
     #[test]

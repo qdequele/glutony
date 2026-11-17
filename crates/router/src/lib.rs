@@ -20,6 +20,14 @@ use serde::{Deserialize, Serialize};
 /// Fallback MIME type when nothing is recognised.
 pub const OCTET_STREAM: &str = "application/octet-stream";
 
+/// Payload size above which [`detect_mime`] should not run on an async thread.
+///
+/// Detection is cheap for most content, but text that opens like JSON is parsed in
+/// full to tell JSON from prose: linear in the payload, hundreds of milliseconds for
+/// a few hundred megabytes. Callers on an async runtime move the call to a blocking
+/// thread above this size.
+pub const DETECT_BLOCKING_THRESHOLD_BYTES: usize = 1024 * 1024;
+
 /// Number of leading bytes inspected by the UTF-8 sniff.
 const SNIFF_LEN: usize = 512;
 
@@ -368,6 +376,12 @@ pub fn plugin_task_queue(plugin: &str) -> &'static str {
 ///
 /// The result is passed through [`canonical_mime`], so `audio/x-wav` becomes
 /// `audio/wav` and `.m4a` becomes `audio/mp4` before any pipeline trigger is matched.
+///
+/// Step 3 parses the whole payload when it opens with `{`/`[`, so this is a blocking
+/// call for large content: see [`DETECT_BLOCKING_THRESHOLD_BYTES`]. JSON nested
+/// deeper than `serde_json`'s recursion limit (128 levels) does not parse there and
+/// is reported as `text/plain`; name the file `.json` or pick the pipeline to route
+/// it as JSON.
 pub fn detect_mime(data: &[u8], filename: Option<&str>, content_type_hint: Option<&str>) -> String {
     canonical_mime(&detect_mime_raw(data, filename, content_type_hint)).to_owned()
 }

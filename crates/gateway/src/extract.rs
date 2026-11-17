@@ -185,10 +185,29 @@ pub async fn extract_payload(
     Ok(Extracted {
         // `Vec::from` takes over the buffer of a uniquely owned `Bytes` instead of
         // copying it, so an upload is held once, not twice.
-        payload: file_payload(Vec::from(body), filename_hint, content_type),
+        payload: detect_file_payload(Vec::from(body), filename_hint, content_type).await?,
         index: None,
         pipeline: None,
     })
+}
+
+/// [`file_payload`] for a request handler: above
+/// [`DETECT_BLOCKING_THRESHOLD_BYTES`](meili_ingest_router::DETECT_BLOCKING_THRESHOLD_BYTES)
+/// the detection runs on the blocking pool, since sniffing JSON parses the whole
+/// payload and would otherwise hold an async worker thread.
+async fn detect_file_payload(
+    data: Vec<u8>,
+    filename: Option<&str>,
+    content_type_hint: Option<&str>,
+) -> Result<IngestPayload, GatewayError> {
+    if data.len() <= meili_ingest_router::DETECT_BLOCKING_THRESHOLD_BYTES {
+        return Ok(file_payload(data, filename, content_type_hint));
+    }
+    let filename = filename.map(str::to_owned);
+    let hint = content_type_hint.map(str::to_owned);
+    tokio::task::spawn_blocking(move || file_payload(data, filename.as_deref(), hint.as_deref()))
+        .await
+        .map_err(|e| GatewayError::Internal(format!("MIME detection failed: {e}")))
 }
 
 /// Build a [`IngestPayload::File`] running MIME detection.
@@ -244,7 +263,7 @@ async fn extract_multipart(mut mp: Multipart) -> Result<Extracted, GatewayError>
 
     let payload = if let Some((data, filename, ct)) = file {
         let filename = filename_override.or(filename);
-        file_payload(data, filename.as_deref(), ct.as_deref())
+        detect_file_payload(data, filename.as_deref(), ct.as_deref()).await?
     } else if let Some(url) = url {
         IngestPayload::Url {
             url,
@@ -923,6 +942,94 @@ mod tests {
             );
             assert_eq!(blob.data, body.as_bytes());
         }
+    }
+
+    /// A runtime with one blocking thread, held busy until the returned sender fires.
+    /// Anything that needs the blocking pool cannot finish while it is held.
+    fn runtime_with_busy_blocking_pool() -> (tokio::runtime::Runtime, std::sync::mpsc::Sender<()>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        rt.spawn_blocking(move || {
+            let _ = held.recv();
+        });
+        (rt, release)
+    }
+
+    /// A JSON array just over the size where detection leaves the async thread.
+    fn large_json_body() -> Bytes {
+        let mut body = String::from("[");
+        while body.len() <= meili_ingest_router::DETECT_BLOCKING_THRESHOLD_BYTES {
+            body.push_str("{\"id\":1,\"title\":\"a reasonably long title\"},");
+        }
+        body.push_str("{\"id\":2}]");
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn mime_detection_of_a_large_raw_body_leaves_the_async_thread() {
+        let (rt, release) = runtime_with_busy_blocking_pool();
+        rt.block_on(async {
+            // Sniffing JSON parses the whole body: with the pool busy the extraction
+            // must wait for it instead of parsing on this thread.
+            let mut pending = Box::pin(extract_payload(
+                Some("application/octet-stream"),
+                large_json_body(),
+                None,
+                None,
+            ));
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+            assert!(
+                waited.is_err(),
+                "a large body was detected on the async thread"
+            );
+
+            // A small body is detected in place and does not need the pool.
+            let small = extract_payload(None, Bytes::from("[1,2,3]"), None, None)
+                .await
+                .unwrap();
+            let IngestPayload::File(blob) = small.payload else {
+                panic!()
+            };
+            assert_eq!(blob.mime, "application/json");
+
+            release.send(()).unwrap();
+            let IngestPayload::File(blob) = pending.await.unwrap().payload else {
+                panic!()
+            };
+            assert_eq!(blob.mime, "application/json");
+            assert_eq!(blob.data, large_json_body());
+        });
+    }
+
+    #[test]
+    fn mime_detection_of_a_large_multipart_file_leaves_the_async_thread() {
+        let (rt, release) = runtime_with_busy_blocking_pool();
+        rt.block_on(async {
+            let b = "XBOUNDARYX";
+            let body = form(
+                b,
+                vec![part(b, "file", Some("rows"), None, &large_json_body())],
+            );
+            let mp = multipart_from(b, body).await;
+            let mut pending = Box::pin(extract_payload(None, Bytes::new(), Some(mp), None));
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+            assert!(
+                waited.is_err(),
+                "a large multipart file was detected on the async thread"
+            );
+            release.send(()).unwrap();
+            let IngestPayload::File(blob) = pending.await.unwrap().payload else {
+                panic!()
+            };
+            assert_eq!(blob.mime, "application/json");
+            assert_eq!(blob.filename.as_deref(), Some("rows"));
+        });
     }
 
     #[tokio::test]
