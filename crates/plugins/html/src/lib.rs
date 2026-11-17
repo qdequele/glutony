@@ -125,6 +125,77 @@ fn base_meta(blob: &Blob) -> DocumentMeta {
     }
 }
 
+/// How far into the page the `<meta charset>` prescan looks, as in the HTML spec.
+const PRESCAN_BYTES: usize = 1024;
+
+/// Decode the page's bytes into text.
+///
+/// In order: a byte order mark; then UTF-8 when the bytes are valid UTF-8 (servers
+/// and templates often declare a legacy charset for pages that are really UTF-8,
+/// and honouring it would garble them); then the charset a `<meta>` in the first
+/// [`PRESCAN_BYTES`] declares; and lossy UTF-8 when nothing usable is declared.
+fn decode_html(bytes: &[u8]) -> String {
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding
+            .decode_without_bom_handling(&bytes[bom_len..])
+            .0
+            .into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    match declared_charset(&bytes[..bytes.len().min(PRESCAN_BYTES)]) {
+        Some(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The encoding a `<meta charset=…>` or `<meta http-equiv="Content-Type"
+/// content="…; charset=…">` in `head` names, when it is a known WHATWG label.
+///
+/// A declared UTF-16 is read as UTF-8, as the spec says: a page whose bytes reached
+/// this point is not UTF-16, or it would have carried a byte order mark.
+fn declared_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let lower = head.to_ascii_lowercase();
+    let mut rest = lower.as_slice();
+    while let Some(start) = find(rest, b"<meta") {
+        let tag = &rest[start + 5..];
+        let end = tag.iter().position(|&b| b == b'>').unwrap_or(tag.len());
+        let tag = &tag[..end];
+        rest = &rest[start + 5 + end..];
+
+        let Some(at) = find(tag, b"charset") else {
+            continue;
+        };
+        let value = tag[at + 7..].trim_ascii_start();
+        let Some(value) = value.strip_prefix(b"=") else {
+            continue;
+        };
+        let value = value.trim_ascii_start();
+        let value = value
+            .strip_prefix(b"\"")
+            .or_else(|| value.strip_prefix(b"'"))
+            .unwrap_or(value);
+        let len = value
+            .iter()
+            .position(|b| matches!(b, b'"' | b'\'' | b';' | b'/' | b'>') || b.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        let Some(encoding) = encoding_rs::Encoding::for_label(&value[..len]) else {
+            continue;
+        };
+        if encoding == encoding_rs::UTF_16BE || encoding == encoding_rs::UTF_16LE {
+            return Some(encoding_rs::UTF_8);
+        }
+        return Some(encoding);
+    }
+    None
+}
+
+/// Index of the first occurrence of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Parse a CSS selector; the selectors used here are constants, so failure is a bug.
 fn selector(css: &str) -> Result<Selector, PluginError> {
     Selector::parse(css)
@@ -306,7 +377,7 @@ impl Plugin for HtmlExtractorPlugin {
         let blob = input.into_bytes()?;
         let base = base_id(&blob);
         let mut meta = base_meta(&blob);
-        let source = blob.text_lossy();
+        let source = decode_html(&blob.data);
 
         let mut doc = Html::parse_document(&source);
         ctx.check_cancelled()?;
@@ -574,6 +645,68 @@ mod tests {
             .await
             .unwrap();
         out.into_documents().unwrap().remove(0)
+    }
+
+    async fn extract_bytes(bytes: &[u8]) -> Document {
+        let out = HtmlExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(Blob::new(bytes.to_vec(), "text/html", None)),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        out.into_documents().unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_page_declared_in_a_legacy_charset_is_decoded_with_it() {
+        let doc = extract_bytes(
+            b"<html><head><meta charset=\"windows-1252\"><title>Caf\xE9 r\xE9sum\xE9</title>\
+              </head><body><p>Caf\xE9 r\xE9sum\xE9</p></body></html>",
+        )
+        .await;
+        assert_eq!(doc.title.as_deref(), Some("Café résumé"));
+        assert_eq!(doc.content, "Café résumé");
+
+        // `iso-8859-1` is a WHATWG label for windows-1252, declared the http-equiv way.
+        let doc = extract_bytes(
+            b"<html><head><META HTTP-EQUIV='Content-Type' CONTENT='text/html; charset=ISO-8859-1'>\
+              </head><body><p>na\xEFve</p></body></html>",
+        )
+        .await;
+        assert_eq!(doc.content, "naïve");
+    }
+
+    #[tokio::test]
+    async fn a_shift_jis_page_is_decoded() {
+        let doc = extract_bytes(
+            b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=Shift_JIS\">\
+              </head><body><p>\x93\xfa\x96{\x8c\xea</p></body></html>",
+        )
+        .await;
+        assert_eq!(doc.content, "日本語");
+    }
+
+    #[tokio::test]
+    async fn a_byte_order_mark_wins_and_is_stripped() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            "<html><head><meta charset=\"windows-1252\"></head><body><p>Café</p></body></html>"
+                .as_bytes(),
+        );
+        let doc = extract_bytes(&bytes).await;
+        assert_eq!(doc.content, "Café");
+    }
+
+    #[tokio::test]
+    async fn valid_utf8_is_kept_despite_a_wrong_legacy_declaration() {
+        let doc = extract_bytes(
+            "<html><head><meta charset=\"iso-8859-1\"></head><body><p>Café</p></body></html>"
+                .as_bytes(),
+        )
+        .await;
+        assert_eq!(doc.content, "Café");
     }
 
     #[tokio::test]

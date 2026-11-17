@@ -130,6 +130,8 @@ lopdf = "0.45"
 docx-rs = { version = "0.4", default-features = false }
 calamine = "0.36"
 scraper = "0.27"
+# WHATWG encodings, to decode HTML pages declared in a legacy charset.
+encoding_rs = "0.8"
 pulldown-cmark = "0.13"
 csv = "1.4"
 # Binary record formats. `rmpv` reads MessagePack without a schema, `apache-avro`

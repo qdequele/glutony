@@ -3471,6 +3471,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ego-tree",
+ "encoding_rs",
  "meili-ingest-plugin-sdk",
  "scraper",
  "serde",
