@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use meili_ingest_plugin_sdk::{
-    Backoff, PipelineDefinition, PluginInput, PluginOutput, RetryConfig, StepDefinition,
+    Backoff, INDEXER_PLUGIN, IndexReport, JobStatus, PipelineDefinition, PluginInput, PluginOutput,
+    RetryConfig, StepActivityOutput, StepDefinition, StepResult, UsageUnits,
 };
 
 /// Steps whose dependencies are all in `done` and that are not yet done themselves,
@@ -105,6 +106,200 @@ pub fn group_documents(
         out.push(PluginInput::Documents(chunk));
     }
     out
+}
+
+/// What a step consumed, for the job's usage event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepMetering {
+    /// Parallel branches the step ran as (1 unless fanned out).
+    pub branches: usize,
+    /// Wall time, summed across the branches that completed.
+    pub duration_ms: u64,
+    /// Bytes consumed, summed across the branches that completed.
+    pub input_bytes: u64,
+    /// Billable units the plugin reported, summed across the branches that completed.
+    pub usage: UsageUnits,
+}
+
+impl StepMetering {
+    /// A step of `branches` branches that metered nothing.
+    pub fn none(branches: usize) -> Self {
+        Self {
+            branches,
+            duration_ms: 0,
+            input_bytes: 0,
+            usage: UsageUnits::none(),
+        }
+    }
+}
+
+/// What a completed step produced, plus the metering the usage event needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepOutcome {
+    /// The step's output (`Many` of the branch outputs when fanned out).
+    pub output: PluginOutput,
+    /// What it consumed.
+    pub metering: StepMetering,
+}
+
+/// Why a step did not complete.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepFailure {
+    /// Cancelled. `Some` when branches had already completed.
+    Cancelled(Option<StepMetering>),
+    /// Failed, with the reason.
+    Failed {
+        /// Why.
+        message: String,
+        /// What the step consumed.
+        metering: StepMetering,
+    },
+}
+
+/// Why one branch activity did not complete.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchError {
+    /// The activity was cancelled.
+    Cancelled,
+    /// The activity failed, with the reason.
+    Failed(String),
+}
+
+/// Fold the results of a fanned-out step's branches into the step's outcome.
+///
+/// Metering is summed across branches: one fanned-out step is one billable line,
+/// however many activities carried it out. A failed branch fails the step and takes
+/// precedence over a cancelled one.
+pub fn merge_branches(
+    results: Vec<Result<StepActivityOutput, BranchError>>,
+) -> Result<StepOutcome, StepFailure> {
+    let total = results.len();
+    let mut outputs = Vec::with_capacity(total);
+    let mut metering = StepMetering::none(total);
+    let mut cancelled = false;
+    let mut first_error: Option<String> = None;
+    for result in results {
+        match result {
+            Ok(o) => {
+                metering.duration_ms += o.duration_ms;
+                metering.input_bytes += o.input_bytes;
+                metering.usage.merge(o.usage);
+                outputs.push(o.output);
+            }
+            Err(BranchError::Cancelled) => cancelled = true,
+            Err(BranchError::Failed(msg)) => {
+                first_error.get_or_insert(msg);
+            }
+        }
+    }
+    if let Some(msg) = first_error {
+        return Err(StepFailure::Failed {
+            message: format!(
+                "{} of {total} branches failed; first error: {msg}",
+                total - outputs.len()
+            ),
+            metering: StepMetering::none(1),
+        });
+    }
+    if cancelled {
+        return Err(StepFailure::Cancelled(None));
+    }
+    Ok(StepOutcome {
+        output: PluginOutput::Many(outputs),
+        metering,
+    })
+}
+
+/// How a round of parallel steps ends the job, when it does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoundEnd {
+    /// A step was cancelled.
+    Cancelled,
+    /// A step failed; the job's error message.
+    Failed(String),
+}
+
+/// What one round of parallel steps did to the job.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Round {
+    /// One row per step to record.
+    pub rows: Vec<StepResult>,
+    /// Outputs of the steps that completed, by step id.
+    pub outputs: Vec<(String, PluginOutput)>,
+    /// The indexer's report, when the indexer completed in this round.
+    pub index_report: Option<IndexReport>,
+    /// Set when the job stops here: the first step, in `ready` order, that did not
+    /// complete decides how.
+    pub end: Option<RoundEnd>,
+}
+
+fn step_row(
+    step: &StepDefinition,
+    status: JobStatus,
+    document_count: usize,
+    error: Option<String>,
+    metering: StepMetering,
+) -> StepResult {
+    StepResult {
+        step_id: step.id.clone(),
+        plugin: step.plugin.clone(),
+        status,
+        document_count,
+        branches: metering.branches,
+        error,
+        duration_ms: metering.duration_ms,
+        input_bytes: metering.input_bytes,
+        usage: metering.usage,
+    }
+}
+
+/// Settle one round: `results[i]` is what running `ready[i]` gave.
+///
+/// Steps are recorded in `ready` order up to the first one that did not complete,
+/// which ends the job.
+pub fn settle_round(
+    ready: &[StepDefinition],
+    results: Vec<Result<StepOutcome, StepFailure>>,
+) -> Round {
+    let mut round = Round::default();
+    for (step, result) in ready.iter().zip(results) {
+        match result {
+            Ok(outcome) => {
+                if let PluginOutput::Indexed(r) = &outcome.output
+                    && step.plugin == INDEXER_PLUGIN
+                {
+                    round.index_report = Some(r.clone());
+                }
+                round.rows.push(step_row(
+                    step,
+                    JobStatus::Succeeded,
+                    outcome.output.document_count(),
+                    None,
+                    outcome.metering,
+                ));
+                round.outputs.push((step.id.clone(), outcome.output));
+            }
+            Err(StepFailure::Cancelled(_)) => {
+                round.end = Some(RoundEnd::Cancelled);
+                break;
+            }
+            Err(StepFailure::Failed { message, .. }) => {
+                round.end = Some(RoundEnd::Failed(format!(
+                    "step {} ({}) failed: {message}",
+                    step.id, step.plugin
+                )));
+                round.rows.push(step_row(
+                    step,
+                    JobStatus::Failed,
+                    0,
+                    Some(message),
+                    StepMetering::none(1),
+                ));
+                break;
+            }
+        }
+    }
+    round
 }
 
 /// Temporal retry parameters derived from a step's [`RetryConfig`].
@@ -340,6 +535,146 @@ mod tests {
             matches!(fan_out_branches("$.many", many.clone(), 10), FanOut::Branches(b) if b.len() == 2)
         );
         assert!(matches!(fan_out_branches("$", many, 10), FanOut::Branches(b) if b.len() == 1));
+    }
+
+    fn branch_ok(tokens: u64, duration_ms: u64, input_bytes: u64) -> StepActivityOutput {
+        StepActivityOutput {
+            step_id: "enrich".into(),
+            output: PluginOutput::Documents(vec![Document::with_id("d", "x")]),
+            duration_ms,
+            usage: UsageUnits::llm(tokens, 1),
+            input_bytes,
+            documents_out: 1,
+        }
+    }
+
+    #[test]
+    fn merged_branches_sum_their_metering() {
+        let out = merge_branches(vec![Ok(branch_ok(10, 5, 100)), Ok(branch_ok(20, 7, 200))])
+            .expect("both branches completed");
+        assert_eq!(out.output.document_count(), 2);
+        assert!(matches!(&out.output, PluginOutput::Many(o) if o.len() == 2));
+        assert_eq!(out.metering.branches, 2);
+        assert_eq!(out.metering.duration_ms, 12);
+        assert_eq!(out.metering.input_bytes, 300);
+        assert_eq!(out.metering.usage.llm_input_tokens, 30);
+        assert_eq!(out.metering.usage.llm_requests, 2);
+    }
+
+    #[test]
+    fn a_failed_branch_wins_over_a_cancelled_one() {
+        let err = merge_branches(vec![
+            Err(BranchError::Cancelled),
+            Err(BranchError::Failed("boom".into())),
+        ])
+        .expect_err("nothing completed");
+        assert!(
+            matches!(&err, StepFailure::Failed { message, .. } if message.starts_with("2 of 2")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_fan_out_over_nothing_is_an_empty_step() {
+        let out = merge_branches(vec![]).expect("nothing to run");
+        assert_eq!(out.output, PluginOutput::Many(vec![]));
+        assert_eq!(out.metering, StepMetering::none(0));
+    }
+
+    fn outcome(tokens: u64) -> StepOutcome {
+        StepOutcome {
+            output: PluginOutput::Documents(vec![
+                Document::with_id("a", "x"),
+                Document::with_id("b", "y"),
+            ]),
+            metering: StepMetering {
+                branches: 1,
+                duration_ms: 40,
+                input_bytes: 9,
+                usage: UsageUnits::llm(tokens, 1),
+            },
+        }
+    }
+
+    fn failed(message: &str, metering: StepMetering) -> StepFailure {
+        StepFailure::Failed {
+            message: message.into(),
+            metering,
+        }
+    }
+
+    fn steps(ids: &[&str]) -> Vec<StepDefinition> {
+        ids.iter().map(|id| StepDefinition::new(*id, "x")).collect()
+    }
+
+    #[test]
+    fn a_round_of_completed_steps_is_recorded_in_order() {
+        let round = settle_round(&steps(&["b", "c"]), vec![Ok(outcome(1)), Ok(outcome(2))]);
+        assert_eq!(round.end, None);
+        assert_eq!(round.index_report, None);
+        let ids: Vec<_> = round.outputs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["b", "c"]);
+        assert_eq!(round.rows.len(), 2);
+        let row = &round.rows[0];
+        assert_eq!(row.step_id, "b");
+        assert_eq!(row.plugin, "x");
+        assert_eq!(row.status, JobStatus::Succeeded);
+        assert_eq!(row.document_count, 2);
+        assert_eq!(row.branches, 1);
+        assert_eq!(row.error, None);
+        assert_eq!(row.duration_ms, 40);
+        assert_eq!(row.input_bytes, 9);
+        assert_eq!(row.usage.llm_input_tokens, 1);
+    }
+
+    #[test]
+    fn a_failed_step_ends_the_job_on_its_own_row() {
+        let round = settle_round(
+            &steps(&["a", "b"]),
+            vec![Ok(outcome(1)), Err(failed("boom", StepMetering::none(1)))],
+        );
+        assert_eq!(
+            round.end,
+            Some(RoundEnd::Failed("step b (x) failed: boom".into()))
+        );
+        let last = round.rows.last().expect("rows");
+        assert_eq!(last.step_id, "b");
+        assert_eq!(last.status, JobStatus::Failed);
+        assert_eq!(last.document_count, 0);
+        assert_eq!(last.error.as_deref(), Some("boom"));
+        assert_eq!(round.outputs.len(), 1);
+    }
+
+    #[test]
+    fn the_first_step_that_did_not_complete_decides_how_the_job_ends() {
+        let round = settle_round(
+            &steps(&["b", "c"]),
+            vec![
+                Err(StepFailure::Cancelled(None)),
+                Err(failed("boom", StepMetering::none(1))),
+            ],
+        );
+        assert_eq!(round.end, Some(RoundEnd::Cancelled));
+    }
+
+    #[test]
+    fn the_indexer_report_is_kept_only_for_the_indexer() {
+        let report = IndexReport {
+            index: "movies".into(),
+            ..Default::default()
+        };
+        let indexed = |report: &IndexReport| StepOutcome {
+            output: PluginOutput::Indexed(report.clone()),
+            metering: StepMetering::none(1),
+        };
+        let ready = vec![
+            StepDefinition::new("other", "x"),
+            StepDefinition::new("index", INDEXER_PLUGIN),
+        ];
+        let round = settle_round(&ready, vec![Ok(indexed(&report)), Ok(indexed(&report))]);
+        assert_eq!(round.index_report, Some(report.clone()));
+        let round = settle_round(&ready[..1], vec![Ok(indexed(&report))]);
+        assert_eq!(round.index_report, None);
     }
 
     #[test]
