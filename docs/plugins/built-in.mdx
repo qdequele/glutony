@@ -257,7 +257,10 @@ file, network or process API, so a script can only reach `doc`. `print` and
 `debug` are accepted but their output is discarded, so a script cannot write to
 the worker's logs. Every run is
 additionally bounded by the operation and wall-clock budgets above, and by fixed
-caps on expression depth, call depth, and string, array and map sizes.
+caps on expression depth (64) and call depth (16). Data sizes are capped on top
+of the incoming document: a script may build up to 512 KiB of string bytes,
+10,000 array elements and 10,000 map entries beyond what `doc` already holds, so
+a large document is not rejected for the size it arrived with.
 
 ### `llm_enricher`
 

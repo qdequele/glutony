@@ -74,11 +74,11 @@ const HEARTBEAT_EVERY: usize = 10;
 const MAX_EXPR_DEPTH: usize = 64;
 /// Deepest function call chain a script may build (bounds recursion).
 const MAX_CALL_LEVELS: usize = 16;
-/// Longest string a script may build, in characters.
+/// String bytes a script may build on top of the document it was given.
 const MAX_STRING_SIZE: usize = 512 * 1024;
-/// Largest array a script may build.
+/// Array elements a script may build on top of the document it was given.
 const MAX_ARRAY_SIZE: usize = 10_000;
-/// Largest map a script may build.
+/// Map entries a script may build on top of the document it was given.
 const MAX_MAP_SIZE: usize = 10_000;
 /// Operations between two wall-clock checks in `on_progress`.
 const PROGRESS_EVERY: u64 = 1_000;
@@ -229,9 +229,29 @@ impl Runner {
             .store(now.saturating_add(budget), Ordering::Relaxed);
     }
 
+    /// Size the string, array and map caps for one document.
+    ///
+    /// Rhai checks the whole container a value lives in, not what the script added:
+    /// after `doc.title = …` it sums every string, array element and map entry in
+    /// `doc`, and after `doc.content.trim()` it measures all of `content`. Fixed caps
+    /// would fail scripts on large documents they only received, so each cap is the
+    /// document's own size plus the fixed headroom. The headroom is added, not
+    /// multiplied, so a script on a large document can build no more than one on a
+    /// small document.
+    fn size_limits_for(&mut self, map: &Map) {
+        let (arrays, maps, strings) = map_sizes(map);
+        self.engine
+            .set_max_string_size(strings.saturating_add(MAX_STRING_SIZE));
+        self.engine
+            .set_max_array_size(arrays.saturating_add(MAX_ARRAY_SIZE));
+        self.engine
+            .set_max_map_size(maps.saturating_add(MAX_MAP_SIZE));
+    }
+
     /// Run the script over one document, mutating it in place.
-    fn run(&self, doc: &mut Document) -> Result<Verdict, PluginError> {
+    fn run(&mut self, doc: &mut Document) -> Result<Verdict, PluginError> {
         let map = to_scope_map(doc)?;
+        self.size_limits_for(&map);
         let mut scope = Scope::new();
         scope.push("doc", map);
 
@@ -252,6 +272,37 @@ impl Runner {
             return Ok(Verdict::Drop);
         }
         Ok(Verdict::Keep)
+    }
+}
+
+/// Sizes of a map as rhai's data-size check counts them: `(array elements, map
+/// entries, string bytes)`, summed over every nested container.
+fn map_sizes(map: &Map) -> (usize, usize, usize) {
+    let mut total = (0, 0, 0);
+    for value in map.values() {
+        total.1 += 1;
+        add_sizes(&mut total, value);
+    }
+    total
+}
+
+/// Add the sizes of the containers and strings inside `value` to `total`, the way
+/// rhai's `calc_data_sizes` does for an element of a map or an array.
+fn add_sizes(total: &mut (usize, usize, usize), value: &Dynamic) {
+    if let Ok(s) = value.as_immutable_string_ref() {
+        total.2 += s.len();
+    } else if let Ok(m) = value.as_map_ref() {
+        let (a, m, s) = map_sizes(&m);
+        total.0 += a;
+        total.1 += m;
+        total.2 += s;
+    } else if let Ok(array) = value.as_array_ref() {
+        for v in array.iter() {
+            total.0 += 1;
+            add_sizes(total, v);
+        }
+    } else if let Ok(blob) = value.as_blob_ref() {
+        total.0 += 1 + blob.len();
     }
 }
 
@@ -490,7 +541,7 @@ impl Plugin for DocumentScriptPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let docs = input.into_documents()?;
-        let runner = Runner::new(&cfg)?;
+        let mut runner = Runner::new(&cfg)?;
 
         let mut out = Vec::with_capacity(docs.len());
         for (i, mut doc) in docs.into_iter().enumerate() {
@@ -1040,6 +1091,59 @@ mod tests {
         let out = run(vec![d], script("doc.fields.n = 2.5;")).await;
 
         assert_eq!(out[0].fields["n"], json!(2.5));
+    }
+
+    /// The size caps bound what a script builds, not the document it was handed:
+    /// rhai checks the whole `doc` map after every assignment into it and the whole
+    /// string after every method call on it.
+    #[tokio::test]
+    async fn a_large_document_is_not_rejected_by_the_size_caps() {
+        let big = "x".repeat(600 * 1024);
+        let mut d = doc("a", &big);
+        d.fields.insert("name".into(), json!("Widget"));
+
+        let out = try_run(vec![d.clone()], script("doc.title = doc.fields.name;"))
+            .await
+            .unwrap();
+        assert_eq!(out[0].title.as_deref(), Some("Widget"));
+        assert_eq!(out[0].content, big);
+
+        let out = try_run(vec![d], script("doc.content.trim();"))
+            .await
+            .unwrap();
+        assert_eq!(out[0].content, big);
+
+        let mut d = doc("b", "x");
+        d.fields
+            .insert("links".into(), json!(vec!["l"; MAX_ARRAY_SIZE + 1]));
+        let out = try_run(vec![d], script("doc.fields.x = 1;")).await.unwrap();
+        assert_eq!(out[0].fields["x"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn a_script_still_cannot_build_an_oversized_string() {
+        let err = try_run(
+            vec![doc("a", "x")],
+            script("let s = \"xxxxxxxx\"; loop { s += s; }"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("too large")),
+            "got {err:?}"
+        );
+
+        // On a large document the headroom is the same fixed cap, not a multiple.
+        let err = try_run(
+            vec![doc("a", &"x".repeat(600 * 1024))],
+            script("doc.content += doc.content;"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("too large")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
