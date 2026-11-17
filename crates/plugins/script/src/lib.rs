@@ -40,7 +40,9 @@
 //! Pipeline configs are tenant-authored, so the engine is locked down. `no_module`
 //! removes `import`/`export`, `no_custom_syntax` removes syntax extension and
 //! `no_time` removes the clock; rhai has no file, network or process API to begin
-//! with, so a script can only reach `doc`. On top of that every run is bounded by an
+//! with, so a script can only reach `doc`. `print` and `debug` are accepted but
+//! their output is discarded, so a script cannot write to the worker's logs. On top
+//! of that every run is bounded by an
 //! operation budget (`max_ops`), a wall-clock budget (`timeout_ms`) and fixed caps on
 //! expression depth, call depth, string, array and map sizes.
 //!
@@ -178,6 +180,11 @@ impl Runner {
     /// the step as `InvalidConfig` whatever `on_error` says.
     fn new(cfg: &Config) -> Result<Self, PluginError> {
         let mut engine = Engine::new();
+        // Rhai's default handlers `println!` the script's text onto the worker's
+        // stdout, next to its logs. Discard it rather than disable the symbols, so
+        // scripts that call them keep compiling.
+        engine.on_print(|_| {});
+        engine.on_debug(|_, _, _| {});
         engine.set_max_operations(cfg.max_ops);
         engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
         engine.set_max_call_levels(MAX_CALL_LEVELS);
@@ -871,6 +878,54 @@ mod tests {
         let out = run(vec![doc("a", "x")], script("doc.fields.v = 10.0 / 4.0;")).await;
 
         assert_eq!(out[0].fields.get("v"), Some(&json!(2.5)));
+    }
+
+    /// Set in the child process [`print_and_debug_do_not_reach_stdout`] spawns.
+    const PRINT_CHILD_ENV: &str = "DOCUMENT_SCRIPT_PRINT_CHILD";
+    const PRINT_MARKER: &str = "forged-log-line-7f3a";
+
+    /// Runs only inside the child process: a script that prints and debugs.
+    #[tokio::test]
+    async fn print_and_debug_child() {
+        if std::env::var_os(PRINT_CHILD_ENV).is_none() {
+            return;
+        }
+        let out = run(
+            vec![doc("a", "x")],
+            script(&format!(
+                r#"print("{PRINT_MARKER}"); debug("{PRINT_MARKER}"); true"#
+            )),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Tenant scripts must not write to the worker's stdout, where they would
+    /// interleave forged lines with the structured logs. Rhai's default `print` and
+    /// `debug` handlers `println!`, so this runs the script in a child test process
+    /// without output capture and checks what reached its stdout.
+    #[test]
+    fn print_and_debug_do_not_reach_stdout() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::print_and_debug_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PRINT_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "child failed: {stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child test did not run: {stdout}"
+        );
+        assert!(
+            !stdout.contains(PRINT_MARKER),
+            "script output reached stdout: {stdout}"
+        );
     }
 
     #[tokio::test]

@@ -248,7 +248,9 @@ JSON has no way to spell those values — without the check they would be indexe
 
 **Sandbox.** Pipeline configs are tenant-authored, so the engine is built with
 `no_module` (no `import`/`export`), `no_custom_syntax` and `no_time`; rhai has no
-file, network or process API, so a script can only reach `doc`. Every run is
+file, network or process API, so a script can only reach `doc`. `print` and
+`debug` are accepted but their output is discarded, so a script cannot write to
+the worker's logs. Every run is
 additionally bounded by the operation and wall-clock budgets above, and by fixed
 caps on expression depth, call depth, and string, array and map sizes.
 
