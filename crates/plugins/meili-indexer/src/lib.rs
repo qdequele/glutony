@@ -46,9 +46,16 @@ use serde_json::Value;
 pub const NAME: &str = INDEXER_PLUGIN;
 
 /// How often Meilisearch is polled while waiting for a task.
+#[cfg(not(test))]
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Waiting is done in slices so a heartbeat is emitted between them.
+#[cfg(not(test))]
 const WAIT_SLICE: Duration = Duration::from_secs(10);
+// Short in tests, so the give-up path of `wait_for_task` runs in about a second.
+#[cfg(test)]
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(test)]
+const WAIT_SLICE: Duration = Duration::from_millis(100);
 /// Default time to wait for one task before giving up (retryable), when neither the
 /// step's `task_timeout_secs` nor the worker's [`TASK_TIMEOUT_ENV`] says otherwise.
 const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -864,6 +871,213 @@ mod tests {
         if std::env::var(TASK_TIMEOUT_ENV).is_err() {
             assert_eq!(task_timeout(Some(0)), DEFAULT_TASK_TIMEOUT);
             assert_eq!(task_timeout(None), DEFAULT_TASK_TIMEOUT);
+        }
+    }
+
+    /// Mount a missing index whose creation (task 1) ends `failed` with `code`.
+    async fn mount_failed_index_creation(server: &MockServer, code: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(index_not_found()))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tasks/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                1,
+                "failed",
+                "indexCreation",
+                json!({"primaryKey": "id"}),
+                Some(meili_error(
+                    code,
+                    "invalid_request",
+                    "index creation failed",
+                )),
+            )))
+            .expect(1..)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_task(server: &MockServer, uid: u32, status: &str, error: Option<Value>) {
+        Mock::given(method("GET"))
+            .and(path(format!("/tasks/{uid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(task(
+                uid,
+                status,
+                "documentAdditionOrUpdate",
+                json!({"receivedDocuments": 1, "indexedDocuments": 1}),
+                error,
+            )))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_task_that_never_finishes_times_out_as_retryable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
+            .mount(&server)
+            .await;
+        mount_documents_add(&server, 7, 1, None).await;
+        mount_task(&server, 7, "processing", None).await;
+
+        let mut cfg = config(&server.uri());
+        cfg["task_timeout_secs"] = json!(1);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            run(&server, PluginInput::Documents(docs()), cfg),
+        )
+        .await
+        .expect("the wait loop must give up")
+        .unwrap_err();
+        match err {
+            PluginError::Retryable(msg) => {
+                assert!(msg.contains("task 7"), "{msg}");
+                assert!(msg.contains("did not finish within 1s"), "{msg}");
+            }
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+        assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
+    }
+
+    #[tokio::test]
+    async fn index_already_exists_on_creation_is_not_an_error() {
+        let server = MockServer::start().await;
+        mount_failed_index_creation(&server, "index_already_exists").await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        let out = run(
+            &server,
+            PluginInput::Documents(docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            PluginOutput::Indexed(IndexReport {
+                index: INDEX.into(),
+                document_count: 2,
+                task_uids: vec![2],
+            })
+        );
+
+        // Same with no documents to add.
+        let server = MockServer::start().await;
+        mount_failed_index_creation(&server, "index_already_exists").await;
+        let out = run(
+            &server,
+            PluginInput::Documents(vec![]),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            PluginOutput::Indexed(IndexReport {
+                index: INDEX.into(),
+                document_count: 0,
+                task_uids: vec![],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_index_creation_failure_is_non_retryable() {
+        let server = MockServer::start().await;
+        mount_failed_index_creation(&server, "invalid_index_uid").await;
+        mount_documents_add(&server, 2, 1, Some("id")).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        let err = run(
+            &server,
+            PluginInput::Documents(docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            PluginError::NonRetryable(msg) => {
+                assert!(msg.contains("task 1 (index creation)"), "{msg}")
+            }
+            other => panic!("expected NonRetryable, got {other:?}"),
+        }
+
+        // Same with no documents to add.
+        let server = MockServer::start().await;
+        mount_failed_index_creation(&server, "invalid_index_uid").await;
+        let err = run(
+            &server,
+            PluginInput::Documents(vec![]),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            PluginError::NonRetryable(msg) => {
+                assert!(msg.contains("task 1 (index creation)"), "{msg}")
+            }
+            other => panic!("expected NonRetryable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_later_batch_fails_the_step_naming_its_task() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
+            .mount(&server)
+            .await;
+        // One batch per document; each addition gets its own task uid, in order.
+        for uid in [10, 11, 12] {
+            Mock::given(method("POST"))
+                .and(path(format!("/indexes/{INDEX}/documents")))
+                .respond_with(
+                    ResponseTemplate::new(202)
+                        .set_body_json(task_info(uid, "documentAdditionOrUpdate")),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        mount_task(&server, 10, "succeeded", None).await;
+        mount_task(
+            &server,
+            11,
+            "failed",
+            Some(meili_error(
+                "invalid_document_id",
+                "invalid_request",
+                "Document identifier is invalid.",
+            )),
+        )
+        .await;
+        mount_task(&server, 12, "succeeded", None).await;
+
+        let mut input = docs();
+        input.push(Document::with_id("c", "third"));
+        let mut cfg = config(&server.uri());
+        cfg["batch_size"] = json!(1);
+        let err = run(&server, PluginInput::Documents(input), cfg)
+            .await
+            .unwrap_err();
+        match err {
+            PluginError::NonRetryable(msg) => {
+                assert!(msg.contains("task 11 (document addition)"), "{msg}");
+                assert!(msg.contains("Document identifier is invalid."), "{msg}");
+            }
+            other => panic!("expected NonRetryable, got {other:?}"),
         }
     }
 
