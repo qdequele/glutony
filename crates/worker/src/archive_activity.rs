@@ -411,6 +411,12 @@ impl ArchiveActivities {
                 continue;
             }
             let mut context = input.context.clone();
+            // A file whose pipeline writes through connections never reads the
+            // request's destination: keep the caller's key out of its history.
+            if pipeline.pins_destination() {
+                context.host = None;
+                context.api_key = None;
+            }
             context.index = Some(file_index(
                 locked,
                 &pipeline,
@@ -936,6 +942,58 @@ mod tests {
             "{:?}",
             wrong_index.failed
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_whose_pipeline_pins_a_connection_gets_no_request_key() {
+        // The archive's own input keeps the request's destination for the files that
+        // need it; a file job that writes through a connection must not carry the
+        // caller's key into its workflow history.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/jobs"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let a = activities(&server.uri());
+        let job_id = Uuid::new_v4();
+        let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"hello")])).await;
+        let expanded = a
+            .expand(&ExpandArchiveInput { job_id, input })
+            .await
+            .unwrap();
+        let mut pinned = pipeline("pinned", None);
+        pinned.steps[1].config = serde_json::json!({ "connection": "prod-movies" });
+
+        for (pipeline, key, host) in [
+            (pinned, None, None),
+            (
+                pipeline("plain", None),
+                Some("key"),
+                Some("http://meili:7700"),
+            ),
+        ] {
+            let out = a
+                .prepare(&PrepareArchiveInput {
+                    job_id,
+                    manifest: expanded.manifest.clone(),
+                    offset: 0,
+                    limit: 10,
+                    context: destination(),
+                    forced_pipeline: Some(ForcedPipeline {
+                        pipeline,
+                        index_pattern: None,
+                    }),
+                    locked_index: Some("locked".into()),
+                })
+                .await
+                .unwrap();
+            let job = &out.jobs[0].workflow_input;
+            assert_eq!(job.context.api_key.as_deref(), key, "{}", job.pipeline.uid);
+            assert_eq!(job.context.host.as_deref(), host, "{}", job.pipeline.uid);
+            assert_eq!(job.context.tenant_id.as_deref(), Some("t1"));
+            assert_eq!(job.context.index.as_deref(), Some("locked"));
+        }
     }
 
     #[tokio::test]

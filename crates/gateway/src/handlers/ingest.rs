@@ -291,6 +291,14 @@ pub async fn submit_one(
         crate::preflight::check_write(&state.http, host, key, &target_index).await?;
     }
 
+    // A pinned pipeline never reads the request's destination: its indexer steps
+    // write with their connection's key. Drop it, so that a key the edge forwards on
+    // every request is not written to the workflow history for nothing.
+    if pipeline.pins_destination() {
+        ctx.host = None;
+        ctx.api_key = None;
+    }
+
     // A Lab engine refuses work for an account out of credits (spec v2 §8.1), and
     // refuses rather than runs unbilled work when the Lab cannot answer (decision A:
     // every Lab-account job is billed).
@@ -485,7 +493,7 @@ fn archive_target_index(
 async fn submit_archive(
     state: &AppState,
     payload: IngestPayload,
-    ctx: MeiliContext,
+    mut ctx: MeiliContext,
     forced: Option<ForcedPipeline>,
     locked_index: Option<&str>,
     mime: &str,
@@ -523,6 +531,16 @@ async fn submit_archive(
         && let (Some(index), Some(host), Some(key)) = (&target_index, &ctx.host, &ctx.api_key)
     {
         crate::preflight::check_write(&state.http, host, key, index).await?;
+    }
+    // Every file runs through the forced pipeline; pinned, it never reads the
+    // request's destination, so keep the caller's key out of the workflow history.
+    // Files routed by their own type may need it: the worker drops it file by file.
+    if forced
+        .as_ref()
+        .is_some_and(|f| f.pipeline.pins_destination())
+    {
+        ctx.host = None;
+        ctx.api_key = None;
     }
     if let (Some(lab), Some(account)) = (&state.lab, ctx.tenant_id.as_deref()) {
         lab.check_credits(account).await?;
@@ -1637,6 +1655,65 @@ mod tests {
             inputs[0].context.host.is_none() && inputs[0].context.api_key.is_none(),
             "the destination comes from the connection, not the request"
         );
+    }
+
+    /// Mount `POST /internal/resolve` → a pipeline whose indexer pins a connection.
+    async fn mount_resolve_pinned(server: &MockServer) {
+        let mut pinned = sample_pipeline("movies", None);
+        pinned.steps[0].config = json!({ "connection": "prod-movies" });
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "pipeline": pinned })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_pinned_pipeline_keeps_the_request_key_out_of_the_workflow() {
+        // The edge forwards the caller's own key on every request. A pipeline pinned
+        // to a connection never uses it, so it must not sit in Temporal's history.
+        let server = MockServer::start().await;
+        mount_resolve_pinned(&server).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(index_scoped_request("/ingest", "http://meili", "callerKey"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let ctx = &starter.inputs()[0].context;
+        assert_eq!(ctx.api_key, None, "the caller's key is dropped");
+        assert_eq!(ctx.host, None);
+        assert_eq!(ctx.tenant_id.as_deref(), Some("hackersearch"));
+        assert_eq!(ctx.index.as_deref(), Some("from-field"));
+
+        // The same pipeline forced on every file of an archive.
+        let mut req = zip_upload("/ingest?pipeline=movies");
+        req.headers_mut()
+            .insert("x-meili-project-id", "hackersearch".parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let ctx = &starter.archive_inputs()[0].context;
+        assert_eq!(ctx.api_key, None, "the caller's key is dropped");
+        assert_eq!(ctx.host, None);
+        assert_eq!(ctx.tenant_id.as_deref(), Some("hackersearch"));
+    }
+
+    #[tokio::test]
+    async fn an_archive_routed_file_by_file_keeps_the_request_destination() {
+        // Its files are routed by their own type in the worker; one whose pipeline
+        // pins nothing still needs the request's destination.
+        let server = MockServer::start().await;
+        mount_resolve_pinned(&server).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app.oneshot(zip_upload("/ingest")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let ctx = &starter.archive_inputs()[0].context;
+        assert_eq!(ctx.api_key.as_deref(), Some("masterKey"));
+        assert_eq!(ctx.host.as_deref(), Some("http://localhost:7700"));
     }
 
     #[tokio::test]

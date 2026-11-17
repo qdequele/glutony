@@ -87,6 +87,11 @@ the document, rather than looping on `413`.
 - The key is decrypted only inside the indexer activity, just before the
   plugin runs. The workflow carries the connection's **name**, so the key is
   never written to Temporal history.
+- A Meilisearch key sent with a request to a pinned pipeline (`X-Meili-Api-Key`,
+  `Authorization: Bearer`, or the `MEILI_API_KEY` fallback) is never used, and
+  is dropped before the job starts, so it is not written to Temporal history
+  either. Inside an archive whose files are routed by their own type, it is
+  dropped for each file whose pipeline is pinned.
 - The host is re-checked against `MEILI_CONNECTION_HOSTS` at every run, so
   tightening the policy takes effect immediately.
 - Connections are tenant-scoped like pipelines: a project sees its own
