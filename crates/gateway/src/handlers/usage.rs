@@ -166,19 +166,24 @@ fn validate_date(value: &str, field: &str) -> Result<(), GatewayError> {
     }
 }
 
+/// At most `max` bytes of `s`, cut on a character boundary (a byte offset can fall
+/// inside a multi-byte character, where slicing panics), with `…` when cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use meili_ingest_usage::clickhouse::ClickHouseConfig;
-    use wiremock::matchers::{method, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn query() -> UsageQuery {
@@ -238,6 +243,51 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(matches!(err, GatewayError::Upstream(_)), "{msg}");
         assert!(msg.contains("497") && !msg.contains("ch-secret"), "{msg}");
+    }
+
+    /// A body whose byte 300 falls inside `é` (bytes 299..301).
+    fn body_with_a_character_across_byte_300() -> String {
+        format!("{}é{}", "a".repeat(299), "b".repeat(10))
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let cut = truncate(&body_with_a_character_across_byte_300(), 300);
+        assert_eq!(cut, format!("{}…", "a".repeat(299)));
+        // Short and exactly-fitting bodies are untouched.
+        assert_eq!(truncate("short", 300), "short");
+        assert_eq!(truncate(&"a".repeat(300), 300), "a".repeat(300));
+        // A boundary exactly at the limit keeps everything before it.
+        assert_eq!(truncate("ab€", 2), "ab…");
+        assert_eq!(truncate("€uro", 1), "…");
+    }
+
+    #[tokio::test]
+    async fn a_tinybird_failure_is_a_bad_gateway_without_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/pipes/tenant_usage.json"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string(body_with_a_character_across_byte_300()),
+            )
+            .mount(&server)
+            .await;
+        let err = fetch_tinybird(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "tb-read-token",
+            "tenant_usage",
+            "acme",
+            &query(),
+        )
+        .await
+        .expect_err("refused");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, GatewayError::Upstream(_)), "{msg}");
+        assert!(
+            msg.contains("502") && !msg.contains("tb-read-token"),
+            "{msg}"
+        );
     }
 
     #[test]
