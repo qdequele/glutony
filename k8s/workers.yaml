@@ -39,7 +39,8 @@ metadata:
     app.kubernetes.io/component: worker
     meili-ingest/task-queue: workers-general
 spec:
-  replicas: 1
+  # No `replicas`: the ScaledObject below owns the count (1-20), and a value here
+  # would reset it on every `kubectl apply -k`. Without KEDA, set it by hand.
   selector:
     matchLabels:
       app.kubernetes.io/name: workers-general

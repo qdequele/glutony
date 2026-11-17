@@ -17,7 +17,7 @@ kubectl -n meili-ingest get pods
 |---|---|
 | `namespace.yaml` | `meili-ingest` namespace |
 | `control-plane.yaml` | shared `ConfigMap`, control plane `Deployment` + `Service` (9000) |
-| `gateway.yaml` | gateway `Deployment` (2 replicas), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
+| `gateway.yaml` | gateway `Deployment` (2–10 replicas via the HPA), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
 | `workers.yaml` | `workers-general` `Deployment` with a KEDA `ScaledObject` |
 | `temporal.yaml` | **reference only** single-pod Temporal (`auto-setup`) + Postgres + UI |
 | `kustomization.yaml` | ties it together; pin the image tag here |
@@ -27,7 +27,8 @@ kubectl -n meili-ingest get pods
 
 - Kubernetes 1.27+.
 - [KEDA](https://keda.sh) 2.12+ for worker autoscaling (`helm install keda kedacore/keda -n keda --create-namespace`).
-  Without KEDA, delete the `ScaledObject`s and set `replicas` by hand.
+  Without KEDA, delete the `ScaledObject` and add `replicas` to the
+  `workers-general` `Deployment` by hand (the manifest leaves it to the autoscaler).
 - Prometheus scraping the Temporal server (for the default trigger), or KEDA ≥ 2.15 for the native `temporal` scaler.
 - A Postgres database for the control plane.
 - An object store bucket for the blob store (pods do not share a disk).
@@ -151,9 +152,11 @@ as env vars or a service account annotation, with `AWS_REGION` for S3. Tenants'
 
 ## 2. Gateway
 
-- 2 replicas, `RollingUpdate` with `maxUnavailable: 0`, spread across nodes.
+- `RollingUpdate` with `maxUnavailable: 0`, spread across nodes.
 - Readiness and liveness on `GET /health`.
-- `HorizontalPodAutoscaler` 2–10 replicas at 70 % CPU.
+- `HorizontalPodAutoscaler` 2–10 replicas at 70 % CPU. The `Deployment` sets no
+  `replicas`, so re-applying the manifests never resets the count the HPA chose; a
+  fresh install starts one pod until the HPA raises it to 2 a few seconds later.
 - `PodDisruptionBudget` `minAvailable: 1`.
 - Envoy trust: `ENVOY_TRUSTED_HEADER` from the secret. For a standalone
   deployment uncomment `MEILI_URL` / `MEILI_API_KEY` instead.
@@ -279,6 +282,17 @@ kustomization, so this never resets it; add any new key with `kubectl patch secr
 and restart the pods. Control-plane migrations run automatically at boot
 (`sqlx::migrate!`). Workflows in flight keep running: the workflow code is versioned
 by Temporal and activities are retried on the new workers.
+
+The gateway and `workers-general` `Deployment`s set no `replicas`: the HPA and the
+KEDA `ScaledObject` own the count, so `kubectl apply -k` keeps it. On a cluster first
+deployed from manifests that still set `replicas`, the first apply without it scales
+both back to one pod until the autoscalers catch up (a few seconds). To avoid that dip,
+remove the `replicas` line from the last applied configuration first:
+
+```bash
+kubectl -n meili-ingest apply edit-last-applied deployment/meili-gateway
+kubectl -n meili-ingest apply edit-last-applied deployment/workers-general
+```
 
 ### Upgrading to Lab contract v2
 
