@@ -51,6 +51,11 @@ Excel `.xlsx` / `.xls` (`calamine`).
 |---|---|---|
 | `mode` | `"row"` | `row` → one document per row with header → cell pairs in `fields`, `meta.section` = sheet name. `sheet` → one document per sheet. |
 
+`.xlsx`, `.xlsm` and `.xlsb` sheets are read cell by cell, so memory follows the
+cells a sheet holds, not the rectangle between its outermost cells: a stray value
+in `XFD1048576` costs one cell. `.xls` and `.ods` sheets are still loaded as a
+whole grid by `calamine` when the workbook is opened.
+
 ### `html_extractor`
 
 HTML (`scraper`). One document: `title` from `<title>`, `content` from
