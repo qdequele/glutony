@@ -80,7 +80,7 @@ inside plugins or workflow code.
 | `TINYBIRD_TOKEN` | — | Append token for per-tenant [usage analytics](/concepts/usage) (`glutony_worker_append`). Absent disables reporting entirely. The gateway needs `TINYBIRD_READ_TOKEN` to serve it back. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
 | `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |
-| `USAGE_CLICKHOUSE_URL` / `_DATABASE` / `_TABLE` / `_USER` / `_PASSWORD` / `_TIMEOUT_SECS` | — / `default` / `meili_ingest_usage` / `default` / empty / `20` | Record usage in a self-hosted ClickHouse instead of Tinybird. The worker creates the table; the user needs `INSERT`, `SELECT` and `CREATE TABLE` on the database. Setting it together with `TINYBIRD_TOKEN` stops the worker at boot. See [ClickHouse instead of Tinybird](/concepts/usage#clickhouse-instead-of-tinybird). |
+| `USAGE_CLICKHOUSE_URL` / `_DATABASE` / `_TABLE` / `_USER` / `_PASSWORD` / `_TIMEOUT_SECS` | — / `default` / `meili_ingest_usage` / `default` / empty / `20` | Record usage in a self-hosted ClickHouse instead of Tinybird. The worker creates the table; the user needs `INSERT`, `SELECT` and `CREATE TABLE` on the database, and `ALTER ADD COLUMN` on the table for the worker to add the columns a new release brings. Setting it together with `TINYBIRD_TOKEN` stops the worker at boot. See [ClickHouse instead of Tinybird](/concepts/usage#clickhouse-instead-of-tinybird). |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 Workers **never** read `MEILI_URL` / `MEILI_API_KEY`: Meilisearch credentials

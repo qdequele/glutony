@@ -5,7 +5,10 @@
 //! with `INSERT … FORMAT JSONEachRow`, into a `ReplacingMergeTree` with the same
 //! columns, sorting key and TTL as `tinybird/datasources/meili_ingest_usage.datasource`.
 //! The table is created on first use ([`ClickHouseConfig::create_table_sql`]), so a
-//! deployment only provides a database and a user.
+//! deployment only provides a database and a user. An insert that finds the table gone
+//! creates it again, and one that finds a column missing (a table from an older
+//! release) adds the missing columns ([`ClickHouseConfig::add_columns_sql`]); both then
+//! retry once.
 //!
 //! The read side ([`ClickHouseConfig::daily_usage`], the gateway's `GET /usage`) does
 //! what Tinybird's hourly copy and `tenant_usage` endpoint do together, in one query
@@ -18,7 +21,7 @@
 //! | `USAGE_CLICKHOUSE_URL` | — | HTTP interface, e.g. `http://127.0.0.1:8123`. Absent ⇒ not this backend. |
 //! | `USAGE_CLICKHOUSE_DATABASE` | `default` | Must exist. |
 //! | `USAGE_CLICKHOUSE_TABLE` | `meili_ingest_usage` | Created if missing. |
-//! | `USAGE_CLICKHOUSE_USER` | `default` | Workers: `INSERT`, `SELECT`, `CREATE TABLE`. Gateway: `SELECT`. |
+//! | `USAGE_CLICKHOUSE_USER` | `default` | Workers: `INSERT`, `SELECT`, `CREATE TABLE` (and `ALTER ADD COLUMN` to upgrade the table). Gateway: `SELECT`. |
 //! | `USAGE_CLICKHOUSE_PASSWORD` | empty | |
 //! | `USAGE_CLICKHOUSE_TIMEOUT_SECS` | `20` | Worker HTTP timeout. |
 
@@ -129,6 +132,13 @@ impl ClickHouseFailure {
     /// The table does not exist yet.
     pub fn is_unknown_table(&self) -> bool {
         self.code == Some(UNKNOWN_TABLE)
+    }
+
+    /// The rows and the table may disagree on columns: `NO_SUCH_COLUMN_IN_TABLE` (16)
+    /// or `INCORRECT_DATA` (117, what a strict `JSONEachRow` insert answers for a field
+    /// the table lacks; also bad data, which adding columns leaves failing).
+    pub fn is_column_drift(&self) -> bool {
+        matches!(self.code, Some(16 | 117))
     }
 }
 
@@ -271,6 +281,19 @@ impl ClickHouseConfig {
         )
     }
 
+    /// `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for every column: brings a table that
+    /// an older release created up to [`COLUMNS`]. Only additive drift: a changed type
+    /// or a renamed column still fails the insert. New columns go at the end, which
+    /// `JSONEachRow` (matched by name) and the named `GET /usage` query do not mind.
+    pub fn add_columns_sql(&self) -> String {
+        let columns = COLUMNS
+            .iter()
+            .map(|(name, ty)| format!("    ADD COLUMN IF NOT EXISTS `{name}` {ty}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("ALTER TABLE {}\n{columns}", self.qualified_table())
+    }
+
     /// The `GET /usage` query: one row per (day, pipeline_uid, plugin) for one tenant,
     /// with the columns of Tinybird's `tenant_usage` endpoint. `FINAL` collapses
     /// redelivered rows before they are counted. Tenant and dates are bound as typed
@@ -374,18 +397,29 @@ FORMAT JSON",
             .map(|_| ())
     }
 
+    /// Add the columns a table created by an older release lacks
+    /// ([`Self::add_columns_sql`]). Needs the `ALTER` grant.
+    pub async fn add_missing_columns(
+        &self,
+        http: &reqwest::Client,
+    ) -> Result<(), ClickHouseFailure> {
+        self.post(http, &self.add_columns_sql(), None, &[])
+            .await
+            .map(|_| ())
+    }
+
     /// Insert NDJSON usage rows. Strict on purpose: an unknown field fails the insert
     /// (the struct and the table have drifted) instead of being dropped silently.
     pub(crate) async fn insert(
         &self,
         http: &reqwest::Client,
-        ndjson: String,
+        ndjson: &str,
     ) -> Result<(), ClickHouseFailure> {
         let sql = format!("INSERT INTO {} FORMAT JSONEachRow", self.qualified_table());
         self.post(
             http,
             &sql,
-            Some(ndjson),
+            Some(ndjson.to_owned()),
             &[
                 // `ts` is RFC 3339 with a `Z`, which the default parser refuses.
                 ("date_time_input_format", "best_effort"),
@@ -664,6 +698,148 @@ mod tests {
         client.send(&events).await.expect_err("still no grant");
     }
 
+    fn insert_query() -> wiremock::matchers::QueryParamExactMatcher {
+        query_param(
+            "query",
+            "INSERT INTO `glutony`.`meili_ingest_usage` FORMAT JSONEachRow",
+        )
+    }
+
+    fn clickhouse_error(status: u16, code: u32) -> ResponseTemplate {
+        ResponseTemplate::new(status)
+            .insert_header("X-ClickHouse-Exception-Code", code.to_string())
+            .set_body_string(format!("Code: {code}. DB::Exception: test"))
+    }
+
+    /// The table is dropped while the worker runs: the next insert recreates it and
+    /// goes through, instead of every job's usage being rejected until a restart.
+    #[tokio::test]
+    async fn a_table_dropped_after_creation_is_recreated_on_the_next_send() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(insert_query())
+            .respond_with(ResponseTemplate::new(200))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(insert_query())
+            .respond_with(clickhouse_error(404, UNKNOWN_TABLE))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(insert_query())
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(3)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::UsageClient::clickhouse(config(&server), reqwest::Client::new());
+        let events = crate::events_for_job(&crate::JobUsageInput::default());
+        client.send(&events).await.expect("first send");
+        client
+            .send(&events)
+            .await
+            .expect("table dropped meanwhile: recreated, then written");
+    }
+
+    /// A table created by an older release lacks a column added since: the insert's
+    /// unknown-field error adds the missing columns and the rows go in.
+    #[tokio::test]
+    async fn a_table_missing_a_new_column_gets_it_added() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "ALTER TABLE `glutony`.`meili_ingest_usage`",
+            ))
+            .and(body_string_contains(
+                "ADD COLUMN IF NOT EXISTS `error_kind` LowCardinality(String)",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(insert_query())
+            .respond_with(clickhouse_error(400, 117))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(insert_query())
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::UsageClient::clickhouse(config(&server), reqwest::Client::new());
+        let events = crate::events_for_job(&crate::JobUsageInput::default());
+        client
+            .send(&events)
+            .await
+            .expect("columns added, rows written");
+    }
+
+    /// Without the `ALTER` grant the drift is reported as it was: the insert's own
+    /// permanent error, not the grant failure.
+    #[tokio::test]
+    async fn drift_without_the_alter_grant_still_fails_loudly() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ALTER TABLE"))
+            .respond_with(clickhouse_error(500, 497))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(insert_query())
+            .respond_with(clickhouse_error(400, 117))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = crate::UsageClient::clickhouse(config(&server), reqwest::Client::new());
+        let events = crate::events_for_job(&crate::JobUsageInput::default());
+        let err = client.send(&events).await.expect_err("drift");
+        assert!(
+            matches!(err, UsageError::Rejected { status: 400, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn add_columns_covers_every_column() {
+        let sql = ClickHouseConfig::new("http://ch:8123", "glutony", "usage", "u", None)
+            .add_columns_sql();
+        assert!(sql.starts_with("ALTER TABLE `glutony`.`usage`"), "{sql}");
+        for (name, ty) in COLUMNS {
+            assert!(
+                sql.contains(&format!("ADD COLUMN IF NOT EXISTS `{name}` {ty}")),
+                "{name}: {sql}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn daily_usage_binds_parameters_and_reads_json_numbers() {
         let server = MockServer::start().await;
@@ -843,5 +1019,46 @@ mod live {
             .find(|r| r["plugin"] == "llm_enricher")
             .expect("llm row");
         assert_eq!(llm["llm_input_tokens"], 400);
+    }
+
+    /// A table an older release created (missing a column), then dropped while the
+    /// client runs: both sends still land.
+    #[tokio::test]
+    async fn an_old_or_dropped_table_is_brought_back() {
+        let Ok(url) = std::env::var("USAGE_CLICKHOUSE_TEST_URL") else {
+            eprintln!("USAGE_CLICKHOUSE_TEST_URL unset: skipping the live ClickHouse test");
+            return;
+        };
+        let table = format!("usage_test_{}", uuid::Uuid::new_v4().simple());
+        let user = std::env::var("USAGE_CLICKHOUSE_TEST_USER").unwrap_or_else(|_| "default".into());
+        let password = std::env::var("USAGE_CLICKHOUSE_TEST_PASSWORD").ok();
+        let database =
+            std::env::var("USAGE_CLICKHOUSE_TEST_DATABASE").unwrap_or_else(|_| "default".into());
+        let config = ClickHouseConfig::new(url, database, table, user, password);
+        let http = reqwest::Client::new();
+        let ddl = |sql: String| {
+            let (config, http) = (config.clone(), http.clone());
+            async move { config.post(&http, &sql, None, &[]).await }
+        };
+        let client = crate::UsageClient::clickhouse(config.clone(), http.clone());
+        let events = crate::events_for_job(&crate::JobUsageInput::default());
+
+        client.prepare().await.expect("create");
+        ddl(format!(
+            "ALTER TABLE {} DROP COLUMN `error_kind`",
+            config.qualified_table()
+        ))
+        .await
+        .expect("make the table look old");
+        let old = client.send(&events).await;
+
+        ddl(format!("DROP TABLE {}", config.qualified_table()))
+            .await
+            .expect("drop");
+        let dropped = client.send(&events).await;
+
+        let _ = ddl(format!("DROP TABLE IF EXISTS {}", config.qualified_table())).await;
+        old.expect("missing column added");
+        dropped.expect("table recreated");
     }
 }

@@ -88,6 +88,7 @@ pub mod lab;
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -662,7 +663,9 @@ enum Sink {
     ClickHouse {
         config: clickhouse::ClickHouseConfig,
         /// Set once `CREATE TABLE IF NOT EXISTS` succeeded; shared by every clone.
-        table_ready: Arc<tokio::sync::OnceCell<()>>,
+        /// Cleared when an insert finds the table gone, so the next try recreates it.
+        /// Two first sends racing may both issue the `CREATE`, which is idempotent.
+        table_ready: Arc<AtomicBool>,
     },
 }
 
@@ -773,7 +776,7 @@ impl UsageClient {
         Self {
             sink: Sink::ClickHouse {
                 config,
-                table_ready: Arc::new(tokio::sync::OnceCell::new()),
+                table_ready: Arc::new(AtomicBool::new(false)),
             },
             http,
         }
@@ -812,16 +815,60 @@ impl UsageClient {
             Sink::ClickHouse {
                 config,
                 table_ready,
-            } => table_ready
-                .get_or_try_init(|| async {
-                    config
-                        .ensure_table(&self.http)
-                        .await
-                        .map_err(UsageError::from)
-                })
-                .await
-                .map(|_| ()),
+            } => {
+                if table_ready.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                config.ensure_table(&self.http).await?;
+                table_ready.store(true, Ordering::Release);
+                Ok(())
+            }
         }
+    }
+
+    /// Insert into ClickHouse, recovering once from a table that changed under us: one
+    /// dropped since it was created is recreated, and one an older release created
+    /// gets the columns added since. Anything else, or a second failure, is returned
+    /// as is.
+    async fn insert_clickhouse(
+        &self,
+        config: &clickhouse::ClickHouseConfig,
+        table_ready: &AtomicBool,
+        body: &str,
+    ) -> Result<(), UsageError> {
+        self.prepare().await?;
+        let failure = match config.insert(&self.http, body).await {
+            Ok(()) => return Ok(()),
+            Err(f) => f,
+        };
+        if failure.is_unknown_table() {
+            tracing::warn!(
+                table = %config.table(),
+                "usage table is gone: creating it again"
+            );
+            table_ready.store(false, Ordering::Release);
+            self.prepare().await?;
+        } else if failure.is_column_drift() {
+            if let Err(alter) = config.add_missing_columns(&self.http).await {
+                // Most likely no `ALTER` grant: report the drift itself, loudly.
+                tracing::warn!(
+                    table = %config.table(),
+                    error = %alter,
+                    "could not add missing columns to the usage table"
+                );
+                return Err(failure.into());
+            }
+            tracing::info!(
+                table = %config.table(),
+                "added missing columns to the usage table"
+            );
+        } else {
+            return Err(failure.into());
+        }
+        config
+            .insert(&self.http, body)
+            .await
+            .map_err(UsageError::from)
     }
 
     /// Append `events` to the data source through
@@ -866,8 +913,10 @@ impl UsageClient {
                 token,
                 datasource,
             } => (base_url, token, datasource),
-            Sink::ClickHouse { config, .. } => {
-                self.prepare().await?;
+            Sink::ClickHouse {
+                config,
+                table_ready,
+            } => {
                 tracing::debug!(
                     table = %config.table(),
                     events = events.len(),
@@ -875,10 +924,7 @@ impl UsageClient {
                     "sending usage events to ClickHouse"
                 );
                 // `INSERT` is synchronous: a 200 means the rows are written.
-                return config
-                    .insert(&self.http, body)
-                    .await
-                    .map_err(UsageError::from);
+                return self.insert_clickhouse(config, table_ready, &body).await;
             }
         };
         let url = format!("{base_url}/v0/events?name={datasource}&wait=true");
