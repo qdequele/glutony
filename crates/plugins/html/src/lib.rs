@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use ego_tree::NodeRef;
+use ego_tree::iter::Edge;
 use meili_ingest_plugin_sdk::prelude::*;
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::Deserialize;
@@ -167,31 +168,34 @@ fn remove_noise(doc: &mut Html) -> Result<(), PluginError> {
 }
 
 /// Walk `node` in document order, appending text and line/cell separators to `out`.
+///
+/// Iterative on purpose: the parser puts no limit on nesting depth, and a walk that
+/// recursed once per level would overflow the thread stack (aborting the worker
+/// process) on a page of a few hundred thousand nested tags.
 fn append_text(node: NodeRef<'_, Node>, out: &mut String) {
-    match node.value() {
-        // Newlines inside a text node are plain whitespace in HTML; only block
-        // elements start new lines.
-        Node::Text(t) => out.push_str(&t.replace(['\n', '\r'], " ")),
-        Node::Element(el) => {
-            let name = el.name();
-            let block = BLOCK_TAGS.contains(&name);
-            let cell = CELL_TAGS.contains(&name);
-            if block {
-                out.push('\n');
-            } else if cell {
-                out.push('\t');
-            }
-            for child in node.children() {
-                append_text(child, out);
-            }
-            if block {
-                out.push('\n');
-            }
-        }
-        // Comments, doctype, processing instructions and the document root itself.
-        _ => {
-            for child in node.children() {
-                append_text(child, out);
+    for edge in node.traverse() {
+        match edge {
+            Edge::Open(n) => match n.value() {
+                // Newlines inside a text node are plain whitespace in HTML; only
+                // block elements start new lines.
+                Node::Text(t) => out.push_str(&t.replace(['\n', '\r'], " ")),
+                Node::Element(el) => {
+                    let name = el.name();
+                    if BLOCK_TAGS.contains(&name) {
+                        out.push('\n');
+                    } else if CELL_TAGS.contains(&name) {
+                        out.push('\t');
+                    }
+                }
+                // Comments, doctype, processing instructions and the document root.
+                _ => {}
+            },
+            Edge::Close(n) => {
+                if let Node::Element(el) = n.value()
+                    && BLOCK_TAGS.contains(&el.name())
+                {
+                    out.push('\n');
+                }
             }
         }
     }
@@ -505,6 +509,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidConfig(_)), "got {err:?}");
+    }
+
+    /// A page nested deeper than the thread stack can recurse through. The walk used
+    /// to recurse once per level, so this overflowed the stack and aborted the whole
+    /// worker process instead of producing a document. A small stack keeps the
+    /// depth (and so the parse time) of the test low while still proving the walk
+    /// does not grow with nesting.
+    #[test]
+    fn a_deeply_nested_page_does_not_overflow_the_stack() {
+        let depth = 30_000;
+        let html = format!(
+            "<html><body>{}deep text{}</body></html>",
+            "<span>".repeat(depth),
+            "</span>".repeat(depth)
+        );
+        let docs = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(HtmlExtractorPlugin::new().execute(
+                        &ActivityContext::noop(),
+                        input(&html),
+                        serde_json::json!({}),
+                    ))
+                    .unwrap()
+                    .into_documents()
+                    .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].content, "deep text");
+    }
+
+    #[tokio::test]
+    async fn blocks_and_cells_nested_in_inline_elements_keep_their_separators() {
+        let html = "<html><body><span><div>one<p>two</p>three</div></span>\
+                    <table><tr><td><span>a</span></td><td><b>b</b></td></tr></table>\
+                    <div><div><br>four</div></div></body></html>";
+        let out = HtmlExtractorPlugin::new()
+            .execute(&ActivityContext::noop(), input(html), serde_json::json!({}))
+            .await
+            .unwrap();
+        let docs = out.into_documents().unwrap();
+        assert_eq!(docs[0].content, "one\ntwo\nthree\na\tb\nfour");
     }
 
     #[tokio::test]
