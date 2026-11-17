@@ -10,6 +10,7 @@
 //! actual connect. Closing it means pinning the resolved address into the connector.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::time::Duration;
 
 use url::Url;
 
@@ -162,6 +163,13 @@ pub struct UrlGuard {
     pub max_redirects: usize,
     /// Maximum bytes read from a response body.
     pub max_bytes: u64,
+    /// Deadline for one whole fetch: every redirect hop, the response headers and the
+    /// body. It has to stay below the start-to-close timeout of the activity that
+    /// fetches, which must still stage what was downloaded.
+    pub total_timeout: Duration,
+    /// Longest wait for the next piece of a response body. A download that keeps
+    /// moving is bounded by `total_timeout` only; one that stalls is given up early.
+    pub idle_timeout: Duration,
 }
 
 impl Default for UrlGuard {
@@ -169,6 +177,8 @@ impl Default for UrlGuard {
         Self {
             max_redirects: 5,
             max_bytes: 512 * 1024 * 1024,
+            total_timeout: Duration::from_secs(10 * 60),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -403,9 +413,11 @@ mod tests {
     }
 
     #[test]
-    fn default_guard_caps_redirects_and_size() {
+    fn default_guard_caps_redirects_size_and_time() {
         let g = UrlGuard::default();
         assert_eq!(g.max_redirects, 5);
         assert_eq!(g.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(g.total_timeout, Duration::from_secs(600));
+        assert_eq!(g.idle_timeout, Duration::from_secs(60));
     }
 }

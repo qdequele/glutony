@@ -237,6 +237,9 @@ forgery unless it is restricted. meili-ingest restricts it by default.
   `PATCH`, omit `auth` to keep it, send `null` to clear it.
 - **Size**: a response is capped at 512 MiB, both as downloaded and once
   decompressed. A file over the cap fails the run without being retried.
+- **Time**: a fetch has 10 minutes, redirects and body included, so a file at
+  the size cap needs about 1 MiB/s. A download that stops sending data for 60
+  seconds is abandoned earlier. Both count as a transport error and are retried.
 
 Without `SOURCE_SECRET_KEY` the gateway answers `501` on every `/sources`
 route.

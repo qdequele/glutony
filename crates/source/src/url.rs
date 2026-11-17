@@ -45,6 +45,10 @@ impl SourceConnector for UrlConnector {
 
         // Redirects are followed here, not by the client, so the host policy sees every
         // hop: a public host redirecting to 169.254.169.254 is the obvious bypass.
+        // One deadline for the whole fetch, redirects and body included. reqwest's
+        // per-request timeout runs until the body has been read, so each hop is given
+        // what is left of it.
+        let deadline = tokio::time::Instant::now() + rt.limits.total_timeout;
         let mut current = parsed.clone();
         let mut hops = 0usize;
         let response = loop {
@@ -54,7 +58,7 @@ impl SourceConnector for UrlConnector {
             let mut req = rt
                 .http
                 .request(method.clone(), current.clone())
-                .timeout(std::time::Duration::from_secs(300));
+                .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
             for (name, value) in headers {
                 req = req.header(name, value);
             }
@@ -133,8 +137,29 @@ impl SourceConnector for UrlConnector {
         let mut hasher = blake3::Hasher::new();
         let mut body: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| SourceError::Fetch(format!("reading {parsed}: {e}")))?;
+        let idle = rt.limits.idle_timeout;
+        loop {
+            // A body that keeps arriving may take the whole deadline; one that stops
+            // arriving is given up after `idle`, not held until the deadline.
+            let next = tokio::time::timeout(idle, stream.next())
+                .await
+                .map_err(|_| {
+                    SourceError::Fetch(format!(
+                        "reading {parsed}: no data received for {} s",
+                        idle.as_secs_f32()
+                    ))
+                })?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|e| {
+                SourceError::Fetch(if e.is_timeout() {
+                    format!(
+                        "reading {parsed}: the download did not finish within {} s",
+                        rt.limits.total_timeout.as_secs_f32()
+                    )
+                } else {
+                    format!("reading {parsed}: {e}")
+                })
+            })?;
             if body.len() as u64 + chunk.len() as u64 > max_bytes {
                 return Err(SourceError::TooLarge(format!(
                     "GET {parsed}: body exceeds the {max_bytes} byte cap"
@@ -649,8 +674,8 @@ mod tests {
         // what rejects this, not the address check.
         let mut rt = rt_without_guard(now());
         rt.limits = UrlGuard {
-            max_redirects: 5,
             max_bytes: 1024,
+            ..UrlGuard::default()
         };
         let err = UrlConnector
             .resolve(
@@ -779,6 +804,116 @@ mod tests {
             requests, 6,
             "the first request plus five redirects, then stop"
         );
+    }
+
+    /// A server that answers any request with `chunks` one-byte pieces of body, `gap`
+    /// apart. wiremock can only delay a whole response, not trickle its body.
+    async fn dripping_server(chunks: usize, gap: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                            _ => return,
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                         content-length: {chunks}\r\nconnection: close\r\n\r\n"
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for _ in 0..chunks {
+                        tokio::time::sleep(gap).await;
+                        if socket.write_all(b"x").await.is_err() {
+                            return;
+                        }
+                        let _ = socket.flush().await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn fetch_dripping(
+        chunks: usize,
+        gap_ms: u64,
+        limits: UrlGuard,
+    ) -> (Result<Resolution, SourceError>, std::time::Duration) {
+        let server = dripping_server(chunks, std::time::Duration::from_millis(gap_ms)).await;
+        let mut rt = rt_without_guard(now());
+        rt.limits = limits;
+        let started = std::time::Instant::now();
+        let got = UrlConnector
+            .resolve(
+                &url_location(format!("{server}/slow.txt")),
+                None,
+                &IncrementalState::default(),
+                &rt,
+            )
+            .await;
+        (got, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn a_slow_body_that_keeps_arriving_is_read_to_the_end() {
+        // 1.5 s of body, far longer than the idle timeout: only a gap counts as idle.
+        let limits = UrlGuard {
+            idle_timeout: std::time::Duration::from_millis(500),
+            total_timeout: std::time::Duration::from_secs(30),
+            ..UrlGuard::default()
+        };
+        let (got, _) = fetch_dripping(30, 50, limits).await;
+        let Resolution::Items { items, .. } = got.expect("a progressing download completes") else {
+            panic!("expected items");
+        };
+        assert_eq!(items[0].bytes, vec![b'x'; 30]);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stalls_is_given_up_after_the_idle_timeout() {
+        let limits = UrlGuard {
+            idle_timeout: std::time::Duration::from_millis(200),
+            total_timeout: std::time::Duration::from_secs(30),
+            ..UrlGuard::default()
+        };
+        let (got, took) = fetch_dripping(3, 5_000, limits).await;
+        let err = got.expect_err("a stalled body fails");
+        assert!(
+            matches!(&err, SourceError::Fetch(m) if m.contains("no data received")),
+            "retryable, and says why: {err:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "long before the total deadline: {took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_whole_fetch_has_one_deadline() {
+        // Never idle, but 10 s of body against a 500 ms deadline.
+        let limits = UrlGuard {
+            idle_timeout: std::time::Duration::from_secs(30),
+            total_timeout: std::time::Duration::from_millis(500),
+            ..UrlGuard::default()
+        };
+        let (got, took) = fetch_dripping(200, 50, limits).await;
+        let err = got.expect_err("past the deadline");
+        assert!(
+            matches!(&err, SourceError::Fetch(m) if m.contains("did not finish within 0.5 s")),
+            "retryable, and says why: {err:?}"
+        );
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
     }
 
     #[test]
