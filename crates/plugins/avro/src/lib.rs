@@ -38,7 +38,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use apache_avro::schema::{Schema, UnionSchema};
+use apache_avro::schema::{NamesRef, NamespaceRef, ResolvedSchema, Schema, UnionSchema};
 use apache_avro::types::Value as Av;
 use apache_avro::{Decimal as AvDecimal, Reader};
 use base64::Engine as _;
@@ -191,7 +191,18 @@ fn time_string(secs: u32, nanos: u32) -> Value {
 /// Convert an Avro value to JSON, using `schema` (when it lines up) only to
 /// resolve information the datum does not carry: decimal scale and union branches.
 /// A schema that does not line up is ignored rather than fatal.
-fn convert(value: Av, schema: Option<&Schema>) -> Value {
+///
+/// A named type used a second time appears in the writer schema as a
+/// [`Schema::Ref`]; it is looked up in `names` (keyed by fully-qualified name,
+/// qualified against `namespace`, the enclosing one) one level per call, so a
+/// recursive type cannot loop. An unresolvable reference is ignored like any
+/// other schema that does not line up.
+fn convert(value: Av, schema: Option<&Schema>, names: &NamesRef, namespace: NamespaceRef) -> Value {
+    if let Some(Schema::Ref { name }) = schema {
+        let qualified = name.fully_qualified_name(namespace);
+        let resolved = names.get(qualified.as_ref()).copied();
+        return convert(value, resolved, names, qualified.namespace());
+    }
     match value {
         Av::Null => Value::Null,
         Av::Boolean(b) => Value::Bool(b),
@@ -202,7 +213,12 @@ fn convert(value: Av, schema: Option<&Schema>) -> Value {
         Av::Bytes(b) | Av::Fixed(_, b) => Value::String(BASE64.encode(b)),
         Av::String(s) => Value::String(s),
         Av::Enum(_, symbol) => Value::String(symbol),
-        Av::Union(idx, inner) => convert(*inner, union_branch(as_union(schema), idx)),
+        Av::Union(idx, inner) => convert(
+            *inner,
+            union_branch(as_union(schema), idx),
+            names,
+            namespace,
+        ),
         Av::Array(items) => {
             let items_schema = match schema {
                 Some(Schema::Array(a)) => Some(a.items.as_ref()),
@@ -211,7 +227,7 @@ fn convert(value: Av, schema: Option<&Schema>) -> Value {
             Value::Array(
                 items
                     .into_iter()
-                    .map(|v| convert(v, items_schema))
+                    .map(|v| convert(v, items_schema, names, namespace))
                     .collect(),
             )
         }
@@ -222,7 +238,7 @@ fn convert(value: Av, schema: Option<&Schema>) -> Value {
             };
             let mut out = Map::with_capacity(entries.len());
             for (k, v) in entries {
-                out.insert(k, convert(v, values_schema));
+                out.insert(k, convert(v, values_schema, names, namespace));
             }
             Value::Object(out)
         }
@@ -231,6 +247,9 @@ fn convert(value: Av, schema: Option<&Schema>) -> Value {
                 Some(Schema::Record(r)) => Some(r),
                 _ => None,
             };
+            // Field types are named relative to the record's own namespace.
+            let record_name = record.map(|r| r.name.fully_qualified_name(namespace));
+            let field_namespace = record_name.as_ref().map_or(namespace, |n| n.namespace());
             let mut out = Map::with_capacity(fields.len());
             for (name, v) in fields {
                 let field_schema = record.and_then(|r| {
@@ -239,7 +258,7 @@ fn convert(value: Av, schema: Option<&Schema>) -> Value {
                         .and_then(|i| r.fields.get(*i))
                         .map(|f| &f.schema)
                 });
-                out.insert(name, convert(v, field_schema));
+                out.insert(name, convert(v, field_schema, names, field_namespace));
             }
             Value::Object(out)
         }
@@ -285,6 +304,11 @@ fn decode_payload(
     })?;
     // Cloned because the reader borrows itself mutably while iterating.
     let schema = reader.writer_schema().clone();
+    // A named type used a second time is a `Schema::Ref`: resolve it by name.
+    let resolved = ResolvedSchema::try_from(&schema).map_err(|e| {
+        PluginError::InvalidInput(format!("{NAME}: invalid Avro writer schema: {e}"))
+    })?;
+    let names = resolved.get_names();
 
     let mut out = Vec::new();
     for (i, record) in reader.enumerate() {
@@ -297,7 +321,7 @@ fn decode_payload(
         let record = record.map_err(|e| {
             PluginError::InvalidInput(format!("{NAME}: invalid Avro record {}: {e}", i + 1))
         })?;
-        out.push(convert(record, Some(&schema)));
+        out.push(convert(record, Some(&schema), names, None));
     }
     Ok(out)
 }
@@ -550,6 +574,109 @@ mod tests {
         );
         assert_eq!(d.fields["kind"], json!("B"), "an enum is its symbol");
         assert_eq!(d.fields["raw"], json!("AQID"), "bytes are base64");
+    }
+
+    /// A named type is defined once and then referenced by name; the decimal scale
+    /// must come from the referenced definition at every use, including through a
+    /// union branch and array items.
+    async fn assert_named_decimal_reused(schema: &str) {
+        let money = || {
+            Av::Record(vec![(
+                "amount".into(),
+                Av::Decimal(Decimal::from(vec![1, 24])),
+            )])
+        };
+        let data = ocf(
+            schema,
+            vec![vec![
+                ("id", Av::String("o1".into())),
+                ("price", money()),
+                ("tax", money()),
+                ("discount", Av::Union(1, Box::new(money()))),
+                ("fees", Av::Array(vec![money(), money()])),
+            ]],
+        );
+        let d = &run(data, None, json!({"flatten_arrays": true})).await[0];
+        assert_eq!(d.fields["price.amount"], json!("2.80"), "inline definition");
+        assert_eq!(d.fields["tax.amount"], json!("2.80"), "reference by name");
+        assert_eq!(
+            d.fields["discount.amount"],
+            json!("2.80"),
+            "reference through a union branch"
+        );
+        assert_eq!(
+            d.fields["fees.0.amount"],
+            json!("2.80"),
+            "reference as array items"
+        );
+        assert_eq!(d.fields["fees.1.amount"], json!("2.80"));
+    }
+
+    #[tokio::test]
+    async fn decimals_in_named_types_referenced_by_name_keep_their_scale() {
+        assert_named_decimal_reused(
+            r#"{
+            "type": "record", "name": "Order",
+            "fields": [
+                {"name": "id", "type": "string"},
+                {"name": "price", "type": {
+                    "type": "record", "name": "Money",
+                    "fields": [{"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}]
+                }},
+                {"name": "tax", "type": "Money"},
+                {"name": "discount", "type": ["null", "Money"]},
+                {"name": "fees", "type": {"type": "array", "items": "Money"}}
+            ]
+        }"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn decimals_in_namespaced_named_types_keep_their_scale() {
+        assert_named_decimal_reused(
+            r#"{
+            "type": "record", "name": "Order", "namespace": "com.acme",
+            "fields": [
+                {"name": "id", "type": "string"},
+                {"name": "price", "type": {
+                    "type": "record", "name": "Money",
+                    "fields": [{"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}]
+                }},
+                {"name": "tax", "type": "Money"},
+                {"name": "discount", "type": ["null", "com.acme.Money"]},
+                {"name": "fees", "type": {"type": "array", "items": "Money"}}
+            ]
+        }"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn recursive_named_types_resolve_one_level_at_a_time() {
+        let schema = r#"{
+            "type": "record", "name": "Node",
+            "fields": [
+                {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
+                {"name": "next", "type": ["null", "Node"]}
+            ]
+        }"#;
+        let amount = || Av::Decimal(Decimal::from(vec![1, 24]));
+        let tail = Av::Record(vec![
+            ("amount".into(), amount()),
+            ("next".into(), Av::Union(0, Box::new(Av::Null))),
+        ]);
+        let data = ocf(
+            schema,
+            vec![vec![
+                ("amount", amount()),
+                ("next", Av::Union(1, Box::new(tail))),
+            ]],
+        );
+        let d = &run(data, None, json!({})).await[0];
+        assert_eq!(d.fields["amount"], json!("2.80"));
+        assert_eq!(d.fields["next.amount"], json!("2.80"));
+        assert_eq!(d.fields["next.next"], json!(null));
     }
 
     #[tokio::test]
