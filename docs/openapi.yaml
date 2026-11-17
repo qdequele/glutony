@@ -224,6 +224,11 @@ paths:
         MIME detection still runs to fill document metadata. A `name` that is not a
         pipeline uid (`[a-zA-Z0-9._-]+`) is a `400 bad_request`.
 
+        The route names the pipeline: a body whose `pipeline` field, or a
+        `?pipeline=` query parameter, names another one is refused with
+        `400 bad_request` (in an `items` batch, an item naming another one fails
+        alone). Naming the same pipeline is accepted.
+
         An archive is expanded and every file it holds runs through this pipeline,
         unless the pipeline's trigger names the archive type, in which case it gets
         the archive whole.

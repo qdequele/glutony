@@ -67,7 +67,22 @@ async fn ingest_with_pipeline_inner(
         .control_plane
         .get_pipeline(&name, pre.tenant_id.as_deref())
         .await?;
+    // The route already names the pipeline. A request that names another one
+    // (`?pipeline=`, or the `pipeline` field) is refused, as a batch item is, rather
+    // than run through a pipeline it did not ask for.
+    let refuse_other = |named: Option<&str>| match named {
+        Some(uid) if uid != pipeline.uid => Err(GatewayError::BadRequest(format!(
+            "request names pipeline {uid:?}, but this route runs {:?}",
+            pipeline.uid
+        ))),
+        _ => Ok(()),
+    };
+    // The query parameter is known before the body is read.
+    refuse_other(query_param(&query, "pipeline"))?;
     let extracted = read_payload(&headers, &query, req).await?;
+    if query_param(&query, "pipeline").is_none() {
+        refuse_other(extracted.pipeline.as_deref())?;
+    }
     let ctx = context_for(&state, &headers, &query, &extracted)?;
     let selection = PipelineSelection::Explicit(Box::new(pipeline));
     let resp = match extracted.payload {
@@ -207,6 +222,83 @@ mod tests {
         assert_eq!(jobs[0]["code"], "bad_request", "{jobs}");
         assert_eq!(jobs[1]["pipeline_used"], "p", "{jobs}");
         assert_eq!(jobs[2]["target_index"], "own", "{jobs}");
+        assert_eq!(starter.inputs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_another_pipeline_is_refused_here() {
+        // A batch item naming another pipeline is refused; a single payload doing the
+        // same used to run through the route's pipeline without a word.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines/p"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sample_pipeline("p", None)))
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let refused = [
+            (
+                "/ingest/pipeline/p",
+                json!({"documents": [{"id": "1"}], "pipeline": "other"}),
+            ),
+            (
+                "/indexes/movies/ingest/pipeline/p",
+                json!({"documents": [{"id": "1"}], "pipeline": "other"}),
+            ),
+            (
+                "/ingest/pipeline/p?pipeline=other",
+                json!({"documents": [{"id": "1"}]}),
+            ),
+            // The query parameter beats the body field, as on `POST /ingest`.
+            (
+                "/ingest/pipeline/p?pipeline=other",
+                json!({"documents": [{"id": "1"}], "pipeline": "p"}),
+            ),
+            (
+                "/ingest/pipeline/p",
+                json!({"items": [{"documents": [{"id": "1"}]}], "pipeline": "other"}),
+            ),
+        ];
+        for (uri, body) in refused {
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    uri,
+                    "application/json",
+                    body.to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+            let err = json_body(resp).await;
+            assert_eq!(err["code"], "bad_request", "{err}");
+            assert!(
+                err["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("request names pipeline \"other\", but this route runs \"p\""),
+                "{err}"
+            );
+        }
+        assert!(starter.inputs().is_empty(), "nothing was queued");
+
+        // Naming the route's own pipeline is fine.
+        for uri in ["/ingest/pipeline/p", "/ingest/pipeline/p?pipeline=p"] {
+            let body = json!({"documents": [{"id": "1"}], "pipeline": "p"});
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    uri,
+                    "application/json",
+                    body.to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{uri}");
+            assert_eq!(json_body(resp).await["pipeline_used"], "p");
+        }
         assert_eq!(starter.inputs().len(), 2);
     }
 
