@@ -333,20 +333,23 @@ fn dynamic_to_json(value: &Dynamic) -> Result<Value, PluginError> {
 ///
 /// `meta` is deliberately not read back: it is provenance the pipeline owns, so the
 /// script sees it but cannot rewrite it.
+///
+/// Every value is converted before any is written, so a failure leaves `doc` exactly
+/// as it was: `on_error: keep` promises the document untouched.
 fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
     for key in ["id", "title", "content", "fields"] {
         if let Some(v) = map.get(key) {
             reject_non_finite(v, &format!("doc.{key}"))?;
         }
     }
-    if let Some(id) = map.get("id") {
-        let id = match dynamic_to_json(id)? {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        doc.id = sanitize_id(&id);
-    }
-    doc.title = match map.get("title") {
+    let id = match map.get("id") {
+        Some(id) => Some(match dynamic_to_json(id)? {
+            Value::String(s) => sanitize_id(&s),
+            other => sanitize_id(&other.to_string()),
+        }),
+        None => None,
+    };
+    let title = match map.get("title") {
         None => None,
         Some(t) if t.is_unit() => None,
         Some(t) => Some(match dynamic_to_json(t)? {
@@ -354,14 +357,15 @@ fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
             other => other.to_string(),
         }),
     };
-    if let Some(content) = map.get("content") {
-        doc.content = match dynamic_to_json(content)? {
+    let content = match map.get("content") {
+        Some(content) => Some(match dynamic_to_json(content)? {
             Value::String(s) => s,
             Value::Null => String::new(),
             other => other.to_string(),
-        };
-    }
-    doc.fields = match map.get("fields") {
+        }),
+        None => None,
+    };
+    let fields = match map.get("fields") {
         Some(f) => match dynamic_to_json(f)? {
             Value::Object(o) => o,
             other => {
@@ -372,6 +376,15 @@ fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
         },
         None => Default::default(),
     };
+
+    if let Some(id) = id {
+        doc.id = id;
+    }
+    doc.title = title;
+    if let Some(content) = content {
+        doc.content = content;
+    }
+    doc.fields = fields;
     Ok(())
 }
 
@@ -722,6 +735,30 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].fields.get("original"), Some(&json!(true)));
         assert!(!out[0].fields.contains_key("boom"));
+    }
+
+    /// The script ran, but reading `doc` back failed after `id`, `title` and
+    /// `content` would already have been converted: none of them may stick.
+    #[tokio::test]
+    async fn on_error_keep_is_untouched_when_the_read_back_fails() {
+        let mut bad = doc("a", "hello");
+        bad.fields.insert("original".into(), json!(true));
+
+        let out = try_run(
+            vec![bad],
+            json!({
+                "script": r#"doc.id = "other"; doc.title = "New"; doc.content = "changed"; doc.fields = 5;"#,
+                "on_error": "keep"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a");
+        assert_eq!(out[0].title, None);
+        assert_eq!(out[0].content, "hello");
+        assert_eq!(out[0].fields.get("original"), Some(&json!(true)));
     }
 
     #[tokio::test]
