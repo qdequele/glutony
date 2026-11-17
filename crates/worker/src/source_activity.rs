@@ -49,6 +49,9 @@ pub struct SourceActivities {
     /// Index used when nothing more specific resolves (mirrors the gateway's
     /// `DEFAULT_INDEX`).
     pub default_index: String,
+    /// Bound on each control plane request ([`CONTROL_PLANE_TIMEOUT`] by default).
+    /// Per request, not on `http`: archive activities fetch input refs with that client.
+    pub control_plane_timeout: std::time::Duration,
 }
 
 impl SourceActivities {
@@ -62,6 +65,7 @@ impl SourceActivities {
             key: None,
             fetch_policy: HostPolicy::default(),
             default_index: "documents".into(),
+            control_plane_timeout: CONTROL_PLANE_TIMEOUT,
         }
     }
 
@@ -184,6 +188,28 @@ pub(crate) fn source_origin(tenant_id: Option<&str>, uid: &str) -> String {
     format!("source:{}/{uid}", tenant_id.unwrap_or(""))
 }
 
+/// The job id of item `ordinal` of a run. Temporal retries `resolve_source` with the
+/// same input, so a retry lands on the job (staged blob key, job row, child workflow id)
+/// of the attempt it replaces instead of orphaning it. The source and the tick are part
+/// of the name because the workflow falls back to a nil `run_id` when it cannot mint one.
+fn source_job_id(
+    run_id: Uuid,
+    source_id: Uuid,
+    scheduled_at: DateTime<Utc>,
+    ordinal: usize,
+) -> Uuid {
+    let name = format!(
+        "source-item/{source_id}/{}/{ordinal}",
+        scheduled_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    );
+    Uuid::new_v5(&run_id, name.as_bytes())
+}
+
+/// Bound on one control plane request. It answers from its own database (or the Lab's
+/// cached credit check), so a request still open after this is hung, and an attempt
+/// must not spend its start-to-close on it. Below `record_source_run`'s 30 s.
+const CONTROL_PLANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn from_source_error(e: SourceError) -> PluginError {
     match e {
         SourceError::Fetch(m) | SourceError::Dns(m) => PluginError::Retryable(m),
@@ -229,6 +255,7 @@ impl SourceActivities {
     ) -> Result<Option<T>, PluginError> {
         let resp =
             crate::connection::authed(self.http.get(url), self.control_plane_token.as_deref())
+                .timeout(self.control_plane_timeout)
                 .send()
                 .await
                 .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
@@ -271,6 +298,7 @@ impl SourceActivities {
         // `send_json` delegates here, so this is the one place the token is attached.
         let req = crate::connection::authed(req, self.control_plane_token.as_deref());
         let resp = req
+            .timeout(self.control_plane_timeout)
             .send()
             .await
             .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
@@ -300,6 +328,7 @@ impl SourceActivities {
         let url = self.url(&["internal", "lab", "credits", account])?;
         let resp =
             crate::connection::authed(self.http.get(url), self.control_plane_token.as_deref())
+                .timeout(self.control_plane_timeout)
                 .send()
                 .await
                 .map_err(|e| {
@@ -422,8 +451,8 @@ impl SourceActivities {
         };
 
         let mut jobs = Vec::with_capacity(items.len());
-        for item in items {
-            let job_id = Uuid::new_v4();
+        for (ordinal, item) in items.into_iter().enumerate() {
+            let job_id = source_job_id(input.run_id, source_id, input.scheduled_at, ordinal);
             let index = resolve_index(
                 &pipeline,
                 d.index_name.as_deref(),
@@ -655,6 +684,16 @@ mod tests {
         pipeline: PipelineDefinition,
         credits: ResponseTemplate,
     ) -> MockServer {
+        control_plane_answering(row, pipeline, credits, ResponseTemplate::new(201)).await
+    }
+
+    /// [`control_plane_with_credits`] whose `POST /internal/jobs` answers `jobs`.
+    async fn control_plane_answering(
+        row: serde_json::Value,
+        pipeline: PipelineDefinition,
+        credits: ResponseTemplate,
+        jobs: ResponseTemplate,
+    ) -> MockServer {
         let cp = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("^/internal/lab/credits/[^/]+$"))
@@ -675,7 +714,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/internal/jobs"))
-            .respond_with(ResponseTemplate::new(201))
+            .respond_with(jobs)
             .mount(&cp)
             .await;
         cp
@@ -754,6 +793,126 @@ mod tests {
             "the destination is the pipeline's connection, not the context"
         );
         assert!(state.hash.is_some());
+    }
+
+    /// A source serving one JSON file, and its control plane.
+    async fn one_file_source() -> (MockServer, MockServer) {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{\"id\":1}", "application/json"))
+            .mount(&files)
+            .await;
+        let cp = control_plane(
+            source_row(&format!("{}/feed.json", files.uri()), None),
+            pipeline(true),
+        )
+        .await;
+        (files, cp)
+    }
+
+    fn only_job(out: ResolveSourceOutput) -> PipelineWorkflowInput {
+        let ResolveSourceOutput::Ready { mut jobs, .. } = out else {
+            panic!("expected jobs, got {out:?}");
+        };
+        assert_eq!(jobs.len(), 1);
+        jobs.remove(0).workflow_input
+    }
+
+    #[tokio::test]
+    async fn a_retried_attempt_reuses_its_job_id_and_staged_blob() {
+        // Temporal retries `resolve_source` with the same input. An attempt that staged
+        // and recorded its job and then timed out must not leave that job orphaned:
+        // the retry has to land on the same id, blob key and job row.
+        let (files, cp) = one_file_source().await;
+        let a = activities(&cp, &files);
+        let run = ResolveSourceInput {
+            run_id: Uuid::parse_str("7f1c1d0e-58a4-4b0c-9a55-0d5a3c1f2e10").expect("uuid"),
+            ..input()
+        };
+
+        let first = only_job(a.resolve(&run).await.expect("first attempt"));
+        let second = only_job(a.resolve(&run).await.expect("retry"));
+        assert_eq!(first.job_id, second.job_id, "one job per run and item");
+        assert_eq!(first.input, second.input, "staged under the same key");
+
+        let rows = requests_to(&cp, "/internal/jobs").await;
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let body: serde_json::Value = row.body_json().expect("json");
+            assert_eq!(
+                body["job_id"],
+                serde_json::json!(first.job_id),
+                "the retry upserts the row of the first attempt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_ids_differ_between_runs_and_between_sources() {
+        let (files, cp) = one_file_source().await;
+        let a = activities(&cp, &files);
+        let run = ResolveSourceInput {
+            run_id: Uuid::parse_str("7f1c1d0e-58a4-4b0c-9a55-0d5a3c1f2e10").expect("uuid"),
+            ..input()
+        };
+        let base = only_job(a.resolve(&run).await.expect("resolves")).job_id;
+
+        let another_run = ResolveSourceInput {
+            run_id: Uuid::parse_str("11112222-3333-4444-5555-666677778888").expect("uuid"),
+            ..run.clone()
+        };
+        let other = only_job(a.resolve(&another_run).await.expect("resolves")).job_id;
+        assert_ne!(base, other, "the next run is a new job");
+
+        // The workflow falls back to a nil run id if it cannot mint one: the source and
+        // the tick still keep such runs apart.
+        let nil = |source_id: &str, hour: u32| {
+            source_job_id(
+                Uuid::nil(),
+                Uuid::parse_str(source_id).expect("uuid"),
+                chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 13, hour, 0, 0)
+                    .single()
+                    .expect("instant"),
+                0,
+            )
+        };
+        let one = "11111111-1111-1111-1111-111111111111";
+        let two = "22222222-2222-2222-2222-222222222222";
+        assert_eq!(nil(one, 0), nil(one, 0));
+        assert_ne!(nil(one, 0), nil(two, 0), "another source");
+        assert_ne!(nil(one, 0), nil(one, 1), "another tick");
+        assert_ne!(
+            source_job_id(run.run_id, run.source_id, run.scheduled_at, 0),
+            source_job_id(run.run_id, run.source_id, run.scheduled_at, 1),
+            "another item of the same run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_that_never_answers_does_not_hang_the_attempt() {
+        // The job row is best effort. A control plane that accepts the request and
+        // then says nothing must cost a bounded wait, not the whole 15-minute attempt.
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{\"id\":1}", "application/json"))
+            .mount(&files)
+            .await;
+        let cp = control_plane_answering(
+            source_row(&format!("{}/feed.json", files.uri()), None),
+            pipeline(true),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"checked": false})),
+            ResponseTemplate::new(201).set_delay(std::time::Duration::from_secs(120)),
+        )
+        .await;
+        let mut a = activities(&cp, &files);
+        a.control_plane_timeout = std::time::Duration::from_millis(500);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), a.resolve(&input()))
+            .await
+            .expect("the attempt is not held by the control plane")
+            .expect("the run goes ahead without its job row");
+        assert!(matches!(out, ResolveSourceOutput::Ready { .. }), "{out:?}");
     }
 
     #[tokio::test]
