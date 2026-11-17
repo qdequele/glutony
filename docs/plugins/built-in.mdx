@@ -101,7 +101,7 @@ joined by a space.
 
 | Key | Default | Description |
 |---|---|---|
-| `delimiter` | `","` | Single-character field delimiter. |
+| `delimiter` | sniffed | Single-character field delimiter. When omitted, the one of `,` `;` tab `\|` that splits the first records (up to 100 or 64 KiB) into the most consistent number of fields; delimiters inside quoted fields do not count. Ties go to more fields, then to the delimiter less often followed by a space, then to that order. Falls back to `,`. |
 | `has_headers` | `true` | First row is the header. Without headers, fields are `col_0`, `col_1`, … |
 | `id_column` | — | Column whose value becomes the document id. Otherwise `<filename>_r<row>`. |
 

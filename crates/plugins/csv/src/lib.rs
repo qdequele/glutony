@@ -10,14 +10,16 @@
 //!
 //! | key               | default            | meaning |
 //! |-------------------|--------------------|---------|
-//! | `delimiter`       | sniffed            | single ASCII character; sniffed among `,` `;` `\t` `\|` from the first line |
+//! | `delimiter`       | sniffed            | single ASCII character; sniffed among `,` `;` `\t` `\|` as the one that splits the first records into the most consistent number of fields (quoted fields ignored) |
 //! | `has_headers`     | `true`             | first row is the header; otherwise columns are named `col_1`, `col_2`, ... |
 //! | `id_column`       | none               | column whose value becomes the document id (sanitized) |
 //! | `content_columns` | all columns        | columns joined by a space into `content` |
 //! | `max_rows`        | unlimited          | stop after this many data rows |
 //! | `trim`            | `true`             | trim whitespace around headers and cells |
 
-use csv::{ReaderBuilder, StringRecord, Trim};
+use std::cmp::Reverse;
+
+use csv::{ByteRecord, ReaderBuilder, StringRecord, Trim};
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -30,6 +32,13 @@ const HEARTBEAT_EVERY: usize = 100;
 
 /// Delimiters tried by the sniffer, in order of preference on ties.
 const CANDIDATE_DELIMITERS: [u8; 4] = *b",;\t|";
+
+/// At most this many bytes from the start of the payload are sampled to sniff
+/// the delimiter.
+const SNIFF_BYTES: usize = 64 * 1024;
+
+/// At most this many records are sampled to sniff the delimiter.
+const SNIFF_RECORDS: usize = 100;
 
 /// The CSV parser plugin. Stateless; construct with [`CsvParserPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -90,20 +99,86 @@ impl Config {
     }
 }
 
-/// Pick the delimiter by counting candidate characters on the first line.
-/// Falls back to `,` when nothing matches.
-fn sniff_delimiter(data: &[u8]) -> u8 {
-    let first_line = data.split(|b| *b == b'\n').next().unwrap_or(data);
-    let mut best = b',';
-    let mut best_count = 0usize;
-    for cand in CANDIDATE_DELIMITERS {
-        let count = first_line.iter().filter(|b| **b == cand).count();
-        if count > best_count {
-            best = cand;
-            best_count = count;
+/// How a candidate delimiter splits the sample. Compared field by field: the
+/// higher score wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DelimiterScore {
+    /// Records with the modal field count, as a share of all sampled records
+    /// (in thousandths, so scores compare exactly).
+    consistency: usize,
+    /// The modal field count itself.
+    fields: usize,
+    /// Fields that start with a space, fewer is better: a delimiter followed by a
+    /// space is more likely prose punctuation (`Address, City`) than a separator.
+    leading_spaces: Reverse<usize>,
+}
+
+/// Score `delimiter` over the sample, parsing it with the same quoting rules as
+/// the real reader so delimiters inside quoted fields do not count. `None` when it
+/// never yields more than one field per record.
+fn score_delimiter(sample: &[u8], truncated: bool, delimiter: u8) -> Option<DelimiterScore> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(sample);
+    let mut records: Vec<(usize, usize)> = Vec::new();
+    let mut record = ByteRecord::new();
+    while records.len() < SNIFF_RECORDS {
+        match reader.read_byte_record(&mut record) {
+            Ok(true) => {
+                let leading = record.iter().skip(1).filter(|f| f.first() == Some(&b' '));
+                records.push((record.len(), leading.count()));
+            }
+            Ok(false) | Err(_) => break,
         }
     }
-    best
+    // A sample cut short ends mid-record; that record says nothing reliable.
+    if truncated && records.len() > 1 && reader.is_done() {
+        records.pop();
+    }
+    if records.is_empty() {
+        return None;
+    }
+
+    let mut counts: Vec<(usize, usize)> = Vec::new(); // (field count, records)
+    for (len, _) in &records {
+        match counts.iter_mut().find(|(n, _)| n == len) {
+            Some((_, seen)) => *seen += 1,
+            None => counts.push((*len, 1)),
+        }
+    }
+    let (fields, seen) = counts
+        .into_iter()
+        .max_by_key(|&(n, seen)| (seen, n))
+        .expect("at least one record");
+    if fields < 2 {
+        return None;
+    }
+    let leading: usize = records.iter().map(|(_, l)| l).sum();
+    Some(DelimiterScore {
+        consistency: seen * 1000 / records.len(),
+        fields,
+        leading_spaces: Reverse(leading),
+    })
+}
+
+/// Pick the delimiter that splits the first records (up to [`SNIFF_RECORDS`] or
+/// [`SNIFF_BYTES`]) into the most consistent number of fields, ignoring delimiters
+/// inside quoted fields. Ties go to more fields, then to the candidate less often
+/// followed by a space, then to the order of [`CANDIDATE_DELIMITERS`]. Falls back
+/// to `,` when no candidate yields more than one field.
+fn sniff_delimiter(data: &[u8]) -> u8 {
+    let truncated = data.len() > SNIFF_BYTES;
+    let sample = &data[..data.len().min(SNIFF_BYTES)];
+    let mut best = (b',', None);
+    for cand in CANDIDATE_DELIMITERS {
+        let score = score_delimiter(sample, truncated, cand);
+        if score > best.1 {
+            best = (cand, score);
+        }
+    }
+    best.0
 }
 
 /// Parse a cell into typed JSON: integer, float, boolean, or string.
@@ -176,7 +251,7 @@ impl Plugin for CsvParserPlugin {
                         "minLength": 1,
                         "maxLength": 1,
                         "default": null,
-                        "description": "Field delimiter (single ASCII char). Sniffed among , ; tab | when omitted."
+                        "description": "Field delimiter (single ASCII char). When omitted, sniffed among , ; tab | as the one that splits the first records into the most consistent number of fields, ignoring quoted fields."
                     },
                     "has_headers": {
                         "type": "boolean",
@@ -421,6 +496,52 @@ mod tests {
 
         let docs = run("a\tb\nx\ty\n", None, json!({})).await;
         assert_eq!(docs[0].fields["b"], json!("y"));
+    }
+
+    #[tokio::test]
+    async fn sniffing_ignores_delimiters_inside_quoted_fields() {
+        let docs = run("\"Last, First\";age\n\"Doe, John\";42\n", None, json!({})).await;
+        assert_eq!(docs[0].fields["Last, First"], json!("Doe, John"));
+        assert_eq!(docs[0].fields["age"], json!(42));
+    }
+
+    #[tokio::test]
+    async fn sniffing_prefers_the_delimiter_not_used_as_prose_punctuation() {
+        let docs = run(
+            "Name;Address, City\nBob;12 Main St, Paris\n",
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(docs[0].fields["Name"], json!("Bob"));
+        assert_eq!(docs[0].fields["Address, City"], json!("12 Main St, Paris"));
+    }
+
+    #[tokio::test]
+    async fn sniffing_prefers_the_delimiter_with_a_consistent_field_count() {
+        // The header has as many commas as tabs, but only tabs split every row
+        // into the same number of fields.
+        let tsv = "title\tsummary,short,long\tyear\nDune\tSand,worms,spice\t1965\nEmma\tMatchmaking\t1815\n";
+        let docs = run(tsv, None, json!({})).await;
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs[0].fields["summary,short,long"],
+            json!("Sand,worms,spice")
+        );
+        assert_eq!(docs[1].fields["year"], json!(1815));
+
+        // A comma file whose free-text column sometimes holds a semicolon.
+        let docs = run("id,tags\n1,a;b\n2,c\n3,d\n", None, json!({})).await;
+        assert_eq!(docs[0].fields["tags"], json!("a;b"));
+    }
+
+    #[test]
+    fn sniffing_falls_back_to_comma_for_single_column_and_empty_input() {
+        assert_eq!(sniff_delimiter(b""), b',');
+        assert_eq!(sniff_delimiter(b"single\ncolumn\n"), b',');
+        assert_eq!(sniff_delimiter(b"a,b\n"), b',');
+        assert_eq!(sniff_delimiter(b"a;b\n"), b';');
+        assert_eq!(sniff_delimiter(b"a|b|c\n1|2|3"), b'|');
     }
 
     #[tokio::test]
