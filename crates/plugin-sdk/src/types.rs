@@ -1148,22 +1148,15 @@ impl PipelineDefinition {
         }
     }
 
-    /// Validate structure and return a topological order (Kahn's algorithm). Steps
-    /// with no mutual dependency are ordered by their position in `steps` for
-    /// determinism. Also rejects a `trigger.filename_pattern` longer than
-    /// [`MAX_FILENAME_PATTERN_LEN`].
-    pub fn validate(&self) -> Result<Vec<String>, PipelineError> {
-        if self.uid.is_empty()
-            || !self
-                .uid
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        {
-            return Err(PipelineError::InvalidUid(self.uid.clone()));
-        }
-        if self.steps.is_empty() {
-            return Err(PipelineError::Empty);
-        }
+    /// [`validate`](Self::validate) plus the checks that only apply when a pipeline is
+    /// created or updated: a `trigger.filename_pattern` longer than
+    /// [`MAX_FILENAME_PATTERN_LEN`] is rejected.
+    ///
+    /// The save paths call this one. The worker calls `validate` at the start of every
+    /// job and on replay, so a pipeline stored before such a check existed keeps
+    /// running and is only refused on its next save.
+    pub fn validate_for_save(&self) -> Result<Vec<String>, PipelineError> {
+        let order = self.validate()?;
         if let Some(pattern) = self
             .trigger
             .as_ref()
@@ -1176,6 +1169,27 @@ impl PipelineDefinition {
                     max: MAX_FILENAME_PATTERN_LEN,
                 });
             }
+        }
+        Ok(order)
+    }
+
+    /// Validate structure and return a topological order (Kahn's algorithm). Steps
+    /// with no mutual dependency are ordered by their position in `steps` for
+    /// determinism.
+    ///
+    /// Structure only: the worker runs it on every job, so a check that a stored
+    /// pipeline may predate belongs in [`validate_for_save`](Self::validate_for_save).
+    pub fn validate(&self) -> Result<Vec<String>, PipelineError> {
+        if self.uid.is_empty()
+            || !self
+                .uid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(PipelineError::InvalidUid(self.uid.clone()));
+        }
+        if self.steps.is_empty() {
+            return Err(PipelineError::Empty);
         }
         let mut ids = HashSet::new();
         for s in &self.steps {
@@ -1361,7 +1375,8 @@ pub const MAX_GLOB_NAME_BYTES: usize = 1024;
 ///
 /// Runs in `O(pattern x name)` time at worst and constant stack, whatever the number
 /// of `*`: both strings come from tenants. The name is bounded by
-/// [`MAX_GLOB_NAME_BYTES`], and [`PipelineDefinition::validate`] bounds the pattern.
+/// [`MAX_GLOB_NAME_BYTES`], and [`PipelineDefinition::validate_for_save`] bounds the
+/// pattern.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
     if name.len() > MAX_GLOB_NAME_BYTES {
@@ -2328,7 +2343,7 @@ steps:
     }
 
     #[test]
-    fn validate_rejects_an_oversized_filename_pattern() {
+    fn saving_rejects_an_oversized_filename_pattern() {
         let with_pattern = |pattern: String| {
             let mut p = pipeline_with(vec![StepDefinition::new("p", "json_parser")]);
             p.trigger = Some(PipelineTrigger {
@@ -2338,18 +2353,45 @@ steps:
             p
         };
         let at_limit = format!("*{}", "a".repeat(MAX_FILENAME_PATTERN_LEN - 1));
-        assert!(with_pattern(at_limit).validate().is_ok());
+        assert_eq!(
+            with_pattern(at_limit).validate_for_save().unwrap(),
+            vec!["p"]
+        );
         // Counted in characters, like the `maxLength` of the OpenAPI schema.
         let multibyte = "é".repeat(MAX_FILENAME_PATTERN_LEN);
-        assert!(with_pattern(multibyte).validate().is_ok());
+        assert!(with_pattern(multibyte).validate_for_save().is_ok());
         let too_long = format!("*{}", "a".repeat(MAX_FILENAME_PATTERN_LEN));
         assert_eq!(
-            with_pattern(too_long).validate(),
+            with_pattern(too_long).validate_for_save(),
             Err(PipelineError::FilenamePatternTooLong {
                 len: MAX_FILENAME_PATTERN_LEN + 1,
                 max: MAX_FILENAME_PATTERN_LEN,
             })
         );
+        // A structural error is still reported on save.
+        let mut empty = with_pattern("*.pdf".into());
+        empty.steps.clear();
+        assert_eq!(empty.validate_for_save(), Err(PipelineError::Empty));
+    }
+
+    #[test]
+    fn a_stored_oversized_filename_pattern_still_yields_the_step_order() {
+        // The worker runs `validate` at the start of every job (and on every replay) to
+        // get the step order. A pipeline saved before the cap keeps running: only its
+        // next save is refused.
+        let mut p = pipeline_with(vec![
+            StepDefinition::new("p", "json_parser"),
+            StepDefinition::new("i", "meili_indexer").depends_on(["p"]),
+        ]);
+        p.trigger = Some(PipelineTrigger {
+            filename_pattern: Some("*a".repeat(MAX_FILENAME_PATTERN_LEN)),
+            ..Default::default()
+        });
+        assert_eq!(p.validate().unwrap(), vec!["p", "i"]);
+        assert!(matches!(
+            p.validate_for_save(),
+            Err(PipelineError::FilenamePatternTooLong { .. })
+        ));
     }
 
     #[test]

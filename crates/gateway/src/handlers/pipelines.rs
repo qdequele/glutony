@@ -105,7 +105,7 @@ pub async fn create_pipeline(
 ) -> Result<(StatusCode, Json<PipelineView>), GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
-    def.validate()
+    def.validate_for_save()
         .map_err(|e| GatewayError::Invalid(e.to_string()))?;
     if def.builtin {
         return Err(GatewayError::Forbidden(

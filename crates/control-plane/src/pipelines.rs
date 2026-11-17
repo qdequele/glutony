@@ -233,7 +233,7 @@ pub fn prepare_definition(def: &mut PipelineDefinition) -> Result<(), CpError> {
         )));
     }
     def.normalize();
-    def.validate()
+    def.validate_for_save()
         .map_err(|e| CpError::Validation(e.to_string()))?;
     def.builtin = false;
     Ok(())
