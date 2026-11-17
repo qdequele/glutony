@@ -267,6 +267,8 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 
 Reply keys are merged into `fields`; `title` → `title`, `summary` →
 `fields.summary`, `keywords` → `fields.keywords`, `language` → `meta.language`.
+A `title` or `language` that is not a string (for example `null` when the model
+finds none) is ignored, so it never replaces the document's own title.
 
 ### `jev_enricher`
 

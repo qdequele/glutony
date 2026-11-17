@@ -60,6 +60,7 @@
 //! |---|---|
 //! | `title` (string) | `Document::title` (only if the document has none, unless `merge_strategy: replace`) |
 //! | `language` (string) | `DocumentMeta::language` (same rule) |
+//! | `title` / `language` (any other type, e.g. `null`) | ignored |
 //! | `summary`, `keywords`, any other key | `Document::fields` (existing keys kept under `merge`, overwritten under `replace`) |
 //!
 //! A reply that is not a JSON object is stored verbatim in `fields.llm_raw` and the
@@ -621,6 +622,10 @@ pub fn apply_reply(doc: &mut Document, raw: &str, strategy: MergeStrategy) {
                     doc.meta.language = Some(l.clone());
                 }
             }
+            // `title` and `language` have a home of their own; anything but a string
+            // there (`null` for "none found" is common) is no answer, and written into
+            // `fields` it would overwrite the real title when the document is indexed.
+            ("title" | "language", _) => {}
             _ => {
                 if replace {
                     doc.fields.insert(key, value);
@@ -1367,6 +1372,28 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("LLM_API_KEY")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_non_string_title_or_language_never_reaches_the_fields() {
+        // `{"title": null}` is a common JSON-mode answer for "no heading"; written into
+        // `fields` it would overwrite the real title when the document is flattened.
+        for strategy in [MergeStrategy::Merge, MergeStrategy::Replace] {
+            let mut doc = Document::with_id("d1", "x");
+            doc.title = Some("Q3 report".into());
+            doc.meta.language = Some("en".into());
+            apply_reply(
+                &mut doc,
+                r#"{"title":null,"summary":"s","language":["fr"]}"#,
+                strategy,
+            );
+            assert!(!doc.fields.contains_key("title"), "{strategy:?}");
+            assert!(!doc.fields.contains_key("language"), "{strategy:?}");
+            assert_eq!(doc.title.as_deref(), Some("Q3 report"), "{strategy:?}");
+            assert_eq!(doc.meta.language.as_deref(), Some("en"), "{strategy:?}");
+            assert_eq!(doc.fields["summary"], "s");
+            assert_eq!(doc.to_index_json()["title"], "Q3 report", "{strategy:?}");
+        }
     }
 
     #[test]
