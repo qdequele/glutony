@@ -24,6 +24,7 @@ inside plugins or workflow code.
 | `BLOB_STORE_URL` | `file://./blobs` | Where uploads and inline `documents` above `INLINE_MAX_BYTES` are staged (`file://`, `s3://`, `gs://`, `az://`, `memory://`). Must be shared with workers. |
 | `INLINE_MAX_BYTES` | `1048576` | Uploads and inline `documents` up to this size travel inside the Temporal payload; larger ones are staged. Keep it well under Temporal's 2 MB payload limit. |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info,meili_ingest=debug`. |
+| `CORS_ALLOW_ORIGINS` | unset (no CORS) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the API cross-origin, any method and header. An entry of another shape is ignored with a warning. Unset, no CORS headers are sent. |
 | `SOURCE_SECRET_KEY` | — | 32 bytes, base64 (`openssl rand -base64 32`). Seals [connection](/concepts/connections) keys and [source](/concepts/sources) credentials. Unset = `/connections` and `/sources` answer `501`. Must match the workers'. Rotating it makes stored secrets unreadable. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Where connections may point: `public` (https, public addresses only), `any`, or a comma list of `host[:port]`. |
 | `LAB_SERVICE_TOKEN` | — | Bearer token the Meilisearch Lab console sends to the management routes, together with a required `X-Glutony-Tenant-Id`: the `CREDENTIAL=` given to `bin/rails lab:hosted_engine:create` (`openssl rand -hex 32`). Setting it closes open mode, and the gateway refuses to start unless `ENVOY_TRUSTED_HEADER` is also set. See [Meilisearch Lab](/deployment/meilisearch-lab). |
@@ -80,8 +81,10 @@ inside plugins or workflow code.
 | `TINYBIRD_TOKEN` | — | Append token for per-tenant [usage analytics](/concepts/usage) (`glutony_worker_append`). Absent disables reporting entirely. The gateway needs `TINYBIRD_READ_TOKEN` to serve it back. |
 | `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Region-specific, e.g. `https://api.eu-central-1.aws.tinybird.co`. |
 | `TINYBIRD_DATASOURCE` | `meili_ingest_usage` | Target data source name. |
+| `TINYBIRD_TIMEOUT_SECS` | `20` | HTTP timeout of each append request, in seconds. |
 | `USAGE_CLICKHOUSE_URL` / `_DATABASE` / `_TABLE` / `_USER` / `_PASSWORD` / `_TIMEOUT_SECS` | — / `default` / `meili_ingest_usage` / `default` / empty / `20` | Record usage in a self-hosted ClickHouse instead of Tinybird. The worker creates the table; the user needs `INSERT`, `SELECT` and `CREATE TABLE` on the database, and `ALTER ADD COLUMN` on the table for the worker to add the columns a new release brings. Setting it together with `TINYBIRD_TOKEN` stops the worker at boot. See [ClickHouse instead of Tinybird](/concepts/usage#clickhouse-instead-of-tinybird). |
 | `RUST_LOG` | `info` | Tracing filter. |
+| `LOG_FORMAT` | JSON | `text` prints human-readable log lines; any other value, or none, logs JSON. |
 
 Workers **never** read `MEILI_URL` / `MEILI_API_KEY`: Meilisearch credentials
 arrive in the workflow input as `MeiliContext`.

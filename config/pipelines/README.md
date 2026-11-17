@@ -54,4 +54,4 @@ curl -X DELETE http://localhost:8080/pipelines/my-pdf-with-enrichment
 | File | What it shows |
 |---|---|
 | `pdf-with-enrichment.yaml` | The SPEC §5 example: extract → chunk → fan-out LLM enrichment → index, with a filename trigger. |
-| `video-ingest.yaml` | Multi-pool pipeline: GPU plugins (ffmpeg, Whisper) → chunker → LLM → indexer, with `index_pattern`. |
+| `video-ingest.yaml` | Audio extraction (pure Rust, no ffmpeg) → transcription over HTTP → chunker → LLM → indexer, every step on `workers-general`, with `index_pattern`. |

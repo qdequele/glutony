@@ -249,13 +249,27 @@ key, is not supported yet (see
 
 ## 5. Verify
 
+Forward the gateway in one terminal:
+
 ```bash
 kubectl -n meili-ingest port-forward svc/meili-gateway 8080:8080
+```
+
+and in another, send a file. With `ENVOY_TRUSTED_HEADER` set (step 1), the gateway
+honours `X-Meili-Host` only together with the matching `X-Meili-Envoy-Secret`:
+
+```bash
 curl -H "X-Meili-Host: http://meilisearch.default.svc:7700" \
+     -H "X-Meili-Envoy-Secret: $(kubectl -n meili-ingest get secret meili-ingest-secrets \
+          -o jsonpath='{.data.ENVOY_TRUSTED_HEADER}' | base64 -d)" \
      -H "Authorization: Bearer <key>" \
      -F file=@report.pdf http://localhost:8080/ingest
 kubectl -n meili-ingest get scaledobjects
 ```
+
+A standalone deployment (`MEILI_URL` / `MEILI_API_KEY` uncommented in
+`k8s/gateway.yaml`) needs neither header: `curl -F file=@report.pdf
+http://localhost:8080/ingest`.
 
 ## Upgrades
 
