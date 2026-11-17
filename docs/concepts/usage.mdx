@@ -67,8 +67,9 @@ sorting key.
 `documents_out` on a step row counts a document once per stage, so a pipeline that
 extracts then chunks then indexes reports it three times. That measures work done,
 not corpus size. The rollups expose `documents_indexed` for the number that actually
-reached Meilisearch, taken from the job row's final-step count — that is the figure
-to report.
+reached Meilisearch, taken from the job row: the documents its `meili_indexer` steps
+wrote (0 for a job cancelled before indexing), or the final step's count for a
+succeeded pipeline with no indexer. That is the figure to report.
 </Note>
 
 | Table | Freshness | Deduplicated | Retention | Use for |
