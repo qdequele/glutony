@@ -1388,8 +1388,8 @@ mod tests {
                 }) => {
                     assert_eq!(
                         uri,
-                        &format!("jobs/{}/input/documents.json", wf.job_id),
-                        "under input/, where no step output can collide"
+                        &format!("jobs/{}/gateway/documents.json", wf.job_id),
+                        "under gateway/, where no step output or upload can collide"
                     );
                     assert_eq!(
                         mime.as_deref(),

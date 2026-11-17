@@ -505,7 +505,7 @@ mod tests {
         let inline = PluginInput::Documents(vec![Document::with_id("1", "x")]);
         // What the gateway sends for documents above INLINE_MAX_BYTES.
         let staged = PluginInput::Ref(ContentRef::Staged {
-            uri: "jobs/j/input/documents.json".into(),
+            uri: "jobs/j/gateway/documents.json".into(),
             mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.into()),
             filename: None,
             origin: None,

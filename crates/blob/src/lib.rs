@@ -993,13 +993,17 @@ impl BlobStore {
 
     /// Gateway helper for inline documents: keep them in the workflow input when they
     /// serialize to at most `inline_max` bytes, otherwise store them at
-    /// `staged_key(job_id, "input/documents.json")` and return a [`PluginInput::Ref`]
+    /// `staged_key(job_id, "gateway/documents.json")` and return a [`PluginInput::Ref`]
     /// with MIME [`SPILLED_OUTPUT_MIME`].
     ///
     /// The object is the JSON of a [`PluginOutput::Documents`], the encoding of a
     /// spilled step output, so [`BlobStore::resolve_input`] hands the first step the
-    /// same documents it would have received inline, not a blob of JSON bytes. It
-    /// lives under `input/`, where no step output is written.
+    /// same documents it would have received inline, not a blob of JSON bytes.
+    ///
+    /// It lives under `gateway/`, which nothing else can write: a step output is one
+    /// key segment (`<step>.json`, `/` percent-encoded) and an upload goes under
+    /// `input/`, which [`BlobStore::hydrate_output`] refuses to read as documents
+    /// because its content is the tenant's.
     pub async fn stage_documents(
         &self,
         job_id: Uuid,
@@ -1013,7 +1017,7 @@ impl BlobStore {
         if bytes.len() <= inline_max {
             return Ok(PluginInput::from(output));
         }
-        let key = Self::staged_key(job_id, "input/documents.json");
+        let key = Self::staged_key(job_id, "gateway/documents.json");
         tracing::debug!(job_id = %job_id, key = %key, size = bytes.len(), "staging inline documents in blob store");
         self.put(&key, Bytes::from(bytes)).await?;
         Ok(PluginInput::Ref(ContentRef::Staged {
@@ -1666,7 +1670,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inline, PluginInput::Documents(documents.clone()));
-        let key = BlobStore::staged_key(job, "input/documents.json");
+        let key = BlobStore::staged_key(job, "gateway/documents.json");
         assert!(matches!(store.get(&key).await, Err(BlobError::NotFound(_))));
 
         // One byte over, they are staged, and the worker reads the same documents.
