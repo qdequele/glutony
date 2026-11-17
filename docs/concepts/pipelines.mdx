@@ -93,7 +93,9 @@ steps:
 - **Failure.** A step that exhausts its retries, or returns a non-retryable
   error, fails the job with `status: failed` and the message in `error`.
   Already-completed steps are not rolled back (documents indexed by an
-  earlier indexer step stay indexed).
+  earlier indexer step stay indexed). What the job consumed before it stopped
+  is still metered: steps running alongside the failed one, and the branches
+  of a fanned-out step that completed before one of them failed.
 - **Cancellation.** `POST /jobs/:id/cancel` sets `cancel_requested`; running
   activities are cancelled, no new step starts, status becomes `cancelled`.
 - **Validation** at creation time (and by `POST /pipelines/validate`, which

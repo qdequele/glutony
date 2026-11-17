@@ -142,7 +142,8 @@ pub struct StepOutcome {
     pub metering: StepMetering,
 }
 
-/// Why a step did not complete.
+/// Why a step did not complete. Both carry what the step consumed before it stopped:
+/// branches that finished spent tokens and CPU whatever happened to their siblings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepFailure {
     /// Cancelled. `Some` when branches had already completed.
@@ -151,7 +152,7 @@ pub enum StepFailure {
     Failed {
         /// Why.
         message: String,
-        /// What the step consumed.
+        /// What the branches that completed consumed.
         metering: StepMetering,
     },
 }
@@ -169,7 +170,8 @@ pub enum BranchError {
 ///
 /// Metering is summed across branches: one fanned-out step is one billable line,
 /// however many activities carried it out. A failed branch fails the step and takes
-/// precedence over a cancelled one.
+/// precedence over a cancelled one; either way the sums of the branches that did
+/// complete are kept.
 pub fn merge_branches(
     results: Vec<Result<StepActivityOutput, BranchError>>,
 ) -> Result<StepOutcome, StepFailure> {
@@ -198,11 +200,13 @@ pub fn merge_branches(
                 "{} of {total} branches failed; first error: {msg}",
                 total - outputs.len()
             ),
-            metering: StepMetering::none(1),
+            metering,
         });
     }
     if cancelled {
-        return Err(StepFailure::Cancelled(None));
+        return Err(StepFailure::Cancelled(
+            (!outputs.is_empty()).then_some(metering),
+        ));
     }
     Ok(StepOutcome {
         output: PluginOutput::Many(outputs),
@@ -222,7 +226,9 @@ pub enum RoundEnd {
 /// What one round of parallel steps did to the job.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Round {
-    /// One row per step to record.
+    /// One row per step to record, the steps that completed first: a job that stops
+    /// here must end on the row of a step that did not complete (the usage event
+    /// reads the job's document count off the last row).
     pub rows: Vec<StepResult>,
     /// Outputs of the steps that completed, by step id.
     pub outputs: Vec<(String, PluginOutput)>,
@@ -255,13 +261,15 @@ fn step_row(
 
 /// Settle one round: `results[i]` is what running `ready[i]` gave.
 ///
-/// Steps are recorded in `ready` order up to the first one that did not complete,
-/// which ends the job.
+/// Every step of the round has finished by now, so every one that consumed something
+/// is recorded, whatever happened to its siblings: a step that completed, a step that
+/// failed, and a cancelled step whose branches had partly completed.
 pub fn settle_round(
     ready: &[StepDefinition],
     results: Vec<Result<StepOutcome, StepFailure>>,
 ) -> Round {
     let mut round = Round::default();
+    let mut stopped = Vec::new();
     for (step, result) in ready.iter().zip(results) {
         match result {
             Ok(outcome) => {
@@ -279,26 +287,30 @@ pub fn settle_round(
                 ));
                 round.outputs.push((step.id.clone(), outcome.output));
             }
-            Err(StepFailure::Cancelled(_)) => {
-                round.end = Some(RoundEnd::Cancelled);
-                break;
+            Err(StepFailure::Cancelled(partial)) => {
+                round.end.get_or_insert(RoundEnd::Cancelled);
+                if let Some(metering) = partial {
+                    stopped.push(step_row(step, JobStatus::Cancelled, 0, None, metering));
+                }
             }
-            Err(StepFailure::Failed { message, .. }) => {
-                round.end = Some(RoundEnd::Failed(format!(
-                    "step {} ({}) failed: {message}",
-                    step.id, step.plugin
-                )));
-                round.rows.push(step_row(
+            Err(StepFailure::Failed { message, metering }) => {
+                round.end.get_or_insert_with(|| {
+                    RoundEnd::Failed(format!(
+                        "step {} ({}) failed: {message}",
+                        step.id, step.plugin
+                    ))
+                });
+                stopped.push(step_row(
                     step,
                     JobStatus::Failed,
                     0,
                     Some(message),
-                    StepMetering::none(1),
+                    metering,
                 ));
-                break;
             }
         }
     }
+    round.rows.extend(stopped);
     round
 }
 
@@ -562,6 +574,28 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_branch_keeps_what_its_siblings_consumed() {
+        let err = merge_branches(vec![
+            Ok(branch_ok(10, 5, 100)),
+            Err(BranchError::Failed("provider said no".into())),
+            Ok(branch_ok(20, 7, 200)),
+            Err(BranchError::Failed("second error".into())),
+        ])
+        .expect_err("a branch failed");
+        let StepFailure::Failed { message, metering } = err else {
+            panic!("unexpected {err:?}");
+        };
+        assert_eq!(
+            message,
+            "2 of 4 branches failed; first error: provider said no"
+        );
+        assert_eq!(metering.branches, 4);
+        assert_eq!(metering.duration_ms, 12);
+        assert_eq!(metering.input_bytes, 300);
+        assert_eq!(metering.usage.llm_input_tokens, 30);
+    }
+
+    #[test]
     fn a_failed_branch_wins_over_a_cancelled_one() {
         let err = merge_branches(vec![
             Err(BranchError::Cancelled),
@@ -571,6 +605,22 @@ mod tests {
         assert!(
             matches!(&err, StepFailure::Failed { message, .. } if message.starts_with("2 of 2")),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_fan_out_keeps_what_completed() {
+        let err = merge_branches(vec![Ok(branch_ok(10, 5, 100)), Err(BranchError::Cancelled)])
+            .expect_err("a branch was cancelled");
+        let StepFailure::Cancelled(Some(metering)) = err else {
+            panic!("unexpected {err:?}");
+        };
+        assert_eq!(metering.branches, 2);
+        assert_eq!(metering.usage.llm_input_tokens, 10);
+        // Nothing completed: nothing to meter.
+        assert_eq!(
+            merge_branches(vec![Err(BranchError::Cancelled)]),
+            Err(StepFailure::Cancelled(None))
         );
     }
 
@@ -625,6 +675,110 @@ mod tests {
         assert_eq!(row.duration_ms, 40);
         assert_eq!(row.input_bytes, 9);
         assert_eq!(row.usage.llm_input_tokens, 1);
+    }
+
+    #[test]
+    fn a_sibling_that_completed_after_a_failed_step_is_still_recorded() {
+        let round = settle_round(
+            &steps(&["b", "c"]),
+            vec![Err(failed("boom", StepMetering::none(1))), Ok(outcome(400))],
+        );
+        assert_eq!(
+            round.end,
+            Some(RoundEnd::Failed("step b (x) failed: boom".into()))
+        );
+        assert_eq!(round.outputs.len(), 1);
+        // The sibling's tokens are billed; the failed step comes last, so the job
+        // reports no documents.
+        let rows: Vec<_> = round
+            .rows
+            .iter()
+            .map(|r| (r.step_id.as_str(), r.status, r.usage.llm_input_tokens))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("c", JobStatus::Succeeded, 400),
+                ("b", JobStatus::Failed, 0)
+            ]
+        );
+        let last = round.rows.last().expect("rows");
+        assert_eq!(last.document_count, 0);
+        assert_eq!(last.error.as_deref(), Some("boom"));
+        assert_eq!(last.branches, 1);
+    }
+
+    #[test]
+    fn a_partly_failed_fan_out_is_recorded_with_what_it_consumed() {
+        let metering = StepMetering {
+            branches: 500,
+            duration_ms: 1_000,
+            input_bytes: 2_000,
+            usage: UsageUnits::llm(900, 90),
+        };
+        let round = settle_round(
+            &steps(&["enrich"]),
+            vec![Err(failed("1 of 500 branches failed", metering))],
+        );
+        assert_eq!(round.rows.len(), 1);
+        let row = &round.rows[0];
+        assert_eq!(row.status, JobStatus::Failed);
+        assert_eq!(row.branches, 500);
+        assert_eq!(row.document_count, 0);
+        assert_eq!(row.duration_ms, 1_000);
+        assert_eq!(row.input_bytes, 2_000);
+        assert_eq!(row.usage.llm_input_tokens, 900);
+        assert!(round.outputs.is_empty());
+    }
+
+    #[test]
+    fn every_failed_step_gets_a_row_and_the_first_names_the_job_error() {
+        let round = settle_round(
+            &steps(&["b", "c"]),
+            vec![
+                Err(failed("first", StepMetering::none(1))),
+                Err(failed("second", StepMetering::none(1))),
+            ],
+        );
+        assert_eq!(
+            round.end,
+            Some(RoundEnd::Failed("step b (x) failed: first".into()))
+        );
+        let ids: Vec<_> = round.rows.iter().map(|r| r.step_id.as_str()).collect();
+        assert_eq!(ids, ["b", "c"]);
+    }
+
+    #[test]
+    fn a_cancelled_round_still_records_what_completed() {
+        let partial = StepMetering {
+            branches: 4,
+            duration_ms: 30,
+            input_bytes: 3,
+            usage: UsageUnits::llm(7, 1),
+        };
+        let round = settle_round(
+            &steps(&["b", "c", "d"]),
+            vec![
+                Err(StepFailure::Cancelled(None)),
+                Ok(outcome(400)),
+                Err(StepFailure::Cancelled(Some(partial))),
+            ],
+        );
+        assert_eq!(round.end, Some(RoundEnd::Cancelled));
+        // `b` consumed nothing and gets no row; `d` had branches that completed.
+        let rows: Vec<_> = round
+            .rows
+            .iter()
+            .map(|r| (r.step_id.as_str(), r.status, r.usage.llm_input_tokens))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("c", JobStatus::Succeeded, 400),
+                ("d", JobStatus::Cancelled, 7)
+            ]
+        );
+        assert_eq!(round.rows[1].branches, 4);
     }
 
     #[test]

@@ -130,6 +130,9 @@ impl PipelineWorkflow {
             }
             let results = join_all(step_futs).await;
 
+            // Every step of the round has finished: record all of them before acting
+            // on a failure or a cancellation, so what the siblings of a failed step
+            // consumed is still metered.
             let round = settle_round(&ready, results);
             if round.index_report.is_some() {
                 index_report = round.index_report;
