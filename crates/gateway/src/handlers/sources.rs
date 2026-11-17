@@ -305,7 +305,8 @@ pub async fn patch_source(
 
     // The schedule first: Temporal validates the cron, and a rejection leaves nothing
     // changed anywhere.
-    if req.cron.is_some() || req.timezone.is_some() {
+    let rescheduled = req.cron.is_some() || req.timezone.is_some();
+    if rescheduled {
         let mut schedule = schedule_of(&stored);
         if let Some(c) = &req.cron {
             schedule.cron = c.clone();
@@ -325,12 +326,38 @@ pub async fn patch_source(
         fetch_auth,
         paused: None,
     };
-    let record = state
+    // The row second. If it cannot be written, put the schedule back on the row's cron
+    // and timezone: Temporal alone decides when the source fires, so it must not keep
+    // a spec the API does not show.
+    let updated = state
         .control_plane
         .update_source(&uid, tenant_id.as_deref(), &patch)
-        .await?
-        .ok_or_else(|| not_found(&uid))?;
+        .await
+        .and_then(|row| row.ok_or_else(|| not_found(&uid)));
+    let record = match updated {
+        Ok(record) => record,
+        Err(e) => {
+            if rescheduled {
+                undo_reschedule(&state, &stored).await;
+            }
+            return Err(e);
+        }
+    };
     Ok(Json(SourceView::from_record(record, key, None)))
+}
+
+/// Best-effort rollback of a schedule change whose row update failed: back to what the
+/// row says. Failures are logged, not returned: the caller is already reporting the
+/// error that caused the rollback. A schedule that is gone (the source was deleted
+/// meanwhile) has nothing to restore and is not recreated.
+async fn undo_reschedule(state: &AppState, stored: &SourceRecord) {
+    let d = &stored.definition;
+    match state.schedules.update(&schedule_of(stored)).await {
+        Ok(()) | Err(GatewayError::NotFound(_)) => {}
+        Err(e) => {
+            tracing::error!(uid = %d.uid, schedule = %d.schedule_id, "rollback: could not restore the schedule's cron: {e}");
+        }
+    }
 }
 
 async fn set_paused(
@@ -342,14 +369,19 @@ async fn set_paused(
     state.connections.key()?;
     check_uid(uid)?;
     let stored = owned(state, uid, tenant_id).await?;
-    state
-        .schedules
-        .set_paused(&stored.definition.schedule_id, paused)
-        .await?;
-    state
-        .control_plane
-        .set_source_paused(stored.definition.id, paused)
-        .await?;
+    let d = &stored.definition;
+    state.schedules.set_paused(&d.schedule_id, paused).await?;
+    if let Err(e) = state.control_plane.set_source_paused(d.id, paused).await {
+        // Same as a failed update: the schedule goes back to what the row says. Best
+        // effort; the error reported is the one that caused the rollback.
+        match state.schedules.set_paused(&d.schedule_id, d.paused).await {
+            Ok(()) | Err(GatewayError::NotFound(_)) => {}
+            Err(undo) => {
+                tracing::error!(uid = %d.uid, schedule = %d.schedule_id, "rollback: could not restore the schedule's paused state: {undo}");
+            }
+        }
+        return Err(e);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -791,6 +823,96 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(schedules.calls().len(), 1, "a rename touches no schedule");
+    }
+
+    const SCHEDULE: &str = "source-11111111-1111-1111-1111-111111111111";
+
+    #[tokio::test]
+    async fn a_failed_row_update_puts_the_schedule_back_on_the_stored_cron() {
+        // The schedule is updated first; when the row then cannot be written, Temporal
+        // must not keep firing on a cron the API does not show.
+        for (cp_status, expected) in [(500, StatusCode::BAD_GATEWAY), (404, StatusCode::NOT_FOUND)]
+        {
+            let cp = MockServer::start().await;
+            mount_source(&cp).await;
+            Mock::given(method("PATCH"))
+                .and(path("/internal/sources/tmdb"))
+                .respond_with(
+                    ResponseTemplate::new(cp_status)
+                        .set_body_json(serde_json::json!({ "error": "nope" })),
+                )
+                .mount(&cp)
+                .await;
+            let schedules = Arc::new(FakeSchedules::default());
+            let (status, body) = call(
+                &app(&cp, schedules.clone(), true),
+                req(
+                    "PATCH",
+                    "/sources/tmdb",
+                    serde_json::json!({ "cron": "0 9 * * *", "timezone": "Europe/Paris" }),
+                ),
+            )
+            .await;
+            assert_eq!(status, expected, "{body}");
+            assert_eq!(
+                schedules.calls(),
+                vec![
+                    format!("update {SCHEDULE} 0 9 * * * Europe/Paris"),
+                    format!("update {SCHEDULE} 30 0 * * * UTC"),
+                ],
+                "control plane answered {cp_status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_row_update_leaves_an_untouched_schedule_alone() {
+        let cp = MockServer::start().await;
+        mount_source(&cp).await;
+        Mock::given(method("PATCH"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let (status, _) = call(
+            &app(&cp, schedules.clone(), true),
+            req(
+                "PATCH",
+                "/sources/tmdb",
+                serde_json::json!({ "name": "TMDB" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(schedules.calls().is_empty(), "{:?}", schedules.calls());
+    }
+
+    #[tokio::test]
+    async fn a_failed_pause_write_puts_the_schedule_back() {
+        let cp = MockServer::start().await;
+        mount_source(&cp).await; // stored unpaused
+        Mock::given(method("PUT"))
+            .and(path(
+                "/internal/sources-by-id/11111111-1111-1111-1111-111111111111/paused",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let (status, _) = call(
+            &app(&cp, schedules.clone(), true),
+            req("POST", "/sources/tmdb/pause", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            schedules.calls(),
+            vec![
+                format!("paused {SCHEDULE} true"),
+                format!("paused {SCHEDULE} false"),
+            ]
+        );
     }
 
     #[tokio::test]
