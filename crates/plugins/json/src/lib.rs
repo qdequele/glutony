@@ -104,15 +104,22 @@ impl FlattenConfig {
 }
 
 /// Parse bytes as a single JSON value, falling back to NDJSON (one value per line).
-fn parse_payload(data: &[u8]) -> Result<Vec<Value>, PluginError> {
+///
+/// Synchronous and CPU-bound: call it from [`run_blocking`]. The NDJSON pass polls
+/// cancellation, since a blocking task cannot be aborted from outside.
+fn parse_payload(ctx: &ActivityContext, data: &[u8]) -> Result<Vec<Value>, PluginError> {
     match serde_json::from_slice::<Value>(data) {
         Ok(v) => Ok(select_roots(v)),
         Err(single_err) => {
+            ctx.check_cancelled()?;
             let text = std::str::from_utf8(data).map_err(|e| {
                 PluginError::InvalidInput(format!("{NAME}: payload is not UTF-8: {e}"))
             })?;
             let mut roots = Vec::new();
             for (i, line) in text.lines().enumerate() {
+                if i.is_multiple_of(HEARTBEAT_EVERY) {
+                    ctx.check_cancelled()?;
+                }
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -421,56 +428,64 @@ impl Plugin for JsonFlattenerPlugin {
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
         let cfg = FlattenConfig::parse(config)?;
+        // Parsing and flattening are CPU-bound: keep them off the async runtime.
+        let ctx = ctx.clone();
+        let docs = run_blocking(move || flatten_input(&ctx, input, &cfg)).await??;
+        Ok(PluginOutput::Documents(docs))
+    }
+}
 
-        // (root value, generated id, fallbacks)
-        let items: Vec<(Value, String, Fallback)> = match input {
-            PluginInput::Bytes(blob) => {
-                let stem = id_stem(&blob, "json");
-                let meta = DocumentMeta {
-                    source: blob.filename.clone(),
-                    filename: blob.filename.clone(),
-                    mime: Some(blob.mime.clone()),
-                    ..Default::default()
-                };
-                parse_payload(&blob.data)?
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        (
-                            v,
-                            format!("{stem}_{i}"),
-                            Fallback {
-                                meta: meta.clone(),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect()
-            }
-            other => other
-                .into_documents()?
+/// Parse (bytes) or re-flatten (documents) `input`. Synchronous; see [`run_blocking`].
+fn flatten_input(
+    ctx: &ActivityContext,
+    input: PluginInput,
+    cfg: &FlattenConfig,
+) -> Result<Vec<Document>, PluginError> {
+    // (root value, generated id, fallbacks)
+    let items: Vec<(Value, String, Fallback)> = match input {
+        PluginInput::Bytes(blob) => {
+            let stem = id_stem(&blob, "json");
+            let meta = DocumentMeta {
+                source: blob.filename.clone(),
+                filename: blob.filename.clone(),
+                mime: Some(blob.mime.clone()),
+                ..Default::default()
+            };
+            parse_payload(ctx, &blob.data)?
                 .into_iter()
                 .enumerate()
-                .map(|(i, d)| {
-                    let generated = format!("{}_{i}", d.id);
+                .map(|(i, v)| {
                     (
-                        Value::Object(d.fields),
-                        generated,
+                        v,
+                        format!("{stem}_{i}"),
                         Fallback {
-                            id: Some(d.id),
-                            title: d.title,
-                            content: Some(d.content),
-                            meta: d.meta,
+                            meta: meta.clone(),
+                            ..Default::default()
                         },
                     )
                 })
-                .collect(),
-        };
-
-        Ok(PluginOutput::Documents(build_documents(
-            ctx, items, &cfg, NAME,
-        )?))
-    }
+                .collect()
+        }
+        other => other
+            .into_documents()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let generated = format!("{}_{i}", d.id);
+                (
+                    Value::Object(d.fields),
+                    generated,
+                    Fallback {
+                        id: Some(d.id),
+                        title: d.title,
+                        content: Some(d.content),
+                        meta: d.meta,
+                    },
+                )
+            })
+            .collect(),
+    };
+    build_documents(ctx, items, cfg, NAME)
 }
 
 #[cfg(test)]
@@ -739,6 +754,35 @@ mod tests {
         )
         .await;
         assert_eq!(docs[0].content, "keep me");
+    }
+
+    /// Parsing a large payload must not hold the runtime thread: on a
+    /// single-threaded runtime, a ticker task keeps running while it parses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsing_runs_off_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let ndjson: String = (0..20_000)
+            .map(|i| format!("{{\"id\": {i}, \"name\": \"row {i}\", \"n\": {{\"v\": {i}}}}}\n"))
+            .collect();
+        let docs = run(bytes(&ndjson, None), json!({})).await;
+        ticker.abort();
+        assert_eq!(docs.len(), 20_000);
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the runtime was blocked for the whole parse"
+        );
     }
 
     #[tokio::test]

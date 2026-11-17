@@ -280,14 +280,8 @@ impl Plugin for MsgpackParserPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let flatten = cfg.flatten()?;
-        let blob = input.into_bytes()?;
+        let mut blob = input.into_bytes()?;
         ctx.check_cancelled()?;
-
-        let data = blob.data.clone();
-        let mut roots = run_blocking(move || decode_payload(&data)).await??;
-        if let Some(max) = cfg.max_records {
-            roots.truncate(max);
-        }
 
         let stem = id_stem(&blob, "msgpack");
         let meta = DocumentMeta {
@@ -296,15 +290,26 @@ impl Plugin for MsgpackParserPlugin {
             mime: Some(blob.mime.clone()),
             ..Default::default()
         };
-        let items = roots
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (v, format!("{stem}_{i}")))
-            .collect();
-
-        Ok(PluginOutput::Documents(documents_from_values(
-            ctx, items, &flatten, &meta, NAME,
-        )?))
+        // Moved, not cloned: nothing below reads the bytes again.
+        let data = std::mem::take(&mut blob.data);
+        let max_records = cfg.max_records;
+        let ctx = ctx.clone();
+        // Decoding and flattening are CPU-bound: keep them off the async runtime.
+        let docs = run_blocking(move || {
+            let mut roots = decode_payload(&data)?;
+            drop(data);
+            if let Some(max) = max_records {
+                roots.truncate(max);
+            }
+            let items = roots
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (v, format!("{stem}_{i}")))
+                .collect();
+            documents_from_values(&ctx, items, &flatten, &meta, NAME)
+        })
+        .await??;
+        Ok(PluginOutput::Documents(docs))
     }
 }
 

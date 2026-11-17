@@ -282,14 +282,8 @@ impl Plugin for ParquetParserPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let flatten = cfg.flatten()?;
-        let blob = input.into_bytes()?;
+        let mut blob = input.into_bytes()?;
         ctx.check_cancelled()?;
-
-        let data = blob.data.clone();
-        let decode_cfg = cfg.clone();
-        let cancelled = ctx.cancellation_flag();
-        let rows = run_blocking(move || decode_payload(data, &decode_cfg, &cancelled)).await??;
-        ctx.heartbeat(format!("{NAME}: {} rows decoded", rows.len()));
 
         let stem = id_stem(&blob, "parquet");
         let meta = DocumentMeta {
@@ -298,15 +292,22 @@ impl Plugin for ParquetParserPlugin {
             mime: Some(blob.mime.clone()),
             ..Default::default()
         };
-        let items = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (v, format!("{stem}_r{}", i + 1)))
-            .collect();
-
-        Ok(PluginOutput::Documents(documents_from_values(
-            ctx, items, &flatten, &meta, NAME,
-        )?))
+        // Moved, not cloned: nothing below reads the bytes again.
+        let data = std::mem::take(&mut blob.data);
+        let ctx = ctx.clone();
+        // Decoding and flattening are CPU-bound: keep them off the async runtime.
+        let docs = run_blocking(move || {
+            let rows = decode_payload(data, &cfg, &ctx.cancellation_flag())?;
+            ctx.heartbeat(format!("{NAME}: {} rows decoded", rows.len()));
+            let items = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (v, format!("{stem}_r{}", i + 1)))
+                .collect();
+            documents_from_values(&ctx, items, &flatten, &meta, NAME)
+        })
+        .await??;
+        Ok(PluginOutput::Documents(docs))
     }
 }
 

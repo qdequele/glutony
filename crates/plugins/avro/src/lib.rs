@@ -387,13 +387,8 @@ impl Plugin for AvroParserPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let flatten = cfg.flatten()?;
-        let blob = input.into_bytes()?;
+        let mut blob = input.into_bytes()?;
         ctx.check_cancelled()?;
-
-        let data = blob.data.clone();
-        let max_records = cfg.max_records;
-        let cancelled = ctx.cancellation_flag();
-        let roots = run_blocking(move || decode_payload(&data, max_records, &cancelled)).await??;
 
         let stem = id_stem(&blob, "avro");
         let meta = DocumentMeta {
@@ -402,15 +397,23 @@ impl Plugin for AvroParserPlugin {
             mime: Some(blob.mime.clone()),
             ..Default::default()
         };
-        let items = roots
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (v, format!("{stem}_r{}", i + 1)))
-            .collect();
-
-        Ok(PluginOutput::Documents(documents_from_values(
-            ctx, items, &flatten, &meta, NAME,
-        )?))
+        // Moved, not cloned: nothing below reads the bytes again.
+        let data = std::mem::take(&mut blob.data);
+        let max_records = cfg.max_records;
+        let ctx = ctx.clone();
+        // Decoding and flattening are CPU-bound: keep them off the async runtime.
+        let docs = run_blocking(move || {
+            let roots = decode_payload(&data, max_records, &ctx.cancellation_flag())?;
+            drop(data);
+            let items = roots
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (v, format!("{stem}_r{}", i + 1)))
+                .collect();
+            documents_from_values(&ctx, items, &flatten, &meta, NAME)
+        })
+        .await??;
+        Ok(PluginOutput::Documents(docs))
     }
 }
 

@@ -292,121 +292,134 @@ impl Plugin for CsvParserPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let blob = input.into_bytes()?;
-
-        let delimiter = match cfg.delimiter {
-            Some(c) => c as u8,
-            None => sniff_delimiter(&blob.data),
-        };
-        let mut reader = ReaderBuilder::new()
-            .delimiter(delimiter)
-            .has_headers(cfg.has_headers)
-            .flexible(true)
-            .trim(if cfg.trim { Trim::All } else { Trim::None })
-            .from_reader(blob.data.as_slice());
-
-        let headers: Vec<String> = if cfg.has_headers {
-            reader
-                .headers()
-                .map_err(|e| PluginError::InvalidInput(format!("{NAME}: invalid CSV header: {e}")))?
-                .iter()
-                .enumerate()
-                .map(|(i, h)| {
-                    if h.is_empty() {
-                        format!("col_{}", i + 1)
-                    } else {
-                        h.to_owned()
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Resolve configured columns up front so typos fail fast.
-        let id_idx = match &cfg.id_column {
-            Some(name) if cfg.has_headers => Some(column_index(&headers, name, "id_column")?),
-            Some(name) => Some(parse_positional(name, "id_column")?),
-            None => None,
-        };
-        let content_idx: Option<Vec<usize>> = match &cfg.content_columns {
-            Some(cols) if cfg.has_headers => Some(
-                cols.iter()
-                    .map(|c| column_index(&headers, c, "content_columns"))
-                    .collect::<Result<_, _>>()?,
-            ),
-            Some(cols) => Some(
-                cols.iter()
-                    .map(|c| parse_positional(c, "content_columns"))
-                    .collect::<Result<_, _>>()?,
-            ),
-            None => None,
-        };
-
-        let stem = id_stem(&blob);
-        let meta = DocumentMeta {
-            source: blob.filename.clone(),
-            filename: blob.filename.clone(),
-            mime: Some(blob.mime.clone()),
-            ..Default::default()
-        };
-
-        let mut docs = Vec::new();
-        let mut record = StringRecord::new();
-        let mut row: usize = 0;
-        loop {
-            ctx.check_cancelled()?;
-            if cfg.max_rows.is_some_and(|max| row >= max) {
-                break;
-            }
-            let more = reader.read_record(&mut record).map_err(|e| {
-                PluginError::InvalidInput(format!("{NAME}: invalid CSV at row {}: {e}", row + 1))
-            })?;
-            if !more {
-                break;
-            }
-            row += 1;
-            if row.is_multiple_of(HEARTBEAT_EVERY) {
-                ctx.heartbeat(format!("{NAME}: {row} rows"));
-            }
-
-            let mut fields = Map::new();
-            let mut content_parts: Vec<&str> = Vec::new();
-            for (i, cell) in record.iter().enumerate() {
-                if cell.is_empty() {
-                    continue;
-                }
-                fields.insert(column_name(&headers, i), typed_cell(cell));
-                let include = match &content_idx {
-                    Some(idx) => idx.contains(&i),
-                    None => true,
-                };
-                if include {
-                    content_parts.push(cell);
-                }
-            }
-            if fields.is_empty() {
-                // Blank line: nothing to index.
-                continue;
-            }
-
-            let id = id_idx
-                .and_then(|i| record.get(i))
-                .filter(|v| !v.is_empty())
-                .map(sanitize_id)
-                .unwrap_or_else(|| format!("{stem}_r{row}"));
-            fields.insert("_row".into(), Value::from(row));
-
-            docs.push(Document {
-                id,
-                title: None,
-                content: content_parts.join(" "),
-                fields,
-                meta: meta.clone(),
-            });
-        }
-
+        // Parsing is CPU-bound: keep it off the async runtime.
+        let ctx = ctx.clone();
+        let docs = run_blocking(move || parse_csv(&ctx, &blob, &cfg)).await??;
         Ok(PluginOutput::Documents(docs))
     }
+}
+
+/// Parse `blob` into one document per row. Synchronous and CPU-bound: run it with
+/// [`run_blocking`]. It polls cancellation per row, since a blocking task cannot
+/// be aborted from outside.
+fn parse_csv(
+    ctx: &ActivityContext,
+    blob: &Blob,
+    cfg: &Config,
+) -> Result<Vec<Document>, PluginError> {
+    let delimiter = match cfg.delimiter {
+        Some(c) => c as u8,
+        None => sniff_delimiter(&blob.data),
+    };
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(cfg.has_headers)
+        .flexible(true)
+        .trim(if cfg.trim { Trim::All } else { Trim::None })
+        .from_reader(blob.data.as_slice());
+
+    let headers: Vec<String> = if cfg.has_headers {
+        reader
+            .headers()
+            .map_err(|e| PluginError::InvalidInput(format!("{NAME}: invalid CSV header: {e}")))?
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                if h.is_empty() {
+                    format!("col_{}", i + 1)
+                } else {
+                    h.to_owned()
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Resolve configured columns up front so typos fail fast.
+    let id_idx = match &cfg.id_column {
+        Some(name) if cfg.has_headers => Some(column_index(&headers, name, "id_column")?),
+        Some(name) => Some(parse_positional(name, "id_column")?),
+        None => None,
+    };
+    let content_idx: Option<Vec<usize>> = match &cfg.content_columns {
+        Some(cols) if cfg.has_headers => Some(
+            cols.iter()
+                .map(|c| column_index(&headers, c, "content_columns"))
+                .collect::<Result<_, _>>()?,
+        ),
+        Some(cols) => Some(
+            cols.iter()
+                .map(|c| parse_positional(c, "content_columns"))
+                .collect::<Result<_, _>>()?,
+        ),
+        None => None,
+    };
+
+    let stem = id_stem(blob);
+    let meta = DocumentMeta {
+        source: blob.filename.clone(),
+        filename: blob.filename.clone(),
+        mime: Some(blob.mime.clone()),
+        ..Default::default()
+    };
+
+    let mut docs = Vec::new();
+    let mut record = StringRecord::new();
+    let mut row: usize = 0;
+    loop {
+        ctx.check_cancelled()?;
+        if cfg.max_rows.is_some_and(|max| row >= max) {
+            break;
+        }
+        let more = reader.read_record(&mut record).map_err(|e| {
+            PluginError::InvalidInput(format!("{NAME}: invalid CSV at row {}: {e}", row + 1))
+        })?;
+        if !more {
+            break;
+        }
+        row += 1;
+        if row.is_multiple_of(HEARTBEAT_EVERY) {
+            ctx.heartbeat(format!("{NAME}: {row} rows"));
+        }
+
+        let mut fields = Map::new();
+        let mut content_parts: Vec<&str> = Vec::new();
+        for (i, cell) in record.iter().enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            fields.insert(column_name(&headers, i), typed_cell(cell));
+            let include = match &content_idx {
+                Some(idx) => idx.contains(&i),
+                None => true,
+            };
+            if include {
+                content_parts.push(cell);
+            }
+        }
+        if fields.is_empty() {
+            // Blank line: nothing to index.
+            continue;
+        }
+
+        let id = id_idx
+            .and_then(|i| record.get(i))
+            .filter(|v| !v.is_empty())
+            .map(sanitize_id)
+            .unwrap_or_else(|| format!("{stem}_r{row}"));
+        fields.insert("_row".into(), Value::from(row));
+
+        docs.push(Document {
+            id,
+            title: None,
+            content: content_parts.join(" "),
+            fields,
+            meta: meta.clone(),
+        });
+    }
+
+    Ok(docs)
 }
 
 /// Without headers, columns are addressed as `col_<n>` (1-based) in the config.
@@ -542,6 +555,36 @@ mod tests {
         assert_eq!(sniff_delimiter(b"a,b\n"), b',');
         assert_eq!(sniff_delimiter(b"a;b\n"), b';');
         assert_eq!(sniff_delimiter(b"a|b|c\n1|2|3"), b'|');
+    }
+
+    /// Parsing a large payload must not hold the runtime thread: on a
+    /// single-threaded runtime, a ticker task keeps running while it parses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsing_runs_off_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let mut csv = String::from("id,name,score\n");
+        for i in 0..20_000 {
+            csv.push_str(&format!("{i},row {i},{i}.5\n"));
+        }
+        let docs = run(&csv, None, json!({})).await;
+        ticker.abort();
+        assert_eq!(docs.len(), 20_000);
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the runtime was blocked for the whole parse"
+        );
     }
 
     #[tokio::test]
