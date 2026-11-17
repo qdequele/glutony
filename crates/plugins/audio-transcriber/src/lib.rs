@@ -602,12 +602,21 @@ fn transcription_usage(duration: Option<f64>, data: &[u8]) -> UsageUnits {
 
 /// Exact duration of an uncompressed RIFF/WAVE payload, read from its header.
 ///
-/// This is not an estimate: for PCM and IEEE-float WAV the `fmt ` chunk states the
-/// byte rate, so `data chunk length / byte rate` is the true length of the audio.
+/// This is not an estimate: for PCM and IEEE-float WAV every sample frame has a fixed
+/// size, so `audio bytes / (sample rate * frame size)` is the true length of the audio.
 /// Returns `None` for anything that is not such a file — in particular for every
 /// compressed format, where byte length says nothing reliable about duration.
+///
+/// The header is uploader-controlled, so only what a decoder plays from counts:
+///
+/// * the rate comes from the sample rate, channels and bits per sample, never from the
+///   informational "average bytes per second" field, and a block align that disagrees
+///   with them (or a zero in any of them) makes the file unmeasurable;
+/// * the audio is every byte after the first `data` header, whatever length it declares,
+///   since decoders read a stream-written file (declared 0 or short) to its end;
+/// * the first `fmt ` and `data` chunks win; later duplicates are ignored.
 fn wav_duration_secs(data: &[u8]) -> Option<f64> {
-    /// Uncompressed formats whose `fmt ` byte rate is exact.
+    /// Uncompressed formats whose frame size is fixed.
     const PCM: u16 = 1;
     const IEEE_FLOAT: u16 = 3;
     const EXTENSIBLE: u16 = 0xFFFE;
@@ -626,10 +635,10 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
         return None;
     }
 
-    let mut byte_rate: Option<u32> = None;
+    let mut byte_rate: Option<u64> = None;
     let mut data_len: Option<u64> = None;
     let mut pos = 12usize;
-    while pos + 8 <= data.len() {
+    while pos + 8 <= data.len() && (byte_rate.is_none() || data_len.is_none()) {
         let id = &data[pos..pos + 4];
         let declared = le_u32(&data[pos + 4..])? as usize;
         let body = &data[pos + 8..];
@@ -637,7 +646,10 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
         // clamp so a truncated upload still yields the length of the bytes we hold.
         let len = declared.min(body.len());
         match id {
-            b"fmt " if len >= 16 => {
+            b"fmt " if byte_rate.is_none() => {
+                if len < 16 {
+                    return None;
+                }
                 let format: u16 = le_u16(body)?;
                 let uncompressed = match format {
                     PCM | IEEE_FLOAT => true,
@@ -651,9 +663,18 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
                 if !uncompressed {
                     return None;
                 }
-                byte_rate = le_u32(&body[8..]);
+                let channels = u64::from(le_u16(&body[2..])?);
+                let sample_rate = u64::from(le_u32(&body[4..])?);
+                let block_align = u64::from(le_u16(&body[12..])?);
+                // For EXTENSIBLE this is the container size, which is what frames hold.
+                let bits = u64::from(le_u16(&body[14..])?);
+                let frame = channels * bits.div_ceil(8);
+                if sample_rate == 0 || frame == 0 || block_align != frame {
+                    return None;
+                }
+                byte_rate = Some(sample_rate * frame);
             }
-            b"data" => data_len = Some(len as u64),
+            b"data" if data_len.is_none() => data_len = Some(body.len() as u64),
             _ => {}
         }
         // Chunks are word-aligned: an odd length is followed by a pad byte.
@@ -661,7 +682,7 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
     }
 
     match (byte_rate, data_len) {
-        (Some(rate), Some(len)) if rate > 0 => Some(len as f64 / f64::from(rate)),
+        (Some(rate), Some(len)) => Some(len as f64 / rate as f64),
         _ => None,
     }
 }
@@ -1221,6 +1242,73 @@ mod tests {
         let mut truncated = wav_bytes(2.0);
         truncated.truncate(44 + 16_000);
         assert_eq!(wav_duration_secs(&truncated), Some(0.5));
+    }
+
+    #[test]
+    fn a_forged_byte_rate_does_not_shrink_the_duration() {
+        // The average-bytes-per-second field is informational: a decoder plays the
+        // samples from the sample rate, channels and bits per sample, so billing must too.
+        let mut forged = wav_bytes(3.5);
+        forged[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(wav_duration_secs(&forged), Some(3.5));
+        // A block align that disagrees with channels * bytes per sample is not a file
+        // we can measure: the seconds stay visibly unknown rather than being guessed.
+        let mut odd_align = wav_bytes(1.0);
+        odd_align[32..34].copy_from_slice(&64u16.to_le_bytes());
+        assert_eq!(wav_duration_secs(&odd_align), None);
+        // Zero sample rate, channels or bits cannot describe playable audio.
+        for (at, len) in [(24usize, 4usize), (22, 2), (34, 2)] {
+            let mut zeroed = wav_bytes(1.0);
+            zeroed[at..at + len].fill(0);
+            assert_eq!(wav_duration_secs(&zeroed), None, "zeroed bytes {at}..");
+        }
+    }
+
+    #[test]
+    fn a_forged_data_length_does_not_shrink_the_duration() {
+        // Decoders read a `data` chunk declared as 0 (or any short length) to the end
+        // of a stream-written file, so the bytes actually held are what is billed.
+        let mut zero = wav_bytes(2.0);
+        zero[40..44].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(wav_duration_secs(&zero), Some(2.0));
+        let mut short = wav_bytes(2.0);
+        short[40..44].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(wav_duration_secs(&short), Some(2.0));
+    }
+
+    #[test]
+    fn only_the_first_fmt_chunk_counts() {
+        // A second `fmt ` chunk after the audio cannot replace the one a decoder used.
+        let mut wav = wav_bytes(1.0);
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&8u16.to_le_bytes()); // 8 channels
+        wav.extend_from_slice(&192_000u32.to_le_bytes());
+        wav.extend_from_slice(&(192_000u32 * 32).to_le_bytes());
+        wav.extend_from_slice(&32u16.to_le_bytes());
+        wav.extend_from_slice(&32u16.to_le_bytes());
+        // The trailing chunk's 24 bytes count as audio (everything after the `data`
+        // header does), but the rate is still the first chunk's.
+        let secs = wav_duration_secs(&wav).unwrap();
+        assert!((secs - 1.0).abs() < 0.01, "got {secs}");
+    }
+
+    #[tokio::test]
+    async fn a_forged_wav_header_is_billed_for_its_real_length() {
+        let mut wav = wav_bytes(3.5);
+        wav[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        let usage = usage_for(
+            serde_json::json!({ "text": "three and a half seconds" }),
+            Blob::new(wav, "audio/wav", Some("clip.wav".into())),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            (usage.audio_seconds - 3.5).abs() < 1e-9,
+            "got {}",
+            usage.audio_seconds
+        );
     }
 
     #[tokio::test]

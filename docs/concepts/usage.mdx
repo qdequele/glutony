@@ -25,7 +25,12 @@ One row per pipeline step, plus one row per job.
 Volume is observed by the worker. Cost units come from the plugins themselves, because
 only the plugin knows what it spent on an external service: the enricher reports the
 token counts the provider returned, the transcriber reports the audio seconds it was
-billed for, the extractors report pages. Plugins report through
+billed for, the extractors report pages. When the transcription response carries no
+duration, an uncompressed WAV upload is measured from its header: the rate comes from
+its sample rate, channels and bits per sample (never the informational bytes-per-second
+field) and the audio is every byte after the `data` header, so a forged header cannot
+shrink the billed seconds. Compressed audio without a duration counts the request only.
+Plugins report through
 `ActivityContext::record_usage`, and the accumulator is shared across clones so a
 plugin fanning out concurrently is not undercounted.
 
