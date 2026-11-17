@@ -5,7 +5,8 @@
 //!
 //! * `mode: "row"` (default) → one [`Document`] per data row. The first row of each
 //!   sheet is used as headers (`has_headers: true`), each cell becomes
-//!   `fields[header]` with its natural JSON type, `content` is the non-empty cell
+//!   `fields[header]` with its natural JSON type (`col_<n>` without a header; a
+//!   repeated header gets a `_2`, `_3`, … suffix), `content` is the non-empty cell
 //!   texts joined by a space, `fields._row` is the 1-based row number,
 //!   `_meta.section` is the sheet name and `_meta.page` the 1-based sheet index.
 //!   Id: `<filename_stem>_<sheet>_r<row>`.
@@ -14,7 +15,7 @@
 //! `sheets` restricts extraction to the named sheets; `max_rows` caps the rows read
 //! per sheet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 
 use calamine::{Data, DataRef, Reader, Sheets};
@@ -132,13 +133,39 @@ fn cell_text(cell: &Data) -> String {
     }
 }
 
-/// Header name for a column: the trimmed header cell text, or `col_<n>` (1-based).
-fn header_name(headers: &[String], col: usize) -> String {
-    headers
-        .get(col)
-        .filter(|h| !h.is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("col_{}", col + 1))
+/// Field name of every column of a sheet `width` columns wide.
+///
+/// A column is named after its trimmed header cell text, or `col_<n>` (1-based) when
+/// the header is empty or missing. Names are unique so that no column overwrites
+/// another: the first column with a given header keeps it, and a later column whose
+/// name is already taken, by a repeated header or by a real header that looks like a
+/// fallback (`col_3`), gets the first free `<name>_<k>` (`k` from 2). Real headers
+/// are reserved before any suffix is picked, so `Notes | Notes | Notes_2` names the
+/// second column `Notes_3`.
+fn column_names(headers: &[String], width: usize) -> Vec<String> {
+    let header = |col: usize| headers.get(col).filter(|h| !h.is_empty());
+    let mut taken: HashSet<String> = (0..headers.len()).filter_map(header).cloned().collect();
+    let mut first_use: HashSet<&str> = HashSet::new();
+    (0..width.max(headers.len()))
+        .map(|col| {
+            if let Some(h) = header(col)
+                && first_use.insert(h.as_str())
+            {
+                return h.clone();
+            }
+            let base = header(col)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{}", col + 1));
+            let mut name = base.clone();
+            let mut k = 2;
+            while taken.contains(&name) {
+                name = format!("{base}_{k}");
+                k += 1;
+            }
+            taken.insert(name.clone());
+            name
+        })
+        .collect()
 }
 
 fn sheet_error(name: &str, e: impl std::fmt::Display) -> PluginError {
@@ -159,6 +186,8 @@ struct SheetCells {
     rows: BTreeMap<u32, BTreeMap<u32, Data>>,
     /// Leftmost column holding a cell.
     first_col: u32,
+    /// Rightmost column holding a cell.
+    last_col: u32,
 }
 
 impl SheetCells {
@@ -166,7 +195,19 @@ impl SheetCells {
         if self.rows.is_empty() || col < self.first_col {
             self.first_col = col;
         }
+        if self.rows.is_empty() || col > self.last_col {
+            self.last_col = col;
+        }
         self.rows.entry(row).or_default().insert(col, value);
+    }
+
+    /// Number of columns between the leftmost and rightmost cells, both included.
+    fn width(&self) -> usize {
+        if self.rows.is_empty() {
+            0
+        } else {
+            (self.last_col - self.first_col) as usize + 1
+        }
     }
 
     /// Absolute index of the first row holding a cell.
@@ -263,6 +304,7 @@ fn extract_rows(
     } else {
         Vec::new()
     };
+    let names = column_names(&headers, cells.width());
     let header_offset = usize::from(cfg.has_headers);
     let sheet_id = sanitize_id(sheet);
     let page = u32::try_from(sheet_index + 1).ok();
@@ -291,7 +333,7 @@ fn extract_rows(
             };
             parts.push(text);
             let col = (col - cells.first_col) as usize;
-            fields.insert(header_name(&headers, col), value);
+            fields.insert(names[col].clone(), value);
         }
         if parts.is_empty() {
             continue;
@@ -676,6 +718,47 @@ mod tests {
             max_gap_us * 4 < total_us,
             "the runtime was blocked for {max_gap_us} us of a {total_us} us extraction"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_headers_get_distinct_field_names() {
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        // Name | Notes | Notes | Notes_2 | (empty) | col_5
+        for (col, header) in [(0, "Name"), (1, "Notes"), (2, "Notes"), (3, "Notes_2")] {
+            ws.write_string(0, col, header).unwrap();
+        }
+        ws.write_string(0, 5, "col_5").unwrap();
+        for (col, value) in [
+            "Ada", "first", "second", "third", "fourth", "fifth", "sixth",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ws.write_string(1, col as u16, value).unwrap();
+        }
+        let bytes = wb.save_to_buffer().unwrap();
+
+        let out = XlsxExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                input(bytes),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let docs = out.into_documents().unwrap();
+        assert_eq!(docs.len(), 1, "{docs:#?}");
+        let fields = &docs[0].fields;
+        assert_eq!(fields["Name"], "Ada");
+        assert_eq!(fields["Notes"], "first");
+        assert_eq!(fields["Notes_3"], "second");
+        assert_eq!(fields["Notes_2"], "third");
+        assert_eq!(fields["col_5_2"], "fourth");
+        assert_eq!(fields["col_5"], "fifth");
+        // Wider than the header row: the fallback name is free here.
+        assert_eq!(fields["col_7"], "sixth");
+        assert_eq!(fields.len(), 8, "{fields:#?}");
     }
 
     #[tokio::test]
