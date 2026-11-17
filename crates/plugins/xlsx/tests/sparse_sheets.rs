@@ -41,11 +41,11 @@ fn input(bytes: Vec<u8>) -> PluginInput {
 }
 
 /// Tests in this binary share the allocator counters; run them one at a time.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn a_stray_cell_on_the_last_row_does_not_allocate_the_full_grid() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = SERIAL.lock().await;
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
     for col in 0..30u16 {
@@ -81,7 +81,7 @@ async fn a_stray_cell_on_the_last_row_does_not_allocate_the_full_grid() {
 
 #[tokio::test]
 async fn opposite_corners_of_a_sheet_are_read_without_a_dense_grid() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = SERIAL.lock().await;
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
     ws.write_string(0, 0, "a").unwrap();
