@@ -51,7 +51,8 @@ Public HTTP API (port 8080). For each ingest request it:
 5. Resolves the target index and writes it into the context.
 6. Stages the payload: bytes and inline `documents` ≤ `INLINE_MAX_BYTES` travel
    inside the workflow input; larger ones go to the blob store as a `Staged`
-   reference.
+   reference. If the workflow then cannot be started, the staged object is
+   removed again.
 7. Starts the `PipelineWorkflow` (id `ingest-<job_id>`) and records the job in
    the control plane.
 

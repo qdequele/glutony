@@ -227,7 +227,7 @@ pub mod test_support {
     use meili_ingest_blob::BlobStore;
     use meili_ingest_plugin_sdk::{
         ArchiveWorkflowInput, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput,
-        StepDefinition,
+        PluginInput, StepDefinition,
     };
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
@@ -250,6 +250,7 @@ pub mod test_support {
         snapshots: Mutex<HashMap<Uuid, JobSnapshot>>,
         forgotten: Mutex<Vec<Uuid>>,
         fail_start: Mutex<bool>,
+        refused: Mutex<Vec<PluginInput>>,
     }
 
     impl FakeStarter {
@@ -278,6 +279,10 @@ pub mod test_support {
         pub fn fail_start(&self) {
             *self.fail_start.lock().unwrap() = true;
         }
+        /// The input of every start refused after [`FakeStarter::fail_start`].
+        pub fn refused_inputs(&self) -> Vec<PluginInput> {
+            self.refused.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -287,6 +292,7 @@ pub mod test_support {
             input: &PipelineWorkflowInput,
         ) -> Result<StartedWorkflow, GatewayError> {
             if *self.fail_start.lock().unwrap() {
+                self.refused.lock().unwrap().push(input.input.clone());
                 return Err(GatewayError::Upstream("temporal unavailable".into()));
             }
             self.inputs.lock().unwrap().push(input.clone());
@@ -300,6 +306,7 @@ pub mod test_support {
             input: &ArchiveWorkflowInput,
         ) -> Result<StartedWorkflow, GatewayError> {
             if *self.fail_start.lock().unwrap() {
+                self.refused.lock().unwrap().push(input.input.clone());
                 return Err(GatewayError::Upstream("temporal unavailable".into()));
             }
             self.archive_inputs.lock().unwrap().push(input.clone());

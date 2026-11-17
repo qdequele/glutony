@@ -96,6 +96,33 @@ pub fn check_index_uid(index_uid: &str) -> Result<&str, GatewayError> {
     }
 }
 
+/// The blob-store key of an input this gateway staged for the job, if it staged one.
+/// A `Staged` ref is only ever built here, by `stage_upload` or `stage_documents`: a
+/// caller's own `url` or `s3` ref is never one.
+fn staged_key_of(input: &PluginInput) -> Option<String> {
+    match input {
+        PluginInput::Ref(ContentRef::Staged { uri, .. }) => Some(uri.clone()),
+        _ => None,
+    }
+}
+
+/// Remove the input staged for a workflow that did not start. No job row and no
+/// workflow names the object, so nothing else would ever find it, and a client that
+/// retries stages a new copy under a new job id each time.
+///
+/// Best effort: a failure is logged and the start error is what the caller gets. If
+/// the start failed after Temporal accepted it (a lost response), that workflow fails
+/// at its first read of the input; the caller was told the request failed and
+/// retries, which beats keeping the upload of every failed request.
+async fn discard_staged(state: &AppState, job_id: Uuid, key: Option<&str>) {
+    let Some(key) = key else {
+        return;
+    };
+    if let Err(e) = state.blob.delete(key).await {
+        tracing::warn!(job_id = %job_id, key = %key, "could not remove the staged input of a job that did not start: {e}");
+    }
+}
+
 fn blank(s: Option<&str>) -> bool {
     s.is_none_or(|s| s.trim().is_empty())
 }
@@ -307,13 +334,20 @@ pub async fn submit_one(
     };
 
     let pipeline_uid = pipeline.uid.clone();
+    let staged = staged_key_of(&input);
     let wf_input = PipelineWorkflowInput {
         job_id,
         pipeline,
         input,
         context: ctx.clone(),
     };
-    let started = state.temporal.start(&wf_input).await?;
+    let started = match state.temporal.start(&wf_input).await {
+        Ok(started) => started,
+        Err(e) => {
+            discard_staged(state, job_id, staged.as_deref()).await;
+            return Err(e);
+        }
+    };
     tracing::info!(
         job_id = %job_id,
         workflow_id = %started.workflow_id,
@@ -514,6 +548,7 @@ async fn submit_archive(
             ));
         }
     };
+    let staged = staged_key_of(&input);
     let wf_input = ArchiveWorkflowInput {
         job_id,
         input,
@@ -523,7 +558,13 @@ async fn submit_archive(
         resume: None,
         batching: None,
     };
-    let started = state.temporal.start_archive(&wf_input).await?;
+    let started = match state.temporal.start_archive(&wf_input).await {
+        Ok(started) => started,
+        Err(e) => {
+            discard_staged(state, job_id, staged.as_deref()).await;
+            return Err(e);
+        }
+    };
     tracing::info!(
         job_id = %job_id,
         workflow_id = %started.workflow_id,
@@ -1360,6 +1401,76 @@ mod tests {
             }
         }
         assert_eq!(ids, ["1", "2", "3"]);
+    }
+
+    /// The key of a staged input.
+    fn staged_uri(input: &PluginInput) -> &str {
+        match input {
+            PluginInput::Ref(ContentRef::Staged { uri, .. }) => uri,
+            other => panic!("expected a staged ref, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_staged_input_is_removed_when_the_workflow_does_not_start() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let cfg = GatewayConfig {
+            inline_max_bytes: 16,
+            ..GatewayConfig::default()
+        };
+        let (app, starter, blob) = app_with_blob(&server, cfg);
+        starter.fail_start();
+
+        // A file above the inline limit, documents above it, and an archive (always
+        // staged).
+        let (ct, body) = multipart_body("file", "big.pdf", "application/pdf", PDF_MAGIC);
+        let documents = json!({"documents": [{"id": "1", "content": "more than 16 bytes"}]});
+        let requests = [
+            standalone_request("/ingest", ct, body),
+            standalone_request("/ingest", "application/json", documents.to_string().into()),
+            zip_upload("/ingest"),
+        ];
+        for req in requests {
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
+        let refused = starter.refused_inputs();
+        assert_eq!(refused.len(), 3);
+        for input in &refused {
+            let uri = staged_uri(input);
+            assert!(
+                matches!(
+                    blob.get(uri).await,
+                    Err(meili_ingest_blob::BlobError::NotFound(_))
+                ),
+                "{uri} is still in the blob store, where nothing references it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_staged_input_is_kept_when_the_workflow_starts() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let cfg = GatewayConfig {
+            inline_max_bytes: 16,
+            ..GatewayConfig::default()
+        };
+        let (app, starter, blob) = app_with_blob(&server, cfg);
+        let (ct, body) = multipart_body("file", "big.pdf", "application/pdf", PDF_MAGIC);
+        let resp = app
+            .oneshot(standalone_request("/ingest", ct, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let inputs = starter.inputs();
+        assert_eq!(
+            blob.get(staged_uri(&inputs[0].input)).await.unwrap(),
+            PDF_MAGIC
+        );
     }
 
     #[tokio::test]
