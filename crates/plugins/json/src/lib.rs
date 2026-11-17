@@ -4,7 +4,9 @@
 //! [`Document`]s whose `fields` are flat, dotted-key objects (`a.b.c`).
 //!
 //! Input can be raw bytes (a JSON value, or NDJSON with one value per line)
-//! or documents from a previous step, whose `fields` are re-flattened.
+//! or documents from a previous step, whose `fields` are re-flattened. Such a
+//! document keeps its own `content` unless `content_fields` is set; the default
+//! "every string leaf" rule only fills an empty one.
 //!
 //! Document selection from a single JSON value:
 //! * top-level array → one document per element;
@@ -280,20 +282,26 @@ fn build_document(
         .filter(|s| !s.is_empty())
         .or(fallback.title);
 
-    let content = match &cfg.content_fields {
-        Some(keys) => keys
-            .iter()
-            .filter_map(|k| fields.remove(k))
-            .map(|v| value_text(&v))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
-        None => string_leaves(&fields).join(" "),
-    };
-    let content = if content.is_empty() {
-        fallback.content.unwrap_or_default()
-    } else {
-        content
+    // An upstream document's own content wins unless `content_fields` says
+    // otherwise: the default "every string leaf" rule only fills an empty one.
+    let upstream = fallback.content.filter(|c| !c.is_empty());
+    let content = match (&cfg.content_fields, upstream) {
+        (Some(keys), upstream) => {
+            let joined = keys
+                .iter()
+                .filter_map(|k| fields.remove(k))
+                .map(|v| value_text(&v))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.is_empty() {
+                upstream.unwrap_or_default()
+            } else {
+                joined
+            }
+        }
+        (None, Some(upstream)) => upstream,
+        (None, None) => string_leaves(&fields).join(" "),
     };
 
     Document {
@@ -384,7 +392,7 @@ impl Plugin for JsonFlattenerPlugin {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
                         "default": null,
-                        "description": "Flattened keys joined by a space into `content` (removed from fields). Defaults to every string leaf."
+                        "description": "Flattened keys joined by a space into `content` (removed from fields). Defaults to every string leaf; an upstream document keeps its own non-empty `content` unless this is set."
                     },
                     "title_field": {
                         "type": ["string", "null"],
@@ -710,8 +718,18 @@ mod tests {
         assert_eq!(out.title.as_deref(), Some("T"));
         assert_eq!(out.fields["nested.x.y"], json!("deep"));
         assert_eq!(out.fields["nested.list"], json!([1, 2]));
-        assert_eq!(out.content, "deep", "content is rebuilt from string leaves");
+        assert_eq!(
+            out.content, "old content",
+            "an upstream content is kept, not rebuilt from string leaves"
+        );
         assert_eq!(out.meta.page, Some(3), "meta is preserved");
+
+        // An empty upstream content is filled from the string leaves.
+        let mut d = Document::with_id("p1", "");
+        d.fields
+            .insert("nested".into(), json!({"x": {"y": "deep"}}));
+        let docs = run(PluginInput::Documents(vec![d]), json!({})).await;
+        assert_eq!(docs[0].content, "deep");
 
         // Many input is flattened too, and an upstream `content` survives when nothing else is textual.
         let d = Document::with_id("p2", "keep me");
@@ -721,6 +739,27 @@ mod tests {
         )
         .await;
         assert_eq!(docs[0].content, "keep me");
+    }
+
+    #[tokio::test]
+    async fn upstream_content_is_kept_over_string_fields() {
+        // An inline document (or an extractor's output) with a body and other
+        // string fields: the body must not be replaced by those fields.
+        let mut d = Document::with_id("1", "long body");
+        d.fields.insert("author".into(), json!("Ada"));
+        let docs = run(PluginInput::Documents(vec![d]), json!({})).await;
+        assert_eq!(docs[0].content, "long body");
+        assert_eq!(docs[0].fields["author"], json!("Ada"), "fields are kept");
+
+        // An explicit `content_fields` still decides.
+        let mut d = Document::with_id("1", "long body");
+        d.fields.insert("author".into(), json!("Ada"));
+        let docs = run(
+            PluginInput::Documents(vec![d]),
+            json!({"content_fields": ["author"]}),
+        )
+        .await;
+        assert_eq!(docs[0].content, "Ada");
     }
 
     #[tokio::test]

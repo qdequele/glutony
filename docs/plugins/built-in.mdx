@@ -110,7 +110,9 @@ joined by a space.
 Accepts **bytes or documents**. Top-level array → one document per element;
 object with a `documents`, `items` or `data` array → those; anything else →
 one document. Nested objects are flattened to dotted keys (`a.b.c`) in
-`fields`; `content` = concatenated string values.
+`fields`; `content` = concatenated string values. For **documents** input,
+each document's own `content` is kept; the string values only fill an empty
+one (unless `content_fields` is set).
 
 Newline-delimited JSON (NDJSON / JSON Lines) gives one document per line. A
 `.ndjson` or `.jsonl` file, or a body with one JSON object or array per line, is
@@ -121,6 +123,8 @@ detected as `application/x-ndjson` and routed to `builtin.json`
 | Key | Default | Description |
 |---|---|---|
 | `id_field` | `"id"` | Field used as document id; generated when missing. |
+| `content_fields` | every string leaf | Keys joined by a space into `content`. When set, they replace an upstream document's `content` too. |
+| `title_field` | — | Key mapped onto `title`. |
 
 ### `parquet_parser`
 
