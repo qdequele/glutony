@@ -20,8 +20,8 @@ use meili_ingest_archive::Limits;
 use meili_ingest_blob::BlobStore;
 use meili_ingest_plugin_sdk::{
     ARCHIVE_WORKFLOW_TYPE, ArchiveBatching, ArchiveWorkflowInput, ArchiveWorkflowOutput, Blob,
-    MeiliContext, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput, PluginInput,
-    StepDefinition,
+    ContentRef, MeiliContext, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput,
+    PluginInput, StepDefinition,
 };
 use meili_ingest_worker::archive_activity::file_job_id;
 use meili_ingest_worker::{
@@ -436,4 +436,89 @@ async fn cancel_while_its_files_run(signal: bool) {
 async fn an_archive_cancelled_while_its_files_run_ends_cancelled() {
     // As `POST /jobs/{id}/cancel` does it: the signal, then the Temporal cancellation.
     cancel_while_its_files_run(true).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_from_temporal_while_its_files_run_ends_cancelled() {
+    // No `cancel` signal: this is what the Temporal UI and CLI do.
+    cancel_while_its_files_run(false).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_while_unpacking_ends_cancelled() {
+    let Some(client) = client().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let cp = control_plane().await;
+    let job_id = Uuid::new_v4();
+    // The archive is fetched from a slow host, so the expansion is still running when
+    // the cancellation lands.
+    Mock::given(method("GET"))
+        .and(path("/bundle.zip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(zip_of(&[("a.json", br#"{"id": 1}"#)]))
+                .set_delay(HELD),
+        )
+        .mount(&cp)
+        .await;
+    let input = PluginInput::Ref(ContentRef::Url {
+        url: format!("{}/bundle.zip", cp.uri()),
+        mime: Some("application/zip".into()),
+        filename: Some("bundle.zip".into()),
+    });
+    let cancel = CancelOn {
+        verb: "GET",
+        path: "/bundle.zip".into(),
+        signal: true,
+    };
+    let (result, _, _) = run_job(
+        client,
+        &cp,
+        job_id,
+        BlobStore::memory(),
+        input,
+        ONE_WAVE,
+        Some(cancel),
+    )
+    .await;
+    assert_cancelled(result, &cp, job_id).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_while_routing_its_files_ends_cancelled() {
+    let Some(client) = client().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let cp = control_plane().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/resolve"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "pipeline": json_pipeline() }))
+                .set_delay(HELD),
+        )
+        .with_priority(1)
+        .mount(&cp)
+        .await;
+    let job_id = Uuid::new_v4();
+    let blob = BlobStore::memory();
+    let zip = zip_of(&[("a.json", br#"{"id": 1}"#)]);
+    let input = blob
+        .stage_upload(
+            job_id,
+            Blob::new(zip, "application/zip", Some("bundle.zip".into())),
+            0,
+        )
+        .await
+        .expect("stage the archive");
+    let cancel = CancelOn {
+        verb: "POST",
+        path: "/internal/resolve".into(),
+        signal: true,
+    };
+    let (result, _, _) = run_job(client, &cp, job_id, blob, input, ONE_WAVE, Some(cancel)).await;
+    assert_cancelled(result, &cp, job_id).await;
 }

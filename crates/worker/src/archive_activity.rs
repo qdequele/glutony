@@ -337,6 +337,24 @@ impl ArchiveActivities {
         })
     }
 
+    /// [`Self::expand`], given up as soon as `cancelled` resolves.
+    ///
+    /// Giving up drops the expansion, which closes the channel its walk feeds: the walk
+    /// stops at its next entry instead of staging the rest of an archive nobody wants
+    /// any more. What was staged until then stays under the job's keys, as after any
+    /// failed expansion.
+    pub async fn expand_unless(
+        &self,
+        input: &ExpandArchiveInput,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<ExpandArchiveOutput, PluginError> {
+        tokio::select! {
+            biased;
+            () = cancelled => Err(PluginError::Cancelled),
+            expanded = self.expand(input) => expanded,
+        }
+    }
+
     /// Route one page of the manifest into child jobs.
     pub async fn prepare(
         &self,
@@ -549,7 +567,8 @@ impl ArchiveActivities {
                 }
             }
         });
-        let result = self.expand(&input).await;
+        // Cancellation reaches an activity through its heartbeats.
+        let result = self.expand_unless(&input, ctx.cancelled()).await;
         keepalive.abort();
         result.map_err(to_activity_error)
     }
@@ -768,6 +787,59 @@ mod tests {
             .unwrap_err();
         assert!(!err.is_retryable(), "{err}");
         assert!(err.to_string().contains("more than 1 files"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_expansion_stops_and_writes_no_manifest() {
+        // The archive comes from a host that takes its time: the expansion is still
+        // fetching it when the job is cancelled.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/q3.zip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(zip_of(&[("a.txt", b"a")]))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let a = activities("http://unused");
+        let job_id = Uuid::new_v4();
+        let input = ExpandArchiveInput {
+            job_id,
+            input: PluginInput::Ref(ContentRef::Url {
+                url: format!("{}/q3.zip", server.uri()),
+                mime: Some("application/zip".into()),
+                filename: Some("q3.zip".into()),
+            }),
+        };
+        let cancelled = async {
+            while server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let out = tokio::time::timeout(Duration::from_secs(10), a.expand_unless(&input, cancelled))
+            .await
+            .expect("a cancelled expansion returns at once");
+        assert!(matches!(out, Err(PluginError::Cancelled)), "{out:?}");
+        assert!(a.blob().get(&manifest_key(job_id)).await.is_err());
+
+        // Not cancelled, it runs to the end.
+        let job_id = Uuid::new_v4();
+        let input = ExpandArchiveInput {
+            job_id,
+            input: staged_archive(&a, job_id, zip_of(&[("a.txt", b"a")])).await,
+        };
+        let out = a
+            .expand_unless(&input, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(out.files, 1);
     }
 
     #[tokio::test]

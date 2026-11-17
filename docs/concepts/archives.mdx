@@ -103,7 +103,8 @@ one), when no file could be ingested at all, or when the archive cannot be read.
 Skipped entries are reported but do not fail it.
 
 `POST /jobs/{job_id}/cancel` stops the archive job: no further file starts and the
-running ones are cancelled.
+running ones are cancelled. The job ends `cancelled` whatever it was doing, unpacking
+included: the worker stops reading the archive at its next entry.
 
 ## What is skipped
 

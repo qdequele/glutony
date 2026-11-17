@@ -25,9 +25,9 @@ use temporalio_common::RetryPolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::workflows::join_all;
 use temporalio_sdk::{
-    ActivityOptions, ApplicationFailure, ChildWorkflowOptions, ContinueAsNewOptions,
-    SyncWorkflowContext, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
-    WorkflowResult, WorkflowTermination,
+    ActivityExecutionError, ActivityOptions, ApplicationFailure, ChildWorkflowOptions,
+    ContinueAsNewOptions, SyncWorkflowContext, WorkflowCancellationToken, WorkflowContext,
+    WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use uuid::Uuid;
 
@@ -54,6 +54,24 @@ pub struct ArchiveWorkflow {
     progress: WorkflowProgress,
 }
 
+/// Why an activity of the archive job did not complete.
+enum Stop {
+    /// The job was cancelled while the activity ran.
+    Cancelled,
+    /// The activity failed.
+    Failed(String),
+}
+
+impl Stop {
+    /// `what` names the work that failed, as the job's error reads it.
+    fn from_activity(what: impl FnOnce() -> String, e: &ActivityExecutionError) -> Self {
+        match e {
+            ActivityExecutionError::Cancelled(_) => Self::Cancelled,
+            other => Self::Failed(format!("{}: {}", what(), describe_activity_failure(other))),
+        }
+    }
+}
+
 /// How one file's job ended, when not in success.
 struct FileFailure {
     path: String,
@@ -77,7 +95,7 @@ impl ArchiveWorkflow {
             }
             None => match Self::expand(ctx, &input).await {
                 Ok(started) => started,
-                Err(message) => return Self::fail(ctx, input.job_id, message).await,
+                Err(stop) => return Self::stop(ctx, input.job_id, stop).await,
             },
         };
 
@@ -86,7 +104,7 @@ impl ArchiveWorkflow {
         });
         let mut waves = 0usize;
         while next < total {
-            if ctx.state(|s| s.progress.cancel_requested) {
+            if Self::cancel_requested(ctx) {
                 return Self::finish_cancelled(ctx, input.job_id).await;
             }
             if waves >= waves_per_run || (waves > 0 && ctx.continue_as_new_suggested()) {
@@ -128,12 +146,9 @@ impl ArchiveWorkflow {
             let prepared = match prepared {
                 Ok(p) => p,
                 Err(e) => {
-                    let message = format!(
-                        "routing files {}-{last} failed: {}",
-                        next + 1,
-                        describe_activity_failure(&e)
-                    );
-                    return Self::fail(ctx, input.job_id, message).await;
+                    let what = || format!("routing files {}-{last} failed", next + 1);
+                    let stop = Stop::from_activity(what, &e);
+                    return Self::stop(ctx, input.job_id, stop).await;
                 }
             };
             if prepared.consumed == 0 {
@@ -173,7 +188,7 @@ impl ArchiveWorkflow {
             ctx.state_mut(|s| s.progress.completed_steps = next);
         }
 
-        if ctx.state(|s| s.progress.cancel_requested) {
+        if Self::cancel_requested(ctx) {
             return Self::finish_cancelled(ctx, input.job_id).await;
         }
         let archive = ctx.state(|s| s.progress.archive.clone().unwrap_or_default());
@@ -214,7 +229,7 @@ impl ArchiveWorkflow {
     async fn expand(
         ctx: &mut WorkflowContext<Self>,
         input: &ArchiveWorkflowInput,
-    ) -> Result<(String, usize, usize), String> {
+    ) -> Result<(String, usize, usize), Stop> {
         ctx.state_mut(|s| {
             s.progress.status = JobStatus::Running;
             s.progress.current_step = Some(UNPACK_STEP.into());
@@ -243,12 +258,7 @@ impl ArchiveWorkflow {
                 expand_options(),
             )
             .await
-            .map_err(|e| {
-                format!(
-                    "could not read the archive: {}",
-                    describe_activity_failure(&e)
-                )
-            })?;
+            .map_err(|e| Stop::from_activity(|| "could not read the archive".into(), &e))?;
         ctx.state_mut(|s| {
             s.progress.total_steps = expanded.files;
             let a = s.progress.archive.get_or_insert_with(Default::default);
@@ -294,6 +304,27 @@ impl ArchiveWorkflow {
         match output.status {
             JobStatus::Succeeded => Ok(()),
             other => Err(failure(format!("ended {}", other.as_str()))),
+        }
+    }
+
+    /// Whether the job was asked to stop: by the `cancel` signal, or by a Temporal
+    /// cancellation that came without it (the Temporal UI and CLI send no signal).
+    fn cancel_requested(ctx: &WorkflowContext<Self>) -> bool {
+        ctx.state(|s| s.progress.cancel_requested) || ctx.cancellation_token().is_cancelled()
+    }
+
+    /// End the job after an activity that did not complete: cancelled when the
+    /// activity was, or when the job was asked to stop meanwhile; failed otherwise.
+    async fn stop(
+        ctx: &mut WorkflowContext<Self>,
+        job_id: Uuid,
+        stop: Stop,
+    ) -> WorkflowResult<ArchiveWorkflowOutput> {
+        match stop {
+            Stop::Failed(message) if !Self::cancel_requested(ctx) => {
+                Self::fail(ctx, job_id, message).await
+            }
+            Stop::Cancelled | Stop::Failed(_) => Self::finish_cancelled(ctx, job_id).await,
         }
     }
 
