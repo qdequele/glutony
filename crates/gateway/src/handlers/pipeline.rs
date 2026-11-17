@@ -6,7 +6,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 
 use super::ingest::{
-    BatchResponse, IngestResponse, PipelineSelection, context_for, path_index, submit_batch,
+    BatchResponse, IngestResponse, PipelineSelection, check_index_uid, context_for, submit_batch,
     submit_one,
 };
 use super::{Query, QueryParams, check_pipeline_name, query_param, read_payload};
@@ -46,7 +46,7 @@ pub async fn ingest_into_index_with_pipeline(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<PipelineIngestResponse>), GatewayError> {
-    let index = path_index(&index_uid)?;
+    let index = check_index_uid(&index_uid)?;
     ingest_with_pipeline_inner(state, name, query, headers, req, Some(index)).await
 }
 

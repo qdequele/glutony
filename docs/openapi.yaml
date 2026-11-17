@@ -1294,7 +1294,12 @@ components:
       name: index
       in: query
       required: false
-      description: Target index. Overrides `X-Meili-Index`; overridden by the pipeline trigger's `index_pattern`.
+      description: |
+        Target index. Overrides `X-Meili-Index`; overridden by the pipeline trigger's
+        `index_pattern`. When it is the index the job writes to, it must be a valid
+        Meilisearch index uid (`^[a-zA-Z0-9_-]{1,400}$`), else the request is refused
+        with `400 bad_request`; the same holds for the `index` body field and
+        `X-Meili-Index`.
       schema:
         type: string
       example: contracts
@@ -1625,7 +1630,7 @@ components:
           description: The content to ingest. Filename and `Content-Type` of the part are used as MIME hints.
         index:
           type: string
-          description: Target index (same as `?index=`).
+          description: Target index (same as `?index=`, including its uid rule).
         filename:
           type: string
           description: Overrides the part's filename.
@@ -1671,7 +1676,7 @@ components:
             is not read, every hop under `SOURCE_FETCH_HOSTS`) before routing.
         index:
           type: string
-          description: Target index (same as `?index=`).
+          description: Target index (same as `?index=`, including its uid rule).
         pipeline:
           type: string
           description: Pipeline `uid` to run instead of routing by content type (same as `?pipeline=`).
@@ -1701,7 +1706,10 @@ components:
           description: As `JsonIngest.content_type`.
         index:
           type: string
-          description: Target index for this item.
+          description: |
+            Target index for this item. One that is not a valid Meilisearch index uid
+            fails the item with `bad_request` when it is the index the item would be
+            written to; the other items still run.
         pipeline:
           type: string
           description: |

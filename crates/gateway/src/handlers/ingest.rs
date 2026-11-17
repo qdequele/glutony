@@ -76,10 +76,11 @@ pub fn context_for(
     resolve_request_context(headers, query_index, &state.config)
 }
 
-/// Validate an index uid taken from the URL path with Meilisearch's own rule
-/// (alphanumeric, `-` and `_`, at most 400 bytes), so a malformed one is a 400 here
-/// rather than a job that fails at the indexer.
-pub fn path_index(index_uid: &str) -> Result<&str, GatewayError> {
+/// Validate an index uid a request names (in the URL path, `?index=`, the `index`
+/// field, `X-Meili-Index` or a batch item) with Meilisearch's own rule (alphanumeric,
+/// `-` and `_`, at most 400 bytes), so a malformed one is a 400 here rather than a
+/// job that fails at the indexer.
+pub fn check_index_uid(index_uid: &str) -> Result<&str, GatewayError> {
     let valid = !index_uid.is_empty()
         && index_uid.len() <= 400
         && index_uid
@@ -93,6 +94,19 @@ pub fn path_index(index_uid: &str) -> Result<&str, GatewayError> {
              are allowed, up to 400 bytes"
         )))
     }
+}
+
+fn blank(s: Option<&str>) -> bool {
+    s.is_none_or(|s| s.trim().is_empty())
+}
+
+/// The index the request itself names, whichever way: `?index=`, the `index` field,
+/// `X-Meili-Index` or a batch item's `index`.
+fn request_index(ctx: &MeiliContext) -> Option<&str> {
+    ctx.index
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
 }
 
 /// Submit one item: route → resolve index → preflight → stage bytes → start workflow →
@@ -223,12 +237,22 @@ pub async fn submit_one(
             ctx.index = Some(fixed.to_string());
             fixed.to_string()
         }
-        (None, None) => resolve_index(
-            &mut ctx,
-            index_pattern.as_deref(),
-            &mime,
-            &state.config.default_index,
-        ),
+        (None, None) => {
+            // Nothing above names the index, so unless the trigger's `index_pattern`
+            // does, the job writes to the request's own. Only then is it the
+            // caller's to get right: one that is overridden is never used.
+            if blank(index_pattern.as_deref())
+                && let Some(index) = request_index(&ctx)
+            {
+                check_index_uid(index)?;
+            }
+            resolve_index(
+                &mut ctx,
+                index_pattern.as_deref(),
+                &mime,
+                &state.config.default_index,
+            )
+        }
     };
 
     // A pinned pipeline writes with its connection's sealed key, which the caller never
@@ -438,6 +462,16 @@ async fn submit_archive(
             )));
         }
     }
+    // The request's index is where a file is written when nothing else names one:
+    // every file under a forced pipeline that names none, and any file routed by its
+    // own type. Refuse a malformed one now rather than fail those files later.
+    let request_index_is_used = locked_index.is_none()
+        && forced.as_ref().is_none_or(|f| {
+            f.pipeline.fixed_index().is_none() && blank(f.index_pattern.as_deref())
+        });
+    if request_index_is_used && let Some(index) = request_index(&ctx) {
+        check_index_uid(index)?;
+    }
     let target_index = archive_target_index(locked_index, forced.as_ref(), ctx.index.as_deref());
 
     if state.config.write_preflight
@@ -581,7 +615,7 @@ pub async fn ingest_into_index(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<IngestResponse>), GatewayError> {
-    let index = path_index(&index_uid)?;
+    let index = check_index_uid(&index_uid)?;
     ingest_inner(state, query, headers, req, Some(index)).await
 }
 
@@ -631,7 +665,7 @@ pub async fn ingest_batch_into_index(
     headers: HeaderMap,
     req: Request,
 ) -> Result<(StatusCode, Json<BatchResponse>), GatewayError> {
-    let index = path_index(&index_uid)?;
+    let index = check_index_uid(&index_uid)?;
     ingest_batch_inner(state, query, headers, req, Some(index)).await
 }
 
@@ -998,11 +1032,113 @@ mod tests {
     }
 
     #[test]
-    fn path_index_follows_meilisearch_uid_rules() {
-        assert!(path_index("glutony-demo_2").is_ok());
-        assert!(path_index("").is_err());
-        assert!(path_index("a b").is_err());
-        assert!(path_index(&"a".repeat(401)).is_err());
+    fn index_uids_follow_meilisearch_uid_rules() {
+        assert!(check_index_uid("glutony-demo_2").is_ok());
+        assert!(check_index_uid("").is_err());
+        assert!(check_index_uid("a b").is_err());
+        assert!(check_index_uid(&"a".repeat(401)).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_request_index_is_400_and_queues_nothing() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.json", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let docs = |index: Option<&str>| {
+            let mut body = json!({"documents": [{"id": "1"}]});
+            if let Some(i) = index {
+                body["index"] = json!(i);
+            }
+            body.to_string().into_bytes()
+        };
+
+        let mut by_header = standalone_request("/ingest", "application/json", docs(None));
+        by_header
+            .headers_mut()
+            .insert("x-meili-index", "bad.uid".parse().unwrap());
+        let requests = [
+            standalone_request("/ingest?index=bad.uid", "application/json", docs(None)),
+            standalone_request("/ingest", "application/json", docs(Some("a b/c"))),
+            by_header,
+            // An archive: any of its files may be written to the request's index.
+            zip_upload("/ingest?index=bad.uid"),
+        ];
+        for req in requests {
+            let what = format!("{} {:?}", req.uri(), req.headers().get("x-meili-index"));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{what}");
+            let err = json_body(resp).await;
+            assert_eq!(err["code"], "bad_request", "{what}");
+            assert!(
+                err["error"].as_str().unwrap().contains("invalid index uid"),
+                "{err}"
+            );
+        }
+        assert!(starter.inputs().is_empty());
+        assert!(starter.archive_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_item_index_fails_that_item_only() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.json", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"items": [
+            {"documents": [{"id": "1"}], "index": "a b/c"},
+            {"documents": [{"id": "2"}]}
+        ]});
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest/batch",
+                "application/json",
+                body.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let jobs = json_body(resp).await["jobs"].clone();
+        assert_eq!(jobs[0]["code"], "bad_request", "{jobs}");
+        assert_eq!(jobs[1]["status"], "queued", "{jobs}");
+        assert_eq!(starter.inputs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_index_that_is_overridden_is_not_checked() {
+        // Only the index the job writes to is the caller's to get right: one that the
+        // path, the pipeline's trigger or its indexer step overrides is never used.
+        let server = MockServer::start().await;
+        mount_resolve(&server, "contracts-pipe", Some("contracts")).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        let body = json!({"documents": [{"id": "1"}]}).to_string();
+        for (uri, target) in [
+            ("/ingest?index=bad.uid", "contracts"),
+            ("/indexes/movies/ingest?index=bad.uid", "movies"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(standalone_request(
+                    uri,
+                    "application/json",
+                    body.clone().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{uri}");
+            assert_eq!(json_body(resp).await["target_index"], target, "{uri}");
+        }
+        // An archive whose forced pipeline names the index, or under a path index.
+        for uri in [
+            "/ingest?pipeline=contracts-pipe&index=bad.uid",
+            "/indexes/movies/ingest?index=bad.uid",
+        ] {
+            let resp = app.clone().oneshot(zip_upload(uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{uri}");
+        }
+        assert_eq!(starter.inputs().len(), 2);
+        assert_eq!(starter.archive_inputs().len(), 2);
     }
 
     #[tokio::test]
