@@ -110,11 +110,12 @@ server.add_insecure_port("[::]:50051")
 server.start(); server.wait_for_termination()
 ```
 
-Raise the gRPC max message size on both sides for media: the worker resolves
-`s3://` and staged references into bytes before calling you, so a 200 MB video
-arrives as a 270 MB base64 string. For very large media, have your plugin
-accept a `ref` input instead (`"accepts": ["ref"]`) and fetch the object
-itself; the worker then passes the reference through untouched.
+Mind the message size for media. The worker resolves `s3://` and staged
+references into bytes before calling you and sends them as base64 in one
+message of at most 64 MiB, so about 48 MiB of raw bytes is the most a gRPC
+plugin can receive. A larger input fails the step without a retry, with an
+error naming the limit, before anything is sent. Raise your server's own
+receive limit to 64 MiB (gRPC servers default to 4 MiB).
 
 ## Deploy
 

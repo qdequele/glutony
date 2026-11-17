@@ -5,7 +5,9 @@
 //! deadline, and [`GrpcConnectOptions::retry_for`] keeps trying a container that is not
 //! up yet (see [`crate::load`]).
 //!
-//! Messages up to 64 MiB are accepted in both directions.
+//! Messages up to 64 MiB ([`MAX_MESSAGE_BYTES`]) are accepted in both directions. The
+//! input travels as JSON with binary content in base64, so about 48 MiB of raw bytes is
+//! the most a plugin can be sent; a larger input is refused before anything is sent.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +15,7 @@ use meili_ingest_plugin_sdk::{
     ActivityContext, Plugin, PluginError, PluginInput, PluginKind, PluginManifest, PluginOutput,
     async_trait,
 };
+use prost::Message;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
@@ -40,6 +43,8 @@ pub const LOAD_RETRY_FOR: Duration = Duration::from_secs(30);
 /// First pause between two attempts; it doubles up to [`RETRY_PAUSE_MAX`].
 const RETRY_PAUSE_START: Duration = Duration::from_millis(250);
 const RETRY_PAUSE_MAX: Duration = Duration::from_secs(4);
+
+const MIB: f64 = 1024.0 * 1024.0;
 
 /// How [`GrpcPlugin::connect_with_options`] reaches a plugin container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +220,24 @@ fn status_to_error(plugin: &str, status: Status) -> PluginError {
     }
 }
 
+/// Length of `bytes` bytes once written as padded base64.
+fn base64_len(bytes: usize) -> usize {
+    bytes.div_ceil(3).saturating_mul(4)
+}
+
+/// The error for an input that cannot fit one `Execute` message. `encoded_bytes` is
+/// the size of the message, or a lower bound of it.
+fn input_too_large(plugin: &str, encoded_bytes: usize) -> PluginError {
+    PluginError::NonRetryable(format!(
+        "grpc plugin {plugin}: the input is {:.1} MiB once encoded, over the {} MiB one gRPC \
+         message may hold. Binary content travels as base64, so a gRPC plugin can be sent \
+         about {} MiB of raw bytes at most",
+        encoded_bytes as f64 / MIB,
+        MAX_MESSAGE_BYTES / (1024 * 1024),
+        MAX_MESSAGE_BYTES / (1024 * 1024) / 4 * 3,
+    ))
+}
+
 #[async_trait]
 impl Plugin for GrpcPlugin {
     fn manifest(&self) -> PluginManifest {
@@ -229,13 +252,35 @@ impl Plugin for GrpcPlugin {
     ) -> Result<PluginOutput, PluginError> {
         ctx.check_cancelled()?;
         let name = self.manifest.name.as_str();
+
+        // A blob that cannot fit is refused before it is copied into base64.
+        if let PluginInput::Bytes(blob) = &input {
+            let encoded = base64_len(blob.data.len());
+            if encoded > MAX_MESSAGE_BYTES {
+                return Err(input_too_large(name, encoded));
+            }
+        }
+
+        let config_json = serde_json::to_vec(&config)?;
+        // Encoding tens of megabytes of base64 would stall the async runtime.
+        let input_json = tokio::task::spawn_blocking(move || serde_json::to_vec(&input))
+            .await
+            .map_err(|e| {
+                PluginError::non_retryable(format!(
+                    "grpc plugin {name}: encoding the input failed: {e}"
+                ))
+            })??;
         let request = ExecuteRequest {
             job_id: ctx.job_id().to_string(),
             step_id: ctx.step_id().to_string(),
-            input_json: serde_json::to_vec(&input)?,
-            config_json: serde_json::to_vec(&config)?,
+            input_json,
+            config_json,
             attempt: ctx.attempt(),
         };
+        let encoded = request.encoded_len();
+        if encoded > MAX_MESSAGE_BYTES {
+            return Err(input_too_large(name, encoded));
+        }
         ctx.heartbeat(format!("grpc {name}: calling Execute on {}", self.endpoint));
 
         let mut client = self.client.clone();
@@ -261,6 +306,21 @@ impl Plugin for GrpcPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_len_matches_the_encoder() {
+        for n in [0usize, 1, 2, 3, 4, 5, 6, 1000, 1001] {
+            let json =
+                serde_json::to_string(&meili_ingest_plugin_sdk::Blob::new(vec![0u8; n], "", None))
+                    .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                value["data"].as_str().unwrap().len(),
+                base64_len(n),
+                "n = {n}"
+            );
+        }
+    }
 
     #[test]
     fn only_statuses_that_may_pass_are_transient() {

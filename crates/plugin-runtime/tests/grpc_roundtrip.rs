@@ -295,3 +295,54 @@ async fn an_endpoint_that_can_never_work_is_not_retried() {
     assert!(matches!(err, RuntimeError::Transport(_)), "got {err:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[tokio::test]
+async fn input_over_the_message_limit_is_refused_with_the_limit() {
+    let (endpoint, calls) = spawn_server().await;
+    let plugin = GrpcPlugin::connect(endpoint).await.unwrap();
+
+    // 50 MiB of bytes is about 67 MiB of base64, over the 64 MiB message limit.
+    let blob = Blob::new(vec![0u8; 50 * 1024 * 1024], "audio/wav", None);
+    let err = plugin
+        .execute(
+            &ActivityContext::noop(),
+            PluginInput::Bytes(blob),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PluginError::NonRetryable(m)
+            if m.contains("echo") && m.contains("64 MiB") && m.contains("48 MiB")),
+        "got {err:?}"
+    );
+    assert!(
+        !calls.load(Ordering::SeqCst),
+        "the plugin must not be called"
+    );
+}
+
+#[tokio::test]
+async fn documents_over_the_message_limit_are_refused_too() {
+    let (endpoint, calls) = spawn_server().await;
+    let plugin = GrpcPlugin::connect(endpoint).await.unwrap();
+
+    // No blob here: only the size of the encoded message can tell.
+    let doc = Document::with_id("big", "a".repeat(65 * 1024 * 1024));
+    let err = plugin
+        .execute(
+            &ActivityContext::noop(),
+            PluginInput::Documents(vec![doc]),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PluginError::NonRetryable(m) if m.contains("65.0 MiB") && m.contains("64 MiB")),
+        "got {err:?}"
+    );
+    assert!(
+        !calls.load(Ordering::SeqCst),
+        "the plugin must not be called"
+    );
+}
