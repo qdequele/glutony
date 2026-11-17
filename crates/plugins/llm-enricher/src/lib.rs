@@ -23,6 +23,9 @@
 //! 6. Precise error mapping: transient upstream failures → [`PluginError::Retryable`],
 //!    everything the operator must fix → `NonRetryable` / `InvalidConfig` /
 //!    `InvalidInput`. Never leak secrets into errors or logs.
+//! 7. A transient failure (429, 5xx, dropped connection) is retried per request a few
+//!    times with backoff before it fails the step (see the `retry` module), so one
+//!    rate-limited document does not restart the whole batch.
 //!
 //! ## Pipeline usage
 //!
@@ -77,6 +80,9 @@ use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
+
+mod retry;
+use retry::{Failure, RetryPolicy, with_retry};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "llm_enricher";
@@ -207,6 +213,8 @@ pub struct LlmEnricherPlugin {
     /// and shared by clones, so a keyless worker keeps one connection pool across steps.
     /// The team key travels per request, so sharing the pool shares no credential.
     lab_http: Arc<OnceLock<reqwest::Client>>,
+    /// In-plugin retry of one request's transient failures (see [`retry`]).
+    retry: RetryPolicy,
 }
 
 impl std::fmt::Debug for LlmEnricherPlugin {
@@ -242,6 +250,7 @@ impl LlmEnricherPlugin {
         Self {
             client: None,
             lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -283,6 +292,7 @@ impl LlmEnricherPlugin {
                 lab: None,
             }),
             lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -376,8 +386,8 @@ impl Plugin for LlmEnricherPlugin {
             std::iter::repeat_with(|| None).take(total).collect();
         let mut stream = futures::stream::iter(docs.into_iter().enumerate())
             .map(|(i, doc)| {
-                let (cfg, client) = (&cfg, &client);
-                async move { (i, client.enrich(ctx, cfg, doc).await) }
+                let (cfg, client, retry) = (&cfg, &client, &self.retry);
+                async move { (i, client.enrich(ctx, cfg, retry, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
@@ -470,10 +480,15 @@ impl LlmClient {
     /// Records the call's usage on `ctx` before returning. This runs inside the
     /// `buffer_unordered` fan-out of [`Plugin::execute`], and the accumulator behind
     /// `ctx` is shared by clones, so concurrent documents sum into one total.
+    ///
+    /// A transient failure (429, 5xx, dropped connection) is retried here under `retry`
+    /// before it fails the step, so one rate-limited document does not throw away the
+    /// completions already paid for.
     async fn enrich(
         &self,
         ctx: &ActivityContext,
         cfg: &LlmEnricherConfig,
+        retry: &RetryPolicy,
         mut doc: Document,
     ) -> Result<Document, PluginError> {
         let content = truncate_chars(&doc.content, cfg.max_input_chars);
@@ -497,13 +512,15 @@ impl LlmClient {
         }
 
         // A failed call records nothing: `?` returns before `record_usage`.
-        let completion = complete(
-            &self.http,
-            &self.base_url,
-            &self.api_key,
-            &body,
-            self.lab.as_ref(),
-        )
+        let completion = with_retry(retry, ctx, NAME, || {
+            complete(
+                &self.http,
+                &self.base_url,
+                &self.api_key,
+                &body,
+                self.lab.as_ref(),
+            )
+        })
         .await?;
         let mut usage = completion.usage;
         ProviderCosts::global().apply(NAME, model, &mut usage);
@@ -542,19 +559,24 @@ pub async fn chat_completion_with_usage(
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<Completion, PluginError> {
-    complete(http, base_url, api_key, body, None).await
+    complete(http, base_url, api_key, body, None)
+        .await
+        .map_err(Failure::into_error)
 }
 
 /// The one chat-completions call behind [`chat_completion_with_usage`] and the plugin.
 /// When `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say: 401
 /// marks the target rejected and is `Retryable`, 402 is a final "budget exhausted".
+///
+/// A failure says whether it is transient (see [`transport_failure`] and
+/// [`http_failure`]), for the plugin's own retry; the public wrappers only surface it.
 async fn complete(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
     lab: Option<&AiTarget>,
-) -> Result<Completion, PluginError> {
+) -> Result<Completion, Failure> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = http
         .post(&url)
@@ -562,22 +584,23 @@ async fn complete(
         .json(body)
         .send()
         .await
-        .map_err(|e| PluginError::retryable(format!("LLM request to {url} failed: {e}")))?;
+        .map_err(|e| transport_failure(&e, format!("LLM request to {url} failed: {e}")))?;
 
     let status = resp.status();
+    let retry_after = retry::retry_after(resp.headers());
     let text = resp
         .text()
         .await
-        .map_err(|e| PluginError::retryable(format!("LLM response body unreadable: {e}")))?;
+        .map_err(|e| transport_failure(&e, format!("LLM response body unreadable: {e}")))?;
     if !status.is_success() {
-        return Err(map_http_failure(status.as_u16(), &text, lab));
+        return Err(http_failure(status.as_u16(), retry_after, &text, lab));
     }
 
     let parsed: ChatCompletion = serde_json::from_str(&text).map_err(|e| {
-        PluginError::non_retryable(format!(
+        Failure::Other(PluginError::non_retryable(format!(
             "LLM response is not a chat completion ({e}): {}",
             truncate_chars(&text, 512)
-        ))
+        )))
     })?;
     let usage = match parsed.usage {
         Some(u) => UsageUnits::llm(u.prompt_tokens, u.completion_tokens),
@@ -589,9 +612,41 @@ async fn complete(
         .next()
         .and_then(|c| c.message.content)
         .ok_or_else(|| {
-            PluginError::non_retryable("LLM response has no choices[0].message.content")
+            Failure::Other(PluginError::non_retryable(
+                "LLM response has no choices[0].message.content",
+            ))
         })?;
     Ok(Completion { content, usage })
+}
+
+/// A request that never got a full answer: `Retryable` either way, and retried in the
+/// plugin unless it timed out (another full timeout would eat the step's budget).
+fn transport_failure(e: &reqwest::Error, message: String) -> Failure {
+    let error = PluginError::retryable(message);
+    if e.is_timeout() {
+        Failure::Other(error)
+    } else {
+        Failure::Transient {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// A non-2xx answer: 429 and 5xx are transient; everything else, including the Lab
+/// Gateway's 401 (only a fresh key helps, and the worker fetches it), is not.
+fn http_failure(
+    code: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+    lab: Option<&AiTarget>,
+) -> Failure {
+    let error = map_http_failure(code, body, lab);
+    if matches!(code, 429 | 500..=599) && error.is_retryable() {
+        Failure::Transient { error, retry_after }
+    } else {
+        Failure::Other(error)
+    }
 }
 
 fn map_http_failure(code: u16, body: &str, lab: Option<&AiTarget>) -> PluginError {
@@ -703,13 +758,16 @@ mod tests {
         })
     }
 
+    /// The env-configured plugin, retrying transient failures without waiting.
     fn plugin(server: &MockServer) -> LlmEnricherPlugin {
-        LlmEnricherPlugin::with_client(
+        let mut p = LlmEnricherPlugin::with_client(
             server.uri(),
             "test-key",
             "test-model",
             reqwest::Client::new(),
-        )
+        );
+        p.retry = RetryPolicy::IMMEDIATE;
+        p
     }
 
     async fn run(
@@ -799,6 +857,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_rate_limited_document_is_retried_without_failing_the_batch() {
+        let server = MockServer::start().await;
+        // The first request is refused once; every other one succeeds.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"summary":"s"}"#)),
+            )
+            .mount(&server)
+            .await;
+        let docs: Vec<Document> = (0..3)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let ctx = ActivityContext::noop();
+        let out = plugin(&server)
+            .execute(&ctx, PluginInput::Documents(docs), serde_json::json!({}))
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|d| d.fields["summary"] == "s"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        // Only the calls that answered are metered.
+        assert_eq!(ctx.usage().llm_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_rate_limit_is_retried_a_bounded_number_of_times() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .expect(u64::from(RetryPolicy::IMMEDIATE.attempts))
+            .mount(&server)
+            .await;
+        let err = run(
+            &plugin(&server),
+            vec![Document::with_id("a", "x")],
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_cap_goes_straight_to_the_activity_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3600"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut p = plugin(&server);
+        p.retry = RetryPolicy::DEFAULT;
+        let err = run(&p, vec![Document::with_id("a", "x")], serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_within_the_cap_is_waited_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0.2"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .mount(&server)
+            .await;
+        let mut p = plugin(&server);
+        p.retry = RetryPolicy::DEFAULT;
+        let started = std::time::Instant::now();
+        run(&p, vec![Document::with_id("a", "x")], serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_ends_a_backoff_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let ctx = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, cancelled.clone());
+        let mut p = plugin(&server);
+        p.retry = RetryPolicy {
+            attempts: 4,
+            base_delay: Duration::from_secs(20),
+            max_delay: Duration::from_secs(20),
+            max_total_wait: Duration::from_secs(60),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let err = p
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![Document::with_id("a", "x")]),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
     async fn rate_limit_is_retryable() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -821,9 +1001,10 @@ mod tests {
     #[tokio::test]
     async fn server_error_is_retryable_and_auth_error_is_not() {
         let server = MockServer::start().await;
+        // Enough 503s to spend the in-plugin retry budget of the first run.
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(1)
+            .up_to_n_times(RetryPolicy::IMMEDIATE.attempts as u64)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1396,10 +1577,12 @@ mod tests {
     #[tokio::test]
     async fn llm_enricher_lab_401_marks_the_target_rejected() {
         let lab = MockServer::start().await;
+        // Only a fresh key helps, which the worker fetches: never retried in-plugin.
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
             )
+            .expect(1)
             .mount(&lab)
             .await;
         let ctx = ctx_with_target(lab_target(&lab));
@@ -1409,6 +1592,27 @@ mod tests {
         assert!(err.is_retryable(), "{err:?}");
         assert!(ctx.ai_target().unwrap().is_rejected());
         assert!(!err.to_string().contains("lab-key"));
+    }
+
+    #[tokio::test]
+    async fn llm_enricher_lab_rate_limit_is_retried_with_the_same_key() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&lab)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer lab-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let mut p = LlmEnricherPlugin::disabled();
+        p.retry = RetryPolicy::IMMEDIATE;
+        run_with(&p, &ctx, serde_json::json!({})).await.unwrap();
+        assert!(!ctx.ai_target().unwrap().is_rejected());
     }
 
     #[tokio::test]

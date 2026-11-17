@@ -56,6 +56,9 @@ use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
+mod retry;
+use retry::{Failure, RetryPolicy, with_retry};
+
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "image_captioner";
 
@@ -166,6 +169,8 @@ pub struct ImageCaptionerPlugin {
     /// and shared by clones, so a keyless worker keeps one connection pool across steps.
     /// The team key travels per request, so sharing the pool shares no credential.
     lab_http: Arc<OnceLock<reqwest::Client>>,
+    /// In-plugin retry of the request's transient failures (see [`retry`]).
+    retry: RetryPolicy,
 }
 
 impl std::fmt::Debug for ImageCaptionerPlugin {
@@ -199,6 +204,7 @@ impl ImageCaptionerPlugin {
         Self {
             client: None,
             lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -239,6 +245,7 @@ impl ImageCaptionerPlugin {
                 lab: None,
             }),
             lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -386,14 +393,17 @@ impl Plugin for ImageCaptionerPlugin {
             body["response_format"] = serde_json::json!({ "type": "json_object" });
         }
 
-        // A failed call records nothing: `?` returns before `record_usage`.
-        let (raw, mut units) = chat_completion(
-            &client.http,
-            &client.base_url,
-            &client.api_key,
-            &body,
-            client.lab.as_ref(),
-        )
+        // A failed call records nothing: `?` returns before `record_usage`. A transient
+        // failure (429, 5xx, dropped connection) is retried here first.
+        let (raw, mut units) = with_retry(&self.retry, ctx, NAME, || {
+            chat_completion(
+                &client.http,
+                &client.base_url,
+                &client.api_key,
+                &body,
+                client.lab.as_ref(),
+            )
+        })
         .await?;
         // One image went to the vision model, and its tokens are billed on top.
         units.images = 1;
@@ -502,14 +512,15 @@ struct ApiUsage {
 ///
 /// 429 / 5xx / transport → `Retryable`; 401 / 403 / 400 / others → `NonRetryable`. When
 /// `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say (see
-/// [`map_http_failure`]).
+/// [`map_http_failure`]). A failure says whether it is transient (see
+/// [`transport_failure`] and [`http_failure`]), for the in-plugin retry.
 async fn chat_completion(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
     lab: Option<&AiTarget>,
-) -> Result<(String, UsageUnits), PluginError> {
+) -> Result<(String, UsageUnits), Failure> {
     let url = format!("{base_url}/chat/completions");
     let resp = http
         .post(&url)
@@ -517,20 +528,21 @@ async fn chat_completion(
         .json(body)
         .send()
         .await
-        .map_err(|e| PluginError::retryable(format!("vision request to {url} failed: {e}")))?;
+        .map_err(|e| transport_failure(&e, format!("vision request to {url} failed: {e}")))?;
     let status = resp.status();
+    let retry_after = retry::retry_after(resp.headers());
     let text = resp
         .text()
         .await
-        .map_err(|e| PluginError::retryable(format!("vision response body unreadable: {e}")))?;
+        .map_err(|e| transport_failure(&e, format!("vision response body unreadable: {e}")))?;
     if !status.is_success() {
-        return Err(map_http_failure(status, &text, lab));
+        return Err(http_failure(status, retry_after, &text, lab));
     }
     let parsed: ChatCompletion = serde_json::from_str(&text).map_err(|e| {
-        PluginError::non_retryable(format!(
+        Failure::Other(PluginError::non_retryable(format!(
             "vision response is not a chat completion ({e}): {}",
             truncate_chars(&text, 512)
-        ))
+        )))
     })?;
     let usage = match parsed.usage {
         Some(u) => UsageUnits::llm(u.prompt_tokens, u.completion_tokens),
@@ -545,9 +557,41 @@ async fn chat_completion(
         .next()
         .and_then(|c| c.message.content)
         .ok_or_else(|| {
-            PluginError::non_retryable("vision response has no choices[0].message.content")
+            Failure::Other(PluginError::non_retryable(
+                "vision response has no choices[0].message.content",
+            ))
         })?;
     Ok((content, usage))
+}
+
+/// A request that never got a full answer: `Retryable` either way, and retried in the
+/// plugin unless it timed out (another full timeout would eat the step's budget).
+fn transport_failure(e: &reqwest::Error, message: String) -> Failure {
+    let error = PluginError::retryable(message);
+    if e.is_timeout() {
+        Failure::Other(error)
+    } else {
+        Failure::Transient {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// A non-2xx answer: 429 and 5xx are transient; everything else, including the Lab
+/// Gateway's 401 (only a fresh key helps, and the worker fetches it), is not.
+fn http_failure(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    body: &str,
+    lab: Option<&AiTarget>,
+) -> Failure {
+    let error = map_http_failure(status, body, lab);
+    if (status.as_u16() == 429 || status.is_server_error()) && error.is_retryable() {
+        Failure::Transient { error, retry_after }
+    } else {
+        Failure::Other(error)
+    }
 }
 
 /// Map a non-2xx reply to a [`PluginError`]. With the Lab's target, a Gateway refusal
@@ -621,13 +665,16 @@ mod tests {
         serde_json::json!({ "choices": [{ "message": { "role": "assistant", "content": content } }] })
     }
 
+    /// The env-configured plugin, retrying transient failures without waiting.
     fn plugin(server: &MockServer) -> ImageCaptionerPlugin {
-        ImageCaptionerPlugin::with_client(
+        let mut p = ImageCaptionerPlugin::with_client(
             server.uri(),
             "test-key",
             "vision-model",
             reqwest::Client::new(),
-        )
+        );
+        p.retry = RetryPolicy::IMMEDIATE;
+        p
     }
 
     fn image() -> PluginInput {
@@ -875,11 +922,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_error_is_retryable_and_auth_error_is_not() {
+    async fn one_rate_limit_is_retried_in_the_plugin() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
             .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"caption":"A cat"}"#)),
+            )
+            .mount(&server)
+            .await;
+        let ctx = ActivityContext::noop();
+        let docs = plugin(&server)
+            .execute(&ctx, image(), serde_json::json!({}))
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(docs[0].content, "A cat");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        // Only the call that answered is metered.
+        assert_eq!(ctx.usage().llm_requests, 1);
+        assert_eq!(ctx.usage().images, 1);
+    }
+
+    #[tokio::test]
+    async fn server_error_is_retryable_and_auth_error_is_not() {
+        let server = MockServer::start().await;
+        // Enough 500s to spend the in-plugin retry budget of the first run.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(u64::from(RetryPolicy::IMMEDIATE.attempts))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1210,10 +1286,12 @@ mod tests {
     #[tokio::test]
     async fn image_captioner_lab_401_marks_the_target_rejected() {
         let lab = MockServer::start().await;
+        // Only a fresh key helps, which the worker fetches: never retried in-plugin.
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
             )
+            .expect(1)
             .mount(&lab)
             .await;
         let ctx = ctx_with_target(lab_target(&lab));

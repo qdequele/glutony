@@ -100,6 +100,15 @@ Retryable errors (network, rate limits, transient upstream failures) go through
 this policy. Non-retryable ones (`InvalidInput`, `InvalidConfig`,
 `NonRetryable`) fail the step at once.
 
+The AI plugins (`llm_enricher`, `jev_enricher`, `image_captioner`) first retry
+each request on their own: a `429`, a `5xx` or a dropped connection is tried up to
+4 times in all, with exponential backoff and jitter (about 1 s, 2 s, 4 s), honouring
+a `Retry-After` of up to 20 s and waiting at most 30 s per request. Only once that is
+spent, or when `Retry-After` asks for longer, does the error reach the step's retry
+policy, so one rate-limited document no longer restarts the whole batch. A timed-out
+request and a Lab Gateway `401` (which needs a fresh key) go to the step's policy
+directly. Failed attempts are not metered.
+
 When a step's input is a URL (`POST /ingest {"url": ...}`), the worker fetches it
 before the plugin runs. A transport error, `408`, `429` or `5xx` goes through the
 step's retry policy; any other `4xx` (`404`, `403`, `410`…), including one returned

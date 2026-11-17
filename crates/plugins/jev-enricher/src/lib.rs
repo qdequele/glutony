@@ -83,6 +83,9 @@ use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
+mod retry;
+use retry::{Failure, RetryPolicy, with_retry};
+
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "jev_enricher";
 
@@ -282,6 +285,8 @@ pub struct JevEnricherPlugin {
     /// and shared by clones, so a keyless worker keeps one connection pool across steps.
     /// The team key travels per request, so sharing the pool shares no credential.
     lab_http: Arc<OnceLock<reqwest::Client>>,
+    /// In-plugin retry of one request's transient failures (see [`retry`]).
+    retry: RetryPolicy,
 }
 
 impl std::fmt::Debug for JevEnricherPlugin {
@@ -317,6 +322,7 @@ impl JevEnricherPlugin {
         Self {
             client: None,
             lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -351,6 +357,7 @@ impl JevEnricherPlugin {
                 lab: None,
             }),
             lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
         }
     }
 
@@ -432,8 +439,8 @@ impl Plugin for JevEnricherPlugin {
             std::iter::repeat_with(|| None).take(total).collect();
         let mut stream = futures::stream::iter(docs.into_iter().enumerate())
             .map(|(i, doc)| {
-                let (cfg, client) = (&cfg, &client);
-                async move { (i, client.enrich(ctx, cfg, doc).await) }
+                let (cfg, client, retry) = (&cfg, &client, &self.retry);
+                async move { (i, client.enrich(ctx, cfg, retry, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
@@ -578,10 +585,15 @@ impl JevClient {
     ///
     /// Records the call's usage on `ctx` before returning; the accumulator behind
     /// `ctx` is shared by clones, so concurrent documents sum into one total.
+    ///
+    /// A transient failure (429, 5xx incl. 529, dropped connection) is retried here
+    /// under `retry` before it fails the step, so one overloaded document does not throw
+    /// away the answers already paid for.
     async fn enrich(
         &self,
         ctx: &ActivityContext,
         cfg: &JevEnricherConfig,
+        retry: &RetryPolicy,
         mut doc: Document,
     ) -> Result<Document, PluginError> {
         let model = cfg.model.as_deref().unwrap_or(&self.default_model);
@@ -598,7 +610,7 @@ impl JevClient {
             "questions": cfg.questions,
         });
         // A failed call records nothing: `?` returns before `record_usage`.
-        let reply = self.systemone(&body).await?;
+        let reply = with_retry(retry, ctx, NAME, || self.systemone(&body)).await?;
         let mut usage = match reply.usage {
             Some(u) => UsageUnits::llm(u.input_tokens, u.output_tokens),
             None => UsageUnits {
@@ -619,7 +631,10 @@ impl JevClient {
     /// 401 / 403 → `NonRetryable` (credentials); 400 / 422 → `NonRetryable` with the
     /// body; other statuses → `NonRetryable`. With the Lab's target, a Gateway refusal
     /// (401 / 402) is mapped by [`gateway_failure`] first.
-    async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, PluginError> {
+    ///
+    /// A failure says whether it is transient (see [`transport_failure`] and
+    /// [`http_failure`]), for the in-plugin retry.
+    async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, Failure> {
         let route = if self.lab.is_some() {
             "decisions"
         } else {
@@ -633,22 +648,58 @@ impl JevClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| PluginError::retryable(format!("Jev request to {url} failed: {e}")))?;
+            .map_err(|e| transport_failure(&e, format!("Jev request to {url} failed: {e}")))?;
 
         let status = resp.status();
+        let retry_after = retry::retry_after(resp.headers());
         let text = resp
             .text()
             .await
-            .map_err(|e| PluginError::retryable(format!("Jev response body unreadable: {e}")))?;
+            .map_err(|e| transport_failure(&e, format!("Jev response body unreadable: {e}")))?;
         if !status.is_success() {
-            return Err(map_http_failure(status.as_u16(), &text, self.lab.as_ref()));
+            return Err(http_failure(
+                status.as_u16(),
+                retry_after,
+                &text,
+                self.lab.as_ref(),
+            ));
         }
         serde_json::from_str(&text).map_err(|e| {
-            PluginError::non_retryable(format!(
+            Failure::Other(PluginError::non_retryable(format!(
                 "Jev response is not a systemone reply ({e}): {}",
                 truncate_chars(&text, 512)
-            ))
+            )))
         })
+    }
+}
+
+/// A request that never got a full answer: `Retryable` either way, and retried in the
+/// plugin unless it timed out (another full timeout would eat the step's budget).
+fn transport_failure(e: &reqwest::Error, message: String) -> Failure {
+    let error = PluginError::retryable(message);
+    if e.is_timeout() {
+        Failure::Other(error)
+    } else {
+        Failure::Transient {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// A non-2xx answer: 429 and 5xx are transient; everything else, including the Lab
+/// Gateway's 401 (only a fresh key helps, and the worker fetches it), is not.
+fn http_failure(
+    code: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+    lab: Option<&AiTarget>,
+) -> Failure {
+    let error = map_http_failure(code, body, lab);
+    if matches!(code, 429 | 500..=599) && error.is_retryable() {
+        Failure::Transient { error, retry_after }
+    } else {
+        Failure::Other(error)
     }
 }
 
@@ -750,8 +801,16 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    /// The env-configured plugin, retrying transient failures without waiting.
     fn plugin(server: &MockServer) -> JevEnricherPlugin {
-        JevEnricherPlugin::with_client(server.uri(), "test-key", "jev-test", reqwest::Client::new())
+        let mut p = JevEnricherPlugin::with_client(
+            server.uri(),
+            "test-key",
+            "jev-test",
+            reqwest::Client::new(),
+        );
+        p.retry = RetryPolicy::IMMEDIATE;
+        p
     }
 
     /// A config asking one question of each type.
@@ -945,6 +1004,54 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("quality")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn one_overloaded_document_is_retried_without_failing_the_batch() {
+        let server = MockServer::start().await;
+        // Jev's 529 "overloaded" once; every other request succeeds.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(529).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .mount(&server)
+            .await;
+        let docs: Vec<Document> = (0..3)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let ctx = ActivityContext::noop();
+        let out = plugin(&server)
+            .execute(&ctx, PluginInput::Documents(docs), three_questions())
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|d| d.fields["category"] == "api"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        // Only the calls that answered are metered.
+        assert_eq!(ctx.usage().llm_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_overload_is_retried_a_bounded_number_of_times() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(529))
+            .expect(u64::from(RetryPolicy::IMMEDIATE.attempts))
+            .mount(&server)
+            .await;
+        let err = run(
+            &plugin(&server),
+            vec![Document::with_id("a", "x")],
+            three_questions(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
     }
 
     #[tokio::test]
@@ -1566,10 +1673,12 @@ mod tests {
     #[tokio::test]
     async fn jev_enricher_lab_401_marks_the_target_rejected() {
         let lab = MockServer::start().await;
+        // Only a fresh key helps, which the worker fetches: never retried in-plugin.
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
             )
+            .expect(1)
             .mount(&lab)
             .await;
         let ctx = ctx_with_target(lab_target(&lab, None));
