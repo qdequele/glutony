@@ -902,6 +902,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_ndjson_body_is_a_file_detected_as_ndjson() {
+        // Not a JSON ingest request: one record per line is content to ingest.
+        let body = "{\"id\":1}\n{\"id\":2}\n";
+        for (content_type, filename) in [
+            (Some("application/x-ndjson"), None),
+            (None, Some("events.ndjson")),
+            (Some("application/octet-stream"), Some("dump.jsonl")),
+            (None, None),
+        ] {
+            let e = extract_payload(content_type, Bytes::from(body), None, filename)
+                .await
+                .unwrap();
+            let IngestPayload::File(blob) = e.payload else {
+                panic!()
+            };
+            assert_eq!(
+                blob.mime, "application/x-ndjson",
+                "{content_type:?} {filename:?}"
+            );
+            assert_eq!(blob.data, body.as_bytes());
+        }
+    }
+
+    #[tokio::test]
     async fn raw_empty_body_is_400() {
         let err = extract_payload(Some("application/pdf"), Bytes::new(), None, None)
             .await

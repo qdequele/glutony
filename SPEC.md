@@ -557,7 +557,7 @@ User pipelines always take precedence (same MIME trigger → user wins).
 | `builtin.text` | `text/plain` | chunker → meili_indexer |
 | `builtin.markdown` | `text/markdown`, `text/x-markdown` | markdown_extractor → meili_indexer |
 | `builtin.csv` | `text/csv` | csv_parser → meili_indexer |
-| `builtin.json` | `application/json` | json_flattener → meili_indexer |
+| `builtin.json` | `application/json`, `application/x-ndjson` | json_flattener → meili_indexer |
 | `builtin.parquet` | `application/vnd.apache.parquet` | parquet_parser → meili_indexer |
 | `builtin.avro` | `application/vnd.apache.avro` | avro_parser → meili_indexer |
 | `builtin.msgpack` | `application/vnd.msgpack` | msgpack_parser → meili_indexer |

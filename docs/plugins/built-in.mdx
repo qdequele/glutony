@@ -86,6 +86,12 @@ object with a `documents`, `items` or `data` array → those; anything else →
 one document. Nested objects are flattened to dotted keys (`a.b.c`) in
 `fields`; `content` = concatenated string values.
 
+Newline-delimited JSON (NDJSON / JSON Lines) gives one document per line. A
+`.ndjson` or `.jsonl` file, or a body with one JSON object or array per line, is
+detected as `application/x-ndjson` and routed to `builtin.json`
+(`application/jsonl`, `application/x-jsonlines`, `application/jsonlines` and
+`application/ndjson` are the same type).
+
 | Key | Default | Description |
 |---|---|---|
 | `id_field` | `"id"` | Field used as document id; generated when missing. |
