@@ -597,13 +597,7 @@ impl StepActivities {
                 .max(SPILLED_REF_SIZE);
             let spilled = self
                 .blob
-                .spill_output(
-                    input.job_id,
-                    &format!("{}-fanout", input.step_id),
-                    Some(i),
-                    as_output,
-                    room,
-                )
+                .spill_fan_out_input(input.job_id, &input.step_id, i, as_output, room)
                 .await
                 .map_err(|e| {
                     PluginError::Retryable(format!("failed to spill fan-out branch: {e}"))
@@ -1564,6 +1558,48 @@ mod tests {
             ids.extend(resolved.into_documents().unwrap().into_iter().map(|d| d.id));
         }
         assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn fan_out_inputs_never_share_a_key_with_another_steps_output() {
+        // The fan-out inputs of step `x` and branch 0 of a step named `x-fanout` are
+        // different objects.
+        let a = StepActivities::new(Arc::new(PluginRegistry::new()), BlobStore::memory(), 64);
+        let job = Uuid::new_v4();
+        let out = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: job,
+                step_id: "x".into(),
+                upstream: PluginOutput::Documents(vec![Document::with_id("a", "x".repeat(200))]),
+                path: "$.documents".into(),
+                max_branches: 100,
+            })
+            .await
+            .unwrap();
+        let PluginInput::Ref(ContentRef::Staged { uri: fan_out, .. }) = &out.branches[0] else {
+            panic!("expected a spilled branch, got {:?}", out.branches[0]);
+        };
+        let other = a
+            .blob
+            .spill_output(
+                job,
+                "x-fanout",
+                Some(0),
+                PluginOutput::Documents(vec![Document::with_id("b", "y".repeat(200))]),
+                0,
+            )
+            .await
+            .unwrap();
+        let PluginOutput::Ref(ContentRef::Staged { uri: step_out, .. }) = &other else {
+            panic!("expected a spilled output, got {other:?}");
+        };
+        assert_ne!(fan_out, step_out);
+        let branch = a
+            .blob
+            .resolve_input(out.branches[0].clone(), &a.http)
+            .await
+            .unwrap();
+        assert_eq!(branch.into_documents().unwrap()[0].id, "a");
     }
 
     #[tokio::test]

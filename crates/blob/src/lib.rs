@@ -894,9 +894,9 @@ impl BlobStore {
     ///
     /// When the output serializes to more than `threshold` bytes of JSON (what it would
     /// weigh in the activity result, see [`PluginOutput::serialized_size_exceeds`]), that
-    /// JSON is stored at `staged_key(job_id, "<step_id>[-<branch>].json")` (`/` and `%` of
-    /// the step id percent-encoded, so the name is one key segment); the returned value
-    /// is a [`PluginOutput::Ref`] to a [`ContentRef::Staged`] with MIME
+    /// JSON is stored at `jobs/<job>/steps/<step>/output.json`, or
+    /// `.../branch-<b>.json` for a fan-out branch (see [`BlobStore::spill_key`]); the
+    /// returned value is a [`PluginOutput::Ref`] to a [`ContentRef::Staged`] with MIME
     /// [`SPILLED_OUTPUT_MIME`]. Otherwise the output is returned unchanged.
     pub async fn spill_output(
         &self,
@@ -906,19 +906,65 @@ impl BlobStore {
         output: PluginOutput,
         threshold: usize,
     ) -> Result<PluginOutput, BlobError> {
+        let kind = match branch {
+            Some(b) => SpillKind::Branch(b),
+            None => SpillKind::Output,
+        };
+        self.spill(job_id, step_id, kind, output, threshold).await
+    }
+
+    /// [`BlobStore::spill_output`] for input `index` of the fan-out of step `step_id`
+    /// (`jobs/<job>/steps/<step>/fanout-<index>.json`), which never shares a key with
+    /// any step's output.
+    pub async fn spill_fan_out_input(
+        &self,
+        job_id: Uuid,
+        step_id: &str,
+        index: usize,
+        output: PluginOutput,
+        threshold: usize,
+    ) -> Result<PluginOutput, BlobError> {
+        self.spill(
+            job_id,
+            step_id,
+            SpillKind::FanOutInput(index),
+            output,
+            threshold,
+        )
+        .await
+    }
+
+    /// Key of a spilled object: `jobs/<job>/steps/<step>/<file>`. The step id is one
+    /// key segment (`/` and `%` percent-encoded) and each kind has its own file name
+    /// inside it, so two different steps, or two kinds of one step, never map to the
+    /// same key, and no step id reaches the upload namespace `input/`.
+    ///
+    /// Keys written before this layout (`jobs/<job>/<step>[-<branch>].json`) are still
+    /// read: a ref carries its full key, and [`BlobStore::hydrate_output`] accepts both.
+    fn spill_key(job_id: Uuid, step_id: &str, kind: SpillKind) -> String {
+        let step = step_id.replace('%', "%25").replace('/', "%2F");
+        let file = match kind {
+            SpillKind::Output => "output.json".to_owned(),
+            SpillKind::Branch(b) => format!("branch-{b}.json"),
+            SpillKind::FanOutInput(i) => format!("fanout-{i}.json"),
+        };
+        Self::staged_key(job_id, &format!("steps/{step}/{file}"))
+    }
+
+    async fn spill(
+        &self,
+        job_id: Uuid,
+        step_id: &str,
+        kind: SpillKind,
+        output: PluginOutput,
+        threshold: usize,
+    ) -> Result<PluginOutput, BlobError> {
         if !output.serialized_size_exceeds(threshold) {
             return Ok(output);
         }
-        // One key segment, whatever the step id: a step named `input/x` must not spill
-        // into the upload namespace, which `hydrate_output` refuses to read.
-        let step = step_id.replace('%', "%25").replace('/', "%2F");
-        let name = match branch {
-            Some(b) => format!("{step}-{b}.json"),
-            None => format!("{step}.json"),
-        };
-        let key = Self::staged_key(job_id, &name);
+        let key = Self::spill_key(job_id, step_id, kind);
         let bytes = serde_json::to_vec(&output)?;
-        tracing::debug!(job_id = %job_id, step_id = %step_id, ?branch, size = bytes.len(), key = %key, "spilling step output to blob store");
+        tracing::debug!(job_id = %job_id, step_id = %step_id, ?kind, size = bytes.len(), key = %key, "spilling step output to blob store");
         self.put(&key, Bytes::from(bytes)).await?;
         Ok(PluginOutput::Ref(ContentRef::Staged {
             uri: key,
@@ -1096,8 +1142,20 @@ fn is_spilled_output_mime(mime: &str) -> bool {
         .eq_ignore_ascii_case(SPILLED_OUTPUT_MIME)
 }
 
-/// Whether `key` can be a spilled output: `jobs/<job>/<name>` outside the upload
-/// namespace `jobs/<job>/input/`, where [`BlobStore::stage_upload`] writes. Empty
+/// What a spilled object is, which picks its file name under `steps/<step>/`.
+#[derive(Debug, Clone, Copy)]
+enum SpillKind {
+    /// The output of a step that is not fanned out.
+    Output,
+    /// The output of branch `n` of a fanned-out step.
+    Branch(usize),
+    /// Input `n` of a step's fan-out.
+    FanOutInput(usize),
+}
+
+/// Whether `key` can be a spilled output: `jobs/<job>/steps/...` (the current layout),
+/// or any older `jobs/<job>/<name>` (still held by refs of jobs in flight), outside the
+/// upload namespace `jobs/<job>/input/`, where [`BlobStore::stage_upload`] writes. Empty
 /// segments are skipped, as the store does when it turns a key into a path.
 fn is_spill_key(key: &str) -> bool {
     let mut segments = key.split('/').filter(|s| !s.is_empty());
@@ -1845,7 +1903,7 @@ mod tests {
         assert_eq!(
             spilled,
             PluginOutput::Ref(ContentRef::Staged {
-                uri: BlobStore::staged_key(job, "chunk-3.json"),
+                uri: BlobStore::staged_key(job, "steps/chunk/branch-3.json"),
                 mime: Some(SPILLED_OUTPUT_MIME.into()),
                 filename: None,
                 origin: None,
@@ -1855,7 +1913,7 @@ mod tests {
         let hydrated = store.hydrate_output(spilled).await.unwrap();
         assert_eq!(hydrated, output);
 
-        // Without a branch the key has no suffix.
+        // Without a branch the step's output has its own file.
         let spilled = store
             .spill_output(job, "chunk", None, output.clone(), 0)
             .await
@@ -1863,7 +1921,7 @@ mod tests {
         assert_eq!(spilled.kind(), meili_ingest_plugin_sdk::OutputKind::Ref);
         assert!(
             store
-                .get(&BlobStore::staged_key(job, "chunk.json"))
+                .get(&BlobStore::staged_key(job, "steps/chunk/output.json"))
                 .await
                 .is_ok()
         );
@@ -1980,10 +2038,10 @@ mod tests {
         let job = Uuid::new_v4();
         let output = PluginOutput::Documents(docs(2));
         for (step, name) in [
-            ("input/extract", "input%2Fextract.json"),
-            ("a/b", "a%2Fb.json"),
-            ("50%/done", "50%25%2Fdone.json"),
-            ("plain", "plain.json"),
+            ("input/extract", "steps/input%2Fextract/output.json"),
+            ("a/b", "steps/a%2Fb/output.json"),
+            ("50%/done", "steps/50%25%2Fdone/output.json"),
+            ("plain", "steps/plain/output.json"),
         ] {
             let spilled = store
                 .spill_output(job, step, None, output.clone(), 0)
@@ -1994,6 +2052,77 @@ mod tests {
             };
             assert_eq!(uri, &BlobStore::staged_key(job, name), "{step}");
             assert_eq!(store.hydrate_output(spilled).await.unwrap(), output);
+        }
+    }
+
+    #[tokio::test]
+    async fn look_alike_step_ids_spill_to_distinct_keys() {
+        // Step ids are only unique: branch 0 of `enrich` and the plain output of a step
+        // named `enrich-0` must not share an object, or one overwrites the other.
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let a = PluginOutput::Documents(docs(1));
+        let b = PluginOutput::Documents(docs(2));
+        let branch = store
+            .spill_output(job, "enrich", Some(0), a.clone(), 0)
+            .await
+            .unwrap();
+        let plain = store
+            .spill_output(job, "enrich-0", None, b.clone(), 0)
+            .await
+            .unwrap();
+        assert_ne!(branch, plain);
+        assert_eq!(store.hydrate_output(branch).await.unwrap(), a);
+        assert_eq!(store.hydrate_output(plain).await.unwrap(), b);
+    }
+
+    #[tokio::test]
+    async fn fan_out_inputs_have_their_own_key() {
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let input = PluginOutput::Documents(docs(1));
+        let spilled = store
+            .spill_fan_out_input(job, "x", 0, input.clone(), 0)
+            .await
+            .unwrap();
+        let PluginOutput::Ref(ContentRef::Staged { uri, .. }) = &spilled else {
+            panic!("expected a staged ref, got {spilled:?}");
+        };
+        assert_eq!(uri, &BlobStore::staged_key(job, "steps/x/fanout-0.json"));
+        let branch = store
+            .spill_output(
+                job,
+                "x-fanout",
+                Some(0),
+                PluginOutput::Documents(docs(2)),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_ne!(spilled, branch);
+        assert_eq!(store.hydrate_output(spilled).await.unwrap(), input);
+    }
+
+    #[tokio::test]
+    async fn keys_of_the_previous_layout_still_hydrate() {
+        // A job in flight across a deploy still holds refs to `<step>[-<b>].json`.
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let output = PluginOutput::Documents(docs(2));
+        for name in ["chunk.json", "chunk-3.json", "enrich-fanout-0.json"] {
+            let key = BlobStore::staged_key(job, name);
+            store
+                .put(&key, Bytes::from(serde_json::to_vec(&output).unwrap()))
+                .await
+                .unwrap();
+            let old = PluginOutput::Ref(ContentRef::Staged {
+                uri: key,
+                mime: Some(SPILLED_OUTPUT_MIME.into()),
+                filename: None,
+                origin: None,
+                charset: None,
+            });
+            assert_eq!(store.hydrate_output(old).await.unwrap(), output, "{name}");
         }
     }
 
