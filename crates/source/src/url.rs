@@ -128,9 +128,13 @@ impl SourceConnector for UrlConnector {
 
         let etag = header_string(&response, reqwest::header::ETAG);
         let last_modified = header_string(&response, reqwest::header::LAST_MODIFIED);
-        let header_mime = header_string(&response, reqwest::header::CONTENT_TYPE)
+        let content_type = header_string(&response, reqwest::header::CONTENT_TYPE);
+        let header_mime = content_type
+            .as_deref()
             .and_then(|ct| ct.split(';').next().map(|s| s.trim().to_ascii_lowercase()))
             .filter(|m| !m.is_empty() && m != "application/octet-stream");
+        // Kept apart from the MIME, which routing compares as a bare essence.
+        let charset = content_type.as_deref().and_then(content_type_charset);
 
         // Stream rather than `.bytes()`: a TMDB export is ~50 MB and several sources may
         // run at once. The cap is enforced DURING the stream, not after.
@@ -194,6 +198,7 @@ impl SourceConnector for UrlConnector {
                 bytes,
                 mime,
                 filename,
+                charset,
             }],
             state: IncrementalState {
                 etag,
@@ -285,6 +290,19 @@ fn header_string(
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+}
+
+/// The `charset` parameter of a `Content-Type` value, unquoted and lower-cased;
+/// `None` when there is none or it is empty.
+fn content_type_charset(value: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|param| {
+        let (name, raw) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = raw.trim().trim_matches('"').trim().to_ascii_lowercase();
+        (!label.is_empty()).then_some(label)
+    })
 }
 
 fn last_segment(path: &str) -> Option<String> {
@@ -492,6 +510,49 @@ mod tests {
             state.hash.is_some(),
             "hash is recorded for etag-less servers"
         );
+    }
+
+    #[tokio::test]
+    async fn the_declared_charset_is_kept_apart_from_the_mime() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/legacy.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=\"ISO-8859-1\"")
+                    .set_body_bytes(b"<p>Caf\xE9</p>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&server)
+            .await;
+
+        let resolve = |p: &str| {
+            let location = url_location(format!("{}{p}", server.uri()));
+            async move {
+                let got = UrlConnector
+                    .resolve(
+                        &location,
+                        None,
+                        &IncrementalState::default(),
+                        &rt_without_guard(now()),
+                    )
+                    .await
+                    .expect("resolves");
+                let Resolution::Items { mut items, .. } = got else {
+                    panic!("expected items");
+                };
+                items.remove(0)
+            }
+        };
+        let item = resolve("/legacy.html").await;
+        assert_eq!(item.mime, "text/html");
+        assert_eq!(item.charset.as_deref(), Some("iso-8859-1"));
+        assert_eq!(item.bytes, b"<p>Caf\xE9</p>");
+        assert_eq!(resolve("/feed.json").await.charset, None);
     }
 
     #[tokio::test]

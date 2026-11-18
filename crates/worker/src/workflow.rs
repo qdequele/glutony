@@ -511,6 +511,7 @@ mod tests {
             mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.into()),
             filename: None,
             origin: None,
+            charset: None,
         });
         assert_eq!(super::initial_mime(&inline), "application/json");
         assert_eq!(super::initial_mime(&staged), "application/json");
@@ -520,6 +521,7 @@ mod tests {
             mime: Some("application/pdf".into()),
             filename: Some("a.pdf".into()),
             origin: None,
+            charset: None,
         });
         assert_eq!(super::initial_mime(&upload), "application/pdf");
         let bytes = PluginInput::Bytes(Blob::new(vec![1], "text/csv", None));

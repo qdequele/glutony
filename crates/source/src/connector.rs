@@ -29,6 +29,9 @@ pub struct ResolvedItem {
     pub mime: String,
     /// Filename hint, used for MIME detection and provenance.
     pub filename: Option<String>,
+    /// The `charset` the server declared in its `Content-Type`, lower-cased, if any.
+    /// Never part of `mime`.
+    pub charset: Option<String>,
 }
 
 /// Outcome of resolving a location.

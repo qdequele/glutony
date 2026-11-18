@@ -464,7 +464,8 @@ impl SourceActivities {
             // fetching `…/data.json` into one index no longer overwrite each other)
             // and stay the same from run to run, even when the URL is templated.
             let blob = Blob::new(item.bytes, item.mime, item.filename)
-                .with_origin(Some(source_origin(d.tenant_id.as_deref(), &d.uid)));
+                .with_origin(Some(source_origin(d.tenant_id.as_deref(), &d.uid)))
+                .with_charset(item.charset);
             let staged = self
                 .blob
                 .stage_upload(job_id, blob, 0)
@@ -809,6 +810,38 @@ mod tests {
         )
         .await;
         (files, cp)
+    }
+
+    #[tokio::test]
+    async fn the_declared_charset_reaches_the_first_step() {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/page.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=windows-1252")
+                    .set_body_bytes(b"<p>Caf\xE9</p>".to_vec()),
+            )
+            .mount(&files)
+            .await;
+        let cp = control_plane(
+            source_row(&format!("{}/page.html", files.uri()), None),
+            pipeline(true),
+        )
+        .await;
+        let acts = activities(&cp, &files);
+        let job = only_job(acts.resolve(&input()).await.expect("resolves"));
+        let PluginInput::Ref(r @ ContentRef::Staged { .. }) = &job.input else {
+            panic!("expected a staged ref, got {:?}", job.input);
+        };
+        // What the worker hands the first step.
+        let blob = acts
+            .blob
+            .fetch_ref(r, &reqwest::Client::new())
+            .await
+            .expect("staged");
+        assert_eq!(blob.mime, "text/html");
+        assert_eq!(blob.charset.as_deref(), Some("windows-1252"));
     }
 
     fn only_job(out: ResolveSourceOutput) -> PipelineWorkflowInput {

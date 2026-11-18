@@ -2010,6 +2010,7 @@ mod tests {
             mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.to_owned()),
             filename: None,
             origin: None,
+            charset: None,
         });
         assert_eq!(spilled.approx_size(), SPILLED_REF_SIZE);
     }

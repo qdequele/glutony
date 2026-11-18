@@ -314,6 +314,13 @@ pub struct Blob {
     /// alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// The character encoding the server declared for the bytes: the `charset`
+    /// parameter of the HTTP `Content-Type` they were fetched with, lower-cased
+    /// (`windows-1252`, `shift_jis`). A declaration only: the bytes are not decoded or
+    /// checked against it, and servers are sometimes wrong. `None` for uploads and
+    /// when no charset was declared. [`Blob::mime`] never carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
 }
 
 /// Hex characters of the origin hash kept in ids (48 bits).
@@ -336,12 +343,22 @@ impl Blob {
             mime: mime.into(),
             filename,
             origin: None,
+            charset: None,
         }
     }
 
     /// Set (or clear) [`Blob::origin`]. An empty origin counts as none.
     pub fn with_origin(mut self, origin: Option<String>) -> Self {
         self.origin = origin.filter(|o| !o.is_empty());
+        self
+    }
+
+    /// Set (or clear) [`Blob::charset`]. The label is trimmed and lower-cased; an empty
+    /// one counts as none.
+    pub fn with_charset(mut self, charset: Option<String>) -> Self {
+        self.charset = charset
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty());
         self
     }
 
@@ -435,6 +452,9 @@ pub enum ContentRef {
         /// fetched archive). `None` for uploads.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// [`Blob::charset`] of the staged bytes, so it survives staging.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charset: Option<String>,
     },
 }
 
@@ -2843,6 +2863,29 @@ steps:
         let config: IndexerConfig =
             serde_json::from_value(with_old_key(serde_json::to_value(&context).unwrap())).unwrap();
         assert_eq!(config.meili.tenant_id.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn a_blob_charset_is_optional_on_the_wire() {
+        // No charset: the JSON is what it was before the field existed.
+        let blob = Blob::new(b"x".to_vec(), "text/html", None);
+        let json = serde_json::to_value(&blob).unwrap();
+        assert!(json.get("charset").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<Blob>(json).unwrap(), blob);
+
+        let blob = blob.with_charset(Some(" Windows-1252 ".into()));
+        assert_eq!(blob.charset.as_deref(), Some("windows-1252"));
+        assert_eq!(blob.mime, "text/html");
+        let json = serde_json::to_value(&blob).unwrap();
+        assert_eq!(json["charset"], "windows-1252");
+        assert_eq!(serde_json::from_value::<Blob>(json).unwrap(), blob);
+        assert_eq!(blob.with_charset(Some(String::new())).charset, None);
+
+        // A staged ref written before the field existed still reads.
+        let old = serde_json::json!({"kind": "staged", "uri": "jobs/j/input/a"});
+        let staged: ContentRef = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(staged, ContentRef::Staged { charset: None, .. }));
+        assert_eq!(serde_json::to_value(&staged).unwrap(), old);
     }
 
     #[test]

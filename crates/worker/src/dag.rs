@@ -501,6 +501,7 @@ mod tests {
             mime: None,
             filename: None,
             origin: None,
+            charset: None,
         });
         assert!(matches!(
             fan_out_branches("$.documents", r, 10),
@@ -514,6 +515,7 @@ mod tests {
             mime: Some("application/vnd.meili-ingest.output+json".into()),
             filename: None,
             origin: None,
+            charset: None,
         })
     }
 

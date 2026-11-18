@@ -1252,6 +1252,7 @@ mod tests {
                 mime,
                 filename,
                 origin,
+                charset: None,
             }) => {
                 assert_eq!(data, PDF_MAGIC);
                 assert_eq!(mime, "application/pdf");
@@ -1306,6 +1307,7 @@ mod tests {
                 mime,
                 filename,
                 origin,
+                charset: None,
             }) => {
                 assert!(uri.contains(&inputs[0].job_id.to_string()), "{uri}");
                 assert_eq!(mime.as_deref(), Some("application/pdf"));
@@ -1385,6 +1387,7 @@ mod tests {
                     mime,
                     filename,
                     origin,
+                    charset: None,
                 }) => {
                     assert_eq!(
                         uri,
@@ -2170,6 +2173,7 @@ mod tests {
                 mime,
                 filename,
                 origin,
+                charset: None,
             }) => {
                 assert!(uri.contains(&a.job_id.to_string()), "{uri}");
                 assert_eq!(mime.as_deref(), Some("application/zip"));

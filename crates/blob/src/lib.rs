@@ -775,11 +775,13 @@ impl BlobStore {
                         BlobError::Rejected(message)
                     });
                 }
-                let header_mime = response
+                let content_type = response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(strip_mime_params);
+                    .and_then(|v| v.to_str().ok());
+                let header_mime = content_type.and_then(strip_mime_params);
+                // Kept apart from the MIME, which routing compares as a bare essence.
+                let charset = content_type.and_then(mime_charset);
                 let data = read_capped_response(response, self.ref_max_bytes, url).await?;
                 let name = filename
                     .clone()
@@ -789,7 +791,9 @@ impl BlobStore {
                     .or(header_mime)
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data, mime, name).with_origin(Some(url_origin(&parsed))))
+                Ok(Blob::new(data, mime, name)
+                    .with_origin(Some(url_origin(&parsed)))
+                    .with_charset(charset))
             }
             ContentRef::S3 {
                 uri,
@@ -820,6 +824,7 @@ impl BlobStore {
                 mime,
                 filename,
                 origin,
+                charset,
             } => {
                 let data = self.get(uri).await?;
                 let name = filename
@@ -830,7 +835,9 @@ impl BlobStore {
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
                 // Not capped: the gateway accepted it under its own upload limit.
-                Ok(Blob::new(Vec::from(data), mime, name).with_origin(origin.clone()))
+                Ok(Blob::new(Vec::from(data), mime, name)
+                    .with_origin(origin.clone())
+                    .with_charset(charset.clone()))
             }
         }
     }
@@ -918,6 +925,7 @@ impl BlobStore {
             mime: Some(SPILLED_OUTPUT_MIME.to_owned()),
             filename: None,
             origin: None,
+            charset: None,
         }))
     }
 
@@ -978,6 +986,7 @@ impl BlobStore {
             mime,
             filename,
             origin,
+            charset,
         } = blob;
         let object_name = staged_object_name(filename.as_deref());
         let key = Self::staged_key(job_id, &format!("input/{object_name}"));
@@ -988,6 +997,7 @@ impl BlobStore {
             mime: Some(mime),
             filename,
             origin,
+            charset,
         }))
     }
 
@@ -1025,6 +1035,7 @@ impl BlobStore {
             mime: Some(SPILLED_OUTPUT_MIME.to_owned()),
             filename: None,
             origin: None,
+            charset: None,
         }))
     }
 }
@@ -1042,6 +1053,19 @@ fn strip_mime_params(value: &str) -> Option<String> {
     } else {
         Some(essence)
     }
+}
+
+/// The `charset` parameter of a `Content-Type` value, unquoted and lower-cased;
+/// `None` when there is none or it is empty.
+fn mime_charset(value: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|param| {
+        let (name, raw) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = raw.trim().trim_matches('"').trim().to_ascii_lowercase();
+        (!label.is_empty()).then_some(label)
+    })
 }
 
 /// The [`Blob::origin`] of a fetched URL: the URL without its query string, fragment
@@ -1622,6 +1646,7 @@ mod tests {
                 mime: Some("application/pdf".into()),
                 filename: Some("big.pdf".into()),
                 origin: None,
+                charset: None,
             })
         );
         assert_eq!(
@@ -1685,6 +1710,7 @@ mod tests {
                 mime: Some(SPILLED_OUTPUT_MIME.into()),
                 filename: None,
                 origin: None,
+                charset: None,
             })
         );
         let resolved = store
@@ -1823,6 +1849,7 @@ mod tests {
                 mime: Some(SPILLED_OUTPUT_MIME.into()),
                 filename: None,
                 origin: None,
+                charset: None,
             })
         );
         let hydrated = store.hydrate_output(spilled).await.unwrap();
@@ -1855,6 +1882,7 @@ mod tests {
             mime: Some("application/pdf".into()),
             filename: Some("report.pdf".into()),
             origin: None,
+            charset: None,
         }))
         .unwrap()
     }
@@ -1923,6 +1951,7 @@ mod tests {
                 mime: Some(SPILLED_OUTPUT_MIME.into()),
                 filename: None,
                 origin: None,
+                charset: None,
             };
             assert_eq!(
                 store
@@ -1982,6 +2011,7 @@ mod tests {
             mime: Some("application/pdf".into()),
             filename: None,
             origin: None,
+            charset: None,
         });
         let many = PluginOutput::Many(vec![spilled, raw_ref.clone(), PluginOutput::Empty]);
         let hydrated = store.hydrate_output(many).await.unwrap();
@@ -2016,6 +2046,7 @@ mod tests {
             mime: None,
             filename: None,
             origin: None,
+            charset: None,
         });
         let resolved = store.resolve_input(input, &http).await.unwrap();
         assert_eq!(
@@ -2051,6 +2082,7 @@ mod tests {
             mime: Some("audio/wav".into()),
             filename: Some("a.wav".into()),
             origin: None,
+            charset: None,
         });
 
         let plain = PluginOutput::Documents(docs(1));
@@ -2192,6 +2224,83 @@ mod tests {
         assert_eq!(store.fetch_ref(r, &http).await.unwrap().origin, None);
     }
 
+    #[tokio::test]
+    async fn fetch_ref_url_keeps_the_declared_charset_out_of_the_mime() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/legacy.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "Text/HTML; Charset=\"Windows-1252\"")
+                    .set_body_bytes(b"<p>Caf\xE9</p>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plain.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"<p>Cafe</p>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let fetch = |p: &str| ContentRef::Url {
+            url: format!("{}{p}", server.uri()),
+            mime: None,
+            filename: None,
+        };
+        let blob = store
+            .fetch_ref(&fetch("/legacy.html"), &http)
+            .await
+            .unwrap();
+        assert_eq!(blob.mime, "text/html", "routing sees the bare essence");
+        assert_eq!(blob.charset.as_deref(), Some("windows-1252"));
+        // The bytes are handed over as fetched, not decoded.
+        assert_eq!(blob.data, b"<p>Caf\xE9</p>".to_vec());
+
+        let blob = store.fetch_ref(&fetch("/plain.html"), &http).await.unwrap();
+        assert_eq!(blob.charset, None);
+    }
+
+    #[tokio::test]
+    async fn a_staged_blob_keeps_its_charset() {
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let blob = Blob::new(
+            b"<p>Caf\xE9</p>".to_vec(),
+            "text/html",
+            Some("a.html".into()),
+        )
+        .with_charset(Some("windows-1252".into()));
+        let staged = store.stage_upload(Uuid::new_v4(), blob, 0).await.unwrap();
+        let PluginInput::Ref(r @ ContentRef::Staged { .. }) = &staged else {
+            panic!("expected a staged ref, got {staged:?}");
+        };
+        let back = store.fetch_ref(r, &http).await.unwrap();
+        assert_eq!(back.charset.as_deref(), Some("windows-1252"));
+        assert_eq!(back.mime, "text/html");
+    }
+
+    #[test]
+    fn the_charset_is_read_from_the_content_type_parameters() {
+        assert_eq!(
+            mime_charset("text/html; charset=UTF-8").as_deref(),
+            Some("utf-8")
+        );
+        assert_eq!(
+            mime_charset("text/html;foo=bar; CHARSET = \"Shift_JIS\" ").as_deref(),
+            Some("shift_jis")
+        );
+        assert_eq!(mime_charset("text/html"), None);
+        assert_eq!(mime_charset("text/html; charset="), None);
+        assert_eq!(mime_charset("text/html; charset=\"\""), None);
+        assert_eq!(mime_charset("text/html; boundary=x"), None);
+    }
+
     /// Non-success statuses and whether retrying the fetch could ever change them.
     const STATUS_TABLE: [(u16, bool); 9] = [
         (400, true),
@@ -2303,6 +2412,7 @@ mod tests {
             mime: None,
             filename: None,
             origin: None,
+            charset: None,
         };
         assert!(matches!(
             store.fetch_ref(&r, &http).await,
