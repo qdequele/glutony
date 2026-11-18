@@ -44,7 +44,7 @@ pipelines whose indexer step names it.
 | `GET /connections` | List. |
 | `POST /connections` | Create (validated as above). |
 | `GET /connections/{uid}` | One connection, with `used_by`. |
-| `PATCH /connections/{uid}` | Change `name`, `host` or `api_key`. Omit `api_key` to keep it. |
+| `PATCH /connections/{uid}` | Change `name`, `host` or `api_key`. Omit `api_key` to keep it while `host` stays on the same origin; moving `host` to another origin (scheme, host or port) needs a new `api_key`, or it answers `422`. |
 | `DELETE /connections/{uid}` | Delete. Never blocked. |
 
 ## Pinning a pipeline

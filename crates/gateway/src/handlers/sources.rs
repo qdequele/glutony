@@ -24,7 +24,7 @@ use crate::handlers::Query;
 use crate::schedules::SourceSchedule;
 use crate::sources::{
     CreateSource, NewSource, RunRecord, SourcePatch, SourceRecord, SourceView, UpdateSource,
-    require_pinned, validate_location,
+    require_pinned, same_fetch_origin, validate_location,
 };
 use crate::state::AppState;
 
@@ -272,7 +272,8 @@ pub async fn get_source(
     Ok(Json(view))
 }
 
-/// `PATCH /sources/{uid}`.
+/// `PATCH /sources/{uid}`. Omitting `auth` keeps the stored credential, unless the
+/// location moves to another origin: that is a 422 until `auth` is re-sent or cleared.
 pub async fn patch_source(
     State(state): State<AppState>,
     scope: Scope,
@@ -290,6 +291,24 @@ pub async fn patch_source(
     let d = &stored.definition;
 
     let timezone = req.timezone.clone().unwrap_or_else(|| d.timezone.clone());
+    // A stored credential was given for the origin it was saved with: moving the source
+    // elsewhere needs it re-sent (or cleared with `null`), never silently carried along.
+    // Checked before any write, so a refusal leaves the schedule and the row unchanged.
+    if req.auth.is_none()
+        && stored.fetch_auth.is_some()
+        && !same_fetch_origin(
+            &d.location,
+            &d.timezone,
+            req.location.as_ref().unwrap_or(&d.location),
+            &timezone,
+        )
+    {
+        return Err(GatewayError::Unprocessable(format!(
+            "source {uid:?}: its location moves to another host, so send `auth` again \
+             (or `\"auth\": null` to drop it); the stored credential is only ever sent \
+             to the host it was saved for"
+        )));
+    }
     if req.location.is_some() || req.timezone.is_some() {
         let location = req.location.as_ref().unwrap_or(&d.location);
         validate_location(location, &timezone, &state.fetch_policy).await?;
@@ -587,7 +606,7 @@ mod tests {
         .with_connections(ConnectionConfig::new(with_key.then(key), HostPolicy::Any))
         .with_sources(
             schedules,
-            HostPolicy::parse("files.example").expect("policy"),
+            HostPolicy::parse("files.example,other.example").expect("policy"),
         );
         crate::router(state)
     }
@@ -899,6 +918,117 @@ mod tests {
                 "control plane answered {cp_status}"
             );
         }
+    }
+
+    /// `tmdb` as stored with a sealed bearer token, on `files.example`.
+    async fn mount_source_with_auth(cp: &MockServer) {
+        let mut stored = record(false);
+        let sealed = meili_ingest_source::seal_json(
+            &key(),
+            &meili_ingest_source::FetchAuth::Bearer {
+                token: "s3cret".into(),
+            },
+        )
+        .expect("seal");
+        stored["fetch_auth"] = serde_json::json!(sealed);
+        Mock::given(method("GET"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(stored))
+            .mount(cp)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record(false)))
+            .mount(cp)
+            .await;
+    }
+
+    async fn sent_patches(cp: &MockServer) -> Vec<serde_json::Value> {
+        cp.received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| serde_json::from_slice(&r.body).expect("json"))
+            .collect()
+    }
+
+    fn url_location(url: &str) -> serde_json::Value {
+        serde_json::json!({ "location": { "kind": "url", "url": url } })
+    }
+
+    #[tokio::test]
+    async fn moving_a_source_to_another_host_without_its_auth_is_422() {
+        for url in [
+            "http://other.example/movie_ids.json.gz",
+            "https://files.example/movie_ids.json.gz",
+            "http://files.example:8080/movie_ids.json.gz",
+            "http://{{ date:%Y }}.files.example/movie_ids.json.gz",
+        ] {
+            let cp = MockServer::start().await;
+            mount_source_with_auth(&cp).await;
+            let schedules = Arc::new(FakeSchedules::default());
+            let mut body = url_location(url);
+            body["cron"] = serde_json::json!("0 9 * * *");
+            let (status, err) = call(
+                &app(&cp, schedules.clone(), true),
+                req("PATCH", "/sources/tmdb", body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{url}: {err}");
+            assert_eq!(err["code"], "validation");
+            assert!(
+                err["error"].as_str().unwrap_or("").contains("auth"),
+                "{err}"
+            );
+            assert!(sent_patches(&cp).await.is_empty(), "{url}: nothing stored");
+            assert!(schedules.calls().is_empty(), "{url}: schedule untouched");
+        }
+    }
+
+    #[tokio::test]
+    async fn moving_a_source_with_new_or_cleared_auth_or_on_its_host_is_accepted() {
+        let cp = MockServer::start().await;
+        mount_source_with_auth(&cp).await;
+        let app = app(&cp, Arc::new(FakeSchedules::default()), true);
+
+        let mut cleared = url_location("http://other.example/x.json");
+        cleared["auth"] = serde_json::Value::Null;
+        let mut replaced = url_location("http://other.example/x.json");
+        replaced["auth"] = serde_json::json!({ "kind": "bearer", "token": "n3w" });
+        let same_host = url_location("http://FILES.example:80/other_{{ date:%Y }}.json");
+        let timezone_only = serde_json::json!({ "timezone": "Europe/Paris" });
+        for body in [cleared, replaced, same_host, timezone_only] {
+            let (status, err) = call(&app, req("PATCH", "/sources/tmdb", body.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {err}");
+        }
+        let sent = sent_patches(&cp).await;
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[0]["fetch_auth"], serde_json::Value::Null, "cleared");
+        assert!(sent[1]["fetch_auth"].is_array(), "a new sealed credential");
+        assert!(sent[2].get("fetch_auth").is_none(), "same host keeps it");
+        assert!(sent[3].get("fetch_auth").is_none(), "same host keeps it");
+    }
+
+    #[tokio::test]
+    async fn moving_a_source_without_stored_auth_needs_no_auth() {
+        let cp = MockServer::start().await;
+        mount_source(&cp).await; // no fetch_auth
+        Mock::given(method("PATCH"))
+            .and(path("/internal/sources/tmdb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record(false)))
+            .mount(&cp)
+            .await;
+        let (status, err) = call(
+            &app(&cp, Arc::new(FakeSchedules::default()), true),
+            req(
+                "PATCH",
+                "/sources/tmdb",
+                url_location("http://other.example/x.json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{err}");
     }
 
     #[tokio::test]

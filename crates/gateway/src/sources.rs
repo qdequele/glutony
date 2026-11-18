@@ -320,6 +320,45 @@ pub async fn validate_location(
     policy.check(&parsed).await.map_err(unprocessable)
 }
 
+/// Whether a stored fetch credential may follow a source from `old` to `new`: only when
+/// every request still goes to the same origin (scheme, host and effective port). A path
+/// change keeps it; anything else, or a location that cannot be read, does not.
+///
+/// A templated origin (`https://{{ date:%Y }}.example/…`) depends on the render time
+/// and timezone, so it only stays put when the template and the timezone are unchanged.
+pub fn same_fetch_origin(old: &Location, old_tz: &str, new: &Location, new_tz: &str) -> bool {
+    let (Location::Url { url: old, .. }, Location::Url { url: new, .. }) = (old, new);
+    match (origin_template(old), origin_template(new)) {
+        (Some(OriginTemplate::Fixed(a)), Some(OriginTemplate::Fixed(b))) => a.is_tuple() && a == b,
+        (Some(OriginTemplate::Templated), Some(OriginTemplate::Templated)) => {
+            old == new && old_tz == new_tz
+        }
+        _ => false,
+    }
+}
+
+enum OriginTemplate {
+    /// The scheme and authority hold no template token.
+    Fixed(url::Origin),
+    /// They do, so the origin is only known once rendered.
+    Templated,
+}
+
+/// The origin of a URL template, read from its `scheme://authority` prefix.
+fn origin_template(template: &str) -> Option<OriginTemplate> {
+    let scheme_end = template.find("://")? + 3;
+    let authority_len = template[scheme_end..]
+        .find(['/', '?', '#'])
+        .unwrap_or(template.len() - scheme_end);
+    let prefix = &template[..scheme_end + authority_len];
+    if prefix.contains("{{") {
+        return Some(OriginTemplate::Templated);
+    }
+    Url::parse(prefix)
+        .ok()
+        .map(|u| OriginTemplate::Fixed(u.origin()))
+}
+
 fn unprocessable(e: SourceError) -> GatewayError {
     GatewayError::Unprocessable(e.to_string())
 }
@@ -511,6 +550,42 @@ mod tests {
         )
         .await
         .expect("an allowlisted host is accepted");
+    }
+
+    #[test]
+    fn a_credential_follows_a_path_change_but_not_an_origin_change() {
+        let same = |a: &str, b: &str| same_fetch_origin(&url(a), "UTC", &url(b), "UTC");
+        assert!(same(
+            "https://x.example/a",
+            "https://X.example:443/b_{{ date:%Y }}"
+        ));
+        assert!(same("https://x.example", "https://x.example?q=1"));
+        assert!(!same("https://x.example/a", "http://x.example/a"), "scheme");
+        assert!(
+            !same("https://x.example/a", "https://x.example:8443/a"),
+            "port"
+        );
+        assert!(!same("https://x.example/a", "https://y.example/a"), "host");
+        assert!(!same(
+            "https://x.example/a",
+            "https://x.example.y.example/a"
+        ));
+        assert!(!same("https://x.example/a", "https://u@y.example/a"));
+        assert!(!same("https://x.example/a", "not a url"));
+
+        // A templated origin stays put only when nothing that renders it changes.
+        let t = "https://{{ date:%Y }}.x.example/a";
+        assert!(same(t, t));
+        assert!(!same(t, "https://{{ date:%Y }}.x.example/b"));
+        assert!(!same(t, "https://2026.x.example/a"));
+        assert!(!same("https://2026.x.example/a", t));
+        assert!(!same_fetch_origin(&url(t), "UTC", &url(t), "Europe/Paris"));
+        assert!(same_fetch_origin(
+            &url("https://x.example/{{ date:%Y }}"),
+            "UTC",
+            &url("https://x.example/{{ date:%Y }}"),
+            "Europe/Paris"
+        ));
     }
 
     #[test]

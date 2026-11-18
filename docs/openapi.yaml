@@ -976,7 +976,13 @@ paths:
       operationId: updateConnection
       summary: Update a connection
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Changing `host` or `api_key` re-runs the create-time checks. Omit `api_key` to keep the stored key.
+      description: |
+        Changing `host` or `api_key` re-runs the create-time checks. Omit `api_key`
+        to keep the stored key, as long as `host` stays on the same origin (scheme,
+        host and port; a path change, a trailing slash or a different case is the
+        same origin). Moving `host` to another origin without a new `api_key` is a
+        `422` and nothing changes: the stored key is only ever sent to the host it
+        was saved for.
       requestBody:
         required: true
         content:
@@ -1133,7 +1139,11 @@ paths:
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Any subset of the create fields except `uid`. `auth` omitted keeps it, `null`
-        clears it. `index` omitted keeps it; `null` or a blank string clears the
+        clears it. A `location` (or, for a URL whose host is templated, a
+        `timezone`) that moves the fetch to another origin (scheme, host or port)
+        while a credential is stored is a `422` unless `auth` is sent too, as a new
+        credential or `null`: the stored one is only ever sent to the origin it was
+        saved for. A path change keeps it. `index` omitted keeps it; `null` or a blank string clears the
         override (the pipeline's `index_pattern`, then the MIME default, apply
         again). `cron` follows the create rules (exactly 5 fields).
       requestBody:
@@ -2241,7 +2251,7 @@ components:
         api_key:
           type: string
           writeOnly: true
-          description: Omit to keep the stored key.
+          description: Omit to keep the stored key. Required when `host` moves to another origin (scheme, host or port).
 
     SourceLocation:
       type: object
@@ -2340,7 +2350,7 @@ components:
           type: [string, "null"]
           description: Omit to keep, `null` or a blank string to clear the override, a name to replace it.
         auth:
-          description: Omit to keep, `null` to clear, an object to replace.
+          description: Omit to keep, `null` to clear, an object to replace. Required (an object or `null`) when the location moves to another origin while a credential is stored.
           oneOf:
             - $ref: "#/components/schemas/FetchAuth"
             - type: "null"

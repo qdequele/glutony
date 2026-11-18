@@ -237,7 +237,10 @@ forgery unless it is restricted. meili-ingest restricts it by default.
   ```
 
   Reads show the kind and header names with values masked as `****`. In
-  `PATCH`, omit `auth` to keep it, send `null` to clear it.
+  `PATCH`, omit `auth` to keep it, send `null` to clear it. A credential stays
+  bound to the origin (scheme, host and port) it was saved with: a `PATCH` that
+  moves the `location` to another origin while one is stored answers `422`
+  unless it also sends `auth`, a new one or `null`. A path change keeps it.
 - **Size**: a response is capped at 512 MiB, both as downloaded and once
   decompressed. A file over the cap fails the run without being retried.
 - **Time**: a fetch has 10 minutes, redirects and body included, so a file at

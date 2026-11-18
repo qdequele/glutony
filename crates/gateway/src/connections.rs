@@ -259,6 +259,14 @@ pub fn normalize_host(raw: &str) -> Result<(String, Url), GatewayError> {
     Ok((host, url))
 }
 
+/// Whether two URLs share an origin (scheme, host and effective port), the unit a stored
+/// secret is bound to. A path change stays on the origin; URLs without a tuple origin
+/// (`file:`, `data:`) never match anything.
+pub fn same_origin(a: &Url, b: &Url) -> bool {
+    let (a, b) = (a.origin(), b.origin());
+    a.is_tuple() && a == b
+}
+
 /// Prove a destination works before it is saved: the host policy, then
 /// `GET /health`, then one authenticated call so a wrong key fails now rather than at
 /// 3am inside a cron run (spec *Connection validation*).
@@ -466,6 +474,22 @@ mod tests {
             Some(Arc::new(SecretKey::from_bytes([1; 32]))),
             HostPolicy::Any,
         )
+    }
+
+    #[test]
+    fn an_origin_is_scheme_host_and_effective_port() {
+        let u = |s: &str| Url::parse(s).expect("url");
+        let base = u("https://m.example");
+        assert!(same_origin(&base, &u("https://M.EXAMPLE:443/prefix")));
+        assert!(!same_origin(&base, &u("http://m.example")), "scheme");
+        assert!(!same_origin(&base, &u("https://m.example:8443")), "port");
+        assert!(!same_origin(&base, &u("https://other.example")), "host");
+        assert!(!same_origin(
+            &base,
+            &u("https://m.example.attacker.example")
+        ));
+        let file = u("file:///etc/passwd");
+        assert!(!same_origin(&file, &file), "no tuple origin never matches");
     }
 
     #[test]
