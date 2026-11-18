@@ -32,6 +32,38 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   image fails as invalid input before it is encoded or sent, instead of costing several
   base64 copies of itself in worker memory and then being refused by the provider. The
   request also holds one base64 copy of the image instead of three.
+- Built-in plugins can checkpoint their progress (`ActivityContext::record_progress`)
+  and read the previous attempt's checkpoint on a retry
+  (`ActivityContext::previous_progress`). The checkpoint travels in the Temporal
+  heartbeat details. No plugin uses it yet.
+- Bytes fetched over HTTP (URL ingests and scheduled URL sources) keep the `charset`
+  declared in their `Content-Type` as `Blob.charset`, also through staging, while `mime`
+  stays the bare type. No plugin decodes with it yet.
+- `MAX_INFLIGHT_UPLOAD_MB` (default twice `MAX_UPLOAD_MB`, `0` to disable) bounds the
+  request body the ingest routes hold in memory at once. A request that does not fit
+  within 2 s gets `503` with `code: overloaded` and `Retry-After`. One maximum-size
+  upload is always admitted when the gateway is idle.
+- `POST /sources/{uid}/reset-state` forgets a source's saved `ETag`, `Last-Modified` and
+  content hash, so its next run fetches and ingests in full even when upstream has not
+  changed. Use it after editing the steps of the source's pipeline, which does not reset
+  the state on its own.
+- `JOBS_RETENTION_DAYS` (control plane, off by default): an hourly pass deletes finished
+  jobs and source runs older than that many days. Running jobs, and archive jobs whose
+  file jobs remain, are kept.
+- `ARCHIVE_INFLIGHT_MB` (worker): the most decompressed archive content held in memory
+  at once, waiting to be staged.
+- `meili_indexer` takes an opt-in `prune: true`. Once the additions succeed, it deletes
+  the documents that share a `_meta.parent_id` with a document of the step but were not
+  sent by it, such as the stale chunks of a document that got shorter. It needs
+  `wait_for_completion`, a key allowed to delete documents, and `_meta.parent_id` plus
+  the primary key in the index's `filterableAttributes`. It cannot be combined with a
+  `fan_out` other than `$` on the indexer step (the pipeline is rejected), and a parent
+  whose chunks are not all in the step (per `meta.chunk_total`) is skipped. Off by
+  default.
+- `json_flattener` takes a `root` option: `"none"` reads the payload as is (a record
+  with an `items` or `data` field stays one document), and a JSON Pointer such as
+  `"/data/orders"` names the array of records, in the payload or in each NDJSON line.
+  Unset keeps the wrapper-key rule.
 
 ### Fixed
 - A batch item's `index` and `pipeline` are honoured. They were dropped without a
@@ -332,6 +364,84 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   account's Gateway target again for 10 s, with `?refresh=true` too: lookups in that
   window get the cached target or `503 lab_unavailable` straight away. A refused key
   (`?rejected_key_id=`) is still reported to the Lab.
+- WASM plugins now see the real job id, step id and attempt: `ctx.job_id()`,
+  `ctx.step_id()` and `ctx.attempt()` used to return the nil UUID, `"test"` and 1. The
+  `execute` envelope carries `job_id`, `step_id` and `attempt` as additive fields. Usage
+  recorded inside a guest is still not billed. The WASM authoring guide now gives the
+  `{"ok"|"error"}` reply the worker actually expects.
+- A step with several `depends_on` no longer receives a merged input larger than
+  Temporal's payload limit: the outputs it merges now share `PAYLOAD_SPILL_BYTES`, like
+  the branches of a fanned-out step.
+- Lab events that never got an answer from the Lab (unreachable, `401`, `5xx`,
+  unreadable answer) are retried for 7 days instead of being dropped after 24 h, so an
+  outage or a credential problem shorter than that loses no usage event. An event the
+  Lab skipped (a `200` that does not accept it) is still dropped, 24 h after its first
+  skip.
+- With `LAB_AI_GATEWAY=true`, an AI step (`llm_enricher`, `image_captioner`,
+  `jev_enricher`) of a Lab account no longer falls back to the worker's own provider key
+  when the control plane serves no Gateway target (for example a replica without
+  `LAB_INSTANCE_*`). The step fails retryably and never runs on the worker's key.
+- Spilled step outputs no longer overwrite each other when step ids look alike (a
+  fan-out step `enrich` and a step `enrich-0`, or a step `x-fanout` and the fan-out of
+  `x`). Each spilled object now has its own key under `jobs/<job>/steps/<step>/`. Jobs
+  in flight keep reading their old keys.
+- `s3_downloader` steps now run on `workers-general` instead of `workers-io`, a queue
+  the Kubernetes manifests never poll, so such a job no longer stays `running` forever.
+- Archive uploads can no longer run a worker out of memory: a worker expands one archive
+  at a time and holds at most `ARCHIVE_INFLIGHT_MB` (new, default 512, never below
+  `ARCHIVE_MAX_FILE_MB`) of its decompressed files at once. Other archive jobs wait
+  their turn. The docs now state the real peak memory (archive + budget + one file per
+  nested level).
+- Staged uploads, source items, archive files and spilled step outputs are no longer
+  kept forever: workers delete everything a job left under `jobs/<job_id>/`
+  `BLOB_TTL_DAYS` (new, control plane, default 7; `0` keeps them) after the job ended.
+  For an archive, this waits until all its file jobs have ended. Workers on S3 now need
+  `s3:ListBucket` and `s3:DeleteObject` on `jobs/`. A bucket lifecycle rule on `jobs/`
+  is documented as the backstop.
+- A retried `meili_indexer` step no longer sends again the batches its previous attempt
+  already enqueued. After a task wait timeout or a 5xx on a later batch, it waits on
+  those Meilisearch tasks and only sends the rest. It falls back to sending everything
+  when the documents, the destination or the tasks no longer match.
+- When `llm_enricher` or `jev_enricher` fails on one document and Temporal retries the
+  step, the retry resumes from the documents already enriched instead of sending the
+  whole batch to the provider again. Their results travel in the step's heartbeat
+  details, capped at 256 KiB, and documents past the cap are redone. Failed attempts are
+  not billed, and a resumed document is not billed twice.
+- `video_audio_extractor` no longer reports `audio_seconds`. `whisper_transcriber`
+  downstream reports the seconds it was billed for, so a video's audio was counted twice
+  in the usage rollups, the tenant usage endpoint and the Lab usage event. Usage already
+  recorded for video jobs stays doubled.
+- `whisper_transcriber` splits an uncompressed WAV larger than `max_bytes` into windows
+  that fit and sends them one after the other, so the built-in `video` pipeline now
+  transcribes videos longer than about 13 min 39 s. The transcript reads as one request:
+  the same document id, segment timestamps offset to the whole recording,
+  `chunk_index`/`chunk_total` counted across windows, and `audio_seconds` for the whole
+  length (one external request per window). Compressed audio over `max_bytes` is still
+  rejected.
+- `parquet_parser` writes `DECIMAL` columns wider than 15 digits as exact strings
+  (`"12345678901234567890.1234567890"`), as `avro_parser` does, instead of rounding them
+  through a float. Narrower decimals stay numbers. Wide decimal ids no longer collapse
+  into one.
+- `csv_parser` keeps cells that look like identifiers as strings: a leading `+`
+  (`+33612345678`), integers too wide for 64 bits and exponent notation (`1E5`) are no
+  longer turned into different numbers.
+- `csv_parser` detects the file's character encoding (byte order mark, UTF-8, the
+  server's declared charset, else windows-1252) and transcodes it, so an Excel export in
+  windows-1252 no longer fails the whole job. A new `encoding` option forces an
+  encoding.
+- Field-name collisions no longer drop values: duplicate CSV headers get `_2`, `_3`, …
+  suffixes, a CSV `_row` column keeps its value (the row number moves to `_row_2`), and
+  JSON keys that flatten alike, or MessagePack keys that render alike, get suffixes too.
+- `html_extractor` also decodes with the `charset` of the HTTP `Content-Type` a page was
+  fetched with (URL ingests and scheduled sources). Following the HTML standard, it
+  ranks above a `<meta charset>`. A legacy page served as `text/html;
+  charset=windows-1252` or `Shift_JIS` without a `<meta>` declaration is no longer
+  indexed as replacement characters. Valid UTF-8 and a byte order mark still win.
+- Files and spreadsheet sheets with non-ASCII names no longer share document ids:
+  `報告.pdf` and `計画.pdf`, or sheets `売上` and `在庫`, used to overwrite each other. A name
+  containing non-ASCII characters now ends with `_` and a 12-character hash of the
+  original. Ids of such names change once, so re-ingesting them leaves the old documents
+  in the index until you delete them. Pure-ASCII names keep exactly the ids they had.
 
 ### Changed
 - Document ids built from a filename keep its folders: `reports/eu/q3.pdf` gives
@@ -370,6 +480,52 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   `replicas`, remove it from the last applied configuration before the first apply
   (`kubectl apply edit-last-applied`), or expect a one-off dip to one pod. See
   [Kubernetes](docs/deployment/kubernetes.mdx), "Upgrades".
+- With the Lab seams on (`LAB_URL` / `LAB_INSTANCE_*` on the control plane), creating or
+  validating a global pipeline whose `meili_indexer` step pins a `connection` answers
+  `422`. A tenant job only resolves its own connections, so global pinned pipelines are
+  standalone-only; pin connections in tenant pipelines.
+- Creating a source whose `uid` is held by an archived source of the tenant now answers
+  `409 conflict`. The message names the archived source and its deleted pipeline;
+  archived sources keep their `uid` until deleted. The answer was a `422` that read like
+  a live duplicate, and the gateway now passes the control plane's `409` through instead
+  of a `502`.
+- `GET /jobs` counts `total` up to 10 000 only, so a page request no longer scans a
+  tenant's whole history; `total: 10000` means "10 000 or more".
+- Boolean environment variables (`WRITE_PREFLIGHT`, `OBJECT_REF_AMBIENT_CREDENTIALS`,
+  `LAB_EVENTS_ENABLED`, `LAB_AI_GATEWAY`, `CONTROL_PLANE_TOKEN_DISABLED`) are parsed the
+  same way by the gateway, the workers and the control plane: `true`/`false`, `1`/`0`,
+  `yes`/`no` or `on`/`off`, in any case. Any other value is `false` with a warning
+  naming the variable. `WRITE_PREFLIGHT=1` no longer stops the gateway, and an
+  unrecognised `OBJECT_REF_AMBIENT_CREDENTIALS` no longer stops the worker.
+- `meili_indexer` with `auto_create_index: false` now fails the step (not retried),
+  naming the index, when the target index does not exist, and sends no documents.
+  Before, the additions still went out and Meilisearch created the index anyway. This
+  replaces the earlier note that 'a missing index is still not created'.
+- `llm_enricher` and `image_captioner` drop reply keys that start with `_` (`_geo`,
+  `_vectors`, …), so a malformed key from the model can no longer make Meilisearch
+  reject the whole batch. **A pipeline whose prompt asks for `_geo` (or any other `_`
+  key) must now list it in the new `allow_reserved` option, e.g. `allow_reserved:
+  ["_geo"]`, or the key is no longer indexed.**
+- `llm_enricher` and `image_captioner` no longer fail the step when the provider
+  declines a document (`finish_reason: content_filter`, a refusal, or an empty reply).
+  The document is indexed un-enriched with `fields.llm_declined` set to
+  `content_filter`, `refusal` or `empty`, and the job goes on. The new `on_refusal:
+  fail` step option restores the old behaviour. HTTP errors (400, 401, 402, 403) still
+  fail the step as before.
+- `video_audio_extractor` caps decoding at four hours by default. With
+  `max_duration_secs` unset or `null`, longer audio now fails the step with a
+  non-retryable error naming `max_duration_secs` instead of being decoded without limit.
+  An explicit `max_duration_secs` still keeps the first that many seconds and can be
+  larger than four hours.
+- Docs: files that differ only by extension (`guide.md` and `guide.html`, `data.csv` and
+  `data.parquet`) share document ids in one index, and the one indexed last wins. The
+  docs now say so and list the workarounds. They also no longer promise manifest
+  overrides through `EXTERNAL_PLUGINS`, and they state the fixed ~48 MiB input limit of
+  gRPC plugins.
+- The Kubernetes manifests now deploy the release they ship with:
+  `k8s/kustomization.yaml` pins `newTag` to `X.Y.Z` instead of `latest`, which nodes
+  kept cached under `imagePullPolicy: IfNotPresent`. The release script writes it and CI
+  fails when it drifts; apply the tree of the release tag you deploy.
 
 ### Added
 - Automated releases: `scripts/prepare-release.sh` bumps the crate version
@@ -493,6 +649,33 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   (`.xlsx`, `.xlsm`, `.xlsb`, `.ods`) is limited to 256 MiB per part and 512 MiB per
   file. A file past either limit fails the step without a retry, instead of exhausting
   the worker.
+- `PATCH /connections/{uid}` no longer sends the stored Meilisearch key to a new host:
+  moving `host` to another origin (scheme, host or port) without a new `api_key` now
+  answers `422`. A path-only change, a trailing slash or a different letter case keeps
+  the stored key.
+- `PATCH /sources/{uid}` no longer carries a stored fetch credential to a new host:
+  moving the `location` to another origin while a credential is stored now answers `422`
+  unless `auth` is sent too (a new credential, or `null` to drop it). A path-only change
+  keeps it.
+- The control plane now requires `CONTROL_PLANE_TOKEN` on every route except `/health`
+  and `/metrics` when a token is configured. `/pipelines`, `/pipelines/validate`,
+  `/pipelines/{uid}`, `/jobs` and `/plugins` on port 9000 answered without it. Anything
+  that calls them on port 9000 directly now needs `Authorization: Bearer
+  $CONTROL_PLANE_TOKEN`; the gateway and workers already send it.
+- A URL refused by a `SOURCE_FETCH_HOSTS` allowlist no longer tells a tenant which hosts
+  are allowed. The ingest and source `422`, the job error and a scheduled source run's
+  error (its `last_error`, including a redirect to a host that is not allowed) say only
+  that the host is not allowed. Standalone callers still see the list, and the worker no
+  longer prints the policy's internal representation.
+- Tenant documents (raw uploads and extracted text) no longer stay readable in the blob
+  store indefinitely after their job: they are deleted `BLOB_TTL_DAYS` after it ended.
+- `parquet_parser`, `avro_parser` and `msgpack_parser` now decode at most
+  `PARSER_MAX_ROWS` rows (default 1,000,000) and `PARSER_MAX_DECODED_MB` of decoded data
+  (default 512) per step. A file over either fails its step without a retry instead of
+  exhausting the worker's memory. A step's `max_rows` / `max_records` can only lower the
+  row count. Before any row of a Parquet file is decoded, its row and value counts are
+  checked, so a few-KB file whose one list cell holds millions of values is refused up
+  front. Its `batch_size` is capped at 8192 rows.
 
 ## [0.1.0] - 2026-10-11
 
