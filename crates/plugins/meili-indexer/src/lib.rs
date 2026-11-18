@@ -33,6 +33,16 @@
 //! Network failures, timeouts and 5xx responses are [`PluginError::Retryable`];
 //! authentication problems (401/403, `auth` error type) and invalid requests are
 //! [`PluginError::NonRetryable`].
+//!
+//! Every enqueued batch is checkpointed ([`ActivityContext::record_progress`]) with its
+//! task uid. A retry of the step (a task that did not finish within
+//! `task_timeout_secs`, a 5xx on a later batch) waits on the tasks the previous
+//! attempt enqueued instead of sending those batches again, and only sends the rest.
+//! It trusts a checkpoint only for the same destination and the same documents, and
+//! only the leading batches whose task Meilisearch still knows (same index, same
+//! enqueue time); from the first one it cannot confirm, every batch is sent again, so
+//! the additions keep their order. Checkpoints are best effort: without one, the
+//! retry sends everything, which `addOrReplace` makes harmless.
 
 use std::time::Duration;
 
@@ -42,6 +52,7 @@ use meilisearch_sdk::client::Client;
 use meilisearch_sdk::errors::{Error as MeiliError, ErrorCode, ErrorType, MeilisearchError};
 use meilisearch_sdk::task_info::TaskInfo;
 use meilisearch_sdk::tasks::Task;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Plugin name referenced by `steps[].plugin`. Equals [`INDEXER_PLUGIN`].
@@ -268,22 +279,181 @@ fn map_error(err: MeiliError, what: &str) -> PluginError {
     }
 }
 
-/// Bytes `payload` takes serialized, counted without building the serialization.
-fn serialized_len(payload: &Value) -> usize {
-    struct Counter(usize);
+/// 64-bit FNV-1a: a small, stable hash for checkpoint fingerprints. Not
+/// cryptographic; it only has to tell one step input from another.
+#[derive(Debug, Clone, Copy)]
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    /// Hash `part` so that the parts of a sequence cannot run into each other.
+    fn part(mut self, part: &[u8]) -> Self {
+        self.write(&(part.len() as u64).to_le_bytes());
+        self.write(part);
+        self
+    }
+
+    fn hex(self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+/// A payload's serialized size and a hash of its serialization.
+#[derive(Debug, Clone, Copy)]
+struct Measured {
+    bytes: usize,
+    hash: u64,
+}
+
+/// Measure `payload` serialized, without building the serialization.
+fn measure(payload: &Value) -> Measured {
+    struct Counter(usize, Fnv);
     impl std::io::Write for Counter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0 += buf.len();
+            self.1.write(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut counter = Counter(0);
+    let mut counter = Counter(0, Fnv::new());
     match serde_json::to_writer(&mut counter, payload) {
-        Ok(()) => counter.0,
-        Err(_) => usize::MAX,
+        Ok(()) => Measured {
+            bytes: counter.0,
+            hash: counter.1.0,
+        },
+        Err(_) => Measured {
+            bytes: usize::MAX,
+            hash: 0,
+        },
+    }
+}
+
+/// A task uid the SDK can wait on or fetch.
+struct TaskUid(u32);
+
+impl AsRef<u32> for TaskUid {
+    fn as_ref(&self) -> &u32 {
+        &self.0
+    }
+}
+
+/// Version of [`Checkpoint`], also how the indexer recognises its own checkpoint.
+const CHECKPOINT_VERSION: u32 = 1;
+
+/// What an attempt checkpoints so that a retry resumes instead of resending: the
+/// batches it enqueued, in send order. Small on purpose (it travels in the Temporal
+/// heartbeat details): fingerprints and task uids, never documents or the API key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Checkpoint {
+    /// Always [`CHECKPOINT_VERSION`].
+    meili_indexer: u32,
+    /// Fingerprint of the host and index the tasks were enqueued on.
+    destination: String,
+    /// Fingerprint of the serialized documents, in order.
+    documents: String,
+    /// The batches enqueued so far, a prefix of the batch plan.
+    batches: Vec<EnqueuedBatch>,
+}
+
+/// One enqueued batch: the documents it covers and the task Meilisearch gave it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct EnqueuedBatch {
+    start: usize,
+    end: usize,
+    task: u32,
+    /// When Meilisearch enqueued the task, in Unix milliseconds: a task uid alone could
+    /// name another task after the instance was reset.
+    enqueued_at_ms: i64,
+}
+
+impl EnqueuedBatch {
+    fn new(range: &std::ops::Range<usize>, info: &TaskInfo) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+            task: info.task_uid,
+            enqueued_at_ms: unix_ms(info.enqueued_at.unix_timestamp_nanos()),
+        }
+    }
+}
+
+fn unix_ms(nanos: i128) -> i64 {
+    i64::try_from(nanos / 1_000_000).unwrap_or(i64::MAX)
+}
+
+impl Checkpoint {
+    /// The previous attempt's checkpoint, when it is this plugin's and describes the
+    /// same destination and documents.
+    fn matching(previous: Option<&Value>, destination: &str, documents: &str) -> Option<Self> {
+        let cp: Self = serde_json::from_value(previous?.clone()).ok()?;
+        (cp.meili_indexer == CHECKPOINT_VERSION
+            && cp.destination == destination
+            && cp.documents == documents)
+            .then_some(cp)
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// The leading batches of `checkpoint` whose task Meilisearch still has as enqueued
+/// by the previous attempt: same position in the plan, same index, same enqueue time.
+/// Stops at the first one it cannot confirm, so every batch after it is sent again
+/// and the additions keep their order.
+async fn confirmed_batches(
+    client: &Client,
+    index_uid: &str,
+    plan: &[std::ops::Range<usize>],
+    checkpoint: Checkpoint,
+) -> Result<Vec<EnqueuedBatch>, PluginError> {
+    let mut confirmed = Vec::new();
+    for (range, batch) in plan.iter().zip(checkpoint.batches) {
+        if range.start != batch.start || range.end != batch.end {
+            break;
+        }
+        let task = match client.get_task(TaskUid(batch.task)).await {
+            Ok(task) => task,
+            // Pruned, from a reset instance, or a status this SDK does not know
+            // (`canceled`): resend rather than trust it.
+            Err(e) if is_task_not_found(&e) || matches!(e, MeiliError::ParseError(_)) => break,
+            Err(e) => return Err(map_error(e, &format!("checking task {}", batch.task))),
+        };
+        let (index, enqueued_at) = match &task {
+            Task::Enqueued { content } => (&content.index_uid, content.enqueued_at),
+            Task::Processing { content } => (&content.index_uid, content.enqueued_at),
+            Task::Succeeded { content } => (&content.index_uid, content.enqueued_at),
+            Task::Failed { content } => (&content.task.index_uid, content.task.enqueued_at),
+        };
+        if index.as_deref() != Some(index_uid)
+            || unix_ms(enqueued_at.unix_timestamp_nanos()) != batch.enqueued_at_ms
+        {
+            break;
+        }
+        confirmed.push(batch);
+    }
+    Ok(confirmed)
+}
+
+/// Whether an SDK error means "no such task".
+fn is_task_not_found(err: &MeiliError) -> bool {
+    match err {
+        MeiliError::Meilisearch(e) => matches!(e.error_code, ErrorCode::TaskNotFound),
+        MeiliError::MeilisearchCommunication(c) => c.status_code == 404,
+        _ => false,
     }
 }
 
@@ -300,17 +470,16 @@ fn task_failed(uid: u32, what: &str, err: &MeilisearchError) -> PluginError {
 async fn wait_for_task(
     client: &Client,
     ctx: &ActivityContext,
-    task: &TaskInfo,
+    uid: u32,
     what: &str,
     timeout: Duration,
 ) -> Result<Option<MeilisearchError>, PluginError> {
-    let uid = task.task_uid;
     let mut waited = Duration::ZERO;
     loop {
         ctx.check_cancelled()?;
         ctx.heartbeat(format!("{NAME}: waiting for task {uid} ({what})"));
         match client
-            .wait_for_task(task, Some(POLL_INTERVAL), Some(WAIT_SLICE))
+            .wait_for_task(TaskUid(uid), Some(POLL_INTERVAL), Some(WAIT_SLICE))
             .await
         {
             Ok(Task::Succeeded { .. }) => return Ok(None),
@@ -410,7 +579,7 @@ async fn check_creation(
     task: &TaskInfo,
     timeout: Duration,
 ) -> Result<(), PluginError> {
-    match wait_for_task(client, ctx, task, "index creation", timeout).await? {
+    match wait_for_task(client, ctx, task.task_uid, "index creation", timeout).await? {
         None => Ok(()),
         Some(err) if matches!(err.error_code, ErrorCode::IndexAlreadyExists) => Ok(()),
         Some(err) => Err(task_failed(task.task_uid, "index creation", &err)),
@@ -560,7 +729,8 @@ impl Plugin for MeiliIndexerPlugin {
         // Consumes the documents: their strings move into the payloads, so the input
         // is held once rather than twice while the batches are sent.
         let payloads: Vec<Value> = docs.into_iter().map(Document::into_index_json).collect();
-        let sizes: Vec<usize> = payloads.iter().map(serialized_len).collect();
+        let measured: Vec<Measured> = payloads.iter().map(measure).collect();
+        let sizes: Vec<usize> = measured.iter().map(|m| m.bytes).collect();
         let batches = plan_batches(&sizes, cfg.batch_size, cfg.max_batch_bytes).map_err(
             |OversizedDoc { index, bytes }| {
                 PluginError::NonRetryable(format!(
@@ -573,10 +743,47 @@ impl Plugin for MeiliIndexerPlugin {
             },
         )?;
         let batch_total = batches.len();
-        let mut tasks: Vec<TaskInfo> = Vec::with_capacity(batch_total);
-        for (batch_no, range) in batches.into_iter().enumerate() {
+
+        // Resume what a previous attempt already enqueued.
+        let destination = Fnv::new()
+            .part(client.get_host().as_bytes())
+            .part(index_uid.as_bytes())
+            .hex();
+        let documents = measured
+            .iter()
+            .fold(Fnv::new(), |h, m| h.part(&m.hash.to_le_bytes()))
+            .hex();
+        let mut checkpoint = Checkpoint {
+            meili_indexer: CHECKPOINT_VERSION,
+            destination,
+            documents,
+            batches: Vec::with_capacity(batch_total),
+        };
+        if let Some(previous) = Checkpoint::matching(
+            ctx.previous_progress(),
+            &checkpoint.destination,
+            &checkpoint.documents,
+        ) {
+            checkpoint.batches = confirmed_batches(&client, &index_uid, &batches, previous).await?;
+            tracing::info!(
+                plugin = NAME,
+                index = %index_uid,
+                attempt = ctx.attempt(),
+                resumed = checkpoint.batches.len(),
+                batches = batch_total,
+                "resuming: not sending again the batches the previous attempt enqueued"
+            );
+        }
+        if ctx.previous_progress().is_some() {
+            // Replace the inherited checkpoint now: it may describe other documents, or
+            // batches that were just found stale.
+            ctx.record_progress(checkpoint.to_value());
+        }
+
+        let resumed = checkpoint.batches.len();
+        for (batch_no, range) in batches.into_iter().enumerate().skip(resumed) {
             ctx.check_cancelled()?;
-            let payload = &payloads[range];
+            let payload = &payloads[range.clone()];
             ctx.heartbeat(format!(
                 "{NAME}: sending batch {}/{batch_total} ({} documents)",
                 batch_no + 1,
@@ -594,15 +801,17 @@ impl Plugin for MeiliIndexerPlugin {
                 documents = payload.len(),
                 "batch enqueued"
             );
-            tasks.push(info);
+            checkpoint.batches.push(EnqueuedBatch::new(&range, &info));
+            ctx.record_progress(checkpoint.to_value());
         }
+        let task_uids: Vec<u32> = checkpoint.batches.iter().map(|b| b.task).collect();
 
         if cfg.wait_for_completion {
-            for info in &tasks {
+            for &uid in &task_uids {
                 if let Some(err) =
-                    wait_for_task(&client, ctx, info, "document addition", timeout).await?
+                    wait_for_task(&client, ctx, uid, "document addition", timeout).await?
                 {
-                    return Err(task_failed(info.task_uid, "document addition", &err));
+                    return Err(task_failed(uid, "document addition", &err));
                 }
             }
             // Enqueued before the additions, so it finished before them: no extra wait.
@@ -614,7 +823,7 @@ impl Plugin for MeiliIndexerPlugin {
         Ok(PluginOutput::Indexed(IndexReport {
             index: index_uid,
             document_count,
-            task_uids: tasks.iter().map(|t| t.task_uid).collect(),
+            task_uids,
         }))
     }
 }
@@ -887,14 +1096,20 @@ mod tests {
     }
 
     #[test]
-    fn serialized_len_matches_the_serialization() {
+    fn measure_matches_the_serialization() {
         for doc in docs() {
             let payload = doc.into_index_json();
-            assert_eq!(
-                serialized_len(&payload),
-                serde_json::to_vec(&payload).unwrap().len()
-            );
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let measured = measure(&payload);
+            assert_eq!(measured.bytes, bytes.len());
+            let mut hash = Fnv::new();
+            hash.write(&bytes);
+            assert_eq!(measured.hash, hash.0);
         }
+        assert_ne!(
+            measure(&json!({"id": "a"})).hash,
+            measure(&json!({"id": "b"})).hash
+        );
     }
 
     #[test]
@@ -981,6 +1196,229 @@ mod tests {
             other => panic!("expected Retryable, got {other:?}"),
         }
         assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
+    }
+
+    // ----- resuming after a retry (checkpointed task uids) -----
+
+    async fn mount_existing_index(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
+            .mount(server)
+            .await;
+    }
+
+    /// Accept `n` document additions, answering them with task uids `first..first+n`.
+    async fn mount_numbered_additions(server: &MockServer, first: u32, n: u32) {
+        for uid in first..first + n {
+            Mock::given(method("POST"))
+                .and(path(format!("/indexes/{INDEX}/documents")))
+                .respond_with(
+                    ResponseTemplate::new(202)
+                        .set_body_json(task_info(uid, "documentAdditionOrUpdate")),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// The ids of the documents in every addition the server received, per request.
+    async fn sent_batches(server: &MockServer) -> Vec<Vec<String>> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == "POST" && r.url.path().ends_with("/documents"))
+            .map(|r| {
+                r.body_json::<Vec<Value>>()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d["id"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn three_docs() -> Vec<Document> {
+        let mut input = docs();
+        input.push(Document::with_id("c", "third"));
+        input
+    }
+
+    async fn run_attempt(
+        attempt: u32,
+        previous: Option<Value>,
+        input: Vec<Document>,
+        cfg: Value,
+    ) -> (Result<PluginOutput, PluginError>, Option<Value>) {
+        let ctx = ActivityContext::detached(ActivityContext::noop().job_id(), "index", attempt)
+            .with_previous_progress(previous);
+        let out = MeiliIndexerPlugin::new()
+            .execute(&ctx, PluginInput::Documents(input), cfg)
+            .await;
+        (out, ctx.progress())
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_wait_timeout_waits_on_the_enqueued_tasks_instead_of_resending() {
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 10, 3).await;
+        // Meilisearch is busy: the first task never leaves the queue during attempt 1.
+        for uid in [10, 11, 12] {
+            mount_task(&server, uid, "enqueued", None).await;
+        }
+        let mut cfg = config(&server.uri());
+        cfg["batch_size"] = json!(1);
+        cfg["task_timeout_secs"] = json!(1);
+        let (out, progress) = run_attempt(1, None, three_docs(), cfg.clone()).await;
+        assert!(matches!(out, Err(PluginError::Retryable(_))), "{out:?}");
+        assert_eq!(sent_batches(&server).await.len(), 3);
+        let progress = progress.expect("the enqueued tasks are checkpointed");
+
+        // Attempt 2: the tasks of attempt 1 have finished meanwhile. Nothing is sent
+        // again; the step waits on those tasks and reports them.
+        server.reset().await;
+        mount_existing_index(&server).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(99, "documentAdditionOrUpdate")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        for uid in [10, 11, 12] {
+            mount_task(&server, uid, "succeeded", None).await;
+        }
+        let (out, _) = run_attempt(2, Some(progress), three_docs(), cfg).await;
+        assert_eq!(
+            out.unwrap(),
+            PluginOutput::Indexed(IndexReport {
+                index: INDEX.into(),
+                document_count: 3,
+                task_uids: vec![10, 11, 12],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_partial_send_only_sends_the_batches_not_yet_enqueued() {
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 10, 1).await;
+        // Batch 2 hits a 5xx: retryable, batch 1 is already in the queue.
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents")))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        let mut cfg = config(&server.uri());
+        cfg["batch_size"] = json!(1);
+        let (out, progress) = run_attempt(1, None, three_docs(), cfg.clone()).await;
+        assert!(matches!(out, Err(PluginError::Retryable(_))), "{out:?}");
+        assert_eq!(sent_batches(&server).await, vec![vec!["a"], vec!["b"]]);
+
+        server.reset().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 20, 2).await;
+        for uid in [10, 20, 21] {
+            mount_task(&server, uid, "succeeded", None).await;
+        }
+        let (out, _) = run_attempt(2, progress, three_docs(), cfg).await;
+        assert_eq!(
+            out.unwrap(),
+            PluginOutput::Indexed(IndexReport {
+                index: INDEX.into(),
+                document_count: 3,
+                task_uids: vec![10, 20, 21],
+            })
+        );
+        assert_eq!(sent_batches(&server).await, vec![vec!["b"], vec!["c"]]);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_that_cannot_be_trusted_falls_back_to_resending() {
+        // First attempt: everything enqueued, nothing finished in time.
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 10, 3).await;
+        for uid in [10, 11, 12] {
+            mount_task(&server, uid, "enqueued", None).await;
+        }
+        let mut cfg = config(&server.uri());
+        cfg["batch_size"] = json!(1);
+        cfg["task_timeout_secs"] = json!(1);
+        let (_, progress) = run_attempt(1, None, three_docs(), cfg.clone()).await;
+        let progress = progress.expect("checkpoint");
+
+        // Task 11 is gone (pruned, or the instance was reset): it and every later batch
+        // are sent again, so the additions keep their order.
+        server.reset().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 30, 2).await;
+        mount_task(&server, 10, "succeeded", None).await;
+        Mock::given(method("GET"))
+            .and(path("/tasks/11"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(meili_error(
+                "task_not_found",
+                "invalid_request",
+                "Task `11` not found.",
+            )))
+            .mount(&server)
+            .await;
+        for uid in [30, 31] {
+            mount_task(&server, uid, "succeeded", None).await;
+        }
+        let (out, _) = run_attempt(2, Some(progress.clone()), three_docs(), cfg.clone()).await;
+        assert_eq!(out.unwrap().document_count(), 3);
+        assert_eq!(sent_batches(&server).await, vec![vec!["b"], vec!["c"]]);
+
+        // Different input than the checkpoint describes: everything is sent.
+        server.reset().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 40, 2).await;
+        for uid in [40, 41] {
+            mount_task(&server, uid, "succeeded", None).await;
+        }
+        let (out, _) = run_attempt(2, Some(progress.clone()), docs(), cfg.clone()).await;
+        assert_eq!(out.unwrap().document_count(), 2);
+        assert_eq!(sent_batches(&server).await, vec![vec!["a"], vec!["b"]]);
+
+        // Another index on the same host: everything is sent.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/indexes/other"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(existing_index()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes/other/documents"))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(50, "documentAdditionOrUpdate")),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        mount_task(&server, 50, "succeeded", None).await;
+        let mut other = cfg.clone();
+        other["index"] = json!("other");
+        let (out, _) = run_attempt(2, Some(progress), three_docs(), other).await;
+        assert_eq!(out.unwrap().document_count(), 3);
+
+        // A checkpoint this plugin does not understand is ignored.
+        server.reset().await;
+        mount_existing_index(&server).await;
+        mount_numbered_additions(&server, 60, 3).await;
+        for uid in [60, 61, 62] {
+            mount_task(&server, uid, "succeeded", None).await;
+        }
+        let (out, _) = run_attempt(2, Some(json!({"something": "else"})), three_docs(), cfg).await;
+        assert_eq!(out.unwrap().document_count(), 3);
+        assert_eq!(sent_batches(&server).await.len(), 3);
     }
 
     #[tokio::test]

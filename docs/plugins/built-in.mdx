@@ -402,6 +402,18 @@ not rewritten: if they lack that field, Meilisearch rejects them and the step
 fails with its error. The index is looked up even with `auto_create_index: false`,
 and a missing one then fails the step (not retried), naming the index uid.
 
+When the step is retried (a task that did not finish within `task_timeout_secs`,
+or a 5xx on a later batch), the retry does not send again the batches the
+previous attempt already enqueued: it waits on their Meilisearch tasks and only
+sends the rest. The task uids travel in the Temporal heartbeat details, so this
+is best effort. The retry sends everything again when it has no checkpoint, when
+the documents or the destination changed, or when Meilisearch no longer knows a
+task (pruned task queue, reset instance); from that batch on, every batch is
+sent again so the additions keep their order. Re-sending is harmless, since
+additions replace documents by id. Every attempt has its own
+`task_timeout_secs`, so a queue slower than all attempts together still fails
+the step: raise `task_timeout_secs` for a Meilisearch shared with busy writers.
+
 Returns `Indexed { index, document_count, task_uids }`.
 
 ## `pptx_extractor`
