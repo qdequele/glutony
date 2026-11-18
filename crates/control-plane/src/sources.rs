@@ -363,16 +363,22 @@ impl SourceRepo {
     /// holder is hidden from the default list, so the answer names it (409); archive is
     /// one-way and an archived source keeps its uid until it is deleted.
     async fn duplicate_uid(&self, new: &NewSource) -> CpError {
-        let holder: Result<Option<(String, Option<DateTime<Utc>>)>, sqlx::Error> = sqlx::query_as(
+        /// The holder's pipeline and archive time.
+        type Holder = (String, Option<DateTime<Utc>>);
+        let holder: Option<Holder> = match sqlx::query_as(
             "SELECT pipeline_uid, archived_at FROM sources \
                  WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
         )
         .bind(&new.uid)
         .bind(new.tenant_id.as_deref())
         .fetch_optional(&self.pool)
-        .await;
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => return CpError::Db(e),
+        };
         match holder {
-            Ok(Some((pipeline_uid, Some(archived_at)))) => CpError::Conflict(format!(
+            Some((pipeline_uid, Some(archived_at))) => CpError::Conflict(format!(
                 "a source named {:?} already exists for this tenant: it was archived on {} \
                  when its pipeline {pipeline_uid:?} was deleted, and archived sources keep \
                  their uid. Delete it (DELETE /sources/{}) to reuse the name, or pick another uid",
