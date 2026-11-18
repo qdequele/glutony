@@ -28,10 +28,11 @@
 //!
 //! # Usage reporting
 //!
-//! The step reports the decoded length as `UsageUnits::audio_seconds` with no
-//! `external_requests`: the decode is local and costs no third-party money. Those
-//! seconds are reported anyway because they are the input a billable transcription
-//! step consumes, and because capacity planning needs media minutes per tenant.
+//! The step records no usage units. The decode is local and costs no third-party
+//! money, and `whisper_transcriber` downstream reports the `audio_seconds` it was
+//! billed for: reporting the decoded length here too would count every video's audio
+//! twice in the usage aggregates, which sum `audio_seconds` over all steps. The
+//! decoded length is still logged with each extraction.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -250,15 +251,10 @@ impl Plugin for VideoAudioExtractorPlugin {
         }
         ctx.check_cancelled()?;
 
+        // No usage is recorded: decoding is local and costs no third-party money, and
+        // the transcription step downstream reports the seconds it was billed for.
+        // Reporting them here too would count every video's audio twice.
         let decoded_seconds = extracted.source_frames as f64 / f64::from(extracted.rate.max(1));
-        // These seconds were decoded locally by symphonia — nothing was purchased, so
-        // `external_requests` stays 0 and this must not be billed as a service call.
-        // They are still worth reporting: this is the audio a transcription step
-        // downstream *will* be billed for, and capacity planning wants the figure.
-        ctx.record_usage(UsageUnits {
-            audio_seconds: decoded_seconds,
-            ..Default::default()
-        });
 
         let target_channels = if cfg.mono { 1 } else { extracted.channels };
         let sample_rate = cfg.sample_rate;
@@ -953,7 +949,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decoded_seconds_are_reported_without_an_external_request() {
+    async fn decoding_records_no_usage() {
+        // The transcription step downstream reports the seconds it was billed for;
+        // reporting them here too would count every video's audio twice.
         let ctx = ActivityContext::noop();
         VideoAudioExtractorPlugin::new()
             .execute(
@@ -969,34 +967,8 @@ mod tests {
             .expect("extraction succeeds");
 
         let usage = ctx.usage();
-        assert!(
-            (usage.audio_seconds - 0.75).abs() < 0.005,
-            "recorded {}s for a 0.75s clip",
-            usage.audio_seconds
-        );
-        // Decoding is local: nothing was bought from anyone.
-        assert_eq!(usage.external_requests, 0);
-        assert_eq!(usage.llm_requests, 0);
-        assert_eq!(usage.pages, 0);
-    }
-
-    #[tokio::test]
-    async fn only_the_audio_actually_decoded_is_reported() {
-        let ctx = ActivityContext::noop();
-        VideoAudioExtractorPlugin::new()
-            .execute(
-                &ctx,
-                PluginInput::Bytes(Blob::new(
-                    wav(440.0, 2.0, 44_100, 1),
-                    "audio/wav",
-                    Some("long.wav".into()),
-                )),
-                serde_json::json!({"max_duration_secs": 1}),
-            )
-            .await
-            .expect("extraction succeeds");
-        let secs = ctx.usage().audio_seconds;
-        assert!((secs - 1.0).abs() < 0.005, "recorded {secs}s for a 1s cap");
+        assert!(usage.is_empty(), "recorded {usage:?}");
+        assert_eq!(usage.audio_seconds, 0.0);
     }
 
     #[tokio::test]
