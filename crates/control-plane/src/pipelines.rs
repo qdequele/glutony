@@ -289,9 +289,9 @@ pub fn config_errors(def: &PipelineDefinition, manifests: &[PluginManifest]) -> 
 /// instead (`scope=tenant`, the tenant's own row only). The two agree for a tenant
 /// pipeline and for a global pipeline run by a tenantless job, so such a pipeline that
 /// passes here does not fail later with "connection not found" unless the connection is
-/// deleted in between. They do not agree for a global pipeline run by a tenant job:
-/// that job needs the tenant's own connection of that name, which this check neither
-/// requires nor looks at.
+/// deleted in between. They cannot agree for a global pipeline run by a tenant job, so
+/// a global pipeline pinned to a connection is standalone-only: with tenants on
+/// ([`AppState::tenants`]) it is refused.
 async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> Result<(), CpError> {
     let manifests = crate::plugins::registered_manifests(&state.pool).await?;
     let registered: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
@@ -306,6 +306,15 @@ async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> R
         let Some(uid) = pinned_connection(&step.config) else {
             continue;
         };
+        if def.tenant_id.is_none() && state.tenants {
+            errors.push(format!(
+                "step {:?} ({}): a global pipeline cannot pin connection {uid:?} on a \
+                 deployment that serves tenants: a tenant job only resolves its own \
+                 connections, so create the pipeline in each tenant instead",
+                step.id, step.plugin
+            ));
+            continue;
+        }
         let found = match def.tenant_id.as_deref() {
             Some(t) => connections.get_owned(uid, t).await?,
             None => connections.get(uid, None).await?,

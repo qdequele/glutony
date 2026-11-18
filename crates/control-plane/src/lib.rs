@@ -69,6 +69,10 @@ pub struct AppState {
     /// Lab Gateway targets behind `GET /internal/lab/ai/{account_id}`; `None` when the
     /// control plane has no Lab instance credentials (no target is served).
     pub lab_ai: Option<std::sync::Arc<meili_ingest_lab::AiTargetCache>>,
+    /// The deployment serves tenants: the control plane runs with the Lab seams
+    /// (`LAB_URL` + `LAB_INSTANCE_*`). A global pipeline may then pin no connection,
+    /// since tenant jobs resolve a pinned name in their own scope only.
+    pub tenants: bool,
 }
 
 impl AppState {
@@ -82,7 +86,14 @@ impl AppState {
             internal_token: None,
             lab_credits: None,
             lab_ai: None,
+            tenants: false,
         }
+    }
+
+    /// Mark the deployment as serving tenants (see [`AppState::tenants`]).
+    pub fn with_tenants(mut self, tenants: bool) -> Self {
+        self.tenants = tenants;
+        self
     }
 
     /// Answer the workers' credit checks from this cache (spec v2 §8.1).

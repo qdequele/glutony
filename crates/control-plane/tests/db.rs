@@ -1017,3 +1017,94 @@ async fn an_indexer_connection_must_exist_for_the_tenant() {
 
     t.drop_schema().await;
 }
+
+/// A global pipeline pinned to a connection resolves that name per job: a tenantless
+/// job takes the global row, a tenant job only its own row. With tenants on (the Lab
+/// seams), save-time cannot promise either, so the pipeline is refused; standalone
+/// keeps checking it against the global row.
+#[tokio::test]
+async fn a_global_pinned_pipeline_is_standalone_only() {
+    use meili_ingest_control_plane::connections::{ConnectionRepo, NewConnection};
+
+    let Some(t) = setup().await else { return };
+    let global_pinned = |uid: &str, connection: &str| PipelineDefinition {
+        uid: uid.into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            StepDefinition::new("index", "meili_indexer")
+                .config(serde_json::json!({ "connection": connection })),
+        ],
+        builtin: false,
+        tenant_id: None,
+    };
+    let repo = ConnectionRepo::new(t.pool.clone());
+    for tenant in [None, Some("t1")] {
+        repo.insert(&NewConnection {
+            id: Uuid::new_v4(),
+            uid: "main".into(),
+            name: "main".into(),
+            tenant_id: tenant.map(str::to_owned),
+            host: "https://movies.example".into(),
+            api_key: vec![1, 2, 3],
+        })
+        .await
+        .unwrap();
+    }
+
+    // Standalone: the global row is what every (tenantless) job uses.
+    let standalone = AppState::new(t.pool.clone());
+    let (status, body) = call(
+        app(standalone),
+        req_json("POST", "/pipelines", &global_pinned("g-main", "main")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // With tenants: refused on validate and on create, even though the row exists.
+    let tenants = AppState::new(t.pool.clone()).with_tenants(true);
+    for uri in ["/pipelines/validate", "/pipelines"] {
+        let (status, body) = call(
+            app(tenants.clone()),
+            req_json("POST", uri, &global_pinned("g-main-2", "main")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation");
+        assert!(
+            err.error.contains("\"main\"") && err.error.contains("global pipeline"),
+            "{uri}: {}",
+            err.error
+        );
+    }
+    // A tenant pipeline pinned to its own connection is unaffected.
+    let mut own = global_pinned("t-main", "main");
+    own.tenant_id = Some("t1".into());
+    let (status, body) = call(app(tenants.clone()), req_json("POST", "/pipelines", &own)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    // So is a global pipeline that pins nothing.
+    let mut unpinned = global_pinned("g-unpinned", "main");
+    unpinned.steps[0].config = serde_json::json!({});
+    let (status, body) = call(app(tenants), req_json("POST", "/pipelines", &unpinned)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    t.drop_schema().await;
+}

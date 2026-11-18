@@ -99,6 +99,11 @@ the document, rather than looping on `413`.
 - A tenant pipeline may only name its **own** connections. Global connections are
   templates: a tenant pipeline that names one is refused (`422`) and its jobs never
   resolve to it.
+- A **global** pipeline that names a connection is for standalone deployments only:
+  its jobs there have no tenant and use the global row. On a deployment that serves
+  tenants (the control plane runs with `LAB_URL` / `LAB_INSTANCE_*`), saving one is
+  refused (`422`), because a tenant job would look the name up among its own
+  connections only. Create the pinned pipeline in each tenant instead.
 
 `MEILI_CONNECTION_HOSTS` controls where connections may point:
 

@@ -283,6 +283,10 @@ reason and retried on the next tick.
   are templates: a tenant pipeline that names one fails validation on save and, if
   it was saved before this rule, fails the indexer step with "a tenant job may only
   use its own connections".
+- A global pipeline may pin no connection: with `LAB_URL` / `LAB_INSTANCE_*` set on
+  the control plane, saving or validating one answers `422`. Pin connections in
+  tenant pipelines. A global pinned pipeline saved before this rule is still served
+  and its tenant jobs still need their own connection of that name.
 - A request that carries a tenant never falls back to `MEILI_URL` / `MEILI_API_KEY`:
   it brings its own `X-Meili-Host` / key, or its pipeline is pinned to a connection.
 - Every control plane route except `/health` and `/metrics` requires

@@ -37,7 +37,10 @@ async fn main() -> anyhow::Result<()> {
              answers 403 token_required, so LAB_AI_GATEWAY workers cannot run Lab AI steps"
         );
     }
-    let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
+    // The Lab seams mean tenants: a global pipeline may then pin no connection.
+    let mut state = AppState::new(pool.clone())
+        .with_internal_token(internal_token)
+        .with_tenants(lab_config.is_some());
     if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
         // Workers ask `GET /internal/lab/credits/{account}` before a source run and
         // `GET /internal/lab/ai/{account}` before an AI step. This client is on that
