@@ -1506,6 +1506,7 @@ mod tests {
         ExpandArchiveInput {
             job_id: Uuid::new_v4(),
             input: PluginInput::Bytes(Blob::new(data, "application/zip", None)),
+            tenant_id: None,
         }
     }
 
