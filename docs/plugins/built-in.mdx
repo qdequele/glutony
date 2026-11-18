@@ -394,6 +394,7 @@ the request.
 | `max_batch_bytes` | `52428800` (50 MiB) | Serialized bytes per request. A batch is cut at whichever of this and `batch_size` comes first. Keep it under Meilisearch's `http_payload_size_limit`. A single document larger than this fails the step. |
 | `wait_for_completion` | `true` | Wait for Meilisearch tasks before finishing the step. |
 | `task_timeout_secs` | `INDEXER_TASK_TIMEOUT_SECS`, else `120` | How long to wait for one Meilisearch task before the step is retried. Keep it below the step's `timeout_secs`. |
+| `prune` | `false` | After the additions succeed, delete the stale derived documents of every parent this step indexed. See [Pruning stale chunks](#pruning-stale-chunks). |
 
 If the target index already exists with a primary key (for example `uid` on an
 index a Scrapix crawl created), additions are sent without `?primaryKey` and
@@ -415,6 +416,39 @@ additions replace documents by id. Every attempt has its own
 the step: raise `task_timeout_secs` for a Meilisearch shared with busy writers.
 
 Returns `Indexed { index, document_count, task_uids }`.
+
+#### Pruning stale chunks
+
+Chunks get positional ids (`<parent>_<index>`), so when a document is ingested
+again and produces fewer chunks, the extra ones from the earlier run stay
+searchable. With `prune: true`, once every addition of the step has succeeded,
+the indexer deletes, for each `meta.parent_id` among the documents it just sent,
+the documents with that `_meta.parent_id` that it did not send:
+
+```text
+_meta.parent_id IN ["guide_3f2a"] AND NOT id IN ["guide_3f2a_0", …, "guide_3f2a_4"]
+```
+
+The indexer never changes index settings or keys, so before turning it on:
+
+- add `_meta.parent_id` and the index's primary key (`id` by default) to the
+  index's `filterableAttributes`;
+- use a key allowed to delete documents (`documents.delete`) as well as add them;
+- keep `wait_for_completion: true` (a step with `prune` and without it is
+  rejected).
+
+When one of these is missing, the step fails without retrying and says what is
+needed; the documents it added stay in the index. A failed addition never
+prunes, so a failed run does not lose the previous version.
+
+What it covers: documents that carry `meta.parent_id` (`chunker` output,
+`audio_transcriber` segments), and only the parents present in this step. A
+parent that disappeared entirely, such as a PDF page or a Markdown section that
+no longer exists, is not in the step, so its chunks stay. Documents without a
+parent are never deleted. All the derived documents of a parent must reach the
+same indexer step, which is how the built-in pipelines work. Two uploads with
+the same filename and no origin already share ids, so they count as the same
+parent.
 
 ## `pptx_extractor`
 

@@ -1832,6 +1832,14 @@ pub struct IndexerConfig {
     /// `timeout_secs`, or Temporal cuts the activity first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_timeout_secs: Option<u64>,
+    /// After the additions succeed, delete the derived documents of every parent this
+    /// step indexed (same `_meta.parent_id`) that this step did not send: the chunks a
+    /// shorter version of a document no longer produces. Off by default: the indexer
+    /// never deletes unless asked. Needs `wait_for_completion`, a key allowed to delete
+    /// documents, and `_meta.parent_id` plus the primary key in the index's
+    /// filterable attributes.
+    #[serde(default)]
+    pub prune: bool,
 }
 
 fn default_primary_key() -> String {

@@ -28,7 +28,13 @@
 //! 4. when `wait_for_completion` (default `true`), poll each task until it
 //!    finishes; a `failed` task is a [`PluginError::NonRetryable`] carrying the
 //!    Meilisearch error message;
-//! 5. return [`PluginOutput::Indexed`] with the [`IndexReport`].
+//! 5. with `prune` (default `false`, needs `wait_for_completion`), once every addition
+//!    succeeded, delete by filter the documents that share a `_meta.parent_id` with a
+//!    document of this step but were not sent by it: the stale chunks of a document
+//!    that got shorter. The index must have `_meta.parent_id` and its primary key
+//!    filterable and the key must be allowed to delete documents; the indexer never
+//!    changes index settings, so a missing one fails the step (non-retryable) saying so;
+//! 6. return [`PluginOutput::Indexed`] with the [`IndexReport`].
 //!
 //! Network failures, timeouts and 5xx responses are [`PluginError::Retryable`];
 //! authentication problems (401/403, `auth` error type) and invalid requests are
@@ -44,11 +50,13 @@
 //! the additions keep their order. Checkpoints are best effort: without one, the
 //! retry sends everything, which `addOrReplace` makes harmless.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use meili_ingest_plugin_sdk::IndexerConfig;
 use meili_ingest_plugin_sdk::prelude::*;
 use meilisearch_sdk::client::Client;
+use meilisearch_sdk::documents::DocumentDeletionQuery;
 use meilisearch_sdk::errors::{Error as MeiliError, ErrorCode, ErrorType, MeilisearchError};
 use meilisearch_sdk::task_info::TaskInfo;
 use meilisearch_sdk::tasks::Task;
@@ -149,6 +157,12 @@ fn parse_config(config: Value) -> Result<ParsedConfig, PluginError> {
     if cfg.max_batch_bytes == 0 {
         return Err(PluginError::InvalidConfig(format!(
             "{NAME}: `max_batch_bytes` must be at least 1"
+        )));
+    }
+    if cfg.prune && !cfg.wait_for_completion {
+        return Err(PluginError::InvalidConfig(format!(
+            "{NAME}: `prune` needs `wait_for_completion`: stale documents are only \
+             deleted once the additions are known to have succeeded"
         )));
     }
     if cfg.primary_key.trim().is_empty() {
@@ -341,6 +355,157 @@ fn measure(payload: &Value) -> Measured {
     }
 }
 
+/// The attribute `prune` deletes by: the parent a derived document (a chunk, a
+/// transcript segment) was cut from.
+const PRUNE_PARENT_ATTRIBUTE: &str = "_meta.parent_id";
+/// Most current documents one prune filter lists, so a large run is pruned with
+/// several bounded deletions instead of one huge filter.
+const PRUNE_IDS_PER_FILTER: usize = 1000;
+
+/// `v` written as a Meilisearch filter value, or `None` when it cannot be written
+/// safely: the filter syntax only unescapes `\"`, so a backslash could change what a
+/// quoted string means.
+fn filter_value(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.contains('\\') => Some(format!("\"{}\"", s.replace('"', "\\\""))),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// The delete filters `prune` sends for `children`, the `(parent id, primary key
+/// value)` of every document of this run that has a parent, in input order. Each
+/// filter matches the documents of some parents that are not among this run's
+/// documents of those parents:
+/// `_meta.parent_id IN [<parents>] AND NOT <primary key> IN [<their current ids>]`.
+///
+/// Parents are grouped, in first-seen order, so that a filter lists at most `max_ids`
+/// current ids, except a parent with more children than that, which gets a filter
+/// of its own (a parent is never split: its current ids must all be excluded at once).
+/// A parent with a value that cannot be written safely is left out entirely: excluding
+/// a wrong set of ids would delete current documents.
+fn prune_filters(children: &[(String, Value)], primary_key: &str, max_ids: usize) -> Vec<String> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut ids: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut unsafe_parents: HashSet<&str> = HashSet::new();
+    for (parent, id) in children {
+        let parent = parent.as_str();
+        if !ids.contains_key(parent) && !unsafe_parents.contains(parent) {
+            order.push(parent);
+        }
+        match (
+            filter_value(&Value::String(parent.to_owned())),
+            filter_value(id),
+        ) {
+            (Some(_), Some(id)) if !unsafe_parents.contains(parent) => {
+                ids.entry(parent).or_default().push(id);
+            }
+            (Some(_), Some(_)) => {}
+            _ => {
+                if unsafe_parents.insert(parent) {
+                    tracing::warn!(
+                        plugin = NAME,
+                        parent_id = %parent,
+                        "prune: an id of this parent cannot be written in a filter; \
+                         its stale documents are left in place"
+                    );
+                }
+                ids.remove(parent);
+            }
+        }
+    }
+
+    let mut filters = Vec::new();
+    let mut group_parents: Vec<String> = Vec::new();
+    let mut group_ids: Vec<String> = Vec::new();
+    let flush = |parents: &mut Vec<String>, current: &mut Vec<String>, out: &mut Vec<String>| {
+        if !parents.is_empty() {
+            out.push(format!(
+                "{PRUNE_PARENT_ATTRIBUTE} IN [{}] AND NOT {primary_key} IN [{}]",
+                parents.join(", "),
+                current.join(", ")
+            ));
+            parents.clear();
+            current.clear();
+        }
+    };
+    for parent in order {
+        let Some(current) = ids.remove(parent) else {
+            continue;
+        };
+        if group_ids.len() + current.len() > max_ids {
+            flush(&mut group_parents, &mut group_ids, &mut filters);
+        }
+        // Checked safe above.
+        group_parents.extend(filter_value(&Value::String(parent.to_owned())));
+        group_ids.extend(current);
+    }
+    flush(&mut group_parents, &mut group_ids, &mut filters);
+    filters
+}
+
+/// Add what `prune` needs to a non-retryable error of its deletion.
+fn with_prune_hint(err: PluginError, primary_key: &str) -> PluginError {
+    match err {
+        PluginError::NonRetryable(msg) => PluginError::NonRetryable(format!(
+            "{msg}. `prune` needs an API key allowed to delete documents \
+             (documents.delete), and `{PRUNE_PARENT_ATTRIBUTE}` and `{primary_key}` in \
+             the index's filterableAttributes"
+        )),
+        other => other,
+    }
+}
+
+/// Delete the derived documents of the parents in `payloads` that this run did not
+/// send (see [`prune_filters`]). Runs once the additions succeeded, so a failed run
+/// never loses the previous version of a document.
+async fn prune(
+    client: &Client,
+    ctx: &ActivityContext,
+    index: &meilisearch_sdk::indexes::Index,
+    payloads: &[Value],
+    primary_key: &str,
+    timeout: Duration,
+) -> Result<(), PluginError> {
+    let children: Vec<(String, Value)> = payloads
+        .iter()
+        .filter_map(|p| {
+            let parent = p.get("_meta")?.get("parent_id")?.as_str()?;
+            let id = p.get(primary_key).cloned().unwrap_or(Value::Null);
+            Some((parent.to_owned(), id))
+        })
+        .collect();
+    let mut tasks = Vec::new();
+    for filter in prune_filters(&children, primary_key, PRUNE_IDS_PER_FILTER) {
+        ctx.check_cancelled()?;
+        let mut query = DocumentDeletionQuery::new(index);
+        query.with_filter(&filter);
+        let info = index.delete_documents_with(&query).await.map_err(|e| {
+            with_prune_hint(
+                map_error(e, "deleting stale derived documents"),
+                primary_key,
+            )
+        })?;
+        tracing::debug!(
+            plugin = NAME,
+            task_uid = info.task_uid,
+            "stale derived documents deletion enqueued"
+        );
+        tasks.push(info.task_uid);
+    }
+    for uid in tasks {
+        if let Some(err) =
+            wait_for_task(client, ctx, uid, "stale document deletion", timeout).await?
+        {
+            return Err(with_prune_hint(
+                task_failed(uid, "stale document deletion", &err),
+                primary_key,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A task uid the SDK can wait on or fetch.
 struct TaskUid(u32);
 
@@ -521,6 +686,17 @@ impl IndexState {
         }
     }
 
+    /// The primary key the index keys documents by: its own, else the configured one
+    /// (declared at creation or by the first addition).
+    fn primary_key<'a>(&'a self, configured: &'a str) -> &'a str {
+        match self {
+            Self::Existing {
+                primary_key: Some(own),
+            } => own,
+            Self::Creating(_) | Self::Existing { primary_key: None } => configured,
+        }
+    }
+
     fn creation(&self) -> Option<&TaskInfo> {
         match self {
             Self::Creating(task) => Some(task),
@@ -673,6 +849,11 @@ impl Plugin for MeiliIndexerPlugin {
                         "type": "integer",
                         "minimum": 1,
                         "description": "How long to wait for one Meilisearch task before retrying the step. Defaults to the worker's INDEXER_TASK_TIMEOUT_SECS, else 120. Keep it below the step's timeout_secs."
+                    },
+                    "prune": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "After the additions succeed, delete the documents that share a _meta.parent_id with a document of this step but were not sent by it (stale chunks of a document that got shorter). Needs wait_for_completion, a key allowed to delete documents, and _meta.parent_id plus the primary key in the index's filterableAttributes."
                     }
                 }
             }))
@@ -818,6 +999,11 @@ impl Plugin for MeiliIndexerPlugin {
             if let Some(task) = creation {
                 check_creation(&client, ctx, task, timeout).await?;
             }
+        }
+        // Only after every addition succeeded (`prune` requires waiting for them).
+        if cfg.prune {
+            let primary_key = state.primary_key(&cfg.primary_key);
+            prune(&client, ctx, &index, &payloads, primary_key, timeout).await?;
         }
 
         Ok(PluginOutput::Indexed(IndexReport {
@@ -1196,6 +1382,293 @@ mod tests {
             other => panic!("expected Retryable, got {other:?}"),
         }
         assert!(started.elapsed() >= Duration::from_secs(1), "gave up early");
+    }
+
+    // ----- prune: deleting the stale derived documents of re-indexed parents -----
+
+    /// Chunks `a_0`, `a_1` of parent `a`, chunk `b_0` of parent `b`, and `x`, which has
+    /// no parent.
+    fn chunked_docs() -> Vec<Document> {
+        let chunk = |id: &str, parent: &str| {
+            let mut d = Document::with_id(id, "text");
+            d.meta.parent_id = Some(parent.into());
+            d
+        };
+        vec![
+            chunk("a_0", "a"),
+            chunk("a_1", "a"),
+            chunk("b_0", "b"),
+            Document::with_id("x", "no parent"),
+        ]
+    }
+
+    fn prune_config(host: &str) -> Value {
+        let mut cfg = config(host);
+        cfg["prune"] = json!(true);
+        cfg
+    }
+
+    async fn mount_prune(server: &MockServer, filter: &str, task_uid: u32, calls: u64) {
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents/delete")))
+            .and(body_json(json!({ "filter": filter })))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(task_uid, "documentDeletion")),
+            )
+            .expect(calls)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_the_derived_documents_of_each_parent_not_sent_again() {
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        mount_prune(
+            &server,
+            r#"_meta.parent_id IN ["a", "b"] AND NOT id IN ["a_0", "a_1", "b_0"]"#,
+            3,
+            1,
+        )
+        .await;
+        mount_task(&server, 3, "succeeded", None).await;
+        let out = run(
+            &server,
+            PluginInput::Documents(chunked_docs()),
+            prune_config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.document_count(), 4);
+        // The deletion is enqueued only once the additions succeeded.
+        let order: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect();
+        let delete = order
+            .iter()
+            .position(|r| r.ends_with("/documents/delete"))
+            .unwrap();
+        let addition_done = order.iter().position(|r| r == "GET /tasks/2").unwrap();
+        assert!(addition_done < delete, "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn prune_filters_on_the_index_primary_key_and_splits_large_runs() {
+        // The index keys on `uid`: that is the attribute the current documents are
+        // kept by.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/indexes/{INDEX}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(index_with_primary_key(json!("uid"))),
+            )
+            .mount(&server)
+            .await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        let input: Vec<Document> = chunked_docs()
+            .into_iter()
+            .map(|mut d| {
+                d.fields.insert("uid".into(), json!(format!("u-{}", d.id)));
+                d
+            })
+            .collect();
+        mount_prune(
+            &server,
+            r#"_meta.parent_id IN ["a", "b"] AND NOT uid IN ["u-a_0", "u-a_1", "u-b_0"]"#,
+            3,
+            1,
+        )
+        .await;
+        mount_task(&server, 3, "succeeded", None).await;
+        run(
+            &server,
+            PluginInput::Documents(input),
+            prune_config(&server.uri()),
+        )
+        .await
+        .unwrap();
+
+        // Filters stay bounded: parents are grouped so a filter lists at most
+        // PRUNE_IDS_PER_FILTER current documents (a parent is never split).
+        let groups = prune_filters(
+            &(0..5)
+                .flat_map(|p| (0..3).map(move |c| (format!("p{p}"), json!(format!("p{p}_{c}")))))
+                .collect::<Vec<_>>(),
+            "id",
+            6,
+        );
+        assert_eq!(
+            groups,
+            vec![
+                r#"_meta.parent_id IN ["p0", "p1"] AND NOT id IN ["p0_0", "p0_1", "p0_2", "p1_0", "p1_1", "p1_2"]"#,
+                r#"_meta.parent_id IN ["p2", "p3"] AND NOT id IN ["p2_0", "p2_1", "p2_2", "p3_0", "p3_1", "p3_2"]"#,
+                r#"_meta.parent_id IN ["p4"] AND NOT id IN ["p4_0", "p4_1", "p4_2"]"#,
+            ]
+        );
+        // A quote is escaped; a value with a backslash cannot be written safely, so its
+        // parent is left alone rather than risk deleting the wrong documents.
+        let groups = prune_filters(
+            &[
+                ("q\"uote".to_owned(), json!("q_0")),
+                ("back\\slash".to_owned(), json!("s_0")),
+                ("n".to_owned(), json!(7)),
+            ],
+            "id",
+            100,
+        );
+        assert_eq!(
+            groups,
+            vec![r#"_meta.parent_id IN ["q\"uote", "n"] AND NOT id IN ["q_0", 7]"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_is_off_by_default_and_has_nothing_to_do_without_parents() {
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 2, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents/delete")))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(3, "documentDeletion")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        run(
+            &server,
+            PluginInput::Documents(chunked_docs()),
+            config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        run(
+            &server,
+            PluginInput::Documents(docs()),
+            prune_config(&server.uri()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_never_runs_after_a_failed_addition() {
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(
+            &server,
+            2,
+            "failed",
+            Some(meili_error(
+                "invalid_document_id",
+                "invalid_request",
+                "Document identifier is invalid.",
+            )),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents/delete")))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(3, "documentDeletion")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = run(
+            &server,
+            PluginInput::Documents(chunked_docs()),
+            prune_config(&server.uri()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PluginError::NonRetryable(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prune_fails_clearly_without_a_filterable_parent_or_delete_permission() {
+        // The attribute is not filterable: the deletion task fails.
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents/delete")))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(3, "documentDeletion")),
+            )
+            .mount(&server)
+            .await;
+        mount_task(
+            &server,
+            3,
+            "failed",
+            Some(meili_error(
+                "invalid_document_filter",
+                "invalid_request",
+                "Attribute `_meta.parent_id` is not filterable.",
+            )),
+        )
+        .await;
+        match run(
+            &server,
+            PluginInput::Documents(chunked_docs()),
+            prune_config(&server.uri()),
+        )
+        .await
+        {
+            Err(PluginError::NonRetryable(msg)) => {
+                assert!(msg.contains("is not filterable"), "{msg}");
+                assert!(msg.contains("filterableAttributes"), "{msg}");
+            }
+            other => panic!("expected NonRetryable, got {other:?}"),
+        }
+
+        // The key may add documents but not delete them.
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents/delete")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(meili_error(
+                "invalid_api_key",
+                "auth",
+                "The provided API key is invalid.",
+            )))
+            .mount(&server)
+            .await;
+        match run(
+            &server,
+            PluginInput::Documents(chunked_docs()),
+            prune_config(&server.uri()),
+        )
+        .await
+        {
+            Err(PluginError::NonRetryable(msg)) => {
+                assert!(msg.contains("documents.delete"), "{msg}")
+            }
+            other => panic!("expected NonRetryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_needs_wait_for_completion() {
+        let Err(PluginError::InvalidConfig(msg)) = parse_config(json!({
+            "host": "http://m", "api_key": "k", "index": "i",
+            "prune": true, "wait_for_completion": false
+        })) else {
+            panic!("prune without waiting must be rejected");
+        };
+        assert!(msg.contains("wait_for_completion"), "{msg}");
     }
 
     // ----- resuming after a retry (checkpointed task uids) -----

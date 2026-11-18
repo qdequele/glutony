@@ -131,7 +131,10 @@ record of `https://httpbin.org/json`. The hash names the source (its project and
   `…/v2/data.json`) never overwrite each other in a shared index.
 
 A run that produces fewer documents than the previous one leaves the extra ones
-in place: delete them, or give the content an id of its own.
+in place: delete them, or give the content an id of its own. Chunks cannot have
+an id of their own; for them, set
+[`prune: true`](/plugins/built-in#pruning-stale-chunks) on the `meili_indexer`
+step, which deletes the stale chunks of every document the run indexed again.
 
 ## Runs and change detection
 
@@ -195,8 +198,9 @@ it learns. Each job a run starts is an ordinary [job](/concepts/jobs) and shows 
 Runs never overlap: if a run is still going when the next tick fires, that
 tick is skipped.
 
-Sources upsert documents; they never delete. A document that disappears
-upstream stays in the index.
+Sources upsert documents; they never delete, except the stale chunks that an
+indexer step with [`prune: true`](/plugins/built-in#pruning-stale-chunks) removes.
+A document that disappears upstream stays in the index.
 
 ## Deleting
 
