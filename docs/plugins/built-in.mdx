@@ -135,8 +135,9 @@ Set `encoding` for anything else, such as a Latin-9 file with `€` signs.
 ### `json_flattener`
 
 Accepts **bytes or documents**. Top-level array → one document per element;
-object with a `documents`, `items` or `data` array → those; anything else →
-one document. Nested objects are flattened to dotted keys (`a.b.c`) in
+object with a `documents`, `items`, `data`, `results` or `hits` array (looked up
+in that order) → those, and the rest of the object is dropped; anything else →
+one document. `root` changes that rule (below). Nested objects are flattened to dotted keys (`a.b.c`) in
 `fields`; `content` = concatenated string values. For **documents** input,
 each document's own `content` is kept; the string values only fill an empty
 one (unless `content_fields` is set).
@@ -157,6 +158,13 @@ detected as `application/x-ndjson` and routed to `builtin.json`
 | `id_field` | `"id"` | Field used as document id; generated when missing. |
 | `content_fields` | every string leaf | Keys joined by a space into `content`. When set, they replace an upstream document's `content` too. |
 | `title_field` | — | Key mapped onto `title`. |
+| `root` | wrapper keys | Where the records of a JSON payload are. `"none"`: the payload as is, so `{"id": "order-1", "items": ["hat"]}` is one document with an `items` field (a top-level array is still one document per element). A JSON Pointer such as `"/data/orders"`: the array it points to; a pointer that is missing or not an array fails the step. |
+
+NDJSON lines are never unwrapped by wrapper keys: each line is one document,
+whatever its fields. A one-line NDJSON file cannot be told from a single JSON
+document, so it follows the single-document rule; with `root: "none"` it reads
+like the same line in a longer file. With a pointer, each line is looked into,
+which suits a file of API response pages.
 
 ### `parquet_parser`
 

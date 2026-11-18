@@ -12,11 +12,17 @@
 //! "a": {"b": 2}}`), the later one gets the first free `_2`, `_3`, … suffix, so no
 //! value is dropped.
 //!
-//! Document selection from a single JSON value:
+//! Document selection from a single JSON value, when `root` is not set:
 //! * top-level array → one document per element;
 //! * object with an array under `documents`, `items`, `data`, `results` or
 //!   `hits` → one document per element of that array;
 //! * anything else → one document.
+//!
+//! NDJSON lines are never unwrapped that way: each line is one document. `root`
+//! replaces the rule: `none` reads the payload as is (a top-level array is one
+//! document per element, anything else one document, a one-line NDJSON file like
+//! any other), and a JSON Pointer (`/data/orders`) names the array holding the
+//! records, in the payload or in each NDJSON line.
 //!
 //! Configuration (all keys optional):
 //!
@@ -27,6 +33,7 @@
 //! | `title_field`    | none    | flattened key mapped onto `title` (removed from `fields`) |
 //! | `flatten_arrays` | `false` | flatten arrays of objects into `a.0.b` keys instead of keeping them as JSON arrays |
 //! | `max_depth`      | `8`     | nesting depth beyond which objects are kept as-is |
+//! | `root`           | wrapper keys | `none`, or a JSON Pointer to the record array (see above) |
 
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
@@ -110,19 +117,89 @@ impl FlattenConfig {
     }
 }
 
-/// Parse bytes as a single JSON value, falling back to NDJSON (one value per line).
+/// Where the records of a byte payload are (`root`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Root {
+    /// Unset: [`select_roots`] on a single value, NDJSON lines as they are.
+    WrapperKeys,
+    /// `none`: the value as is; a top-level array is still one record per element.
+    AsIs,
+    /// A JSON Pointer to the array of records, in the value or in each NDJSON line.
+    Pointer(String),
+}
+
+impl Root {
+    /// Take `root` out of a raw `config:` block, so the rest is a [`FlattenConfig`].
+    fn take(config: &mut Value) -> Result<Self, PluginError> {
+        match config.as_object_mut().and_then(|o| o.remove("root")) {
+            None | Some(Value::Null) => Ok(Self::WrapperKeys),
+            Some(Value::String(s)) if s == "none" => Ok(Self::AsIs),
+            Some(Value::String(s)) if s.starts_with('/') => Ok(Self::Pointer(s)),
+            Some(other) => Err(PluginError::InvalidConfig(format!(
+                "{NAME}: `root` must be \"none\" or a JSON Pointer such as \"/data/items\", \
+                 got {other}"
+            ))),
+        }
+    }
+
+    /// The records of one parsed value: the whole payload, or one NDJSON line.
+    fn select(&self, value: Value, ndjson_line: bool) -> Result<Vec<Value>, PluginError> {
+        match self {
+            Self::WrapperKeys if ndjson_line => Ok(vec![value]),
+            Self::WrapperKeys => Ok(select_roots(value)),
+            Self::AsIs if ndjson_line => Ok(vec![value]),
+            Self::AsIs => Ok(match value {
+                Value::Array(items) => items,
+                other => vec![other],
+            }),
+            Self::Pointer(pointer) => {
+                let mut value = value;
+                match value.pointer_mut(pointer).map(Value::take) {
+                    Some(Value::Array(items)) => Ok(items),
+                    Some(other) => Err(PluginError::InvalidInput(format!(
+                        "{NAME}: `root` {pointer} holds {}, not an array of records",
+                        kind(&other)
+                    ))),
+                    None => Err(PluginError::InvalidInput(format!(
+                        "{NAME}: `root` {pointer} is not in the payload"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// A JSON value's kind, for error messages.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Parse bytes as a single JSON value, falling back to NDJSON (one value per line),
+/// and pick the records by `root`.
 ///
 /// Synchronous and CPU-bound: call it from [`run_blocking`]. The NDJSON pass polls
 /// cancellation, since a blocking task cannot be aborted from outside.
-fn parse_payload(ctx: &ActivityContext, data: &[u8]) -> Result<Vec<Value>, PluginError> {
+fn parse_payload(
+    ctx: &ActivityContext,
+    data: &[u8],
+    root: &Root,
+) -> Result<Vec<Value>, PluginError> {
     match serde_json::from_slice::<Value>(data) {
-        Ok(v) => Ok(select_roots(v)),
+        Ok(v) => root.select(v, false),
         Err(single_err) => {
             ctx.check_cancelled()?;
             let text = std::str::from_utf8(data).map_err(|e| {
                 PluginError::InvalidInput(format!("{NAME}: payload is not UTF-8: {e}"))
             })?;
             let mut roots = Vec::new();
+            let mut lines = 0usize;
             for (i, line) in text.lines().enumerate() {
                 if i.is_multiple_of(HEARTBEAT_EVERY) {
                     ctx.check_cancelled()?;
@@ -136,9 +213,10 @@ fn parse_payload(ctx: &ActivityContext, data: &[u8]) -> Result<Vec<Value>, Plugi
                         i + 1
                     ))
                 })?;
-                roots.push(v);
+                roots.extend(root.select(v, true)?);
+                lines += 1;
             }
-            if roots.is_empty() {
+            if lines == 0 {
                 return Err(PluginError::InvalidInput(format!(
                     "{NAME}: invalid JSON: {single_err}"
                 )));
@@ -441,6 +519,12 @@ impl Plugin for JsonFlattenerPlugin {
                         "minimum": 1,
                         "default": 8,
                         "description": "Nesting depth beyond which objects are kept as JSON values."
+                    },
+                    "root": {
+                        "type": ["string", "null"],
+                        "pattern": "^(none|/.*)$",
+                        "default": null,
+                        "description": "Where the records of a JSON payload are. Unset: a top-level array, or the array under a documents/items/data/results/hits key. \"none\": the payload as is (a top-level array is one document per element, anything else one document). A JSON Pointer such as \"/data/orders\": the array it points to, in the payload or in each NDJSON line."
                     }
                 }
             }))
@@ -452,10 +536,12 @@ impl Plugin for JsonFlattenerPlugin {
         input: PluginInput,
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
+        let mut config = config;
+        let root = Root::take(&mut config)?;
         let cfg = FlattenConfig::parse(config)?;
         // Parsing and flattening are CPU-bound: keep them off the async runtime.
         let ctx = ctx.clone();
-        let docs = run_blocking(move || flatten_input(&ctx, input, &cfg)).await??;
+        let docs = run_blocking(move || flatten_input(&ctx, input, &cfg, &root)).await??;
         Ok(PluginOutput::Documents(docs))
     }
 }
@@ -465,6 +551,7 @@ fn flatten_input(
     ctx: &ActivityContext,
     input: PluginInput,
     cfg: &FlattenConfig,
+    root: &Root,
 ) -> Result<Vec<Document>, PluginError> {
     // (root value, generated id, fallbacks)
     let items: Vec<(Value, String, Fallback)> = match input {
@@ -476,7 +563,7 @@ fn flatten_input(
                 mime: Some(blob.mime.clone()),
                 ..Default::default()
             };
-            parse_payload(ctx, &blob.data)?
+            parse_payload(ctx, &blob.data, root)?
                 .into_iter()
                 .enumerate()
                 .map(|(i, v)| {
@@ -632,6 +719,7 @@ mod tests {
             "title_field",
             "flatten_arrays",
             "max_depth",
+            "root",
         ] {
             assert!(props.contains_key(key), "schema missing {key}");
         }
@@ -714,6 +802,101 @@ mod tests {
         let docs = run(bytes(&payload, None), json!({"flatten_arrays": true})).await;
         assert_eq!(docs[0].fields["order.items.0.sku"], json!("a"));
         assert_eq!(docs[0].fields["order.items.1.sku"], json!("b"));
+    }
+
+    #[tokio::test]
+    async fn root_none_keeps_a_record_with_a_wrapper_named_field_whole() {
+        let order = r#"{"id":"order-1","customer":"Ada","items":["hat","shoe"]}"#;
+        // Unset: today's wrapper-key unwrapping.
+        let docs = run(bytes(order, None), json!({})).await;
+        assert_eq!(docs.len(), 2);
+
+        let docs = run(bytes(order, None), json!({"root": "none"})).await;
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, "order-1");
+        assert_eq!(docs[0].fields["customer"], json!("Ada"));
+        assert_eq!(docs[0].fields["items"], json!(["hat", "shoe"]));
+
+        let empty = r#"{"id":"order-2","items":[]}"#;
+        let docs = run(bytes(empty, None), json!({"root": "none"})).await;
+        assert_eq!(
+            docs.len(),
+            1,
+            "an empty wrapper-named array is just a field"
+        );
+        assert_eq!(docs[0].id, "order-2");
+
+        // A one-line NDJSON file is read like the same line in a longer file.
+        let one = run(
+            bytes("{\"id\":1,\"data\":[1,2]}\n", None),
+            json!({"root": "none"}),
+        )
+        .await;
+        let two = run(
+            bytes("{\"id\":1,\"data\":[1,2]}\n{\"id\":2}\n", None),
+            json!({"root": "none"}),
+        )
+        .await;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].fields, two[0].fields);
+        assert_eq!(one[0].id, two[0].id);
+
+        // A top-level array is still one document per element.
+        let docs = run(
+            bytes(r#"[{"id":"a","items":[1]},{"id":"b"}]"#, None),
+            json!({"root": "none"}),
+        )
+        .await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(docs[0].fields["items"], json!([1]));
+    }
+
+    #[tokio::test]
+    async fn root_pointer_selects_the_record_array() {
+        let page = r#"{"data": {"orders": [{"id": "x"}, {"id": "y"}]}, "items": [{"id": "z"}]}"#;
+        let docs = run(bytes(page, None), json!({"root": "/data/orders"})).await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+
+        // Each NDJSON line is a page of its own.
+        let pages = "{\"r\":[{\"id\":1},{\"id\":2}]}\n{\"r\":[{\"id\":3}]}\n";
+        let docs = run(bytes(pages, None), json!({"root": "/r"})).await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+
+        let docs = run(bytes(r#"{"r": []}"#, None), json!({"root": "/r"})).await;
+        assert!(docs.is_empty(), "an empty record array is no records");
+
+        let plugin = JsonFlattenerPlugin::new();
+        let ctx = ActivityContext::noop();
+        for (payload, root) in [(page, "/missing"), (page, "/data")] {
+            let err = plugin
+                .execute(&ctx, bytes(payload, None), json!({"root": root}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, PluginError::InvalidInput(m) if m.contains(root)),
+                "{root}: {err}"
+            );
+        }
+        for bad in [
+            json!({"root": "data"}),
+            json!({"root": 3}),
+            json!({"root": "auto"}),
+        ] {
+            let err = plugin
+                .execute(&ctx, bytes(page, None), bad.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PluginError::InvalidConfig(_)), "{bad}: {err}");
+        }
     }
 
     #[tokio::test]
