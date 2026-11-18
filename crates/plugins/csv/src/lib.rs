@@ -16,8 +16,19 @@
 //! | `content_columns` | all columns        | columns joined by a space into `content` |
 //! | `max_rows`        | unlimited          | stop after this many data rows |
 //! | `trim`            | `true`             | trim whitespace around headers and cells |
+//! | `encoding`        | detected           | character encoding of the file, as a WHATWG label (`windows-1252`, `iso-8859-15`, `shift_jis`, `utf-16le`, …) |
+//!
+//! Without `encoding`, the bytes are decoded by the first rule that applies: a
+//! byte order mark (UTF-8, UTF-16LE, UTF-16BE); UTF-8 when the whole file is valid
+//! UTF-8; the charset the server declared ([`Blob::charset`]) unless it is UTF-8,
+//! which the bytes just contradicted; else windows-1252, which maps every byte, so
+//! an Excel export in a Western European locale reads right and no file fails on a
+//! stray byte. A forced `encoding` replaces bytes it cannot map with U+FFFD.
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
+
+use encoding_rs::Encoding;
 
 use csv::{ByteRecord, ReaderBuilder, StringRecord, Trim};
 use meili_ingest_plugin_sdk::prelude::*;
@@ -61,6 +72,7 @@ struct Config {
     content_columns: Option<Vec<String>>,
     max_rows: Option<usize>,
     trim: bool,
+    encoding: Option<String>,
 }
 
 impl Default for Config {
@@ -72,6 +84,7 @@ impl Default for Config {
             content_columns: None,
             max_rows: None,
             trim: true,
+            encoding: None,
         }
     }
 }
@@ -95,8 +108,54 @@ impl Config {
                 "{NAME}: `max_rows` must be greater than zero when set"
             )));
         }
+        cfg.forced_encoding()?;
         Ok(cfg)
     }
+
+    /// The encoding `encoding` names, when set.
+    fn forced_encoding(&self) -> Result<Option<&'static Encoding>, PluginError> {
+        self.encoding
+            .as_deref()
+            .map(|label| {
+                Encoding::for_label(label.trim().as_bytes()).ok_or_else(|| {
+                    PluginError::InvalidConfig(format!(
+                        "{NAME}: `encoding` {label:?} is not a known character encoding \
+                         (try utf-8, windows-1252, iso-8859-15, shift_jis, utf-16le)"
+                    ))
+                })
+            })
+            .transpose()
+    }
+}
+
+/// Encoding of a file that is not valid UTF-8 and declares nothing usable.
+const FALLBACK_ENCODING: &Encoding = encoding_rs::WINDOWS_1252;
+
+/// The file's bytes as UTF-8, borrowed when they already are. See the module docs
+/// for the detection order; `forced` (the `encoding` option) skips it.
+fn decode_text<'a>(
+    data: &'a [u8],
+    declared: Option<&str>,
+    forced: Option<&'static Encoding>,
+) -> Cow<'a, [u8]> {
+    let utf8 = |text: Cow<'a, str>| match text {
+        Cow::Borrowed(t) => Cow::Borrowed(t.as_bytes()),
+        Cow::Owned(t) => Cow::Owned(t.into_bytes()),
+    };
+    if let Some(encoding) = forced {
+        return utf8(encoding.decode_with_bom_removal(data).0);
+    }
+    if let Some((encoding, bom_len)) = Encoding::for_bom(data) {
+        return utf8(encoding.decode_without_bom_handling(&data[bom_len..]).0);
+    }
+    if std::str::from_utf8(data).is_ok() {
+        return Cow::Borrowed(data);
+    }
+    let encoding = declared
+        .and_then(|label| Encoding::for_label(label.as_bytes()))
+        .filter(|e| *e != encoding_rs::UTF_8)
+        .unwrap_or(FALLBACK_ENCODING);
+    utf8(encoding.decode_without_bom_handling(data).0)
 }
 
 /// How a candidate delimiter splits the sample. Compared field by field: the
@@ -291,6 +350,11 @@ impl Plugin for CsvParserPlugin {
                         "type": "boolean",
                         "default": true,
                         "description": "Trim whitespace around headers and cells."
+                    },
+                    "encoding": {
+                        "type": ["string", "null"],
+                        "default": null,
+                        "description": "Character encoding of the file, as a WHATWG label (windows-1252, iso-8859-15, shift_jis, utf-16le, ...). When omitted: a byte order mark, else UTF-8 when the file is valid UTF-8, else the charset the server declared, else windows-1252."
                     }
                 }
             }))
@@ -319,16 +383,17 @@ fn parse_csv(
     blob: &Blob,
     cfg: &Config,
 ) -> Result<Vec<Document>, PluginError> {
+    let data = decode_text(&blob.data, blob.charset.as_deref(), cfg.forced_encoding()?);
     let delimiter = match cfg.delimiter {
         Some(c) => c as u8,
-        None => sniff_delimiter(&blob.data),
+        None => sniff_delimiter(&data),
     };
     let mut reader = ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(cfg.has_headers)
         .flexible(true)
         .trim(if cfg.trim { Trim::All } else { Trim::None })
-        .from_reader(blob.data.as_slice());
+        .from_reader(&*data);
 
     let headers: Vec<String> = if cfg.has_headers {
         reader
@@ -486,6 +551,7 @@ mod tests {
             "content_columns",
             "max_rows",
             "trim",
+            "encoding",
         ] {
             assert!(props.contains_key(key), "schema missing {key}");
         }
@@ -681,6 +747,98 @@ mod tests {
         assert_eq!(typed_cell("NaN"), json!("NaN"));
         assert_eq!(typed_cell("+"), json!("+"));
         assert_eq!(typed_cell("-"), json!("-"));
+    }
+
+    async fn run_raw(blob: Blob, cfg: Value) -> Result<Vec<Document>, PluginError> {
+        match CsvParserPlugin::new()
+            .execute(&ActivityContext::noop(), PluginInput::Bytes(blob), cfg)
+            .await?
+        {
+            PluginOutput::Documents(d) => Ok(d),
+            other => panic!("expected documents, got {other:?}"),
+        }
+    }
+
+    fn raw(data: &[u8]) -> Blob {
+        Blob::new(data.to_vec(), "text/csv", None)
+    }
+
+    #[tokio::test]
+    async fn a_legacy_encoded_file_is_transcoded_instead_of_failing() {
+        // Excel on Windows: windows-1252, `é` is the single byte 0xE9.
+        let docs = run_raw(raw(b"name,city\nSoci\xE9t\xE9,Paris\n"), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Société"));
+        // In a header too: configured columns still resolve.
+        let docs = run_raw(
+            raw(b"soci\xE9t\xE9,v\nx,1\n"),
+            json!({"id_column": "société", "content_columns": ["société"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(docs[0].fields["société"], json!("x"));
+        assert_eq!(docs[0].id, "x");
+    }
+
+    #[tokio::test]
+    async fn the_declared_charset_and_byte_order_marks_are_honoured() {
+        // Shift_JIS for `名前` (name) / `東京` (Tokyo), declared by the server.
+        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode("名前,市\n東京,1\n");
+        let docs = run_raw(raw(&sjis).with_charset(Some("Shift_JIS".into())), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["名前"], json!("東京"));
+
+        // Excel's "Unicode Text": UTF-16LE with a byte order mark, tab-separated.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "name\tcity\nZoë\tKöln\n".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        let docs = run_raw(raw(&utf16), json!({})).await.unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Zoë"));
+        assert_eq!(docs[0].fields["city"], json!("Köln"));
+
+        // A UTF-8 byte order mark is not part of the first header.
+        let docs = run_raw(raw("\u{FEFF}name\nAda\n".as_bytes()), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Ada"));
+
+        // Valid UTF-8 wins over a declaration it contradicts.
+        let docs = run_raw(
+            raw("name\nSociété\n".as_bytes()).with_charset(Some("windows-1252".into())),
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Société"));
+    }
+
+    #[tokio::test]
+    async fn the_encoding_option_forces_one() {
+        // 0xA4 is `€` in ISO-8859-15 and `¤` in windows-1252.
+        let data = b"price\n10\xA4\n";
+        let docs = run_raw(raw(data), json!({"encoding": "iso-8859-15"}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["price"], json!("10€"));
+        let docs = run_raw(raw(data), json!({})).await.unwrap();
+        assert_eq!(
+            docs[0].fields["price"],
+            json!("10¤"),
+            "windows-1252 fallback"
+        );
+        // Forcing UTF-8 on a stray byte replaces it rather than failing the file.
+        let docs = run_raw(raw(data), json!({"encoding": "utf-8"}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["price"], json!("10\u{FFFD}"));
+
+        let err = run_raw(raw(data), json!({"encoding": "klingon"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidConfig(_)), "{err}");
     }
 
     #[tokio::test]

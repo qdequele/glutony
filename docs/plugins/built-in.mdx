@@ -111,6 +111,15 @@ left out of `fields`.
 | `delimiter` | sniffed | Single-character field delimiter. When omitted, the one of `,` `;` tab `\|` that splits the first records (up to 100 or 64 KiB) into the most consistent number of fields; delimiters inside quoted fields do not count. Ties go to more fields, then to the delimiter less often followed by a space, then to that order. Falls back to `,`. |
 | `has_headers` | `true` | First row is the header. Without headers, fields are `col_0`, `col_1`, … |
 | `id_column` | — | Column whose value becomes the document id. Otherwise `<filename>_r<row>`. |
+| `encoding` | detected | Character encoding of the file, as a [WHATWG label](https://encoding.spec.whatwg.org/#names-and-labels): `windows-1252`, `iso-8859-15`, `shift_jis`, `utf-16le`, … Bytes it cannot map become U+FFFD. An unknown label fails the step. |
+
+Without `encoding`, the bytes are decoded by the first rule that applies: a byte
+order mark (UTF-8, UTF-16LE, UTF-16BE, as in Excel's "Unicode Text"); UTF-8 when
+the whole file is valid UTF-8; the `charset` of the HTTP `Content-Type` a fetched
+file came with, unless it says UTF-8, which the bytes just contradicted; else
+`windows-1252`. A CSV exported by Excel in a Western European locale therefore
+reads right (`Société`, not a failed job), and a stray byte never fails the file.
+Set `encoding` for anything else, such as a Latin-9 file with `€` signs.
 
 ### `json_flattener`
 
