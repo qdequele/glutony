@@ -53,6 +53,10 @@ A file's path inside the archive becomes its filename, so documents keep their
 folder in `meta.filename` (`reports/eu/q3.pdf`), and ids include it:
 `reports/eu/q3.pdf` becomes `reports_eu_q3`, so `reports/us/q3.pdf` does not
 overwrite it. Uploading the same archive again updates the same documents.
+The extension is not part of the id, so two files of one folder that differ
+only by it (`guide.md` and `guide.html`) share ids and the one indexed last wins;
+give them different names (see the note in
+[built-in plugins](/plugins/built-in)).
 A path longer than 400 characters is shortened in the id and ends with a short
 hash of the full path, so every page and chunk id still fits Meilisearch's
 511-byte limit.

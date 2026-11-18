@@ -7,8 +7,10 @@
 //! * `execute(bytes) -> bytes` — receives a JSON [`ExecuteEnvelope`]
 //!   (`{"input": PluginInput, "config": {...}}`) and returns a JSON [`ExecuteReply`]
 //!   (`{"ok": PluginOutput}` or `{"error": {"message": "...", "retryable": bool}}`).
-//! * `manifest() -> bytes` — *optional*, returns a JSON `PluginManifest`. When absent
-//!   the caller must supply a manifest override.
+//! * `manifest() -> bytes` — returns a JSON `PluginManifest`. The worker loads modules
+//!   from `EXTERNAL_PLUGINS`, which has no way to supply a manifest, so a module it
+//!   loads must export this. Only a host using this crate directly can do without it,
+//!   by passing a manifest override to [`WasmPlugin::from_file`].
 //!
 //! The `meili-ingest-plugin-sdk` crate's `wasm` feature provides `run_plugin` /
 //! `manifest_json` so a guest written in Rust is a dozen lines
@@ -155,8 +157,9 @@ impl std::fmt::Debug for WasmPlugin {
 impl WasmPlugin {
     /// Load a module from a `.wasm` file, without limits.
     ///
-    /// `manifest_override`, when given, wins over the guest's own `manifest` export
-    /// (useful to rename a plugin or to run modules that do not export one).
+    /// `manifest_override`, when given, wins over the guest's own `manifest` export, so
+    /// a host calling this directly can rename a plugin or run a module that does not
+    /// export one. The worker never passes one: [`crate::parse_env`] has no syntax for it.
     pub fn from_file(
         path: impl AsRef<Path>,
         manifest_override: Option<PluginManifest>,

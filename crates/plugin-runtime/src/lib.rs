@@ -45,7 +45,10 @@ pub struct ExternalPluginSpec {
     pub kind: PluginKind,
     /// File path (WASM) or endpoint URI (gRPC).
     pub location: String,
-    /// Optional manifest override (see [`WasmPlugin::from_file`] / [`GrpcPlugin::connect_with_manifest`]).
+    /// Optional manifest override (see [`WasmPlugin::from_file`] /
+    /// [`GrpcPlugin::connect_with_manifest`]), for hosts that build specs in code.
+    /// [`parse_env`] never sets it, so plugins the worker loads from `EXTERNAL_PLUGINS`
+    /// always describe themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PluginManifest>,
 }

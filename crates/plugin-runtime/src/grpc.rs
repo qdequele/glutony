@@ -92,8 +92,10 @@ impl GrpcPlugin {
     }
 
     /// Connect to `endpoint`; when `manifest_override` is given the `GetManifest` RPC is
-    /// skipped and the override is used instead (for containers that only implement
-    /// `Execute`, or to rename a plugin).
+    /// skipped and the override is used instead (for a host calling this directly, with
+    /// a container that only implements `Execute` or a plugin to rename). The worker
+    /// never passes one: [`crate::parse_env`] has no syntax for it, so a container it
+    /// loads must implement `GetManifest`.
     pub async fn connect_with_manifest(
         endpoint: impl Into<String>,
         manifest_override: Option<PluginManifest>,

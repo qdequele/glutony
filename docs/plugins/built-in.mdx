@@ -15,6 +15,14 @@ A filename or sheet name with non-ASCII characters also ends with a 12-character
 hash of the original name (`報告.pdf` gives `___<hash>_p1`), so two non-Latin
 names never share ids; ASCII names give the ids they always did.
 
+Because the extension is dropped, files that differ only by it share ids when
+they go to the same index: `guide.md` and `guide.html` both give `guide` (or
+`guide_s1`, …), `data.csv` and `data.parquet` both give `data_r1`, …, and the
+one indexed last replaces the other's documents, with both jobs succeeding. The
+same holds inside one archive. Rename one of the files, send them to separate
+indexes, or take ids from the data with `id_column` / `id_field` where the
+extractor has one.
+
 Content fetched rather than uploaded (a URL or object-ref ingest, a scheduled
 source, and the files of such an archive) also carries a 12-character hash of
 where it came from: `https://a.example/export/data.json` gives `data_<hash>_0`,

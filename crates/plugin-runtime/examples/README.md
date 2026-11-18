@@ -39,7 +39,8 @@ serde_json = "1"
 ```
 
 Implement `Plugin` exactly as you would for a built-in, then export the two entry points
-the runtime looks for (`manifest` is optional, `execute` is required):
+the runtime looks for. Both are required for a module the worker loads from
+`EXTERNAL_PLUGINS`, which cannot supply a manifest for it:
 
 ```rust
 // src/lib.rs
