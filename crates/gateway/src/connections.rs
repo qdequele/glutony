@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::RowScope;
+use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, PipelineDefinition, RowScope, pinned_connection};
 use meili_ingest_source::{HostPolicy, SecretKey, SourceError};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -279,6 +279,45 @@ pub async fn validate_destination(
             "Meilisearch at {host} answered GET /indexes with {s}"
         ))),
     }
+}
+
+/// Refuse to run `pipeline` for `tenant_id` when one of its `meili_indexer` steps names a
+/// connection that, for this tenant, is a global one.
+///
+/// A tenant's job only ever resolves a connection the tenant owns; the worker fails the
+/// step otherwise. This turns that into a 422 at submit time wherever the gateway can
+/// see it. A connection that does not exist (yet) is not refused here: like a deleted
+/// one, it fails at run time (spec Decision 15). Without a tenant nothing is checked —
+/// untagged jobs keep using global connections.
+pub async fn require_tenant_connections(
+    control_plane: &ControlPlaneClient,
+    pipeline: &PipelineDefinition,
+    tenant_id: Option<&str>,
+) -> Result<(), GatewayError> {
+    let Some(tenant) = tenant_id else {
+        return Ok(());
+    };
+    let mut names: Vec<&str> = pipeline
+        .steps
+        .iter()
+        .filter(|s| s.plugin == INDEXER_PLUGIN)
+        .filter_map(|s| pinned_connection(&s.config))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        // The read falls back to the global row, which is exactly what is refused.
+        let row = control_plane.get_connection(name, Some(tenant)).await?;
+        if row.is_some_and(|r| r.tenant_id.is_none()) {
+            return Err(GatewayError::Unprocessable(format!(
+                "pipeline {:?} writes through {name:?}, a global connection; jobs for \
+                 tenant {tenant:?} can only use connections that tenant owns. Create a \
+                 connection named {name:?} for the tenant, or name one it already has",
+                pipeline.uid
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

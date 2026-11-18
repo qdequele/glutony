@@ -7,9 +7,16 @@
 //! this process. The key is therefore never part of the activity input, and never
 //! recorded in Temporal history.
 //!
+//! A job with a tenant only ever resolves a connection that tenant owns: it asks the
+//! control plane with `scope=tenant`, which never falls back to a global row, and this
+//! module re-checks the owner of whatever comes back, so a tenant's pipeline naming a
+//! global connection uid can never write with the operator's key. A job without a
+//! tenant resolves global connections, as before.
+//!
 //! Failure modes are deliberately split: anything that retrying cannot fix (unknown
-//! connection, missing or wrong `SOURCE_SECRET_KEY`, a host the policy forbids) is
-//! non-retryable and names the connection; transport and DNS trouble is retryable.
+//! connection, a connection the job's tenant does not own, missing or wrong
+//! `SOURCE_SECRET_KEY`, a host the policy forbids) is non-retryable and names the
+//! connection; transport and DNS trouble is retryable.
 
 use std::sync::Arc;
 
@@ -33,6 +40,9 @@ pub struct ConnectionSettings {
 /// rather than imported so the worker does not link the control plane.
 #[derive(Deserialize)]
 struct ConnectionRow {
+    /// Owner; absent for a global connection.
+    #[serde(default, alias = "project_id")]
+    tenant_id: Option<String>,
     host: String,
     api_key: Vec<u8>,
 }
@@ -90,6 +100,18 @@ pub async fn resolve_connection(
         tenant_id,
     )
     .await?;
+    // The control plane already scopes the lookup; this holds even against one that
+    // falls back (an older binary, or a bug), and before the key is ever opened.
+    if row.tenant_id.as_deref() != tenant_id {
+        return Err(fail(match (tenant_id, row.tenant_id.as_deref()) {
+            (Some(t), None) => format!(
+                "it is a global connection, and jobs for tenant {t:?} can only use \
+                 connections that tenant owns; create a connection named {name:?} for \
+                 the tenant"
+            ),
+            _ => "it belongs to another tenant".into(),
+        }));
+    }
 
     let api_key = key.open(&row.api_key).map_err(|_| {
         fail(
@@ -387,6 +409,53 @@ mod tests {
         )
         .await;
         // `expect(1)` is verified when the server drops.
+    }
+
+    #[tokio::test]
+    async fn a_tenant_job_never_uses_a_global_connection() {
+        // A control plane that still falls back to the global row (an older one, or a
+        // bug) must not be enough to hand a tenant the operator's key.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "11111111-1111-1111-1111-111111111111",
+                "uid": "prod-movies",
+                "name": "Movies",
+                "host": "http://meilisearch:7700",
+                "api_key": sealed_key(),
+                "created_at": "2026-09-23T00:00:00Z",
+                "updated_at": "2026-09-23T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: None,
+        };
+        let err = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            Some("tenant-1"),
+        )
+        .await
+        .expect_err("a global connection is not the tenant's");
+        let PluginError::NonRetryable(msg) = err else {
+            panic!("retrying cannot make the connection the tenant's: {err:?}");
+        };
+        assert!(
+            msg.contains("prod-movies") && msg.contains("global"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(PLAINTEXT_KEY),
+            "an error must never carry the key"
+        );
     }
 
     #[tokio::test]
