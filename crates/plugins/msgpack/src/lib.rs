@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use meili_ingest_plugin_json::limits::NODE_BYTES;
 use meili_ingest_plugin_json::{
-    DecodeBudget, DecodeLimits, FlattenConfig, documents_from_values, id_stem, insert_unique,
+    DecodeBudget, DecodeLimits, FlattenConfig, UniqueKeys, documents_from_values, id_stem,
     select_roots,
 };
 use meili_ingest_plugin_sdk::prelude::*;
@@ -162,7 +162,7 @@ fn utf8_string(s: Utf8String) -> String {
 
 /// Render a map key as a string: strings stay as they are, everything else is
 /// rendered the way it would read in JSON. A key that then repeats another gets a
-/// `_2`, `_3`, … suffix ([`insert_unique`]), so no entry is silently dropped.
+/// `_2`, `_3`, … suffix ([`UniqueKeys`]), so no entry is silently dropped.
 fn map_key(key: Mp) -> String {
     match key {
         Mp::String(s) => utf8_string(s),
@@ -195,9 +195,10 @@ fn convert(value: Mp) -> Value {
         Mp::Array(items) => Value::Array(items.into_iter().map(convert).collect()),
         Mp::Map(entries) => {
             let mut out = Map::with_capacity(entries.len());
+            let mut keys = UniqueKeys::default();
             for (k, v) in entries {
                 // Integer 7 and string "7" both render as "7": keep both.
-                insert_unique(&mut out, map_key(k), convert(v));
+                keys.insert(&mut out, map_key(k), convert(v));
             }
             Value::Object(out)
         }
@@ -589,6 +590,29 @@ mod tests {
         let f = &docs[0].fields;
         assert_eq!(f["7"], json!("by-int"));
         assert_eq!(f["7_2"], json!("by-str"));
+    }
+
+    #[tokio::test]
+    async fn a_map_of_one_repeated_key_is_converted_in_linear_time() {
+        // Each repeat used to search the suffixes from `_2` again: n^2/2 lookups.
+        let n = 30_000;
+        let value = Mp::Map(
+            (0..n)
+                .map(|i| (Mp::String("k".into()), Mp::Integer(i.into())))
+                .collect(),
+        );
+        let started = std::time::Instant::now();
+        let docs = run(pack_raw(&value), None, json!({})).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+        let f = &docs[0].fields;
+        assert_eq!(f["k"], json!(0));
+        for i in 2..=n {
+            assert_eq!(f[&format!("k_{i}")], json!(i - 1), "k_{i}");
+        }
     }
 
     #[tokio::test]

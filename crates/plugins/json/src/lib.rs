@@ -38,6 +38,7 @@
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 pub mod limits;
 pub use limits::{DecodeBudget, DecodeLimits, decoded_size};
@@ -250,19 +251,40 @@ pub fn select_roots(value: Value) -> Vec<Value> {
 /// when `key` is taken, so a collision never drops a value: `{"a.b": 1, "a": {"b": 2}}`
 /// flattens to `a.b` and `a.b_2`. Public so the binary formats apply the same rule
 /// to their own key collisions.
+///
+/// Each call searches the suffixes from `_2`: to insert many keys into one map,
+/// use a [`UniqueKeys`], which picks the same names in amortised constant time.
 pub fn insert_unique(out: &mut Map<String, Value>, key: String, value: Value) {
-    if !out.contains_key(&key) {
-        out.insert(key, value);
-        return;
-    }
-    let mut k = 2usize;
-    loop {
-        let candidate = format!("{key}_{k}");
-        if !out.contains_key(&candidate) {
-            out.insert(candidate, value);
+    UniqueKeys::default().insert(out, key, value);
+}
+
+/// [`insert_unique`] for many keys into one map: it remembers, per key, the next
+/// suffix to try, so `n` repeats of one key cost `O(n)` lookups instead of
+/// `O(n^2)`. It picks exactly the names [`insert_unique`] would, as long as no key
+/// is removed from the map while it is used (a suffix found taken stays taken).
+#[derive(Debug, Default)]
+pub struct UniqueKeys {
+    next: HashMap<String, usize>,
+}
+
+impl UniqueKeys {
+    /// Insert `value` under `key`, or under the first free `<key>_<k>` (`k` from 2).
+    pub fn insert(&mut self, out: &mut Map<String, Value>, key: String, value: Value) {
+        if !out.contains_key(&key) {
+            out.insert(key, value);
             return;
         }
-        k += 1;
+        // Every suffix below the remembered one is taken already.
+        let mut k = self.next.get(&key).copied().unwrap_or(2);
+        let candidate = loop {
+            let candidate = format!("{key}_{k}");
+            if !out.contains_key(&candidate) {
+                break candidate;
+            }
+            k += 1;
+        };
+        out.insert(candidate, value);
+        self.next.insert(key, k + 1);
     }
 }
 
@@ -928,6 +950,22 @@ mod tests {
         assert_eq!(m["k"], json!(1));
         assert_eq!(m["k_2"], json!(2));
         assert_eq!(m["k_3"], json!(3));
+    }
+
+    #[test]
+    fn unique_keys_pick_the_names_insert_unique_picks() {
+        // Repeats, keys that look like suffixes, and suffixes of suffixes.
+        let keys = [
+            "k", "k_3", "k", "k", "k_2", "k", "j", "k_2", "k_2", "j", "k_6", "k", "k",
+        ];
+        let (mut one_by_one, mut shared) = (Map::new(), Map::new());
+        let mut unique = UniqueKeys::default();
+        for (i, key) in keys.iter().enumerate() {
+            insert_unique(&mut one_by_one, (*key).to_owned(), json!(i));
+            unique.insert(&mut shared, (*key).to_owned(), json!(i));
+        }
+        assert_eq!(shared.len(), keys.len(), "no value dropped");
+        assert_eq!(shared, one_by_one);
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use encoding_rs::Encoding;
 
@@ -302,15 +302,17 @@ fn id_stem(blob: &Blob) -> String {
 /// Same rules as `xlsx_extractor`.
 struct Columns {
     names: Vec<String>,
-    taken: HashSet<String>,
+    taken: Taken,
     /// Key of the row number.
     row_key: String,
 }
 
 impl Columns {
     fn new(headers: &[String]) -> Self {
-        let mut taken: HashSet<String> =
-            headers.iter().filter(|h| !h.is_empty()).cloned().collect();
+        let mut taken = Taken {
+            names: headers.iter().filter(|h| !h.is_empty()).cloned().collect(),
+            next: HashMap::new(),
+        };
         let mut first_use: HashSet<&str> = HashSet::new();
         let mut names = Vec::with_capacity(headers.len());
         for (i, h) in headers.iter().enumerate() {
@@ -323,9 +325,9 @@ impl Columns {
             } else {
                 h.clone()
             };
-            names.push(free_name(&mut taken, base));
+            names.push(taken.free_name(base));
         }
-        let row_key = free_name(&mut taken, "_row".to_owned());
+        let row_key = taken.free_name("_row".to_owned());
         Self {
             names,
             taken,
@@ -337,23 +339,40 @@ impl Columns {
     fn name(&mut self, idx: usize) -> &str {
         while self.names.len() <= idx {
             let base = format!("col_{}", self.names.len() + 1);
-            let name = free_name(&mut self.taken, base);
+            let name = self.taken.free_name(base);
             self.names.push(name);
         }
         &self.names[idx]
     }
 }
 
-/// `base`, or the first `<base>_<k>` (`k` from 2) not in `taken`, which it joins.
-fn free_name(taken: &mut HashSet<String>, base: String) -> String {
-    let mut name = base.clone();
-    let mut k = 2;
-    while taken.contains(&name) {
-        name = format!("{base}_{k}");
-        k += 1;
+/// The field names given out so far.
+struct Taken {
+    names: HashSet<String>,
+    /// Per base name, the next suffix to try: every `<base>_<k>` below it is
+    /// taken already, so `n` repeats of one header cost `O(n)` lookups, not
+    /// `O(n^2)`. Names are never released, so that stays true.
+    next: HashMap<String, usize>,
+}
+
+impl Taken {
+    /// `base`, or the first `<base>_<k>` (`k` from 2) not taken, which it takes.
+    fn free_name(&mut self, base: String) -> String {
+        if self.names.insert(base.clone()) {
+            return base;
+        }
+        let mut k = self.next.get(&base).copied().unwrap_or(2);
+        let name = loop {
+            let name = format!("{base}_{k}");
+            if !self.names.contains(&name) {
+                break name;
+            }
+            k += 1;
+        };
+        self.names.insert(name.clone());
+        self.next.insert(base, k + 1);
+        name
     }
-    taken.insert(name.clone());
-    name
 }
 
 /// Resolve a configured column name to its index, or fail with `InvalidConfig`.
@@ -842,6 +861,26 @@ mod tests {
         let f = &docs[0].fields;
         assert_eq!(f["col_1"], json!("y"));
         assert_eq!(f["col_1_2"], json!("x"));
+    }
+
+    #[tokio::test]
+    async fn a_header_row_of_one_repeated_name_is_named_in_linear_time() {
+        // Each repeat used to search the suffixes from `_2` again: n^2/2 lookups.
+        let n = 30_000;
+        let header = vec!["n"; n].join(",");
+        let row = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let started = std::time::Instant::now();
+        let docs = run(&format!("{header}\n{row}\n"), None, json!({})).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+        let f = &docs[0].fields;
+        assert_eq!(f["n"], json!(0));
+        for i in 2..=n {
+            assert_eq!(f[&format!("n_{i}")], json!(i - 1), "n_{i}");
+        }
     }
 
     async fn run_raw(blob: Blob, cfg: Value) -> Result<Vec<Document>, PluginError> {
