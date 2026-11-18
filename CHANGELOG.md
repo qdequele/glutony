@@ -442,6 +442,10 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   containing non-ASCII characters now ends with `_` and a 12-character hash of the
   original. Ids of such names change once, so re-ingesting them leaves the old documents
   in the index until you delete them. Pure-ASCII names keep exactly the ids they had.
+- `avro_parser` refuses a truncated or malformed record or block (`invalid Avro record
+  N: …`, `invalid Avro block: …`) instead of indexing nulls for what it could not read:
+  each record is now measured from its bytes before it is decoded, so that
+  `PARSER_MAX_DECODED_MB` holds for a single huge record too.
 
 ### Changed
 - Document ids built from a filename keep its folders: `reports/eu/q3.pdf` gives
