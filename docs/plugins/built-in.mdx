@@ -133,6 +133,14 @@ schema supplies the types, so nothing is guessed; nested structs flatten to
 dotted keys and null cells are omitted. `columns` is pushed down into the
 reader, so unselected columns are never decoded.
 
+A `DECIMAL` column of precision 15 or less becomes a JSON number, which holds
+every such value exactly. A wider one (`DECIMAL(18,2)`, `DECIMAL(38,10)`, …)
+becomes an exact string, `"12345678901234567890.1234567890"`, as in
+`avro_parser`: a number that wide would be rounded. The choice follows the
+column's declared precision, so a field is never a number in one document and a
+string in the next. Like any string, a wide decimal counts as a string leaf for
+the default `content`; set `content_fields` to keep it out.
+
 | Key | Default | Description |
 |---|---|---|
 | `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_r<row>`. |

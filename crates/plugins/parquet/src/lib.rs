@@ -13,7 +13,10 @@
 //! * **No type guessing.** Where `csv_parser` has to sniff whether `007` is a
 //!   number, Parquet states it. Integers, floats, booleans, dates and timestamps
 //!   arrive typed, and nested structs and lists map onto the same dotted keys as
-//!   nested JSON.
+//!   nested JSON. A decimal column of precision up to 15 digits is a JSON number,
+//!   which an f64 holds exactly; a wider one is an exact string such as
+//!   `"12345678901234567890.1234567890"`, as in `avro_parser`. The choice is made
+//!   per column, so one field never mixes the two.
 //! * **Projection is cheap.** `columns` pushes the selection down into the reader,
 //!   so unread columns are never decoded off disk.
 //!
@@ -39,7 +42,12 @@
 //! the step as invalid input instead of being truncated. The footer's row count is
 //! checked first, so an oversized file is refused before any row is decoded.
 
-use arrow_json::ArrayWriter;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type};
+use arrow_array::{Array, PrimitiveArray, types::DecimalType};
+use arrow_json::writer::{JsonArray, NullableEncoder, WriterBuilder};
+use arrow_json::{Encoder, EncoderFactory, EncoderOptions};
+use arrow_schema::{ArrowError, DataType, FieldRef};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -148,11 +156,62 @@ impl Config {
     }
 }
 
+/// Widest decimal, in digits, written as a JSON number: an f64 holds every
+/// decimal of up to 15 significant digits exactly, and the JSON text arrow writes
+/// for it parses back to that value.
+const MAX_NUMERIC_DECIMAL_DIGITS: u8 = 15;
+
+/// Writes the decimals of a column wider than [`MAX_NUMERIC_DECIMAL_DIGITS`] as
+/// exact JSON strings. arrow-json writes every decimal as a bare number, which
+/// `serde_json` would round through an f64. The writer asks the factory for every
+/// array, nested ones included, so decimals inside structs and lists are covered.
+#[derive(Debug)]
+struct WideDecimalsAsStrings;
+
+/// Encodes one decimal array as quoted strings.
+struct DecimalString<'a, T: DecimalType>(&'a PrimitiveArray<T>);
+
+impl<T: DecimalType> Encoder for DecimalString<'_, T> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        // Digits, a sign and a dot: nothing to escape.
+        out.push(b'"');
+        out.extend_from_slice(self.0.value_as_string(idx).as_bytes());
+        out.push(b'"');
+    }
+}
+
+impl EncoderFactory for WideDecimalsAsStrings {
+    fn make_default_encoder<'a>(
+        &self,
+        _field: &'a FieldRef,
+        array: &'a dyn Array,
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
+        let encoder: Box<dyn Encoder + 'a> = match array.data_type() {
+            DataType::Decimal32(p, _) if *p > MAX_NUMERIC_DECIMAL_DIGITS => {
+                Box::new(DecimalString(array.as_primitive::<Decimal32Type>()))
+            }
+            DataType::Decimal64(p, _) if *p > MAX_NUMERIC_DECIMAL_DIGITS => {
+                Box::new(DecimalString(array.as_primitive::<Decimal64Type>()))
+            }
+            DataType::Decimal128(p, _) if *p > MAX_NUMERIC_DECIMAL_DIGITS => {
+                Box::new(DecimalString(array.as_primitive::<Decimal128Type>()))
+            }
+            DataType::Decimal256(p, _) if *p > MAX_NUMERIC_DECIMAL_DIGITS => {
+                Box::new(DecimalString(array.as_primitive::<Decimal256Type>()))
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(NullableEncoder::new(encoder, array.nulls().cloned())))
+    }
+}
+
 /// Decode a Parquet payload into one JSON object per row.
 ///
 /// Arrow's own JSON writer does the per-cell type mapping, so the 40-odd Arrow
-/// types (decimals, dictionaries, timestamps with zones, nested lists) are
-/// rendered the canonical way instead of by a hand-written table here.
+/// types (dictionaries, timestamps with zones, nested lists) are rendered the
+/// canonical way instead of by a hand-written table here. Wide decimals are the
+/// exception, see [`WideDecimalsAsStrings`].
 ///
 /// The rows produced (after `max_rows`) and their decoded size are counted against
 /// `limits`; going over either fails with [`PluginError::InvalidInput`].
@@ -223,7 +282,9 @@ fn decode_payload(
             batch.map_err(|e| PluginError::InvalidInput(format!("{NAME}: bad row group: {e}")))?;
         budget.add_rows(batch.num_rows() as u64)?;
         let mut buf = Vec::new();
-        let mut writer = ArrayWriter::new(&mut buf);
+        let mut writer = WriterBuilder::new()
+            .with_encoder_factory(Arc::new(WideDecimalsAsStrings))
+            .build::<_, JsonArray>(&mut buf);
         writer
             .write(&batch)
             .and_then(|()| writer.finish())
@@ -658,6 +719,74 @@ mod tests {
                 "{cfg}: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wide_decimals_are_exact_strings_and_narrow_ones_exact_numbers() {
+        use arrow_array::builder::{Decimal128Builder, ListBuilder};
+        use arrow_array::{Decimal64Array, Decimal128Array};
+
+        let amount = Decimal128Array::from(vec![
+            Some(123_456_789_012_345_678_901_234_567_890i128),
+            Some(-5),
+            None,
+        ])
+        .with_precision_and_scale(38, 10)
+        .unwrap();
+        // Two ids above 2^64 that an f64 cannot tell apart.
+        let id = Decimal128Array::from(vec![
+            18_446_744_073_709_551_617i128,
+            18_446_744_073_709_551_618,
+            18_446_744_073_709_551_619,
+        ])
+        .with_precision_and_scale(38, 0)
+        .unwrap();
+        let price = Decimal64Array::from(vec![999_999_999_999_999i64, 1_050, -1])
+            .with_precision_and_scale(15, 4)
+            .unwrap();
+        let wide64 = Decimal64Array::from(vec![123_456_789_012_345_678i64, 0, 1])
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        // A wide decimal nested in a list is a string too.
+        let mut list = ListBuilder::new(
+            Decimal128Builder::new()
+                .with_precision_and_scale(20, 3)
+                .unwrap(),
+        );
+        for v in [12_345_678_901_234_567i128, 1, 2] {
+            list.values().append_value(v);
+            list.append(true);
+        }
+        let list = list.finish();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(id) as ArrayRef),
+            ("amount", Arc::new(amount) as ArrayRef),
+            ("price", Arc::new(price) as ArrayRef),
+            ("wide64", Arc::new(wide64) as ArrayRef),
+            ("parts", Arc::new(list) as ArrayRef),
+        ])
+        .expect("batch");
+
+        let docs = run(parquet_file(&[batch]), None, json!({})).await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            [
+                "18446744073709551617",
+                "18446744073709551618",
+                "18446744073709551619"
+            ],
+            "distinct exact ids"
+        );
+        let d = &docs[0];
+        assert_eq!(d.fields["amount"], json!("12345678901234567890.1234567890"));
+        assert_eq!(docs[1].fields["amount"], json!("-0.0000000005"));
+        assert!(!docs[2].fields.contains_key("amount"), "null stays omitted");
+        assert_eq!(d.fields["wide64"], json!("1234567890123456.78"));
+        assert_eq!(d.fields["parts"], json!(["12345678901234.567"]));
+        // Up to 15 digits an f64 holds every value exactly: those stay numbers.
+        assert_eq!(d.fields["price"].to_string(), "99999999999.9999");
+        assert_eq!(docs[1].fields["price"], json!(0.105));
+        assert_eq!(docs[2].fields["price"], json!(-0.0001));
     }
 
     #[tokio::test]
