@@ -21,6 +21,13 @@ use crate::{AppState, CpError, JsonBody};
 /// file must never change.
 const CONVERT_PRE_V2: &str = include_str!("../../../migrations/0005_lab_events_v2.sql");
 
+/// Run right after [`CONVERT_PRE_V2`], in its transaction: a converted row is a new
+/// event for the Lab, so the skips of its pre-v2 shape no longer count. The conversion
+/// sets `created_at = now()`, the transaction's start, which picks out exactly the rows
+/// it just rewrote (a row inserted in the same transaction has no skip to clear).
+const CLEAR_SKIPS_OF_CONVERTED: &str = "UPDATE lab_events SET first_skipped_at = NULL \
+     WHERE delivered_at IS NULL AND first_skipped_at IS NOT NULL AND created_at = now()";
+
 /// Whether `events` may hold a pre-v2 `usage.recorded` event: one with a `data` object
 /// and no `data.operation`. A superset of what [`CONVERT_PRE_V2`] matches, so skipping
 /// the conversion when this is false never leaves a pre-v2 row of this batch
@@ -99,6 +106,9 @@ impl LabEventRepo {
             // upgrade did (the migration is idempotent and only touches pre-v2 rows).
             // It scans the undelivered outbox, so v2 batches skip it.
             sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
+            sqlx::query(CLEAR_SKIPS_OF_CONVERTED)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(inserted)
@@ -139,6 +149,9 @@ impl LabEventRepo {
     ) -> Result<Vec<PendingEvent>, CpError> {
         let mut tx = self.pool.begin().await?;
         sqlx::raw_sql(CONVERT_PRE_V2).execute(&mut *tx).await?;
+        sqlx::query(CLEAR_SKIPS_OF_CONVERTED)
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query_as(
             "UPDATE lab_events SET next_attempt = now() + make_interval(secs => $2) \
              WHERE id = ANY($1) AND delivered_at IS NULL \
@@ -191,8 +204,41 @@ impl LabEventRepo {
         .rows_affected())
     }
 
-    /// Delete undelivered rows older than `older_than` and return their ids. Delivered
-    /// rows are never touched here (see `purge_delivered`).
+    /// [`Self::reschedule`] for rows the Lab answered `200` for without accepting them:
+    /// also stamps `first_skipped_at` (kept on a later skip), in the same statement so
+    /// another replica never sees the back-off without the mark.
+    pub async fn reschedule_skipped(&self, ids: &[Uuid]) -> Result<u64, CpError> {
+        Ok(sqlx::query(
+            "UPDATE lab_events SET attempts = attempts + 1, \
+                 first_skipped_at = COALESCE(first_skipped_at, now()), \
+                 next_attempt = now() + make_interval(secs => \
+                     LEAST(power(2, LEAST(attempts + 1, 9)), 300) * (0.8 + random() * 0.4)) \
+             WHERE id = ANY($1) AND delivered_at IS NULL",
+        )
+        .bind(ids)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// Delete undelivered rows the Lab first skipped more than `older_than` ago and
+    /// return their ids. Rows that only saw whole-batch failures are never touched here.
+    pub async fn drop_skipped(&self, older_than: Duration) -> Result<Vec<Uuid>, CpError> {
+        Ok(sqlx::query_scalar(
+            "DELETE FROM lab_events \
+             WHERE delivered_at IS NULL AND first_skipped_at IS NOT NULL \
+               AND first_skipped_at < now() - make_interval(secs => $1) \
+             RETURNING id",
+        )
+        .bind(older_than.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Delete undelivered rows older than `older_than`, skipped or not, and return their
+    /// ids: the cap that keeps the outbox bounded when the Lab never answers (revoked
+    /// credentials, decommissioned Lab). Delivered rows are never touched here (see
+    /// `purge_delivered`).
     pub async fn drop_stale(&self, older_than: Duration) -> Result<Vec<Uuid>, CpError> {
         Ok(sqlx::query_scalar(
             "DELETE FROM lab_events \

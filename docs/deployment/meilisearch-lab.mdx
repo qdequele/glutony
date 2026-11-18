@@ -148,12 +148,14 @@ plane sends batches of up to 500 to `POST {LAB_URL}/internal/events` with
 marks the ids the Lab lists in `accepted`, and retries the rest with backoff (max
 5 min). A Lab `401` is logged and retried like any other failure.
 
-An event the Lab has not accepted **24 h** after it was written to the outbox (its
-`created_at`) was skipped on purpose (for example `product mismatch`): it is dropped
-with an error log and counted in `glutony_lab_events_dropped_total`. The check runs
-hourly. Set `LAB_URL` before enabling `LAB_EVENTS_ENABLED`: events already older than
-24 h when the sender first starts get at most one delivery attempt before they are
-dropped.
+An event the Lab answered `200` for without listing it in `accepted` was skipped on
+purpose (for example `product mismatch`): it is dropped **24 h** after that first
+skip. An event that never got such an answer (Lab unreachable, `401`, any other
+status, an unreadable answer) is not taken as rejected: it is retried for **7 days**
+after it was written to the outbox, then dropped. Both drops log an error and count
+in `glutony_lab_events_dropped_total`. The check runs hourly, so a Lab outage or a
+credential problem fixed within 7 days loses no event, and events that waited while
+`LAB_URL` was unset are delivered once it is set, if they are under 7 days old.
 
 ### Credit pre-check
 
@@ -216,7 +218,7 @@ threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
 - alert: GlutonyLabEventsDropped
   expr: increase(glutony_lab_events_dropped_total[1h]) > 0
   annotations:
-    summary: glutony dropped usage events the Lab never accepted within 24 h
+    summary: glutony dropped usage events the Lab skipped, or never accepted within 7 days
 ```
 
 ## AI steps on the team's Gateway
@@ -330,7 +332,8 @@ gives the commands.
 
 Lab events still waiting in the outbox from a pre-v2 release (written by the old
 workers, in a shape a v2 Lab rejects) are converted to the v2 `usage.recorded` shape
-when the new control plane first boots, and get a fresh 24 h delivery window. Workers
+when the new control plane first boots, and get a fresh delivery window (their
+earlier skips are forgotten). Workers
 not upgraded yet keep posting that old shape while the rollout runs (the control plane
 goes first), and an old control-plane replica still running stores it as is, so the
 new control plane also converts such events when it stores them and, at the latest,

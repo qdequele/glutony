@@ -2,9 +2,11 @@
 //!
 //! Every 2 s, or right after an insert, lease up to 500 due rows, send them in one
 //! signed batch, mark the ids the Lab lists in `accepted` as delivered and back the
-//! rest off. Rows are retried for 24 h; after that they are dropped with an error log
-//! (spec v2 §3.4). A Lab `401` is logged and retried: the Lab can never stop glutony
-//! from serving.
+//! rest off. A row the Lab answered `200` for without accepting it was skipped and is
+//! dropped 24 h after that first skip (spec v2 §3.4). A row that never got such an
+//! answer (Lab unreachable, `401`, `5xx`, malformed answer) is retried for 7 days, then
+//! dropped; both drops log an error. A Lab `401` is logged and retried: the Lab can
+//! never stop glutony from serving.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,8 +30,12 @@ pub const LEASE: Duration = Duration::from_secs(30);
 pub const MAX_ACK_BYTES: usize = 1024 * 1024;
 /// Delivered rows are kept this long.
 pub const RETENTION: Duration = Duration::from_secs(7 * 86_400);
-/// Undelivered rows older than this were never acknowledged and are dropped (spec §3.4).
-pub const STALE_AFTER: Duration = Duration::from_secs(24 * 3_600);
+/// A row the Lab skipped (a `200` that did not list it in `accepted`) is dropped this
+/// long after the first skip (spec v2 §3.4).
+pub const SKIPPED_STALE_AFTER: Duration = Duration::from_secs(24 * 3_600);
+/// Any undelivered row older than this is dropped, skipped or not: the cap that bounds
+/// the outbox when the Lab never answers (revoked credentials, Lab gone).
+pub const UNANSWERED_STALE_AFTER: Duration = Duration::from_secs(7 * 86_400);
 
 /// `LAB_URL` + `LAB_INSTANCE_ID` + `LAB_INSTANCE_SECRET`: where the sender delivers and
 /// how it signs (spec v2 §3.3). The control plane's credit check uses the same
@@ -250,7 +256,7 @@ impl LabSender {
                 .failed_total
                 .with_label_values(&["not_accepted"])
                 .inc_by(rest.len() as u64);
-            if let Err(e) = self.repo.reschedule(&rest).await {
+            if let Err(e) = self.repo.reschedule_skipped(&rest).await {
                 tracing::error!(error = %e, "cannot back off unaccepted lab events");
             }
         }
@@ -276,22 +282,35 @@ impl LabSender {
         }
     }
 
-    /// Hourly housekeeping: purge delivered rows past retention, and drop undelivered
-    /// rows the Lab never acknowledged within [`STALE_AFTER`] (spec §3.4: a skipped
-    /// event is never acknowledged, so after 24 h it is permanently rejected).
+    /// Hourly housekeeping: purge delivered rows past retention, drop rows the Lab
+    /// skipped more than [`SKIPPED_STALE_AFTER`] ago (spec §3.4: a skipped event is
+    /// never acknowledged, so it is permanently rejected), and drop any undelivered row
+    /// older than [`UNANSWERED_STALE_AFTER`].
     pub async fn maintain(&self) {
         match self.repo.purge_delivered(RETENTION).await {
             Ok(n) if n > 0 => tracing::info!(purged = n, "old delivered lab events purged"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "cannot purge delivered lab events"),
         }
-        match self.repo.drop_stale(STALE_AFTER).await {
+        match self.repo.drop_skipped(SKIPPED_STALE_AFTER).await {
             Ok(ids) if !ids.is_empty() => {
                 self.metrics.dropped_total.inc_by(ids.len() as u64);
                 tracing::error!(
                     count = ids.len(),
                     ids = ?ids,
-                    "lab events never acknowledged for 24 h were dropped; the Lab skipped them (check its logs for the reason)"
+                    "lab events the Lab skipped 24 h ago and never accepted were dropped (check its logs for the reason)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot drop skipped lab events"),
+        }
+        match self.repo.drop_stale(UNANSWERED_STALE_AFTER).await {
+            Ok(ids) if !ids.is_empty() => {
+                self.metrics.dropped_total.inc_by(ids.len() as u64);
+                tracing::error!(
+                    count = ids.len(),
+                    ids = ?ids,
+                    "lab events still undelivered after 7 days were dropped; the Lab was unreachable or refused every batch (check LAB_URL and LAB_INSTANCE_*)"
                 );
             }
             Ok(_) => {}

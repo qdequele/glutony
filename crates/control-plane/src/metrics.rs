@@ -43,7 +43,7 @@ impl Default for LabMetrics {
         .expect("valid metric");
         let dropped_total = IntCounter::new(
             "glutony_lab_events_dropped_total",
-            "Lab events dropped after 24 h without acknowledgement",
+            "Lab events dropped undelivered: 24 h after the Lab skipped them, or after 7 days without acknowledgement",
         )
         .expect("valid metric");
         for m in [
