@@ -547,7 +547,19 @@ equivalent. Runs on the `workers-general` queue.
 | `temperature` | `null` | Sampling temperature. |
 | `segment_documents` | `false` | One document per segment with `fields.start` / `fields.end`, else one for the whole file. |
 | `timeout_secs` | `600` | Per-request timeout. |
-| `max_bytes` | `26214400` | Reject larger uploads (the OpenAI limit). |
+| `max_bytes` | `26214400` | Largest upload per request (the OpenAI limit). A larger uncompressed WAV is split into windows that fit; any other larger file is rejected. |
+
+An uncompressed (PCM or IEEE-float) WAV over `max_bytes`, which is what
+`video_audio_extractor` emits for anything longer than about 13 min 39 s, is
+cut on frame boundaries into consecutive windows of at most `max_bytes`, each
+sent as its own request, one after the other. The result reads as if one
+request had been made: the transcripts are joined into the same document,
+segment `start` / `end` are offset to the whole recording, `chunk_index` /
+`chunk_total` count across windows, and `audio_seconds` is the whole length.
+Cuts are fixed, so a word that straddles one can be split between windows. A
+retry of the step sends every window again, and the step's timeout has to
+cover all of them. Compressed audio (MP3, FLAC, OGG, M4A, …) cannot be cut this
+way and is still rejected above `max_bytes`.
 
 ## `video_audio_extractor`
 

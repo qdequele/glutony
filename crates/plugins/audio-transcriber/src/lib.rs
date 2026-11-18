@@ -38,6 +38,13 @@
 //! several endpoints happily demux a container themselves, but the normal pipeline puts
 //! `video_audio_extractor` in front so only the audio track travels over the wire.
 //!
+//! A blob over `max_bytes` (the 25 MiB OpenAI upload limit by default) is rejected,
+//! unless it is an uncompressed WAV, which is what `video_audio_extractor` emits. That
+//! one is cut on frame boundaries into consecutive windows that each fit, sent one
+//! after the other, and the responses are put back together as if one request had
+//! been made: the texts are joined, segment timestamps are offset by the window's
+//! start and segment indexes run across windows.
+//!
 //! ## Output
 //!
 //! With `segment_documents: false` (default) a single [`Document`] whose `content` is
@@ -52,8 +59,8 @@
 //!
 //! ## Usage reporting
 //!
-//! Every successful call reports one `external_requests`. The seconds of audio it was
-//! billed for come from the response's `duration` (`verbose_json` only), or — when the
+//! Every successful call (one per window) reports one `external_requests`. The seconds
+//! of audio it was billed for come from the response's `duration` (`verbose_json` only), or — when the
 //! response format does not carry one — from the exact header of an uncompressed WAV
 //! payload. For a compressed payload with no `duration` the seconds are genuinely
 //! unknowable and are reported as zero rather than guessed from the byte length; see
@@ -105,7 +112,8 @@ pub struct WhisperTranscriberConfig {
     pub segment_documents: bool,
     /// Per-request HTTP timeout, in seconds.
     pub timeout_secs: u64,
-    /// Reject blobs larger than this many bytes before uploading anything.
+    /// Largest upload per request. A larger uncompressed WAV is sent in windows that
+    /// fit; any other larger blob is rejected before uploading anything.
     pub max_bytes: usize,
 }
 
@@ -297,7 +305,7 @@ impl Plugin for WhisperTranscriberPlugin {
                         "type": "integer",
                         "minimum": 1,
                         "default": DEFAULT_MAX_BYTES,
-                        "description": "Reject larger blobs before uploading (OpenAI caps uploads at 25 MiB)"
+                        "description": "Largest upload per request (OpenAI caps uploads at 25 MiB). A larger uncompressed WAV is split into windows that fit; any other larger blob is rejected"
                     }
                 }
             }))
@@ -333,45 +341,108 @@ impl Plugin for WhisperTranscriberPlugin {
         if blob.data.is_empty() {
             return Err(PluginError::invalid_input("empty audio"));
         }
-        if blob.data.len() > cfg.max_bytes {
+        // An uncompressed WAV over the limit goes up in windows that each fit; any
+        // other payload over it is refused before anything is uploaded.
+        let (layout, windows) = if blob.data.len() <= cfg.max_bytes {
+            let whole = Window {
+                bytes: 0..blob.data.len(),
+                start_secs: 0.0,
+                secs: wav_duration_secs(&blob.data),
+            };
+            (None, vec![whole])
+        } else if let Some((layout, windows)) = wav_windows(&blob.data, cfg.max_bytes) {
+            (Some(layout), windows)
+        } else {
             return Err(PluginError::NonRetryable(format!(
-                "{NAME}: {} bytes exceeds max_bytes ({}); split the audio into shorter \
-                 parts or point TRANSCRIBE_BASE_URL at a self-hosted endpoint without \
-                 the 25 MiB upload limit",
+                "{NAME}: {} bytes exceeds max_bytes ({}); only an uncompressed WAV is \
+                 split into requests that fit, so split the audio into shorter parts or \
+                 point TRANSCRIBE_BASE_URL at a self-hosted endpoint without the 25 MiB \
+                 upload limit",
                 blob.data.len(),
                 cfg.max_bytes
             )));
-        }
-        ctx.check_cancelled()?;
-        ctx.heartbeat(format!("{NAME}: uploading {} bytes", blob.data.len()));
+        };
 
         let model = cfg.model.as_deref().unwrap_or(&client.default_model);
         // Always a direct call: a `<provider>/` prefix naming the vendor is stripped.
-        let form = build_form(&blob, &mime, direct_model(&client.base_url, model), &cfg)?;
-        let body = post_transcription(client, form, Duration::from_secs(cfg.timeout_secs)).await?;
-        let parsed = parse_transcription(&body)?;
+        let wire_model = direct_model(&client.base_url, model);
+        let total = windows.len();
+        let mut texts: Vec<String> = Vec::new();
+        let mut segments: Vec<TranscriptionSegment> = Vec::new();
+        let mut any_segments = false;
+        let mut language: Option<String> = None;
+        let mut last_body = String::new();
+        for (index, window) in windows.iter().enumerate() {
+            ctx.check_cancelled()?;
+            let file = match &layout {
+                None => blob.data.clone(),
+                Some(layout) => wav_window(&blob.data, layout, &blob.data[window.bytes.clone()]),
+            };
+            if total == 1 {
+                ctx.heartbeat(format!("{NAME}: uploading {} bytes", file.len()));
+            } else {
+                ctx.heartbeat(format!(
+                    "{NAME}: uploading window {}/{total} ({} bytes)",
+                    index + 1,
+                    file.len()
+                ));
+            }
+            let form = build_form(&blob, file, &mime, wire_model, &cfg)?;
+            let body =
+                post_transcription(client, form, Duration::from_secs(cfg.timeout_secs)).await?;
+            let TranscriptionResponse {
+                text,
+                segments: window_segments,
+                language: detected,
+                duration,
+            } = parse_transcription(&body)?;
 
-        let TranscriptionResponse {
-            text,
-            segments,
-            language: detected,
-            duration,
-        } = parsed;
-        // The endpoint bills per second of audio, so report what it actually got.
-        let mut usage = transcription_usage(duration, &blob.data);
-        ProviderCosts::global().apply(NAME, model, &mut usage);
-        ctx.record_usage(usage);
-        let language = detected
-            .filter(|l| !l.trim().is_empty())
-            .or_else(|| cfg.language.clone());
-        let full_text = match text {
-            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => join_segments(&segments),
-        };
+            // The endpoint bills per second of audio, so report what it actually got.
+            let mut usage = transcription_usage(duration, window.secs);
+            ProviderCosts::global().apply(NAME, model, &mut usage);
+            ctx.record_usage(usage);
+
+            if language.is_none() {
+                language = detected.filter(|l| !l.trim().is_empty());
+            }
+            let window_text = match text {
+                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                _ => join_segments(&window_segments),
+            };
+            if window_segments.is_empty() {
+                // A window the endpoint returned no segments for still contributes its
+                // text, spanning the window, in case another window has segments.
+                if !window_text.is_empty() {
+                    segments.push(TranscriptionSegment {
+                        start: Some(window.start_secs),
+                        end: window.secs.map(|secs| window.start_secs + secs),
+                        text: Some(window_text.clone()),
+                    });
+                }
+            } else {
+                any_segments = true;
+                // Timestamps are relative to the window: shift them onto the recording.
+                segments.extend(window_segments.into_iter().map(|seg| TranscriptionSegment {
+                    start: seg.start.map(|t| t + window.start_secs),
+                    end: seg.end.map(|t| t + window.start_secs),
+                    text: seg.text,
+                }));
+            }
+            if !window_text.is_empty() {
+                texts.push(window_text);
+            }
+            last_body = body;
+        }
+        if !any_segments {
+            // No window had segments: the endpoint ignores `verbose_json`.
+            segments.clear();
+        }
+        let language = language.or_else(|| cfg.language.clone());
+        let full_text = texts.join(" ");
         if full_text.is_empty() && segments.is_empty() {
             return Err(PluginError::non_retryable(format!(
                 "{NAME}: transcription response carries neither `text` nor `segments`: {}",
-                truncate_chars(&body, 512)
+                truncate_chars(&last_body, 512)
             )));
         }
         ctx.heartbeat(format!(
@@ -462,11 +533,12 @@ fn base_id(blob: &Blob) -> String {
 /// optional `language` / `prompt` / `temperature`).
 fn build_form(
     blob: &Blob,
+    file: Vec<u8>,
     mime: &str,
     model: &str,
     cfg: &WhisperTranscriberConfig,
 ) -> Result<reqwest::multipart::Form, PluginError> {
-    let part = reqwest::multipart::Part::bytes(blob.data.clone())
+    let part = reqwest::multipart::Part::bytes(file)
         .file_name(upload_filename(blob, mime))
         .mime_str(mime)
         .map_err(|e| {
@@ -587,10 +659,8 @@ struct TranscriptionSegment {
 /// figure would silently misbill). Those calls report `external_requests: 1` with
 /// zero seconds, so the request is still counted and the seconds are visibly absent
 /// rather than invented.
-fn transcription_usage(duration: Option<f64>, data: &[u8]) -> UsageUnits {
-    let seconds = duration
-        .filter(|d| d.is_finite() && *d >= 0.0)
-        .or_else(|| wav_duration_secs(data));
+fn transcription_usage(duration: Option<f64>, measured: Option<f64>) -> UsageUnits {
+    let seconds = duration.filter(|d| d.is_finite() && *d >= 0.0).or(measured);
     match seconds {
         Some(secs) => UsageUnits::transcription(secs),
         None => UsageUnits {
@@ -616,6 +686,25 @@ fn transcription_usage(duration: Option<f64>, data: &[u8]) -> UsageUnits {
 ///   since decoders read a stream-written file (declared 0 or short) to its end;
 /// * the first `fmt ` and `data` chunks win; later duplicates are ignored.
 fn wav_duration_secs(data: &[u8]) -> Option<f64> {
+    let layout = wav_layout(data)?;
+    Some((data.len() - layout.data_start) as f64 / layout.byte_rate as f64)
+}
+
+/// Where the format and the audio of an uncompressed RIFF/WAVE payload live, read
+/// by the rules of [`wav_duration_secs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WavLayout {
+    /// The body of the first `fmt ` chunk.
+    fmt: std::ops::Range<usize>,
+    /// Bytes per second of audio: sample rate times frame size.
+    byte_rate: u64,
+    /// Bytes per sample frame (one sample of every channel).
+    frame: usize,
+    /// The first byte after the first `data` header. The audio runs to the end.
+    data_start: usize,
+}
+
+fn wav_layout(data: &[u8]) -> Option<WavLayout> {
     /// Uncompressed formats whose frame size is fixed.
     const PCM: u16 = 1;
     const IEEE_FLOAT: u16 = 3;
@@ -635,10 +724,11 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
         return None;
     }
 
-    let mut byte_rate: Option<u64> = None;
-    let mut data_len: Option<u64> = None;
+    // The `fmt ` body, the byte rate and the frame size.
+    let mut format: Option<(std::ops::Range<usize>, u64, u64)> = None;
+    let mut data_start: Option<usize> = None;
     let mut pos = 12usize;
-    while pos + 8 <= data.len() && (byte_rate.is_none() || data_len.is_none()) {
+    while pos + 8 <= data.len() && (format.is_none() || data_start.is_none()) {
         let id = &data[pos..pos + 4];
         let declared = le_u32(&data[pos + 4..])? as usize;
         let body = &data[pos + 8..];
@@ -646,12 +736,12 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
         // clamp so a truncated upload still yields the length of the bytes we hold.
         let len = declared.min(body.len());
         match id {
-            b"fmt " if byte_rate.is_none() => {
+            b"fmt " if format.is_none() => {
                 if len < 16 {
                     return None;
                 }
-                let format: u16 = le_u16(body)?;
-                let uncompressed = match format {
+                let tag: u16 = le_u16(body)?;
+                let uncompressed = match tag {
                     PCM | IEEE_FLOAT => true,
                     // WAVE_FORMAT_EXTENSIBLE names its real format in the GUID that
                     // starts 24 bytes into the chunk.
@@ -672,19 +762,102 @@ fn wav_duration_secs(data: &[u8]) -> Option<f64> {
                 if sample_rate == 0 || frame == 0 || block_align != frame {
                     return None;
                 }
-                byte_rate = Some(sample_rate * frame);
+                format = Some((pos + 8..pos + 8 + len, sample_rate * frame, frame));
             }
-            b"data" if data_len.is_none() => data_len = Some(body.len() as u64),
+            b"data" if data_start.is_none() => data_start = Some(pos + 8),
             _ => {}
         }
         // Chunks are word-aligned: an odd length is followed by a pad byte.
         pos += 8 + len + (len & 1);
     }
 
-    match (byte_rate, data_len) {
-        (Some(rate), Some(len)) => Some(len as f64 / rate as f64),
-        _ => None,
+    let ((fmt, byte_rate, frame), data_start) = (format?, data_start?);
+    Some(WavLayout {
+        fmt,
+        byte_rate,
+        frame: usize::try_from(frame).ok()?,
+        data_start,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Windows
+// ---------------------------------------------------------------------------
+
+/// One request's worth of audio.
+#[derive(Debug, Clone, PartialEq)]
+struct Window {
+    /// The bytes of the blob this window carries: all of them when the blob is not
+    /// split, else a run of whole frames of the WAV's audio.
+    bytes: std::ops::Range<usize>,
+    /// Where the window starts in the whole recording, in seconds.
+    start_secs: f64,
+    /// Its length in seconds, when the payload is an uncompressed WAV.
+    secs: Option<f64>,
+}
+
+/// Cut an uncompressed WAV into windows that each fit in `max_bytes` once
+/// [`wav_window`] gives them their own header.
+///
+/// Windows hold whole frames and follow one another with no gap or overlap, so their
+/// transcripts put back together read as the whole recording (a word straddling a
+/// cut can be split between two windows). `None` when `data` is not an uncompressed
+/// WAV, or when `max_bytes` cannot hold a header and one frame.
+fn wav_windows(data: &[u8], max_bytes: usize) -> Option<(WavLayout, Vec<Window>)> {
+    let layout = wav_layout(data)?;
+    // Every window is a RIFF file, whose lengths are 32-bit.
+    let limit = max_bytes.min(u32::MAX as usize);
+    let per_window = limit.checked_sub(wav_header_len(&layout))? / layout.frame * layout.frame;
+    if per_window == 0 {
+        return None;
     }
+    // A trailing partial frame cannot be played, so it is dropped.
+    let audio = (data.len() - layout.data_start) / layout.frame * layout.frame;
+    let byte_rate = layout.byte_rate as f64;
+    let windows: Vec<Window> = (0..audio)
+        .step_by(per_window)
+        .map(|offset| {
+            let len = per_window.min(audio - offset);
+            let start = layout.data_start + offset;
+            Window {
+                bytes: start..start + len,
+                start_secs: offset as f64 / byte_rate,
+                secs: Some(len as f64 / byte_rate),
+            }
+        })
+        .collect();
+    if windows.is_empty() {
+        return None;
+    }
+    Some((layout, windows))
+}
+
+/// Size of the header [`wav_window`] writes: `RIFF`/`WAVE`, the source's `fmt `
+/// chunk (padded to a word) and the `data` header.
+fn wav_header_len(layout: &WavLayout) -> usize {
+    let fmt = layout.fmt.len();
+    12 + 8 + fmt + (fmt & 1) + 8
+}
+
+/// A standalone WAV file holding `audio`: the source's `fmt ` chunk verbatim, and
+/// `RIFF` and `data` lengths that match what it holds.
+fn wav_window(data: &[u8], layout: &WavLayout, audio: &[u8]) -> Vec<u8> {
+    let fmt = &data[layout.fmt.clone()];
+    let header = wav_header_len(layout);
+    let mut out = Vec::with_capacity(header + audio.len());
+    out.extend_from_slice(b"RIFF");
+    // Both lengths fit: `wav_windows` keeps a window within `u32::MAX` bytes.
+    out.extend_from_slice(&((header - 8 + audio.len()) as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    out.extend_from_slice(fmt);
+    if fmt.len() & 1 == 1 {
+        out.push(0);
+    }
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(audio.len() as u32).to_le_bytes());
+    out.extend_from_slice(audio);
+    out
 }
 
 fn parse_transcription(body: &str) -> Result<TranscriptionResponse, PluginError> {
@@ -1321,6 +1494,214 @@ mod tests {
             (usage.audio_seconds - 3.5).abs() < 1e-9,
             "got {}",
             usage.audio_seconds
+        );
+    }
+
+    /// The WAV file carried in a multipart body (from `RIFF` to the end of the chunk
+    /// its header declares).
+    fn uploaded_wav(body: &[u8]) -> &[u8] {
+        let at = body
+            .windows(4)
+            .position(|w| w == b"RIFF")
+            .expect("a RIFF file in the body");
+        let size = u32::from_le_bytes(body[at + 4..at + 8].try_into().unwrap()) as usize;
+        &body[at..at + 8 + size]
+    }
+
+    #[tokio::test]
+    async fn a_wav_over_max_bytes_is_sent_in_windows_and_reads_as_one_transcript() {
+        // The default 25 MiB holds 819.2 s of 16 kHz mono 16-bit audio: what
+        // `video_audio_extractor` emits for a 13 min 40 s video.
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": format!(" part {n} ") }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let wav = wav_bytes(820.0);
+        assert!(wav.len() > DEFAULT_MAX_BYTES);
+        let ctx = ActivityContext::noop();
+        let docs = plugin(&server)
+            .execute(
+                &ctx,
+                PluginInput::Bytes(Blob::new(wav, "audio/wav", Some("talk.wav".into()))),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, "talk");
+        assert_eq!(docs[0].content, "part 0 part 1");
+        assert!(docs[0].meta.chunk_index.is_none());
+
+        let usage = ctx.usage();
+        assert!(
+            (usage.audio_seconds - 820.0).abs() < 1e-9,
+            "got {}",
+            usage.audio_seconds
+        );
+        assert_eq!(usage.external_requests, 2);
+
+        // Each window is a well-formed WAV within the limit, cut on a frame boundary,
+        // and together they hold every sample.
+        let reqs = server.received_requests().await.unwrap();
+        let mut total = 0.0;
+        for req in &reqs {
+            let window = uploaded_wav(&req.body);
+            assert!(window.len() <= DEFAULT_MAX_BYTES, "{} bytes", window.len());
+            let declared = u32::from_le_bytes(window[40..44].try_into().unwrap()) as usize;
+            assert_eq!(declared, window.len() - 44);
+            assert_eq!(declared % 2, 0);
+            total += wav_duration_secs(window).unwrap();
+        }
+        assert!((total - 820.0).abs() < 1e-9, "windows hold {total}s");
+    }
+
+    #[tokio::test]
+    async fn segments_from_every_window_are_offset_and_numbered_as_one() {
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = match n {
+                    // An endpoint may return no segments for one window: its text
+                    // still comes back, spanning the window.
+                    1 => serde_json::json!({ "text": "middle", "language": "en" }),
+                    _ => serde_json::json!({
+                        "text": format!("w{n}"),
+                        "language": "en",
+                        "duration": if n == 2 { 0.5 } else { 1.0 },
+                        "segments": [
+                            { "start": 0.0, "end": 0.25, "text": format!(" w{n}a") },
+                            { "start": 0.25, "end": 0.5, "text": format!(" w{n}b") }
+                        ]
+                    }),
+                };
+                ResponseTemplate::new(200).set_body_json(body)
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        // 1 s windows (32,000 bytes of audio plus the 44-byte header) over 2.5 s.
+        let ctx = ActivityContext::noop();
+        let docs = plugin(&server)
+            .execute(
+                &ctx,
+                PluginInput::Bytes(Blob::new(
+                    wav_bytes(2.5),
+                    "audio/wav",
+                    Some("call.wav".into()),
+                )),
+                serde_json::json!({ "segment_documents": true, "max_bytes": 32_044 }),
+            )
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+
+        let got: Vec<(String, String, f64, f64, usize)> = docs
+            .iter()
+            .map(|d| {
+                assert_eq!(d.meta.chunk_total, Some(5));
+                assert_eq!(d.meta.parent_id.as_deref(), Some("call"));
+                (
+                    d.id.clone(),
+                    d.content.clone(),
+                    d.fields["start"].as_f64().unwrap(),
+                    d.fields["end"].as_f64().unwrap(),
+                    d.meta.chunk_index.unwrap(),
+                )
+            })
+            .collect();
+        let want = [
+            ("call_t0", "w0a", 0.0, 0.25, 0),
+            ("call_t1", "w0b", 0.25, 0.5, 1),
+            ("call_t2", "middle", 1.0, 2.0, 2),
+            ("call_t3", "w2a", 2.0, 2.25, 3),
+            ("call_t4", "w2b", 2.25, 2.5, 4),
+        ]
+        .map(|(id, text, start, end, i)| (id.to_string(), text.to_string(), start, end, i));
+        assert_eq!(got, want);
+
+        let usage = ctx.usage();
+        assert!(
+            (usage.audio_seconds - 2.5).abs() < 1e-9,
+            "got {}",
+            usage.audio_seconds
+        );
+        assert_eq!(usage.external_requests, 3);
+    }
+
+    #[test]
+    fn windows_find_the_audio_past_extra_chunks_and_keep_every_frame() {
+        // Stereo 16-bit (4-byte frames) with a LIST chunk of odd length (and its pad
+        // byte) between `fmt ` and `data`, and a trailing partial frame.
+        let mut wav = wav_bytes(0.0);
+        wav.truncate(36);
+        wav[22..24].copy_from_slice(&2u16.to_le_bytes()); // channels
+        wav[28..32].copy_from_slice(&64_000u32.to_le_bytes());
+        wav[32..34].copy_from_slice(&4u16.to_le_bytes()); // block align
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&5u32.to_le_bytes());
+        wav.extend_from_slice(b"INFO!\0");
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        let audio: Vec<u8> = (0..1_003u32).map(|i| (i % 251) as u8).collect();
+        wav.extend_from_slice(&audio);
+
+        let (layout, windows) = wav_windows(&wav, 44 + 400).unwrap();
+        assert_eq!(layout.frame, 4);
+        assert_eq!(windows.len(), 3);
+        let mut joined = Vec::new();
+        for (i, w) in windows.iter().enumerate() {
+            let file = wav_window(&wav, &layout, &wav[w.bytes.clone()]);
+            assert!(file.len() <= 44 + 400);
+            assert_eq!(w.start_secs, (i * 400) as f64 / 64_000.0);
+            let own = wav_layout(&file).unwrap();
+            assert_eq!(own.byte_rate, 64_000);
+            assert_eq!(own.data_start, 44);
+            assert_eq!(wav_duration_secs(&file), w.secs);
+            joined.extend_from_slice(&file[own.data_start..]);
+        }
+        // Every whole frame, in order; only the 3-byte partial frame is dropped.
+        assert_eq!(joined, audio[..1_000]);
+    }
+
+    #[tokio::test]
+    async fn a_wav_that_cannot_be_split_under_max_bytes_is_still_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // 45 bytes cannot hold the 44-byte header and one 2-byte frame.
+        let err = plugin(&server)
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(Blob::new(wav_bytes(1.0), "audio/wav", None)),
+                serde_json::json!({ "max_bytes": 45 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("max_bytes")),
+            "{err:?}"
         );
     }
 
