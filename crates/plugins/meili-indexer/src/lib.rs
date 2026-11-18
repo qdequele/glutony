@@ -10,8 +10,10 @@
 //! Behaviour:
 //! 1. validate the config (`host`, `api_key` and `index` are mandatory);
 //! 2. look the index up with `GET /indexes/{uid}`. When it does not exist and
-//!    `auto_create_index` (default `true`) is set, enqueue its creation with
-//!    `primary_key`, without waiting: Meilisearch runs tasks in enqueue order, so the
+//!    `auto_create_index` is `false`, fail with a [`PluginError::NonRetryable`] naming
+//!    the index and send nothing: an addition would make Meilisearch create it
+//!    implicitly. Otherwise (the default) enqueue its creation with `primary_key`,
+//!    without waiting: Meilisearch runs tasks in enqueue order, so the
 //!    document additions sent next always run after it, and waiting would only double
 //!    the time spent behind other tenants' tasks on a busy instance. Its outcome is
 //!    checked once the documents are done;
@@ -331,8 +333,6 @@ async fn wait_for_task(
 /// What [`ensure_index`] found (or did) for the target index.
 #[derive(Debug)]
 enum IndexState {
-    /// The index did not exist and `auto_create_index` is off: nothing was enqueued.
-    Missing,
     /// The index did not exist; its creation (with the configured key) was enqueued.
     Creating(TaskInfo),
     /// The index exists, with its own primary key or none yet.
@@ -348,22 +348,21 @@ impl IndexState {
             Self::Existing {
                 primary_key: Some(_),
             } => None,
-            Self::Missing | Self::Creating(_) | Self::Existing { primary_key: None } => {
-                Some(configured)
-            }
+            Self::Creating(_) | Self::Existing { primary_key: None } => Some(configured),
         }
     }
 
     fn creation(&self) -> Option<&TaskInfo> {
         match self {
             Self::Creating(task) => Some(task),
-            Self::Missing | Self::Existing { .. } => None,
+            Self::Existing { .. } => None,
         }
     }
 }
 
-/// Look the index up. When it does not exist and `create` is set, enqueue its creation
-/// (with `primary_key`) without waiting for it.
+/// Look the index up. When it does not exist, enqueue its creation (with
+/// `primary_key`) without waiting for it if `create` is set, else fail: sending
+/// documents to a missing index would have Meilisearch create it anyway.
 async fn ensure_index(
     client: &Client,
     uid: &str,
@@ -387,7 +386,10 @@ async fn ensure_index(
                 primary_key: index.primary_key,
             })
         }
-        Err(e) if is_index_not_found(&e) && !create => Ok(IndexState::Missing),
+        Err(e) if is_index_not_found(&e) && !create => Err(PluginError::NonRetryable(format!(
+            "{NAME}: index {uid:?} does not exist and auto_create_index is false; create \
+             it first, or check the index uid"
+        ))),
         Err(e) if is_index_not_found(&e) => {
             tracing::info!(plugin = NAME, index = %uid, primary_key = %primary_key, "creating index");
             client
@@ -479,7 +481,7 @@ impl Plugin for MeiliIndexerPlugin {
                     "auto_create_index": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Create the index when GET /indexes/{uid} returns 404. The lookup runs either way, so an existing primary key is respected."
+                        "description": "Create the index when GET /indexes/{uid} returns 404. When false, a missing index fails the step (non-retryable) and no documents are sent, since Meilisearch would otherwise create the index on the first addition. The lookup runs either way, so an existing primary key is respected."
                     },
                     "batch_size": {
                         "type": "integer",
@@ -1294,30 +1296,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_create_index_false_does_not_create_a_missing_index() {
-        // The index is still looked up (to learn its primary key), but a missing one is
-        // not created: the additions go out with the configured key, as before.
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/indexes/{INDEX}")))
-            .respond_with(ResponseTemplate::new(404).set_body_json(index_not_found()))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/indexes"))
-            .respond_with(ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")))
-            .expect(0)
-            .mount(&server)
-            .await;
-        mount_documents_add(&server, 3, 1, Some("id")).await;
-        let mut cfg = config(&server.uri());
-        cfg["auto_create_index"] = json!(false);
-        cfg["wait_for_completion"] = json!(false);
-        let out = run(&server, PluginInput::Documents(docs()), cfg)
-            .await
-            .unwrap();
-        assert_eq!(out.document_count(), 2);
+    async fn auto_create_index_false_fails_on_a_missing_index_without_sending_anything() {
+        // Sending the additions anyway would make Meilisearch create the index
+        // implicitly (with a key that may create indexes), which is what the flag is
+        // there to prevent: a typo in the uid must fail the step, not add an index.
+        for input in [PluginInput::Documents(docs()), PluginInput::Empty] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/indexes/{INDEX}")))
+                .respond_with(ResponseTemplate::new(404).set_body_json(index_not_found()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/indexes"))
+                .respond_with(
+                    ResponseTemplate::new(202).set_body_json(task_info(1, "indexCreation")),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(format!("/indexes/{INDEX}/documents")))
+                .respond_with(
+                    ResponseTemplate::new(202)
+                        .set_body_json(task_info(3, "documentAdditionOrUpdate")),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            let mut cfg = config(&server.uri());
+            cfg["auto_create_index"] = json!(false);
+            cfg["wait_for_completion"] = json!(false);
+            match run(&server, input, cfg).await {
+                Err(PluginError::NonRetryable(msg)) => {
+                    assert!(msg.contains(&format!("{INDEX:?}")), "{msg}");
+                    assert!(msg.contains("auto_create_index"), "{msg}");
+                }
+                other => panic!("expected NonRetryable, got {other:?}"),
+            }
+        }
     }
 
     fn index_with_primary_key(primary_key: Value) -> Value {

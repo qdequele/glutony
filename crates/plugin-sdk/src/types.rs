@@ -1810,7 +1810,9 @@ pub struct IndexerConfig {
     /// has one keeps its own.
     #[serde(default = "default_primary_key")]
     pub primary_key: String,
-    /// Create the index if missing.
+    /// Create the index if missing. When `false`, a missing index fails the step
+    /// (non-retryable) and no documents are sent: an addition would have Meilisearch
+    /// create the index implicitly.
     #[serde(default = "default_true")]
     pub auto_create_index: bool,
     /// Maximum documents per `addDocuments` request.

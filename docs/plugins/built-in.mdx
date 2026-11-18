@@ -387,7 +387,7 @@ the request.
 | Key | Default | Description |
 |---|---|---|
 | `primary_key` | `"id"` | Primary key declared when creating the index, and sent as `?primaryKey` on additions while the index has none. An index that already has a primary key keeps its own. |
-| `auto_create_index` | `true` | Create the index when it does not exist. |
+| `auto_create_index` | `true` | Create the index when it does not exist. When `false`, a missing index fails the step and no documents are sent (Meilisearch would otherwise create the index on the first addition). |
 | `connection` | none | Name of a Meilisearch [connection](/concepts/connections) to index into. It wins over the request's `MeiliContext`, and pipelines run by a scheduled source need one. |
 | `index` | resolved | Pin the target index uid. When unset it comes from the pipeline's `trigger.index_pattern`, then the request, then the deployment default. |
 | `batch_size` | `1000` | Documents per `addDocuments` request. |
@@ -399,7 +399,8 @@ If the target index already exists with a primary key (for example `uid` on an
 index a Scrapix crawl created), additions are sent without `?primaryKey` and
 Meilisearch uses the index's own key, whatever `primary_key` says. Documents are
 not rewritten: if they lack that field, Meilisearch rejects them and the step
-fails with its error. The index is looked up even with `auto_create_index: false`.
+fails with its error. The index is looked up even with `auto_create_index: false`,
+and a missing one then fails the step (not retried), naming the index uid.
 
 Returns `Indexed { index, document_count, task_uids }`.
 
