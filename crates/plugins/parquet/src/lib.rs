@@ -43,6 +43,8 @@
 //! the row groups' row counts and the page headers' value counts are checked, so a
 //! small file whose one list cell holds millions of values is refused up front. Each
 //! record batch is then measured from its Arrow arrays before it is rendered to JSON.
+//! Strings and binaries are read as Arrow view arrays, so a dictionary-encoded column
+//! is not copied once per row before its batch can be measured.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type};
@@ -51,7 +53,7 @@ use arrow_array::{
 };
 use arrow_json::writer::{JsonArray, NullableEncoder, WriterBuilder};
 use arrow_json::{Encoder, EncoderFactory, EncoderOptions};
-use arrow_schema::{ArrowError, DataType, FieldRef};
+use arrow_schema::{ArrowError, DataType, FieldRef, Schema, SchemaRef};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -62,7 +64,9 @@ use meili_ingest_plugin_json::{
 };
 use meili_ingest_plugin_sdk::prelude::*;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::column::page::PageReader;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::serialized_reader::SerializedPageReader;
@@ -228,6 +232,49 @@ fn effective_batch_size(cfg: &Config, limits: DecodeLimits) -> usize {
 
 fn unreadable(e: impl std::fmt::Display) -> PluginError {
     PluginError::InvalidInput(format!("{NAME}: unreadable Parquet: {e}"))
+}
+
+/// `data_type` with every string and binary array read as its view type, at any
+/// depth. Parquet dictionary-encodes string columns by default; read as `Utf8`,
+/// each row gets its own copy of its dictionary value, so a short dictionary of
+/// long strings can take gigabytes before a batch can be measured. A view array
+/// points into the dictionary page instead, and [`element_sizes`] still counts
+/// each row at its rendered length. Arrow dictionaries are kept as they are: they
+/// share their values already.
+fn as_views(data_type: &DataType) -> DataType {
+    let field = |f: &FieldRef| Arc::new(f.as_ref().clone().with_data_type(as_views(f.data_type())));
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+        DataType::Binary | DataType::LargeBinary => DataType::BinaryView,
+        DataType::List(f) => DataType::List(field(f)),
+        DataType::LargeList(f) => DataType::LargeList(field(f)),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(field(f), *n),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+        DataType::Map(f, sorted) => DataType::Map(field(f), *sorted),
+        other => other.clone(),
+    }
+}
+
+/// `schema` with its string and binary columns read as views, see [`as_views`].
+fn view_schema(schema: &Schema) -> SchemaRef {
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|f| Arc::new(f.as_ref().clone().with_data_type(as_views(f.data_type()))))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// A reader of `data` with the file's own Arrow types, except that strings and
+/// binaries are read as views ([`as_views`]).
+fn reader_builder(data: Bytes) -> Result<ParquetRecordBatchReaderBuilder<Bytes>, PluginError> {
+    let file = ParquetRecordBatchReaderBuilder::try_new(data.clone()).map_err(unreadable)?;
+    let options = ArrowReaderOptions::new().with_schema(view_schema(file.schema()));
+    let metadata =
+        ArrowReaderMetadata::try_new(Arc::clone(file.metadata()), options).map_err(unreadable)?;
+    Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+        data, metadata,
+    ))
 }
 
 /// The value levels the reader will decode: one per leaf value, null or empty
@@ -452,9 +499,8 @@ fn decode_payload(
     }
 
     let data = Bytes::from(data);
-    let mut builder = ParquetRecordBatchReaderBuilder::try_new(data.clone())
-        .map_err(unreadable)?
-        .with_batch_size(effective_batch_size(cfg, limits));
+    let mut builder =
+        reader_builder(data.clone())?.with_batch_size(effective_batch_size(cfg, limits));
     let mut budget = DecodeBudget::new(limits, NAME);
 
     let mask = match &cfg.columns {
@@ -1108,6 +1154,30 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_string_column_is_measured_without_copying_its_dictionary_per_row() {
+        // An ordinary Utf8 column: ArrowWriter dictionary-encodes it on disk, so
+        // 1024 rows repeating one 256 KiB string hold it once in the file (a few KB
+        // once compressed), and 256 MiB once each row holds its own copy.
+        let big = "x".repeat(256 * 1024);
+        let column = StringArray::from(vec![big.as_str(); 1024]);
+        let batch =
+            RecordBatch::try_from_iter(vec![("v", Arc::new(column) as ArrayRef)]).expect("batch");
+        let data = parquet_file(&[batch]);
+        assert!(data.len() < 2 * big.len(), "{} bytes", data.len());
+        let limit = 4 * 1024 * 1024;
+        let limits = DecodeLimits {
+            max_decoded_bytes: limit,
+            ..DecodeLimits::default()
+        };
+        let (err, peak) = refused_with_peak(data, json!({}), limits);
+        assert_too_large(&err);
+        assert!(
+            peak < 2 * limit as usize,
+            "held {peak} bytes before refusing"
+        );
+    }
+
+    #[test]
     fn the_batch_size_never_exceeds_the_row_limit_or_the_ceiling() {
         let limits = DecodeLimits {
             max_rows: 3,
@@ -1190,13 +1260,27 @@ mod tests {
             ("dict", Arc::new(dict) as ArrayRef),
         ])
         .expect("batch");
-        let reread: Vec<RecordBatch> =
-            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet_file(&[batch])))
-                .unwrap()
-                .build()
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
+        let file = Bytes::from(parquet_file(&[batch]));
+        let reread: Vec<RecordBatch> = reader_builder(file.clone())
+            .unwrap()
+            .build()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Reading strings and binaries as views does not change what is rendered.
+        let as_written: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(reread.len(), as_written.len());
+        for (viewed, written) in reread.iter().zip(&as_written) {
+            assert_eq!(
+                String::from_utf8(render(viewed).unwrap()).unwrap(),
+                String::from_utf8(render(written).unwrap()).unwrap()
+            );
+        }
         for batch in &reread {
             let bound = decoded_upper_bound(batch).unwrap();
             let decoded: Vec<Value> = serde_json::from_slice(&render(batch).unwrap()).unwrap();
