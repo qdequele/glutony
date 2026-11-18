@@ -28,6 +28,9 @@ use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+pub mod limits;
+pub use limits::{DecodeBudget, DecodeLimits, decoded_size};
+
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "json_flattener";
 

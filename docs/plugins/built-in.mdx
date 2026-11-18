@@ -139,8 +139,18 @@ reader, so unselected columns are never decoded.
 | `content_fields` | every string leaf | Keys joined by a space into `content`. |
 | `title_field` | — | Key mapped onto `title`. |
 | `columns` | all | Columns to read, pushed down as a projection. An unknown name is an error. |
-| `max_rows` | — | Stop after this many rows. |
+| `max_rows` | — | Stop after this many rows. It can only lower the worker's limit below. |
 | `batch_size` | `1024` | Rows decoded per record batch. |
+
+<Note>
+`parquet_parser`, `avro_parser` and `msgpack_parser` decode at most
+`PARSER_MAX_ROWS` rows (default 1,000,000) and `PARSER_MAX_DECODED_MB` of decoded
+data (default 512) per step, whatever the step's `max_rows` / `max_records`. A file
+over either fails the step without a retry and nothing of it is indexed: it is not
+truncated. A Parquet file is checked against the row count its footer declares
+before any row is decoded. Split larger files, or raise the limits on the worker
+([environment variables](/deployment/environment-variables)).
+</Note>
 
 ### `avro_parser`
 
@@ -156,7 +166,7 @@ that was actually written, so `["null","string"]` is just a string.
 | `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_r<row>`. |
 | `content_fields` | every string leaf | Keys joined by a space into `content`. |
 | `title_field` | — | Key mapped onto `title`. |
-| `max_records` | — | Stop after this many records. |
+| `max_records` | — | Stop after this many records. It can only lower the worker's `PARSER_MAX_ROWS` (see `parquet_parser`). |
 
 ### `msgpack_parser`
 
@@ -177,7 +187,7 @@ content type, or route it with an explicit pipeline.
 | `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_<index>`. |
 | `content_fields` | every string leaf | Keys joined by a space into `content`. |
 | `title_field` | — | Key mapped onto `title`. |
-| `max_records` | — | Stop after this many documents. |
+| `max_records` | — | Stop after this many documents. It can only lower the worker's `PARSER_MAX_ROWS` (see `parquet_parser`). |
 
 ### `image_captioner`
 

@@ -49,7 +49,8 @@ async fn main() -> anyhow::Result<()> {
     // Plugins
     // With LAB_AI_GATEWAY, AI plugins without their env key still register: a Lab
     // tenant's step runs on the team's Gateway; any other fails naming the key.
-    let mut registry = PluginRegistry::builtin_with(config.lab_ai_gateway);
+    tracing::info!(limits = ?config.parser_limits, "record parser limits");
+    let mut registry = PluginRegistry::builtin_with(config.lab_ai_gateway, config.parser_limits);
     if let Some(spec) = &config.external_plugins {
         registry.load_external(spec).await;
     }

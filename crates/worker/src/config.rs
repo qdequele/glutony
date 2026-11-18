@@ -38,6 +38,9 @@ pub struct WorkerConfig {
     /// Decompressed archive content held in memory at once, in bytes
     /// (`ARCHIVE_INFLIGHT_MB`).
     pub archive_inflight_bytes: u64,
+    /// Bounds on one Parquet / Avro / MessagePack step (`PARSER_MAX_ROWS`,
+    /// `PARSER_MAX_DECODED_MB`).
+    pub parser_limits: meili_ingest_plugin_json::DecodeLimits,
 }
 
 /// Default of `SHUTDOWN_GRACE_SECS`: with [`SHUTDOWN_HARD_MARGIN`] the worker is gone
@@ -67,6 +70,7 @@ impl WorkerConfig {
         let shutdown_grace = shutdown_grace(std::env::var("SHUTDOWN_GRACE_SECS").ok().as_deref())?;
         let archive_limits = archive_limits(|name| std::env::var(name).ok())?;
         let archive_inflight_bytes = archive_inflight_bytes(|name| std::env::var(name).ok())?;
+        let parser_limits = parser_limits(|name| std::env::var(name).ok())?;
         Ok(Self {
             temporal_url: std::env::var("TEMPORAL_URL")
                 .unwrap_or_else(|_| "http://temporal-frontend:7233".to_string()),
@@ -93,6 +97,7 @@ impl WorkerConfig {
             shutdown_grace,
             archive_limits,
             archive_inflight_bytes,
+            parser_limits,
         })
     }
 }
@@ -142,6 +147,20 @@ pub fn archive_inflight_bytes(env: impl Fn(&str) -> Option<String>) -> anyhow::R
         }))
 }
 
+/// What one `parquet_parser` / `avro_parser` / `msgpack_parser` step may decode
+/// (`PARSER_MAX_ROWS`, `PARSER_MAX_DECODED_MB`), each from its variable when set
+/// (blank is unset), with the same rules as [`archive_limits`].
+pub fn parser_limits(
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<meili_ingest_plugin_json::DecodeLimits> {
+    let defaults = meili_ingest_plugin_json::DecodeLimits::default();
+    Ok(meili_ingest_plugin_json::DecodeLimits {
+        max_rows: positive_var(&env, "PARSER_MAX_ROWS")?.unwrap_or(defaults.max_rows),
+        max_decoded_bytes: positive_var(&env, "PARSER_MAX_DECODED_MB")?
+            .map_or(defaults.max_decoded_bytes, |n| n.saturating_mul(MIB)),
+    })
+}
+
 impl std::fmt::Debug for WorkerConfig {
     /// Redacts `control_plane_token`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,6 +182,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("shutdown_grace", &self.shutdown_grace)
             .field("archive_limits", &self.archive_limits)
             .field("archive_inflight_bytes", &self.archive_inflight_bytes)
+            .field("parser_limits", &self.parser_limits)
             .finish()
     }
 }
@@ -316,6 +336,7 @@ mod tests {
             shutdown_grace: std::time::Duration::from_secs(1),
             archive_limits: meili_ingest_archive::Limits::default(),
             archive_inflight_bytes: crate::archive_activity::DEFAULT_INFLIGHT_BYTES,
+            parser_limits: meili_ingest_plugin_json::DecodeLimits::default(),
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("cp-token-value"), "{shown}");
@@ -367,6 +388,35 @@ mod tests {
             let env = |name: &str| (name == "ARCHIVE_INFLIGHT_MB").then(|| bad.to_string());
             let err = super::archive_inflight_bytes(env).unwrap_err().to_string();
             assert!(err.contains("ARCHIVE_INFLIGHT_MB"), "{err}");
+        }
+    }
+
+    #[test]
+    fn parser_limits_default_and_parse() {
+        use meili_ingest_plugin_json::DecodeLimits;
+        assert_eq!(
+            super::parser_limits(|_| None).unwrap(),
+            DecodeLimits::default()
+        );
+        let env = |name: &str| match name {
+            "PARSER_MAX_ROWS" => Some(" 5000 ".to_string()),
+            "PARSER_MAX_DECODED_MB" => Some("64".to_string()),
+            _ => None,
+        };
+        let l = super::parser_limits(env).unwrap();
+        assert_eq!(l.max_rows, 5000);
+        assert_eq!(l.max_decoded_bytes, 64 * 1024 * 1024);
+        let blank = |name: &str| (name == "PARSER_MAX_ROWS").then(String::new);
+        assert_eq!(
+            super::parser_limits(blank).unwrap().max_rows,
+            DecodeLimits::default().max_rows
+        );
+        for var in ["PARSER_MAX_ROWS", "PARSER_MAX_DECODED_MB"] {
+            for bad in ["0", "-1", "lots"] {
+                let env = |name: &str| (name == var).then(|| bad.to_string());
+                let err = super::parser_limits(env).unwrap_err().to_string();
+                assert!(err.contains(var), "{err}");
+            }
         }
     }
 }

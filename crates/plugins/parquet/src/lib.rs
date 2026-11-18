@@ -31,15 +31,22 @@
 //! | `columns`        | all     | columns to read; pushed down as a projection |
 //! | `flatten_arrays` | `false` | flatten arrays of objects into `a.0.b` keys instead of keeping them as JSON arrays |
 //! | `max_depth`      | `8`     | nesting depth beyond which objects are kept as-is |
-//! | `max_rows`       | unlimited | stop after this many rows |
+//! | `max_rows`       | none    | stop after this many rows (truncates) |
 //! | `batch_size`     | `1024`  | rows decoded per record batch |
+//!
+//! Whatever the step says, the worker's [`DecodeLimits`] (`PARSER_MAX_ROWS`,
+//! `PARSER_MAX_DECODED_MB`) bound what one file may decode: a file over either fails
+//! the step as invalid input instead of being truncated. The footer's row count is
+//! checked first, so an oversized file is refused before any row is decoded.
 
 use arrow_json::ArrayWriter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use meili_ingest_plugin_json::{FlattenConfig, documents_from_values, id_stem};
+use meili_ingest_plugin_json::{
+    DecodeBudget, DecodeLimits, FlattenConfig, decoded_size, documents_from_values, id_stem,
+};
 use meili_ingest_plugin_sdk::prelude::*;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -55,14 +62,21 @@ const MAGIC: &[u8; 4] = b"PAR1";
 /// Default rows per decoded record batch.
 const DEFAULT_BATCH_SIZE: usize = 1_024;
 
-/// The Parquet parser plugin. Stateless; construct with [`ParquetParserPlugin::new`].
+/// The Parquet parser plugin. Construct with [`ParquetParserPlugin::new`].
 #[derive(Debug, Clone, Default)]
-pub struct ParquetParserPlugin;
+pub struct ParquetParserPlugin {
+    limits: DecodeLimits,
+}
 
 impl ParquetParserPlugin {
-    /// Create the plugin.
+    /// Create the plugin with the default [`DecodeLimits`].
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create the plugin with the worker's [`DecodeLimits`].
+    pub fn with_limits(limits: DecodeLimits) -> Self {
+        Self { limits }
     }
 }
 
@@ -139,9 +153,13 @@ impl Config {
 /// Arrow's own JSON writer does the per-cell type mapping, so the 40-odd Arrow
 /// types (decimals, dictionaries, timestamps with zones, nested lists) are
 /// rendered the canonical way instead of by a hand-written table here.
+///
+/// The rows produced (after `max_rows`) and their decoded size are counted against
+/// `limits`; going over either fails with [`PluginError::InvalidInput`].
 fn decode_payload(
     data: Vec<u8>,
     cfg: &Config,
+    limits: DecodeLimits,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Value>, PluginError> {
     if data.len() < MAGIC.len() * 2 || !data.starts_with(MAGIC) || !data.ends_with(MAGIC) {
@@ -153,6 +171,18 @@ fn decode_payload(
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data))
         .map_err(|e| PluginError::InvalidInput(format!("{NAME}: unreadable Parquet: {e}")))?
         .with_batch_size(cfg.batch_size);
+    let mut budget = DecodeBudget::new(limits, NAME);
+
+    // The footer's row count is cheap and refuses an oversized file before any
+    // decode. It is the file's own claim, so the loop below still counts every row.
+    let declared = u64::try_from(builder.metadata().file_metadata().num_rows()).unwrap_or(0);
+    budget.check_rows(
+        cfg.max_rows
+            .map_or(declared, |max| declared.min(max as u64)),
+    )?;
+    if let Some(max) = cfg.max_rows {
+        builder = builder.with_limit(max);
+    }
 
     if let Some(columns) = &cfg.columns {
         let known: Vec<String> = builder
@@ -191,20 +221,21 @@ fn decode_payload(
         }
         let batch =
             batch.map_err(|e| PluginError::InvalidInput(format!("{NAME}: bad row group: {e}")))?;
+        budget.add_rows(batch.num_rows() as u64)?;
         let mut buf = Vec::new();
         let mut writer = ArrayWriter::new(&mut buf);
         writer
             .write(&batch)
             .and_then(|()| writer.finish())
             .map_err(|e| PluginError::NonRetryable(format!("{NAME}: cannot render batch: {e}")))?;
+        drop(batch);
+        // The JSON text is smaller than the values parsed from it: refuse a batch
+        // that cannot fit before parsing it.
+        budget.check_bytes(buf.len() as u64)?;
         let decoded: Vec<Value> = serde_json::from_slice(&buf)?;
+        drop(buf);
+        budget.add_bytes(decoded.iter().map(decoded_size).sum())?;
         rows.extend(decoded);
-        if cfg.max_rows.is_some_and(|max| rows.len() >= max) {
-            break;
-        }
-    }
-    if let Some(max) = cfg.max_rows {
-        rows.truncate(max);
     }
     Ok(rows)
 }
@@ -262,7 +293,7 @@ impl Plugin for ParquetParserPlugin {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "default": null,
-                        "description": "Stop after this many rows."
+                        "description": "Stop after this many rows. The worker's PARSER_MAX_ROWS still applies."
                     },
                     "batch_size": {
                         "type": "integer",
@@ -294,10 +325,11 @@ impl Plugin for ParquetParserPlugin {
         };
         // Moved, not cloned: nothing below reads the bytes again.
         let data = std::mem::take(&mut blob.data);
+        let limits = self.limits;
         let ctx = ctx.clone();
         // Decoding and flattening are CPU-bound: keep them off the async runtime.
         let docs = run_blocking(move || {
-            let rows = decode_payload(data, &cfg, &ctx.cancellation_flag())?;
+            let rows = decode_payload(data, &cfg, limits, &ctx.cancellation_flag())?;
             ctx.heartbeat(format!("{NAME}: {} rows decoded", rows.len()));
             let items = rows
                 .into_iter()
@@ -374,7 +406,7 @@ mod tests {
 
     #[test]
     fn manifest_is_correct() {
-        let m = ParquetParserPlugin.manifest();
+        let m = ParquetParserPlugin::new().manifest();
         assert_eq!(m.name, NAME);
         assert_eq!(m.accepts, vec![InputKind::Bytes]);
         assert_eq!(m.produces, OutputKind::Documents);
@@ -559,6 +591,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_default_row_limit_fails_instead_of_filling_memory() {
+        // A million and one identical values: a few KB on disk once RLE-encoded.
+        let rows = meili_ingest_plugin_json::limits::DEFAULT_MAX_ROWS as usize + 1;
+        let batch = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(Int64Array::from(vec![7; rows])) as ArrayRef,
+        )])
+        .expect("batch");
+        let data = parquet_file(&[batch]);
+        assert!(data.len() < 64 * 1024, "{} bytes", data.len());
+        let err = ParquetParserPlugin::new()
+            .execute(&ActivityContext::noop(), bytes(data, None), Value::Null)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_worker_limits_bound_rows_and_decoded_bytes_and_a_step_cannot_raise_them() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as ArrayRef,
+        )])
+        .expect("batch");
+        let data = parquet_file(&[batch]);
+        let rows_cap = ParquetParserPlugin::with_limits(DecodeLimits {
+            max_rows: 3,
+            ..DecodeLimits::default()
+        });
+        let ctx = ActivityContext::noop();
+        let exec = |plugin: &ParquetParserPlugin, cfg: Value| {
+            let plugin = plugin.clone();
+            let (ctx, data) = (ctx.clone(), data.clone());
+            async move { plugin.execute(&ctx, bytes(data, None), cfg).await }
+        };
+
+        for cfg in [json!({}), json!({"max_rows": 4}), json!({"batch_size": 1})] {
+            let err = exec(&rows_cap, cfg.clone()).await.unwrap_err();
+            assert!(
+                matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+                "{cfg}: {err}"
+            );
+        }
+        // Lowering the count below the cap is the step's own truncation.
+        match exec(&rows_cap, json!({"max_rows": 3})).await.unwrap() {
+            PluginOutput::Documents(d) => assert_eq!(d.len(), 3),
+            other => panic!("{other:?}"),
+        }
+
+        // Five one-letter strings take more than 4 nodes' worth of memory.
+        let bytes_cap = ParquetParserPlugin::with_limits(DecodeLimits {
+            max_decoded_bytes: 4 * meili_ingest_plugin_json::limits::NODE_BYTES,
+            ..DecodeLimits::default()
+        });
+        for cfg in [json!({}), json!({"batch_size": 1})] {
+            let err = exec(&bytes_cap, cfg.clone()).await.unwrap_err();
+            assert!(
+                matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_DECODED_MB")),
+                "{cfg}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

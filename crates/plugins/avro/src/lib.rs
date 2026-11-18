@@ -33,7 +33,12 @@
 //! | `title_field`    | none    | flattened key mapped onto `title` (removed from `fields`) |
 //! | `flatten_arrays` | `false` | flatten arrays of objects into `a.0.b` keys instead of keeping them as JSON arrays |
 //! | `max_depth`      | `8`     | nesting depth beyond which objects are kept as-is |
-//! | `max_records`    | unlimited | stop after this many records |
+//! | `max_records`    | none    | stop after this many records (truncates) |
+//!
+//! Whatever the step says, the worker's [`DecodeLimits`] (`PARSER_MAX_ROWS`,
+//! `PARSER_MAX_DECODED_MB`) bound what one file may decode: a file over either fails
+//! the step as invalid input instead of being truncated. Each record is counted as
+//! it is decoded, so the step stops at the record that goes over.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +49,9 @@ use apache_avro::{Decimal as AvDecimal, Reader};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, NaiveTime};
-use meili_ingest_plugin_json::{FlattenConfig, documents_from_values, id_stem};
+use meili_ingest_plugin_json::{
+    DecodeBudget, DecodeLimits, FlattenConfig, decoded_size, documents_from_values, id_stem,
+};
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -55,14 +62,21 @@ pub const NAME: &str = "avro_parser";
 /// Seconds in a day, for turning an Avro `date` into a calendar date.
 const SECS_PER_DAY: i64 = 86_400;
 
-/// The Avro parser plugin. Stateless; construct with [`AvroParserPlugin::new`].
+/// The Avro parser plugin. Construct with [`AvroParserPlugin::new`].
 #[derive(Debug, Clone, Default)]
-pub struct AvroParserPlugin;
+pub struct AvroParserPlugin {
+    limits: DecodeLimits,
+}
 
 impl AvroParserPlugin {
-    /// Create the plugin.
+    /// Create the plugin with the default [`DecodeLimits`].
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create the plugin with the worker's [`DecodeLimits`].
+    pub fn with_limits(limits: DecodeLimits) -> Self {
+        Self { limits }
     }
 }
 
@@ -293,10 +307,12 @@ fn convert(value: Av, schema: Option<&Schema>, names: &NamesRef, namespace: Name
     }
 }
 
-/// Read every record of an OCF payload, honouring `max_records`.
+/// Read every record of an OCF payload, honouring `max_records`, and counting
+/// each record and its decoded size against `limits`.
 fn decode_payload(
     data: &[u8],
     max_records: Option<usize>,
+    limits: DecodeLimits,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Value>, PluginError> {
     let reader = Reader::new(data).map_err(|e| {
@@ -310,6 +326,7 @@ fn decode_payload(
     })?;
     let names = resolved.get_names();
 
+    let mut budget = DecodeBudget::new(limits, NAME);
     let mut out = Vec::new();
     for (i, record) in reader.enumerate() {
         if max_records.is_some_and(|max| out.len() >= max) {
@@ -321,7 +338,10 @@ fn decode_payload(
         let record = record.map_err(|e| {
             PluginError::InvalidInput(format!("{NAME}: invalid Avro record {}: {e}", i + 1))
         })?;
-        out.push(convert(record, Some(&schema), names, None));
+        budget.add_rows(1)?;
+        let value = convert(record, Some(&schema), names, None);
+        budget.add_bytes(decoded_size(&value))?;
+        out.push(value);
     }
     Ok(out)
 }
@@ -373,7 +393,7 @@ impl Plugin for AvroParserPlugin {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "default": null,
-                        "description": "Stop after this many records."
+                        "description": "Stop after this many records. The worker's PARSER_MAX_ROWS still applies."
                     }
                 }
             }))
@@ -400,10 +420,11 @@ impl Plugin for AvroParserPlugin {
         // Moved, not cloned: nothing below reads the bytes again.
         let data = std::mem::take(&mut blob.data);
         let max_records = cfg.max_records;
+        let limits = self.limits;
         let ctx = ctx.clone();
         // Decoding and flattening are CPU-bound: keep them off the async runtime.
         let docs = run_blocking(move || {
-            let roots = decode_payload(&data, max_records, &ctx.cancellation_flag())?;
+            let roots = decode_payload(&data, max_records, limits, &ctx.cancellation_flag())?;
             drop(data);
             let items = roots
                 .into_iter()
@@ -459,7 +480,7 @@ mod tests {
 
     #[test]
     fn manifest_is_correct() {
-        let m = AvroParserPlugin.manifest();
+        let m = AvroParserPlugin::new().manifest();
         assert_eq!(m.name, NAME);
         assert_eq!(m.accepts, vec![InputKind::Bytes]);
         assert_eq!(m.produces, OutputKind::Documents);
@@ -775,6 +796,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_default_row_limit_fails_instead_of_filling_memory() {
+        // `null` records take no bytes at all: a tiny file, a million and one rows.
+        let schema = Schema::parse_str(r#""null""#).expect("schema");
+        let mut writer = Writer::new(&schema, Vec::new()).expect("writer");
+        for _ in 0..=meili_ingest_plugin_json::limits::DEFAULT_MAX_ROWS {
+            writer.append_value(Av::Null).expect("append");
+        }
+        let data = writer.into_inner().expect("finish");
+        assert!(data.len() < 64 * 1024, "{} bytes", data.len());
+        let err = AvroParserPlugin::new()
+            .execute(&ActivityContext::noop(), bytes(data, None), Value::Null)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_worker_limits_bound_records_and_decoded_bytes() {
+        let schema = r#"{"type":"record","name":"R","fields":[{"name":"v","type":"string"}]}"#;
+        let rows: Vec<Vec<(&str, Av)>> = (0..5)
+            .map(|i| vec![("v", Av::String(format!("v{i}")))])
+            .collect();
+        let data = ocf(schema, rows);
+        let ctx = ActivityContext::noop();
+
+        let rows_cap = AvroParserPlugin::with_limits(DecodeLimits {
+            max_rows: 3,
+            ..DecodeLimits::default()
+        });
+        for cfg in [json!({}), json!({"max_records": 4})] {
+            let err = rows_cap
+                .execute(&ctx, bytes(data.clone(), None), cfg.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+                "{cfg}: {err}"
+            );
+        }
+        let out = rows_cap
+            .execute(&ctx, bytes(data.clone(), None), json!({"max_records": 3}))
+            .await
+            .unwrap();
+        assert!(matches!(out, PluginOutput::Documents(d) if d.len() == 3));
+
+        // One record whose single array holds many nulls: a few bytes on disk.
+        let schema = r#"{"type":"record","name":"R","fields":[{"name":"v","type":{"type":"array","items":"null"}}]}"#;
+        let data = ocf(schema, vec![vec![("v", Av::Array(vec![Av::Null; 1_000]))]]);
+        let bytes_cap = AvroParserPlugin::with_limits(DecodeLimits {
+            max_decoded_bytes: 500 * meili_ingest_plugin_json::limits::NODE_BYTES,
+            ..DecodeLimits::default()
+        });
+        let err = bytes_cap
+            .execute(&ctx, bytes(data, None), json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_DECODED_MB")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use meili_ingest_plugin_json::DecodeLimits;
 use meili_ingest_plugin_sdk::{Plugin, PluginError, PluginManifest};
 
 use crate::ai_target::LAB_AI_PLUGINS;
@@ -57,7 +58,7 @@ impl PluginRegistry {
     /// fail to construct are recorded as unavailable instead of aborting startup, so a
     /// `workers-general` pool without `LLM_API_KEY` still boots.
     pub fn builtin() -> Self {
-        Self::builtin_with(false)
+        Self::builtin_with(false, DecodeLimits::default())
     }
 
     /// [`Self::builtin`], for a worker whose Lab tenants' AI steps may run on the
@@ -65,14 +66,15 @@ impl PluginRegistry {
     /// [`LAB_AI_PLUGINS`] without its env key is registered disabled rather than
     /// unavailable: a step with a Lab target runs, any other fails with
     /// `InvalidConfig` naming the missing key. `whisper_transcriber` takes no target
-    /// and is unchanged.
-    pub fn builtin_with(lab_ai_gateway: bool) -> Self {
-        Self::builtin_from(lab_ai_gateway, AiPlugins::from_env())
+    /// and is unchanged. `decode_limits` bound what one `parquet_parser`,
+    /// `avro_parser` or `msgpack_parser` step may decode (`PARSER_MAX_*`).
+    pub fn builtin_with(lab_ai_gateway: bool, decode_limits: DecodeLimits) -> Self {
+        Self::builtin_from(lab_ai_gateway, AiPlugins::from_env(), decode_limits)
     }
 
     /// [`Self::builtin_with`] from already-built AI plugins (tests pass them without
     /// touching the process environment).
-    fn builtin_from(lab_ai_gateway: bool, ai: AiPlugins) -> Self {
+    fn builtin_from(lab_ai_gateway: bool, ai: AiPlugins, decode_limits: DecodeLimits) -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(meili_ingest_plugin_pdf::PdfExtractorPlugin::new()));
         reg.register(Arc::new(
@@ -92,11 +94,13 @@ impl PluginRegistry {
             meili_ingest_plugin_json::JsonFlattenerPlugin::new(),
         ));
         reg.register(Arc::new(
-            meili_ingest_plugin_msgpack::MsgpackParserPlugin::new(),
+            meili_ingest_plugin_msgpack::MsgpackParserPlugin::with_limits(decode_limits),
         ));
-        reg.register(Arc::new(meili_ingest_plugin_avro::AvroParserPlugin::new()));
         reg.register(Arc::new(
-            meili_ingest_plugin_parquet::ParquetParserPlugin::new(),
+            meili_ingest_plugin_avro::AvroParserPlugin::with_limits(decode_limits),
+        ));
+        reg.register(Arc::new(
+            meili_ingest_plugin_parquet::ParquetParserPlugin::with_limits(decode_limits),
         ));
         reg.register(Arc::new(meili_ingest_plugin_chunker::ChunkerPlugin::new()));
         reg.register(Arc::new(
@@ -315,7 +319,7 @@ mod tests {
 
     #[test]
     fn builtin_with_lab_gateway_registers_ai_plugins_without_keys() {
-        let r = PluginRegistry::builtin_from(true, no_ai_keys());
+        let r = PluginRegistry::builtin_from(true, no_ai_keys(), DecodeLimits::default());
         for name in ["llm_enricher", "image_captioner", "jev_enricher"] {
             assert!(r.get(name).is_some(), "{name} runs on the Lab's Gateway");
             assert!(!r.unavailable().contains_key(name), "{name}");
@@ -327,9 +331,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_record_parsers_get_the_workers_decode_limits() {
+        let limits = DecodeLimits {
+            max_rows: 2,
+            ..DecodeLimits::default()
+        };
+        let r = PluginRegistry::builtin_from(false, no_ai_keys(), limits);
+        let plugin = r.get("msgpack_parser").expect("registered");
+        let input = meili_ingest_plugin_sdk::PluginInput::Bytes(
+            meili_ingest_plugin_sdk::Blob::new(vec![0xC0; 3], "application/vnd.msgpack", None),
+        );
+        let err = plugin
+            .execute(
+                &meili_ingest_plugin_sdk::ActivityContext::noop(),
+                input,
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn builtin_without_lab_gateway_marks_keyless_ai_plugins_unavailable() {
-        let r = PluginRegistry::builtin_from(false, no_ai_keys());
+        let r = PluginRegistry::builtin_from(false, no_ai_keys(), DecodeLimits::default());
         for name in [
             "llm_enricher",
             "image_captioner",
