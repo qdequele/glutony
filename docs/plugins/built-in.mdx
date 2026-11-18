@@ -210,9 +210,10 @@ the default `content`; set `content_fields` to keep it out.
 data (default 512) per step, whatever the step's `max_rows` / `max_records`. A file
 over either fails the step without a retry and nothing of it is indexed: it is not
 truncated. Before any row of a Parquet file is decoded, its row groups' row counts
-and its pages' value counts are checked (each value, null cells included, counts
-as at least 32 bytes), so a small file whose one list cell holds millions of values
-is refused up front. Split larger files, or raise the limits on the worker
+and the value counts of its list and map columns' pages are checked (each list
+value, nulls included, counts as at least 32 bytes), so a small file whose one list
+cell holds millions of values is refused up front. Null cells of other columns are
+not counted: they are left out of the documents. Split larger files, or raise the limits on the worker
 ([environment variables](/deployment/environment-variables)).
 </Note>
 

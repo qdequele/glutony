@@ -40,8 +40,9 @@
 //! Whatever the step says, the worker's [`DecodeLimits`] (`PARSER_MAX_ROWS`,
 //! `PARSER_MAX_DECODED_MB`) bound what one file may decode: a file over either fails
 //! the step as invalid input instead of being truncated. Before any page is decoded,
-//! the row groups' row counts and the page headers' value counts are checked, so a
-//! small file whose one list cell holds millions of values is refused up front. Each
+//! the row groups' row counts and the page headers' value counts of list and map
+//! columns are checked, so a small file whose one list cell holds millions of values
+//! is refused up front. Each
 //! record batch is then measured from its Arrow arrays before it is rendered to JSON.
 //! Strings and binaries are read as Arrow view arrays, so a dictionary-encoded column
 //! is not copied once per row before its batch can be measured.
@@ -277,11 +278,17 @@ fn reader_builder(data: Bytes) -> Result<ParquetRecordBatchReaderBuilder<Bytes>,
     ))
 }
 
-/// The value levels the reader will decode: one per leaf value, null or empty
-/// list, summed over the selected leaf columns of the row groups it reads (all of
-/// them, or those that hold the first `max_rows` rows). They are read from the page
-/// headers, which the decoder itself follows, so a footer that understates its
-/// counts cannot hide values. Only the headers are read: no page is decompressed.
+/// The value levels the reader will decode in repeated leaves: one per list
+/// value, null or empty list, summed over the selected leaf columns that sit under
+/// a list or map (`max_rep_level > 0`) in the row groups it reads (all of them, or
+/// those that hold the first `max_rows` rows). They are read from the page headers,
+/// which the decoder itself follows, so a footer that understates its counts cannot
+/// hide values. Only the headers are read: no page is decompressed.
+///
+/// A flat leaf holds exactly one level per row, which the row limit and the
+/// per-batch measure already bound, so it is not counted here: its null cells
+/// are omitted from the decoded rows, and counting them would refuse a sparse
+/// table far smaller than the limit.
 fn declared_levels(
     data: &Bytes,
     metadata: &ParquetMetaData,
@@ -298,6 +305,9 @@ fn declared_levels(
         rows = rows.saturating_add(group_rows as u64);
         for (leaf, chunk) in group.columns().iter().enumerate() {
             if mask.is_some_and(|m| !m.leaf_included(leaf)) {
+                continue;
+            }
+            if chunk.column_descr().max_rep_level() == 0 {
                 continue;
             }
             let mut pages = SerializedPageReader::new(Arc::clone(&reader), chunk, group_rows, None)
@@ -483,7 +493,7 @@ fn render(batch: &RecordBatch) -> Result<Vec<u8>, PluginError> {
 /// The rows produced (after `max_rows`) and their decoded size are counted against
 /// `limits`; going over either fails with [`PluginError::InvalidInput`]. Before any
 /// page is decoded, the row groups' row counts and the page headers' value counts
-/// ([`declared_levels`], one node each) are checked against them. Then each record
+/// of repeated leaves ([`declared_levels`], one node each) are checked against them. Then each record
 /// batch is measured from its Arrow arrays ([`decoded_upper_bound`]) before it is
 /// rendered to JSON, and the parsed values are counted at their real size.
 fn decode_payload(
@@ -1175,6 +1185,41 @@ mod tests {
             peak < 2 * limit as usize,
             "held {peak} bytes before refusing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sparse_table_under_the_byte_limit_is_accepted() {
+        // 10,000 rows of 60 Int64 columns, 90% null: 600,000 cells, of which only
+        // the 60,000 set ones are decoded (null cells are omitted), a few MB.
+        let rows = 10_000;
+        let columns: Vec<(String, ArrayRef)> = (0..60)
+            .map(|c| {
+                let values: Int64Array = (0..rows)
+                    .map(|r| ((r + c) % 10 == 0).then_some(r as i64))
+                    .collect();
+                (format!("c{c}"), Arc::new(values) as ArrayRef)
+            })
+            .collect();
+        let batch = RecordBatch::try_from_iter(columns).expect("batch");
+        let plugin = ParquetParserPlugin::with_limits(DecodeLimits {
+            max_decoded_bytes: 16 * 1024 * 1024,
+            ..DecodeLimits::default()
+        });
+        let docs = match plugin
+            .execute(
+                &ActivityContext::noop(),
+                bytes(parquet_file(&[batch]), None),
+                json!({}),
+            )
+            .await
+            .unwrap()
+        {
+            PluginOutput::Documents(d) => d,
+            other => panic!("expected documents, got {other:?}"),
+        };
+        assert_eq!(docs.len(), rows);
+        assert_eq!(docs[0].fields["c0"], json!(0));
+        assert!(!docs[0].fields.contains_key("c1"), "null cells are omitted");
     }
 
     #[test]
