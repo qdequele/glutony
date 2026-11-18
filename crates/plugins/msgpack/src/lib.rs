@@ -39,7 +39,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use meili_ingest_plugin_json::limits::NODE_BYTES;
 use meili_ingest_plugin_json::{
-    DecodeBudget, DecodeLimits, FlattenConfig, documents_from_values, id_stem, select_roots,
+    DecodeBudget, DecodeLimits, FlattenConfig, documents_from_values, id_stem, insert_unique,
+    select_roots,
 };
 use meili_ingest_plugin_sdk::prelude::*;
 use rmpv::Utf8String;
@@ -160,7 +161,8 @@ fn utf8_string(s: Utf8String) -> String {
 }
 
 /// Render a map key as a string: strings stay as they are, everything else is
-/// rendered the way it would read in JSON so no entry is silently dropped.
+/// rendered the way it would read in JSON. A key that then repeats another gets a
+/// `_2`, `_3`, … suffix ([`insert_unique`]), so no entry is silently dropped.
 fn map_key(key: Mp) -> String {
     match key {
         Mp::String(s) => utf8_string(s),
@@ -194,7 +196,8 @@ fn convert(value: Mp) -> Value {
         Mp::Map(entries) => {
             let mut out = Map::with_capacity(entries.len());
             for (k, v) in entries {
-                out.insert(map_key(k), convert(v));
+                // Integer 7 and string "7" both render as "7": keep both.
+                insert_unique(&mut out, map_key(k), convert(v));
             }
             Value::Object(out)
         }
@@ -574,6 +577,18 @@ mod tests {
 
         let docs = run(data, None, json!({"max_records": 2})).await;
         assert_eq!(docs.len(), 2, "max_records truncates");
+    }
+
+    #[tokio::test]
+    async fn keys_that_stringify_alike_both_survive() {
+        let value = Mp::Map(vec![
+            (Mp::Integer(7.into()), Mp::String("by-int".into())),
+            (Mp::String("7".into()), Mp::String("by-str".into())),
+        ]);
+        let docs = run(pack_raw(&value), None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["7"], json!("by-int"));
+        assert_eq!(f["7_2"], json!("by-str"));
     }
 
     #[tokio::test]

@@ -6,6 +6,10 @@
 //! float or boolean), and `content` is the space-joined text of the
 //! configured content columns.
 //!
+//! Field names are unique, so no cell overwrites another: a repeated header gets
+//! the first free `_2`, `_3`, … suffix (`name,name` → `name`, `name_2`), and the row
+//! number, normally `_row`, moves to `_row_2` when the file has a `_row` column.
+//!
 //! Configuration (all keys optional):
 //!
 //! | key               | default            | meaning |
@@ -27,6 +31,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use encoding_rs::Encoding;
 
@@ -285,11 +290,70 @@ fn id_stem(blob: &Blob) -> String {
     blob.id_stem("csv")
 }
 
-fn column_name(headers: &[String], idx: usize) -> String {
-    headers
-        .get(idx)
-        .cloned()
-        .unwrap_or_else(|| format!("col_{}", idx + 1))
+/// The field name of every column, unique so that no cell overwrites another.
+///
+/// A column is named after its header, or `col_<n>` (1-based) when the header is
+/// empty, missing (a cell past the header row) or there are no headers. The first
+/// column with a given name keeps it; a later one whose name is taken, by a repeated
+/// header or by a real header that looks like a fallback (`col_3`), gets the first
+/// free `<name>_<k>` (`k` from 2). Real headers are reserved first, so
+/// `name,name,name_2` names the second column `name_3`. The row number goes under
+/// `_row`, or the first free `_row_<k>` when the file has a `_row` column of its own.
+/// Same rules as `xlsx_extractor`.
+struct Columns {
+    names: Vec<String>,
+    taken: HashSet<String>,
+    /// Key of the row number.
+    row_key: String,
+}
+
+impl Columns {
+    fn new(headers: &[String]) -> Self {
+        let mut taken: HashSet<String> =
+            headers.iter().filter(|h| !h.is_empty()).cloned().collect();
+        let mut first_use: HashSet<&str> = HashSet::new();
+        let mut names = Vec::with_capacity(headers.len());
+        for (i, h) in headers.iter().enumerate() {
+            if !h.is_empty() && first_use.insert(h.as_str()) {
+                names.push(h.clone());
+                continue;
+            }
+            let base = if h.is_empty() {
+                format!("col_{}", i + 1)
+            } else {
+                h.clone()
+            };
+            names.push(free_name(&mut taken, base));
+        }
+        let row_key = free_name(&mut taken, "_row".to_owned());
+        Self {
+            names,
+            taken,
+            row_key,
+        }
+    }
+
+    /// Name of column `idx`, naming the columns past the header row on first use.
+    fn name(&mut self, idx: usize) -> &str {
+        while self.names.len() <= idx {
+            let base = format!("col_{}", self.names.len() + 1);
+            let name = free_name(&mut self.taken, base);
+            self.names.push(name);
+        }
+        &self.names[idx]
+    }
+}
+
+/// `base`, or the first `<base>_<k>` (`k` from 2) not in `taken`, which it joins.
+fn free_name(taken: &mut HashSet<String>, base: String) -> String {
+    let mut name = base.clone();
+    let mut k = 2;
+    while taken.contains(&name) {
+        name = format!("{base}_{k}");
+        k += 1;
+    }
+    taken.insert(name.clone());
+    name
 }
 
 /// Resolve a configured column name to its index, or fail with `InvalidConfig`.
@@ -395,23 +459,18 @@ fn parse_csv(
         .trim(if cfg.trim { Trim::All } else { Trim::None })
         .from_reader(&*data);
 
-    let headers: Vec<String> = if cfg.has_headers {
+    let raw_headers: Vec<String> = if cfg.has_headers {
         reader
             .headers()
             .map_err(|e| PluginError::InvalidInput(format!("{NAME}: invalid CSV header: {e}")))?
             .iter()
-            .enumerate()
-            .map(|(i, h)| {
-                if h.is_empty() {
-                    format!("col_{}", i + 1)
-                } else {
-                    h.to_owned()
-                }
-            })
+            .map(str::to_owned)
             .collect()
     } else {
         Vec::new()
     };
+    let mut columns = Columns::new(&raw_headers);
+    let headers = columns.names.clone();
 
     // Resolve configured columns up front so typos fail fast.
     let id_idx = match &cfg.id_column {
@@ -466,7 +525,7 @@ fn parse_csv(
             if cell.is_empty() {
                 continue;
             }
-            fields.insert(column_name(&headers, i), typed_cell(cell));
+            fields.insert(columns.name(i).to_owned(), typed_cell(cell));
             let include = match &content_idx {
                 Some(idx) => idx.contains(&i),
                 None => true,
@@ -485,7 +544,7 @@ fn parse_csv(
             .filter(|v| !v.is_empty())
             .map(sanitize_id)
             .unwrap_or_else(|| format!("{stem}_r{row}"));
-        fields.insert("_row".into(), Value::from(row));
+        fields.insert(columns.row_key.clone(), Value::from(row));
 
         docs.push(Document {
             id,
@@ -747,6 +806,42 @@ mod tests {
         assert_eq!(typed_cell("NaN"), json!("NaN"));
         assert_eq!(typed_cell("+"), json!("+"));
         assert_eq!(typed_cell("-"), json!("-"));
+    }
+
+    #[tokio::test]
+    async fn colliding_field_names_never_drop_a_value() {
+        // Duplicate headers, and a generated suffix that a real header already uses.
+        let docs = run("name,name,name_2,name\nAda,Lovelace,x,y\n", None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["name"], json!("Ada"));
+        assert_eq!(f["name_2"], json!("x"), "a real header keeps its name");
+        assert_eq!(f["name_3"], json!("Lovelace"));
+        assert_eq!(f["name_4"], json!("y"));
+        // `id_column` binds to the first of the duplicates, a suffixed name to its own.
+        let docs = run(
+            "name,name\nAda,Lovelace\n",
+            None,
+            json!({"id_column": "name", "content_columns": ["name_2"]}),
+        )
+        .await;
+        assert_eq!(docs[0].id, "Ada");
+        assert_eq!(docs[0].content, "Lovelace");
+
+        // A `_row` column keeps its value; the row number gives way.
+        let docs = run("_row,v\n99,x\n", None, json!({})).await;
+        assert_eq!(docs[0].fields["_row"], json!(99));
+        assert_eq!(docs[0].fields["_row_2"], json!(1));
+
+        // Extra cells past the header row do not overwrite a real `col_<n>` header.
+        let docs = run("a,b,col_4\n1,2,3,4\n", None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["col_4"], json!(3));
+        assert_eq!(f["col_4_2"], json!(4));
+        // Neither does an empty header's fallback name.
+        let docs = run(",col_1\nx,y\n", None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["col_1"], json!("y"));
+        assert_eq!(f["col_1_2"], json!("x"));
     }
 
     async fn run_raw(blob: Blob, cfg: Value) -> Result<Vec<Document>, PluginError> {

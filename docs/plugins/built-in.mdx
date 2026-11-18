@@ -21,7 +21,8 @@ when its signature changes), of the object URI, or of the source's project and
 `uid` (a templated source URL keeps its ids from run to run). A document's own
 id (`id_field`, `id_column`) is always kept as is.
 
-`csv_parser` additionally stores the 1-based row number in a `_row` field. The
+`csv_parser` additionally stores the 1-based row number in a `_row` field (or
+`_row_2`, … when the file has a `_row` column of its own, which keeps its value). The
 parsers that decode to JSON first — `json_flattener`, `msgpack_parser`,
 `avro_parser`, `parquet_parser` — deliberately do not: their generated id
 already carries the index, and keeping the family uniform matters more than
@@ -106,11 +107,21 @@ zero (`007`, `01234`), a leading `+` (`+33612345678`), an integer too wide for 6
 bits (`123456789012345678901234`) and exponent notation (`1E5`). Empty cells are
 left out of `fields`.
 
+Field names are unique, so no cell overwrites another. A column is named after its
+header, or `col_<n>` (1-based) when the header is empty or the cell lies past the
+header row. A repeated header keeps its name on its first column and gets the
+first free `_2`, `_3`, … suffix on the later ones (`name,name,name_2` → `name`,
+`name_3`, `name_2`), as in `xlsx_extractor`. `id_column` and `content_columns`
+name the first of the duplicates by the header, the others by their suffixed name.
+
 | Key | Default | Description |
 |---|---|---|
 | `delimiter` | sniffed | Single-character field delimiter. When omitted, the one of `,` `;` tab `\|` that splits the first records (up to 100 or 64 KiB) into the most consistent number of fields; delimiters inside quoted fields do not count. Ties go to more fields, then to the delimiter less often followed by a space, then to that order. Falls back to `,`. |
-| `has_headers` | `true` | First row is the header. Without headers, fields are `col_0`, `col_1`, … |
+| `has_headers` | `true` | First row is the header. Without headers, fields are `col_1`, `col_2`, … (1-based), and `id_column` / `content_columns` use those names. |
 | `id_column` | — | Column whose value becomes the document id. Otherwise `<filename>_r<row>`. |
+| `content_columns` | all columns | Columns joined by a space into `content`. |
+| `max_rows` | — | Stop after this many data rows. |
+| `trim` | `true` | Trim whitespace around headers and cells. |
 | `encoding` | detected | Character encoding of the file, as a [WHATWG label](https://encoding.spec.whatwg.org/#names-and-labels): `windows-1252`, `iso-8859-15`, `shift_jis`, `utf-16le`, … Bytes it cannot map become U+FFFD. An unknown label fails the step. |
 
 Without `encoding`, the bytes are decoded by the first rule that applies: a byte
@@ -129,6 +140,11 @@ one document. Nested objects are flattened to dotted keys (`a.b.c`) in
 `fields`; `content` = concatenated string values. For **documents** input,
 each document's own `content` is kept; the string values only fill an empty
 one (unless `content_fields` is set).
+
+When two values flatten to the same key (`{"a.b": 1, "a": {"b": 2}}`), the later
+one gets the first free `_2`, `_3`, … suffix (`a.b` and `a.b_2`), so no value is
+dropped. The same holds in `msgpack_parser`, `avro_parser` and `parquet_parser`,
+and for MessagePack map keys that render alike (integer `7` and string `"7"`).
 
 Newline-delimited JSON (NDJSON / JSON Lines) gives one document per line. A
 `.ndjson` or `.jsonl` file, or a body with one JSON object or array per line, is

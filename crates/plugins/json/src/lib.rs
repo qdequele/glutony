@@ -8,6 +8,10 @@
 //! document keeps its own `content` unless `content_fields` is set; the default
 //! "every string leaf" rule only fills an empty one.
 //!
+//! Flattened keys are unique: when two values flatten to the same key (`{"a.b": 1,
+//! "a": {"b": 2}}`), the later one gets the first free `_2`, `_3`, … suffix, so no
+//! value is dropped.
+//!
 //! Document selection from a single JSON value:
 //! * top-level array → one document per element;
 //! * object with an array under `documents`, `items`, `data`, `results` or
@@ -164,6 +168,26 @@ pub fn select_roots(value: Value) -> Vec<Value> {
     }
 }
 
+/// Insert `value` under `key`, or under the first free `<key>_<k>` (`k` from 2)
+/// when `key` is taken, so a collision never drops a value: `{"a.b": 1, "a": {"b": 2}}`
+/// flattens to `a.b` and `a.b_2`. Public so the binary formats apply the same rule
+/// to their own key collisions.
+pub fn insert_unique(out: &mut Map<String, Value>, key: String, value: Value) {
+    if !out.contains_key(&key) {
+        out.insert(key, value);
+        return;
+    }
+    let mut k = 2usize;
+    loop {
+        let candidate = format!("{key}_{k}");
+        if !out.contains_key(&candidate) {
+            out.insert(candidate, value);
+            return;
+        }
+        k += 1;
+    }
+}
+
 fn is_scalar(v: &Value) -> bool {
     !matches!(v, Value::Object(_) | Value::Array(_))
 }
@@ -186,7 +210,7 @@ fn flatten_into(
     match value {
         Value::Object(obj) => {
             if depth >= cfg.max_depth || obj.is_empty() {
-                out.insert(prefix.to_owned(), Value::Object(obj));
+                insert_unique(out, prefix.to_owned(), Value::Object(obj));
                 return;
             }
             for (k, v) in obj {
@@ -196,16 +220,14 @@ fn flatten_into(
         Value::Array(items) => {
             let all_scalars = items.iter().all(is_scalar);
             if all_scalars || !cfg.flatten_arrays || depth >= cfg.max_depth {
-                out.insert(prefix.to_owned(), Value::Array(items));
+                insert_unique(out, prefix.to_owned(), Value::Array(items));
             } else {
                 for (i, v) in items.into_iter().enumerate() {
                     flatten_into(&key(&i.to_string()), v, depth + 1, cfg, out);
                 }
             }
         }
-        scalar => {
-            out.insert(prefix.to_owned(), scalar);
-        }
+        scalar => insert_unique(out, prefix.to_owned(), scalar),
     }
 }
 
@@ -692,6 +714,37 @@ mod tests {
         let docs = run(bytes(&payload, None), json!({"flatten_arrays": true})).await;
         assert_eq!(docs[0].fields["order.items.0.sku"], json!("a"));
         assert_eq!(docs[0].fields["order.items.1.sku"], json!("b"));
+    }
+
+    #[tokio::test]
+    async fn colliding_flattened_keys_never_drop_a_value() {
+        let docs = run(
+            bytes(
+                r#"{"a.b": 1, "a": {"b": 2}, "c": [{"x": 3}], "c.0.x": 4}"#,
+                None,
+            ),
+            json!({"flatten_arrays": true}),
+        )
+        .await;
+        let f = &docs[0].fields;
+        let mut ab: Vec<Value> = ["a.b", "a.b_2"].iter().map(|k| f[*k].clone()).collect();
+        ab.sort_by_key(|v| v.as_i64());
+        assert_eq!(ab, [json!(1), json!(2)], "{f:?}");
+        let mut cx: Vec<Value> = ["c.0.x", "c.0.x_2"].iter().map(|k| f[*k].clone()).collect();
+        cx.sort_by_key(|v| v.as_i64());
+        assert_eq!(cx, [json!(3), json!(4)], "{f:?}");
+        assert_eq!(f.len(), 4, "{f:?}");
+    }
+
+    #[test]
+    fn insert_unique_takes_the_first_free_suffix() {
+        let mut m = Map::new();
+        insert_unique(&mut m, "k".into(), json!(1));
+        insert_unique(&mut m, "k_2".into(), json!(2));
+        insert_unique(&mut m, "k".into(), json!(3));
+        assert_eq!(m["k"], json!(1));
+        assert_eq!(m["k_2"], json!(2));
+        assert_eq!(m["k_3"], json!(3));
     }
 
     #[tokio::test]
