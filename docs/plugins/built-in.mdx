@@ -188,15 +188,17 @@ the default `content`; set `content_fields` to keep it out.
 | `title_field` | — | Key mapped onto `title`. |
 | `columns` | all | Columns to read, pushed down as a projection. An unknown name is an error. |
 | `max_rows` | — | Stop after this many rows. It can only lower the worker's limit below. |
-| `batch_size` | `1024` | Rows decoded per record batch. |
+| `batch_size` | `1024` | Rows decoded per record batch, at most 8192 and at most the worker's `PARSER_MAX_ROWS`. |
 
 <Note>
 `parquet_parser`, `avro_parser` and `msgpack_parser` decode at most
 `PARSER_MAX_ROWS` rows (default 1,000,000) and `PARSER_MAX_DECODED_MB` of decoded
 data (default 512) per step, whatever the step's `max_rows` / `max_records`. A file
 over either fails the step without a retry and nothing of it is indexed: it is not
-truncated. A Parquet file is checked against the row count its footer declares
-before any row is decoded. Split larger files, or raise the limits on the worker
+truncated. Before any row of a Parquet file is decoded, its row groups' row counts
+and its pages' value counts are checked (each value, null cells included, counts
+as at least 32 bytes), so a small file whose one list cell holds millions of values
+is refused up front. Split larger files, or raise the limits on the worker
 ([environment variables](/deployment/environment-variables)).
 </Note>
 
