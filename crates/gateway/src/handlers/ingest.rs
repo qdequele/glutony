@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{Query, QueryParams, query_param, read_payload};
+use crate::connections::require_tenant_connections;
 use crate::context::{
     lists_fetch_allowlist, require_destination, resolve_index, resolve_request_context,
 };
@@ -246,6 +247,8 @@ pub async fn submit_one(
     if !pipeline.pins_destination() {
         require_destination(&ctx)?;
     }
+    // A tenant's job can only write through connections the tenant owns.
+    require_tenant_connections(&state.control_plane, &pipeline, ctx.tenant_id.as_deref()).await?;
 
     // An indexer step that names its own `index` writes there whatever the request says
     // (the worker only fills an unset one). Under `/indexes/{uid}/…` that would write
@@ -1744,10 +1747,10 @@ mod tests {
         );
     }
 
-    /// Mount `POST /internal/resolve` → a pipeline whose indexer pins a connection.
-    async fn mount_resolve_pinned(server: &MockServer) {
+    /// Mount `POST /internal/resolve` → a pipeline whose indexer pins `connection`.
+    async fn mount_pinned_resolve(server: &MockServer, connection: &str) {
         let mut pinned = sample_pipeline("movies", None);
-        pinned.steps[0].config = json!({ "connection": "prod-movies" });
+        pinned.steps[0].config = json!({ "connection": connection });
         Mock::given(method("POST"))
             .and(path("/internal/resolve"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "pipeline": pinned })))
@@ -1760,7 +1763,7 @@ mod tests {
         // The edge forwards the caller's own key on every request. A pipeline pinned
         // to a connection never uses it, so it must not sit in Temporal's history.
         let server = MockServer::start().await;
-        mount_resolve_pinned(&server).await;
+        mount_pinned_resolve(&server, "prod-movies").await;
         mount_jobs_ok(&server).await;
         let (app, starter) = test_app(&server, GatewayConfig::default()).await;
 
@@ -1793,7 +1796,7 @@ mod tests {
         // Its files are routed by their own type in the worker; one whose pipeline
         // pins nothing still needs the request's destination.
         let server = MockServer::start().await;
-        mount_resolve_pinned(&server).await;
+        mount_pinned_resolve(&server, "prod-movies").await;
         mount_jobs_ok(&server).await;
         let (app, starter) = test_app(&server, GatewayConfig::default()).await;
         let resp = app.oneshot(zip_upload("/ingest")).await.unwrap();
@@ -1801,6 +1804,67 @@ mod tests {
         let ctx = &starter.archive_inputs()[0].context;
         assert_eq!(ctx.api_key.as_deref(), Some("masterKey"));
         assert_eq!(ctx.host.as_deref(), Some("http://localhost:7700"));
+    }
+
+    fn tenant_pdf_request(tenant: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header(CONTENT_TYPE, "application/pdf")
+            .header("x-meili-project-id", tenant)
+            .body(Body::from(PDF_MAGIC))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_ingest_through_a_global_connection() {
+        let server = MockServer::start().await;
+        mount_pinned_resolve(&server, "prod-movies").await;
+        mount_connection(&server, "prod-movies", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app.oneshot(tenant_pdf_request("acme")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = json_body(resp).await;
+        let msg = json["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("prod-movies") && msg.contains("global"),
+            "{json}"
+        );
+        assert!(starter.inputs().is_empty(), "no workflow is started");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_ingests_through_its_own_connection() {
+        let server = MockServer::start().await;
+        mount_pinned_resolve(&server, "prod-movies").await;
+        mount_connection(&server, "prod-movies", Some("acme")).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let resp = app.oneshot(tenant_pdf_request("acme")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(starter.inputs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn untagged_ingest_through_a_global_connection_is_unchanged() {
+        let server = MockServer::start().await;
+        mount_pinned_resolve(&server, "prod-movies").await;
+        mount_connection(&server, "prod-movies", None).await;
+        mount_jobs_ok(&server).await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header(CONTENT_TYPE, "application/pdf")
+            .body(Body::from(PDF_MAGIC))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(starter.inputs().len(), 1);
     }
 
     #[tokio::test]
