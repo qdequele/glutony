@@ -39,7 +39,9 @@
 //!
 //! One document. With `json: true` (default) the model must reply with
 //! `{"caption", "tags", "text_in_image"}`: `caption` → `content`, `tags` →
-//! `fields.tags`, `text_in_image` → `fields.ocr_text`, other keys → `fields`. If the
+//! `fields.tags`, `text_in_image` → `fields.ocr_text`, other keys → `fields`, except
+//! keys starting with `_` (`_geo`, `_vectors`, …), which are dropped unless the step
+//! lists them in `allow_reserved`. If the
 //! reply is not a JSON object the whole text becomes `content`. With `json: false` the
 //! model's full text reply is the `content`. `meta.mime` / `meta.filename` /
 //! `meta.source` come from the input blob; the id derives from the filename when known.
@@ -114,6 +116,11 @@ pub struct ImageCaptionerConfig {
     /// anything is encoded or sent.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// Reply keys starting with `_` that may reach the document (for example
+    /// `["_geo"]`). Every other `_` key is dropped: Meilisearch reserves them, and a
+    /// malformed one makes it reject the whole batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_reserved: Vec<String>,
 }
 
 fn default_prompt() -> String {
@@ -138,6 +145,7 @@ impl Default for ImageCaptionerConfig {
             max_tokens: default_max_tokens(),
             json: true,
             max_bytes: DEFAULT_MAX_BYTES,
+            allow_reserved: Vec::new(),
         }
     }
 }
@@ -306,7 +314,13 @@ impl Plugin for ImageCaptionerPlugin {
                     "detail": { "type": "string", "enum": ["low", "high", "auto"], "default": "auto" },
                     "max_tokens": { "type": "integer", "minimum": 1, "default": 400 },
                     "json": { "type": "boolean", "default": true },
-                    "max_bytes": { "type": "integer", "minimum": 1, "default": DEFAULT_MAX_BYTES }
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": DEFAULT_MAX_BYTES },
+                    "allow_reserved": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^_" },
+                        "description": "Reply keys starting with _ to keep, e.g. [\"_geo\"]; any other is dropped",
+                        "default": []
+                    }
                 }
             }))
     }
@@ -418,7 +432,7 @@ impl Plugin for ImageCaptionerPlugin {
         doc.meta.mime = Some(blob.mime.clone());
         doc.meta.filename = blob.filename.clone();
         doc.meta.source = blob.filename.clone();
-        apply_reply(&mut doc, &raw, cfg.json);
+        apply_reply(&mut doc, &raw, cfg.json, &cfg.allow_reserved);
 
         tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, id = %doc.id, "captioned image");
         Ok(PluginOutput::Documents(vec![doc]))
@@ -444,7 +458,9 @@ fn prompt_text(cfg: &ImageCaptionerConfig) -> String {
 // ---------------------------------------------------------------------------
 
 /// Map the model reply onto the document (see the crate docs).
-pub fn apply_reply(doc: &mut Document, raw: &str, json: bool) {
+///
+/// A reply key starting with `_` is dropped unless `allow_reserved` lists it.
+pub fn apply_reply(doc: &mut Document, raw: &str, json: bool, allow_reserved: &[String]) {
     let parsed = if json { parse_json_object(raw) } else { None };
     let Some(obj) = parsed else {
         doc.content = raw.trim().to_string();
@@ -460,6 +476,11 @@ pub fn apply_reply(doc: &mut Document, raw: &str, json: bool) {
                 if !value.is_null() {
                     doc.fields.insert("ocr_text".into(), value);
                 }
+            }
+            // Meilisearch reserves `_` keys (`_geo`, `_vectors`, ...): only the ones the
+            // step asked for get through.
+            (k, _) if k.starts_with('_') && !allow_reserved.iter().any(|a| a == k) => {
+                tracing::debug!(plugin = NAME, key = k, "dropping reserved reply key");
             }
             _ => {
                 doc.fields.insert(key, value);
@@ -768,6 +789,42 @@ mod tests {
             body["messages"][0]["content"][1]["image_url"]["detail"],
             "high"
         );
+    }
+
+    #[tokio::test]
+    async fn reserved_reply_keys_are_dropped_unless_allowed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply(
+                r#"{"caption":"c","_geo":{"lat":48.8,"lng":2.3},"_vectors":{"x":[1]},"mood":"calm"}"#,
+            )))
+            .mount(&server)
+            .await;
+        let p = plugin(&server);
+        let caption = |cfg: serde_json::Value| {
+            let p = p.clone();
+            async move {
+                p.execute(&ActivityContext::noop(), image(), cfg)
+                    .await
+                    .unwrap()
+                    .into_documents()
+                    .unwrap()
+                    .remove(0)
+            }
+        };
+        let d = caption(serde_json::json!({})).await;
+        assert_eq!(d.fields["mood"], "calm");
+        assert!(
+            d.fields.keys().all(|k| !k.starts_with('_')),
+            "{:?}",
+            d.fields
+        );
+        let d = caption(serde_json::json!({ "allow_reserved": ["_geo"] })).await;
+        assert_eq!(
+            d.fields["_geo"],
+            serde_json::json!({"lat": 48.8, "lng": 2.3})
+        );
+        assert!(!d.fields.contains_key("_vectors"));
     }
 
     #[tokio::test]

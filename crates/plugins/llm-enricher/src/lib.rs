@@ -65,6 +65,7 @@
 //! | `language` (string) | `DocumentMeta::language` (same rule) |
 //! | `title` / `language` (any other type, e.g. `null`) | ignored |
 //! | `summary`, `keywords`, any other key | `Document::fields` (existing keys kept under `merge`, overwritten under `replace`) |
+//! | any key starting with `_` (`_geo`, `_vectors`, …) | dropped, unless the step lists it in `allow_reserved` (then as any other key) |
 //!
 //! A reply that is not a JSON object is stored verbatim in `fields.llm_raw` and the
 //! document is otherwise left unchanged; a single bad reply never fails the batch.
@@ -141,6 +142,11 @@ pub struct LlmEnricherConfig {
     /// System prompt; defaults to [`DEFAULT_SYSTEM_PROMPT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Reply keys starting with `_` that may reach the document (for example
+    /// `["_geo"]`). Every other `_` key is dropped: Meilisearch reserves them, and a
+    /// malformed one (`"_geo": "Paris"`) makes it reject the whole batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_reserved: Vec<String>,
 }
 
 fn default_prompt() -> String {
@@ -164,6 +170,7 @@ impl Default for LlmEnricherConfig {
             max_input_chars: default_max_input_chars(),
             merge_strategy: MergeStrategy::Merge,
             system_prompt: None,
+            allow_reserved: Vec::new(),
         }
     }
 }
@@ -356,7 +363,13 @@ impl Plugin for LlmEnricherPlugin {
                     "max_tokens": { "type": "integer", "minimum": 1 },
                     "max_input_chars": { "type": "integer", "minimum": 1, "default": 12000 },
                     "merge_strategy": { "type": "string", "enum": ["merge", "replace"], "default": "merge" },
-                    "system_prompt": { "type": "string", "default": DEFAULT_SYSTEM_PROMPT }
+                    "system_prompt": { "type": "string", "default": DEFAULT_SYSTEM_PROMPT },
+                    "allow_reserved": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^_" },
+                        "description": "Reply keys starting with _ to keep, e.g. [\"_geo\"]; any other is dropped",
+                        "default": []
+                    }
                 }
             }))
     }
@@ -525,7 +538,12 @@ impl LlmClient {
         let mut usage = completion.usage;
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
-        apply_reply(&mut doc, &completion.content, cfg.merge_strategy);
+        apply_reply(
+            &mut doc,
+            &completion.content,
+            cfg.merge_strategy,
+            &cfg.allow_reserved,
+        );
         Ok(doc)
     }
 }
@@ -675,7 +693,14 @@ fn map_http_failure(code: u16, body: &str, lab: Option<&AiTarget>) -> PluginErro
 // ---------------------------------------------------------------------------
 
 /// Merge the model's raw reply into `doc` (see the crate docs for the mapping).
-pub fn apply_reply(doc: &mut Document, raw: &str, strategy: MergeStrategy) {
+///
+/// A reply key starting with `_` is dropped unless `allow_reserved` lists it.
+pub fn apply_reply(
+    doc: &mut Document,
+    raw: &str,
+    strategy: MergeStrategy,
+    allow_reserved: &[String],
+) {
     let Some(obj) = parse_json_object(raw) else {
         doc.fields
             .insert("llm_raw".into(), serde_json::Value::String(raw.to_string()));
@@ -698,6 +723,11 @@ pub fn apply_reply(doc: &mut Document, raw: &str, strategy: MergeStrategy) {
             // there (`null` for "none found" is common) is no answer, and written into
             // `fields` it would overwrite the real title when the document is indexed.
             ("title" | "language", _) => {}
+            // Meilisearch reserves `_` keys (`_geo`, `_vectors`, ...): only the ones the
+            // step asked for get through.
+            (k, _) if k.starts_with('_') && !allow_reserved.iter().any(|a| a == k) => {
+                tracing::debug!(plugin = NAME, key = k, "dropping reserved reply key");
+            }
             _ => {
                 if replace {
                     doc.fields.insert(key, value);
@@ -1684,6 +1714,7 @@ mod tests {
                 &mut doc,
                 r#"{"title":null,"summary":"s","language":["fr"]}"#,
                 strategy,
+                &[],
             );
             assert!(!doc.fields.contains_key("title"), "{strategy:?}");
             assert!(!doc.fields.contains_key("language"), "{strategy:?}");
@@ -1691,6 +1722,50 @@ mod tests {
             assert_eq!(doc.meta.language.as_deref(), Some("en"), "{strategy:?}");
             assert_eq!(doc.fields["summary"], "s");
             assert_eq!(doc.to_index_json()["title"], "Q3 report", "{strategy:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_reply_keys_are_dropped_unless_allowed() {
+        // `_geo: "Paris"` (model-chosen or prompt-injected from the document text) would
+        // make Meilisearch reject the whole batch.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply(
+                r#"{"summary":"s","_geo":{"lat":48.8,"lng":2.3},"_vectors":{"x":[1]},"_meta":1}"#,
+            )))
+            .mount(&server)
+            .await;
+        let p = plugin(&server);
+        for strategy in ["merge", "replace"] {
+            let out = run(
+                &p,
+                vec![Document::with_id("d1", "x")],
+                serde_json::json!({ "merge_strategy": strategy }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out[0].fields["summary"], "s");
+            assert!(
+                out[0].fields.keys().all(|k| !k.starts_with('_')),
+                "{strategy}: {:?}",
+                out[0].fields
+            );
+
+            // A pipeline that asks for `_geo` on purpose lists it.
+            let out = run(
+                &p,
+                vec![Document::with_id("d1", "x")],
+                serde_json::json!({ "merge_strategy": strategy, "allow_reserved": ["_geo"] }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                out[0].fields["_geo"],
+                serde_json::json!({"lat": 48.8, "lng": 2.3})
+            );
+            assert!(!out[0].fields.contains_key("_vectors"), "{strategy}");
+            assert!(!out[0].fields.contains_key("_meta"), "{strategy}");
         }
     }
 

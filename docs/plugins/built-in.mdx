@@ -199,6 +199,11 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | `max_tokens` | `400` | `max_tokens` of the completion. |
 | `json` | `true` | JSON mode: `caption` → `content`, `tags` → `fields.tags`, `text_in_image` → `fields.ocr_text`, other keys → `fields`. With `false` the whole text reply is the `content`. |
 | `max_bytes` | `20971520` (20 MiB) | Largest image accepted, in bytes. A larger one fails as invalid input before it is encoded or sent. |
+| `allow_reserved` | `[]` | Reply keys starting with `_` to keep, for example `["_geo"]`. Any other `_` key in the reply is dropped. |
+
+Meilisearch reserves keys starting with `_` (`_geo`, `_vectors`, …), and a malformed
+one makes it reject the whole batch, so the plugin drops every such key the model
+returns unless `allow_reserved` lists it.
 
 ## Transformers (documents → documents)
 
@@ -312,11 +317,25 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | `max_concurrent` | `8` | Parallel requests inside one activity (`buffer_unordered`). |
 | `temperature` | `0` | Sampling temperature. |
 | `fields_to_merge` | all keys | Restrict which keys of the reply are merged into `fields`. |
+| `allow_reserved` | `[]` | Reply keys starting with `_` to keep, for example `["_geo"]`. Any other `_` key in the reply is dropped. |
 
 Reply keys are merged into `fields`; `title` → `title`, `summary` →
 `fields.summary`, `keywords` → `fields.keywords`, `language` → `meta.language`.
 A `title` or `language` that is not a string (for example `null` when the model
 finds none) is ignored, so it never replaces the document's own title.
+
+Reply keys starting with `_` are dropped: Meilisearch reserves them (`_geo`,
+`_vectors`, …), and one the model gets wrong (`"_geo": "Paris"`) makes it reject
+the whole batch. A pipeline that prompts for such a key on purpose lists it in
+`allow_reserved`:
+
+```yaml
+- id: enrich
+  plugin: llm_enricher
+  config:
+    prompt: "Extract as JSON: title, summary, _geo ({lat, lng} of the place described)."
+    allow_reserved: ["_geo"]
+```
 
 ### `jev_enricher`
 
