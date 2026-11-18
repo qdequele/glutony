@@ -3820,6 +3820,7 @@ dependencies = [
  "meili-ingest-router",
  "meili-ingest-source",
  "meili-ingest-usage",
+ "object_store",
  "reqwest 0.13.5",
  "serde",
  "serde_json",

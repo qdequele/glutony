@@ -35,6 +35,9 @@ pub struct WorkerConfig {
     /// Bounds on one archive upload (`ARCHIVE_MAX_FILES`, `ARCHIVE_MAX_FILE_MB`,
     /// `ARCHIVE_MAX_UNPACKED_MB`, `ARCHIVE_MAX_DEPTH`).
     pub archive_limits: meili_ingest_archive::Limits,
+    /// Decompressed archive content held in memory at once, in bytes
+    /// (`ARCHIVE_INFLIGHT_MB`).
+    pub archive_inflight_bytes: u64,
 }
 
 /// Default of `SHUTDOWN_GRACE_SECS`: with [`SHUTDOWN_HARD_MARGIN`] the worker is gone
@@ -63,6 +66,7 @@ impl WorkerConfig {
         };
         let shutdown_grace = shutdown_grace(std::env::var("SHUTDOWN_GRACE_SECS").ok().as_deref())?;
         let archive_limits = archive_limits(|name| std::env::var(name).ok())?;
+        let archive_inflight_bytes = archive_inflight_bytes(|name| std::env::var(name).ok())?;
         Ok(Self {
             temporal_url: std::env::var("TEMPORAL_URL")
                 .unwrap_or_else(|_| "http://temporal-frontend:7233".to_string()),
@@ -88,6 +92,7 @@ impl WorkerConfig {
             lab_ai_gateway: lab_ai_gateway(std::env::var("LAB_AI_GATEWAY").ok().as_deref()),
             shutdown_grace,
             archive_limits,
+            archive_inflight_bytes,
         })
     }
 }
@@ -97,20 +102,7 @@ impl WorkerConfig {
 pub fn archive_limits(
     env: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<meili_ingest_archive::Limits> {
-    const MIB: u64 = 1024 * 1024;
-    let read = |name: &str| -> anyhow::Result<Option<u64>> {
-        match env(name)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            None => Ok(None),
-            Some(v) => match v.parse::<u64>() {
-                Ok(0) => anyhow::bail!("{name} must be greater than 0"),
-                Ok(n) => Ok(Some(n)),
-                Err(_) => anyhow::bail!("{name} must be a positive integer, got {v:?}"),
-            },
-        }
-    };
+    let read = |name: &str| positive_var(&env, name);
     let defaults = meili_ingest_archive::Limits::default();
     let as_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
     Ok(meili_ingest_archive::Limits {
@@ -121,6 +113,33 @@ pub fn archive_limits(
             .map_or(defaults.max_total_bytes, |n| n.saturating_mul(MIB)),
         max_depth: read("ARCHIVE_MAX_DEPTH")?.map_or(defaults.max_depth, as_usize),
     })
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// A positive integer variable; blank is unset, zero and anything else refused.
+fn positive_var(env: &impl Fn(&str) -> Option<String>, name: &str) -> anyhow::Result<Option<u64>> {
+    match env(name)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => Ok(None),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => anyhow::bail!("{name} must be greater than 0"),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => anyhow::bail!("{name} must be a positive integer, got {v:?}"),
+        },
+    }
+}
+
+/// `ARCHIVE_INFLIGHT_MB`, in bytes: how much decompressed archive content the worker
+/// holds in memory at once (default [`crate::archive_activity::DEFAULT_INFLIGHT_BYTES`]).
+/// The archive activities raise it to `ARCHIVE_MAX_FILE_MB` when it is lower.
+pub fn archive_inflight_bytes(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<u64> {
+    Ok(positive_var(&env, "ARCHIVE_INFLIGHT_MB")?
+        .map_or(crate::archive_activity::DEFAULT_INFLIGHT_BYTES, |n| {
+            n.saturating_mul(MIB)
+        }))
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -143,6 +162,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("lab_ai_gateway", &self.lab_ai_gateway)
             .field("shutdown_grace", &self.shutdown_grace)
             .field("archive_limits", &self.archive_limits)
+            .field("archive_inflight_bytes", &self.archive_inflight_bytes)
             .finish()
     }
 }
@@ -295,6 +315,7 @@ mod tests {
             lab_ai_gateway: true,
             shutdown_grace: std::time::Duration::from_secs(1),
             archive_limits: meili_ingest_archive::Limits::default(),
+            archive_inflight_bytes: crate::archive_activity::DEFAULT_INFLIGHT_BYTES,
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("cp-token-value"), "{shown}");
@@ -328,6 +349,24 @@ mod tests {
             let env = |name: &str| (name == "ARCHIVE_MAX_FILES").then(|| bad.to_string());
             let err = super::archive_limits(env).unwrap_err().to_string();
             assert!(err.contains("ARCHIVE_MAX_FILES"), "{err}");
+        }
+    }
+
+    #[test]
+    fn archive_inflight_budget_default_and_parse() {
+        assert_eq!(
+            super::archive_inflight_bytes(|_| None).unwrap(),
+            crate::archive_activity::DEFAULT_INFLIGHT_BYTES
+        );
+        let env = |name: &str| (name == "ARCHIVE_INFLIGHT_MB").then(|| " 64 ".to_string());
+        assert_eq!(
+            super::archive_inflight_bytes(env).unwrap(),
+            64 * 1024 * 1024
+        );
+        for bad in ["0", "-1", "lots"] {
+            let env = |name: &str| (name == "ARCHIVE_INFLIGHT_MB").then(|| bad.to_string());
+            let err = super::archive_inflight_bytes(env).unwrap_err().to_string();
+            assert!(err.contains("ARCHIVE_INFLIGHT_MB"), "{err}");
         }
     }
 }

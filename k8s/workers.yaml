@@ -120,6 +120,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
+          # An archive expansion (one at a time per worker) holds the archive (up to
+          # MAX_UPLOAD_MB) plus at most ARCHIVE_INFLIGHT_MB of its files, about 1 GiB
+          # with the defaults, plus ARCHIVE_MAX_FILE_MB per nested archive level. Raise
+          # the limit with those variables. See docs/concepts/archives.mdx, "Memory".
           resources:
             requests:
               cpu: 500m

@@ -208,8 +208,34 @@ pub fn walk(
     limits: &Limits,
     sink: &mut dyn FnMut(Event) -> Result<(), String>,
 ) -> Result<Summary, ArchiveError> {
+    walk_reserving(data, format, name, limits, &mut |_| Ok(()), sink)
+}
+
+/// [`walk`], calling `reserve(n)` before each file is decompressed into memory, `n`
+/// being the most bytes that file can take there (never more than
+/// [`Limits::max_file_bytes`]).
+///
+/// It lets the caller bound how much decompressed data is held at once: `reserve` may
+/// block until earlier files are let go. What follows a reservation is the file's own
+/// [`Event::File`], an [`Event::Skipped`] for it, or, when the file is a nested
+/// archive that gets opened, the reservations and events of its own entries. Either
+/// way, a reservation ends at the next reservation or event. Returning `Err` stops the
+/// walk, as from the sink.
+///
+/// A nested archive, and a gzip around a lone file or a tar, keep their own
+/// decompressed layer in memory while their content is walked: only the files handed
+/// to the sink are reserved.
+pub fn walk_reserving(
+    data: &[u8],
+    format: Format,
+    name: Option<&str>,
+    limits: &Limits,
+    reserve: &mut dyn FnMut(u64) -> Result<(), String>,
+    sink: &mut dyn FnMut(Event) -> Result<(), String>,
+) -> Result<Summary, ArchiveError> {
     let mut walker = Walker {
         limits,
+        reserve,
         sink,
         files: 0,
         skipped: 0,
@@ -225,6 +251,7 @@ pub fn walk(
 
 struct Walker<'a> {
     limits: &'a Limits,
+    reserve: &'a mut dyn FnMut(u64) -> Result<(), String>,
     sink: &'a mut dyn FnMut(Event) -> Result<(), String>,
     /// Files yielded so far.
     files: usize,
@@ -291,6 +318,9 @@ impl Walker<'_> {
                 self.skip(path, &self.too_large())?;
                 continue;
             }
+            // The declared size bounds what is read: a larger entry is refused one
+            // byte past it (`read_counted`).
+            self.reserve(declared)?;
             let mut file = match archive.by_index(i) {
                 Ok(f) => f,
                 Err(e) => {
@@ -370,6 +400,7 @@ impl Walker<'_> {
                 self.skip(path, &self.too_large())?;
                 continue;
             }
+            self.reserve(entry.size())?;
             let mut content = Vec::new();
             match (&mut entry)
                 .take(self.limits.max_file_bytes.saturating_add(1))
@@ -422,6 +453,8 @@ impl Walker<'_> {
             return self.tar_entries(metered, &fault, prefix, depth);
         }
 
+        // A gzip stream announces no size: it may take up to the per-file limit.
+        self.reserve(self.limits.max_file_bytes)?;
         let inner = match self.read_counted(&mut stream, None) {
             Ok(Some(d)) => d,
             Ok(None) => return Err(ArchiveError::FileTooLarge(self.limits.max_file_bytes)),
@@ -477,6 +510,11 @@ impl Walker<'_> {
             reason: reason.to_string(),
         })
         .map_err(ArchiveError::Stopped)
+    }
+
+    /// Announce that a file of at most `bytes` is about to be decompressed.
+    fn reserve(&mut self, bytes: u64) -> Result<(), ArchiveError> {
+        (self.reserve)(bytes.min(self.limits.max_file_bytes)).map_err(ArchiveError::Stopped)
     }
 
     fn too_large(&self) -> String {
@@ -1123,5 +1161,69 @@ mod tests {
         });
         assert_eq!(r, Err(ArchiveError::Stopped("receiver gone".into())));
         assert_eq!(seen, 1);
+    }
+
+    /// Every file handed to the sink was reserved, for at least its size, right
+    /// before it was decompressed: zip, tar, a lone gzip, a `.tar.gz` and a nested
+    /// zip alike.
+    #[test]
+    fn every_file_is_reserved_before_it_is_decompressed() {
+        let inner = zip_of(&[("deep.txt", b"deep deep")]);
+        let tar = tar_of(&[("t1.txt", b"tar one"), ("t2.txt", b"tar two!")]);
+        let data = zip_of(&[
+            ("a.txt", b"alpha"),
+            ("logs.tar", &tar),
+            ("logs.tar.gz", &gz(&tar)),
+            ("note.txt.gz", &gz(b"gzipped note")),
+            ("inner.zip", &inner),
+            ("empty.txt", b""),
+        ]);
+        let limits = Limits::default();
+        // What the sink and the reservation hook saw, in order.
+        let seen = RefCell::new(Vec::<Result<u64, Event>>::new());
+        let r = walk_reserving(
+            &data,
+            Format::Zip,
+            None,
+            &limits,
+            &mut |n| {
+                seen.borrow_mut().push(Ok(n));
+                Ok(())
+            },
+            &mut |e| {
+                seen.borrow_mut().push(Err(e));
+                Ok(())
+            },
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let seen = seen.into_inner();
+        let mut files = 0;
+        for (i, step) in seen.iter().enumerate() {
+            if let Err(Event::File { path, data }) = step {
+                files += 1;
+                let Some(Ok(reserved)) = i.checked_sub(1).map(|p| &seen[p]) else {
+                    panic!("{path} was not reserved right before it: {seen:?}");
+                };
+                assert!(*reserved >= data.len() as u64, "{path}: {reserved}");
+                assert!(*reserved <= limits.max_file_bytes);
+            }
+        }
+        assert_eq!(files, 7, "{seen:?}");
+
+        // A reservation that fails stops the walk before anything is decompressed.
+        let mut events = 0;
+        let r = walk_reserving(
+            &data,
+            Format::Zip,
+            None,
+            &limits,
+            &mut |_| Err("abandoned".into()),
+            &mut |_| {
+                events += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(r, Err(ArchiveError::Stopped("abandoned".into())));
+        assert_eq!(events, 0);
     }
 }

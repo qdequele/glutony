@@ -67,5 +67,7 @@ dotenvy.workspace = true
 temporalio-sdk = { workspace = true, features = ["testing"] }
 wiremock.workspace = true
 zip.workspace = true
+# A blob store that is slow to write, for the archive memory bound.
+object_store.workspace = true
 jsonschema = { version = "0.45", default-features = false }
 serde_yaml.workspace = true

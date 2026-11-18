@@ -676,6 +676,15 @@ impl BlobStore {
         }
     }
 
+    /// A store over any [`ObjectStore`], without a key prefix: for tests that need a
+    /// store which is slow, fails or counts what it is asked.
+    pub fn from_object_store(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            ..Self::memory()
+        }
+    }
+
     /// The URL this store was built from.
     pub fn url(&self) -> &str {
         &self.url

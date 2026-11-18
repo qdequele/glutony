@@ -155,12 +155,19 @@ async fn main() -> anyhow::Result<()> {
         .with_default_index(default_index.clone());
     // Archives route their files through the control plane like the gateway does, and
     // stage them in the same blob store; they need no fetch credential.
-    tracing::info!(limits = ?config.archive_limits, "archive limits");
+    // One archive expands at a time on this worker, holding at most
+    // ARCHIVE_INFLIGHT_MB of its decompressed files in memory at once.
     let archive_activities = ArchiveActivities::new(
         SourceActivities::new(config.control_plane_url.clone(), blob.clone())
             .with_control_plane_token(config.control_plane_token.clone())
             .with_default_index(default_index),
         config.archive_limits.clone(),
+    )
+    .with_inflight_bytes(config.archive_inflight_bytes);
+    tracing::info!(
+        limits = ?config.archive_limits,
+        inflight_bytes = archive_activities.budget().bytes(),
+        "archive limits"
     );
 
     if config.lab_events_enabled && config.control_plane_url.is_none() {
