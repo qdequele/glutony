@@ -200,6 +200,13 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | `json` | `true` | JSON mode: `caption` → `content`, `tags` → `fields.tags`, `text_in_image` → `fields.ocr_text`, other keys → `fields`. With `false` the whole text reply is the `content`. |
 | `max_bytes` | `20971520` (20 MiB) | Largest image accepted, in bytes. A larger one fails as invalid input before it is encoded or sent. |
 | `allow_reserved` | `[]` | Reply keys starting with `_` to keep, for example `["_geo"]`. Any other `_` key in the reply is dropped. |
+| `on_refusal` | `"keep"` | An image the provider declines: `keep` emits its document without a caption and with `fields.llm_declined` set; `fail` fails the step. |
+
+An image the provider declines to describe does not fail the step by default. When
+the reply's first choice has `finish_reason: content_filter`, a `refusal`, or no
+usable content, the document is still emitted, with an empty `content`, the usual
+`meta`, and `fields.llm_declined` set to `content_filter`, `refusal` or `empty`.
+HTTP errors are not refusals: 401, 402, 403 and 400 still fail the step.
 
 Meilisearch reserves keys starting with `_` (`_geo`, `_vectors`, …), and a malformed
 one makes it reject the whole batch, so the plugin drops every such key the model
@@ -318,6 +325,16 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | `temperature` | `0` | Sampling temperature. |
 | `fields_to_merge` | all keys | Restrict which keys of the reply are merged into `fields`. |
 | `allow_reserved` | `[]` | Reply keys starting with `_` to keep, for example `["_geo"]`. Any other `_` key in the reply is dropped. |
+| `on_refusal` | `"keep"` | A document the provider declines: `keep` indexes it un-enriched with `fields.llm_declined` set; `fail` fails the step. |
+
+A document the provider declines to answer for does not fail the batch. When the
+reply's first choice has `finish_reason: content_filter`, a `refusal`, or no
+usable content (none, `null` or blank), the document is kept as it came in, plus
+`fields.llm_declined` set to `content_filter`, `refusal` or `empty`, and the other
+documents go on (add `llm_declined` to the index's filterable attributes to find
+them). Set `on_refusal: fail` to
+fail the step instead. HTTP errors are not refusals: 401, 402 and 403 (including
+a Lab Gateway 403 for filtered content) and 400 still fail the step.
 
 Reply keys are merged into `fields`; `title` → `title`, `summary` →
 `fields.summary`, `keywords` → `fields.keywords`, `language` → `meta.language`.

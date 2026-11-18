@@ -43,7 +43,15 @@
 //! keys starting with `_` (`_geo`, `_vectors`, …), which are dropped unless the step
 //! lists them in `allow_reserved`. If the
 //! reply is not a JSON object the whole text becomes `content`. With `json: false` the
-//! model's full text reply is the `content`. `meta.mime` / `meta.filename` /
+//! model's full text reply is the `content`.
+//!
+//! An image the provider declines (a 200 whose first choice has
+//! `finish_reason: content_filter`, a `message.refusal`, or no usable content) still
+//! gives its document, with an empty `content` and [`DECLINED_FIELD`]
+//! (`fields.llm_declined`) set to `content_filter`, `refusal` or `empty`;
+//! `on_refusal: fail` fails the step instead. HTTP errors are not refusals.
+//!
+//! `meta.mime` / `meta.filename` /
 //! `meta.source` come from the input blob; the id derives from the filename when known.
 
 #![forbid(unsafe_code)]
@@ -121,6 +129,48 @@ pub struct ImageCaptionerConfig {
     /// malformed one makes it reject the whole batch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_reserved: Vec<String>,
+    /// What an image the provider declines (content filter, refusal, empty reply)
+    /// does: kept uncaptioned with a marker (default), or fails the step.
+    #[serde(default)]
+    pub on_refusal: OnRefusal,
+}
+
+/// What an image the provider declines to describe does to the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRefusal {
+    /// Emit the document without a caption, with [`DECLINED_FIELD`] naming the reason.
+    #[default]
+    Keep,
+    /// Fail the step (`NonRetryable`).
+    Fail,
+}
+
+/// Field set on a document whose image the provider declined to describe, holding the
+/// [`Declined`] reason (`content_filter`, `refusal` or `empty`).
+pub const DECLINED_FIELD: &str = "llm_declined";
+
+/// Why a completion carries no usable reply for the image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Declined {
+    /// `finish_reason: content_filter`: the provider's filter stopped the reply.
+    ContentFilter,
+    /// The model refused (`message.refusal`).
+    Refusal,
+    /// No choice, or a null, absent or blank `message.content`.
+    Empty,
+}
+
+impl Declined {
+    /// The value written into [`DECLINED_FIELD`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentFilter => "content_filter",
+            Self::Refusal => "refusal",
+            Self::Empty => "empty",
+        }
+    }
 }
 
 fn default_prompt() -> String {
@@ -146,6 +196,7 @@ impl Default for ImageCaptionerConfig {
             json: true,
             max_bytes: DEFAULT_MAX_BYTES,
             allow_reserved: Vec::new(),
+            on_refusal: OnRefusal::Keep,
         }
     }
 }
@@ -320,6 +371,12 @@ impl Plugin for ImageCaptionerPlugin {
                         "items": { "type": "string", "pattern": "^_" },
                         "description": "Reply keys starting with _ to keep, e.g. [\"_geo\"]; any other is dropped",
                         "default": []
+                    },
+                    "on_refusal": {
+                        "type": "string",
+                        "enum": ["keep", "fail"],
+                        "default": "keep",
+                        "description": "An image the provider declines: keep the document uncaptioned with llm_declined set, or fail the step"
                     }
                 }
             }))
@@ -408,8 +465,9 @@ impl Plugin for ImageCaptionerPlugin {
         }
 
         // A failed call records nothing: `?` returns before `record_usage`. A transient
-        // failure (429, 5xx, dropped connection) is retried here first.
-        let (raw, mut units) = with_retry(&self.retry, ctx, NAME, || {
+        // failure (429, 5xx, dropped connection) is retried here first. A declined one
+        // was answered, and billed, like any other.
+        let (reply, mut units) = with_retry(&self.retry, ctx, NAME, || {
             chat_completion(
                 &client.http,
                 &client.base_url,
@@ -432,9 +490,25 @@ impl Plugin for ImageCaptionerPlugin {
         doc.meta.mime = Some(blob.mime.clone());
         doc.meta.filename = blob.filename.clone();
         doc.meta.source = blob.filename.clone();
-        apply_reply(&mut doc, &raw, cfg.json, &cfg.allow_reserved);
-
-        tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, id = %doc.id, "captioned image");
+        match reply {
+            Ok(raw) => {
+                apply_reply(&mut doc, &raw, cfg.json, &cfg.allow_reserved);
+                tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, id = %doc.id, "captioned image");
+            }
+            Err(reason) if cfg.on_refusal == OnRefusal::Fail => {
+                return Err(PluginError::non_retryable(format!(
+                    "vision model declined the image ({}); set on_refusal: keep to index it uncaptioned",
+                    reason.as_str()
+                )));
+            }
+            Err(reason) => {
+                tracing::warn!(job_id = %ctx.job_id(), plugin = NAME, id = %doc.id, reason = reason.as_str(), "the vision model declined an image; kept uncaptioned");
+                doc.fields.insert(
+                    DECLINED_FIELD.into(),
+                    serde_json::Value::String(reason.as_str().into()),
+                );
+            }
+        }
         Ok(PluginOutput::Documents(vec![doc]))
     }
 }
@@ -507,12 +581,18 @@ struct ChatCompletion {
 }
 #[derive(Deserialize)]
 struct Choice {
+    #[serde(default)]
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
+    /// OpenAI's structured refusal, set instead of `content`.
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 /// The `usage` object of an OpenAI-compatible chat completion.
@@ -524,8 +604,8 @@ struct ApiUsage {
     completion_tokens: u64,
 }
 
-/// POST `{base_url}/chat/completions` and return `choices[0].message.content` plus the
-/// units the call cost.
+/// POST `{base_url}/chat/completions` and return `choices[0].message.content` (or why
+/// the provider declined, see [`read_choice`]) plus the units the call cost.
 ///
 /// The `usage` object is optional — some gateways omit it — and when it is missing the
 /// returned units still count one request, with the token counts left at zero rather
@@ -541,7 +621,7 @@ async fn chat_completion(
     api_key: &str,
     body: &serde_json::Value,
     lab: Option<&AiTarget>,
-) -> Result<(String, UsageUnits), Failure> {
+) -> Result<(Result<String, Declined>, UsageUnits), Failure> {
     let url = format!("{base_url}/chat/completions");
     let resp = http
         .post(&url)
@@ -572,17 +652,30 @@ async fn chat_completion(
             ..Default::default()
         },
     };
-    let content = parsed
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .ok_or_else(|| {
-            Failure::Other(PluginError::non_retryable(
-                "vision response has no choices[0].message.content",
-            ))
-        })?;
-    Ok((content, usage))
+    Ok((read_choice(parsed.choices.into_iter().next()), usage))
+}
+
+/// What the first choice of a completion says about the image: the reply, or why the
+/// provider declined to give one.
+fn read_choice(choice: Option<Choice>) -> Result<String, Declined> {
+    let Some(choice) = choice else {
+        return Err(Declined::Empty);
+    };
+    if choice.finish_reason.as_deref() == Some("content_filter") {
+        return Err(Declined::ContentFilter);
+    }
+    if choice
+        .message
+        .refusal
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+    {
+        return Err(Declined::Refusal);
+    }
+    match choice.message.content {
+        Some(c) if !c.trim().is_empty() => Ok(c),
+        _ => Err(Declined::Empty),
+    }
 }
 
 /// A request that never got a full answer: `Retryable` either way, and retried in the
@@ -825,6 +918,60 @@ mod tests {
             serde_json::json!({"lat": 48.8, "lng": 2.3})
         );
         assert!(!d.fields.contains_key("_vectors"));
+    }
+
+    #[tokio::test]
+    async fn a_declined_image_is_kept_uncaptioned_with_a_marker() {
+        let cases = [
+            (
+                serde_json::json!({ "choices": [{ "finish_reason": "content_filter",
+                    "message": { "role": "assistant", "content": null } }] }),
+                "content_filter",
+            ),
+            (
+                serde_json::json!({ "choices": [{ "message": { "role": "assistant",
+                    "content": null, "refusal": "I can't describe this image." } }] }),
+                "refusal",
+            ),
+            (serde_json::json!({ "choices": [] }), "empty"),
+            (chat_reply(" "), "empty"),
+        ];
+        for (reply, reason) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+                .mount(&server)
+                .await;
+            let ctx = ActivityContext::noop();
+            let docs = plugin(&server)
+                .execute(&ctx, image(), serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("{reason}: {e:?}"))
+                .into_documents()
+                .unwrap();
+            assert_eq!(docs.len(), 1);
+            let d = &docs[0];
+            assert_eq!(d.id, "cat_photo_png");
+            assert_eq!(d.content, "", "{reason}");
+            assert_eq!(d.fields.len(), 1, "{reason}: {:?}", d.fields);
+            assert_eq!(d.fields["llm_declined"], reason);
+            assert_eq!(d.meta.filename.as_deref(), Some("cat photo.png"));
+            // The provider answered and bills the call, image included.
+            assert_eq!(ctx.usage().images, 1, "{reason}");
+
+            let err = plugin(&server)
+                .execute(
+                    &ActivityContext::noop(),
+                    image(),
+                    serde_json::json!({ "on_refusal": "fail" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, PluginError::NonRetryable(m) if m.contains(reason)),
+                "{err:?}"
+            );
+        }
     }
 
     #[tokio::test]

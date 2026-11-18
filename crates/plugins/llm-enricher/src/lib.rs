@@ -69,6 +69,13 @@
 //!
 //! A reply that is not a JSON object is stored verbatim in `fields.llm_raw` and the
 //! document is otherwise left unchanged; a single bad reply never fails the batch.
+//!
+//! A document the provider declines (a 200 whose first choice has
+//! `finish_reason: content_filter`, a `message.refusal`, or no usable content) is kept
+//! un-enriched with [`DECLINED_FIELD`] (`fields.llm_declined`) set to
+//! `content_filter`, `refusal` or `empty`, and the batch goes on. `on_refusal: fail`
+//! fails the step instead. HTTP errors (401, 402, 403, 400, …) are not refusals and
+//! keep their classes above.
 
 #![forbid(unsafe_code)]
 
@@ -115,6 +122,53 @@ pub enum MergeStrategy {
     Replace,
 }
 
+/// What a document the provider declines to answer for does to the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRefusal {
+    /// Keep the document un-enriched, with [`DECLINED_FIELD`] naming the reason, and
+    /// go on with the batch.
+    #[default]
+    Keep,
+    /// Fail the step (`NonRetryable`).
+    Fail,
+}
+
+/// Field set on a document the provider declined to enrich, holding the
+/// [`Declined`] reason (`content_filter`, `refusal` or `empty`).
+pub const DECLINED_FIELD: &str = "llm_declined";
+
+/// Why a completion carries no usable reply for one document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Declined {
+    /// `finish_reason: content_filter`: the provider's filter stopped the reply.
+    ContentFilter,
+    /// The model refused (`message.refusal`).
+    Refusal,
+    /// No choice, or a null, absent or blank `message.content` (a tool call, say).
+    Empty,
+}
+
+impl Declined {
+    /// The value written into [`DECLINED_FIELD`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentFilter => "content_filter",
+            Self::Refusal => "refusal",
+            Self::Empty => "empty",
+        }
+    }
+
+    /// The step failure under `on_refusal: fail`.
+    fn into_error(self) -> PluginError {
+        PluginError::non_retryable(format!(
+            "LLM declined the document ({}); set on_refusal: keep to index it un-enriched",
+            self.as_str()
+        ))
+    }
+}
+
 /// The step `config:` block. Every field has a default so `config: {}` is valid.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmEnricherConfig {
@@ -147,6 +201,10 @@ pub struct LlmEnricherConfig {
     /// malformed one (`"_geo": "Paris"`) makes it reject the whole batch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_reserved: Vec<String>,
+    /// What a document the provider declines (content filter, refusal, empty reply)
+    /// does: kept un-enriched with a marker (default), or fails the step.
+    #[serde(default)]
+    pub on_refusal: OnRefusal,
 }
 
 fn default_prompt() -> String {
@@ -171,6 +229,7 @@ impl Default for LlmEnricherConfig {
             merge_strategy: MergeStrategy::Merge,
             system_prompt: None,
             allow_reserved: Vec::new(),
+            on_refusal: OnRefusal::Keep,
         }
     }
 }
@@ -369,6 +428,12 @@ impl Plugin for LlmEnricherPlugin {
                         "items": { "type": "string", "pattern": "^_" },
                         "description": "Reply keys starting with _ to keep, e.g. [\"_geo\"]; any other is dropped",
                         "default": []
+                    },
+                    "on_refusal": {
+                        "type": "string",
+                        "enum": ["keep", "fail"],
+                        "default": "keep",
+                        "description": "A document the provider declines: keep it un-enriched with llm_declined set, or fail the step"
                     }
                 }
             }))
@@ -441,12 +506,41 @@ struct ChatCompletion {
 }
 #[derive(Deserialize)]
 struct Choice {
+    #[serde(default)]
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
+    /// OpenAI's structured refusal, set instead of `content`.
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+/// What the first choice of a completion says about the document: the reply, or why
+/// the provider declined to give one.
+fn read_choice(choice: Option<Choice>) -> Result<String, Declined> {
+    let Some(choice) = choice else {
+        return Err(Declined::Empty);
+    };
+    if choice.finish_reason.as_deref() == Some("content_filter") {
+        return Err(Declined::ContentFilter);
+    }
+    if choice
+        .message
+        .refusal
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+    {
+        return Err(Declined::Refusal);
+    }
+    match choice.message.content {
+        Some(c) if !c.trim().is_empty() => Ok(c),
+        _ => Err(Declined::Empty),
+    }
 }
 
 /// The `usage` object of an OpenAI-compatible chat completion.
@@ -524,8 +618,9 @@ impl LlmClient {
             body["max_tokens"] = serde_json::json!(max);
         }
 
-        // A failed call records nothing: `?` returns before `record_usage`.
-        let completion = with_retry(retry, ctx, NAME, || {
+        // A failed call records nothing: `?` returns before `record_usage`. A declined
+        // one was answered, and billed, like any other.
+        let (choice, mut usage) = with_retry(retry, ctx, NAME, || {
             complete(
                 &self.http,
                 &self.base_url,
@@ -535,16 +630,35 @@ impl LlmClient {
             )
         })
         .await?;
-        let mut usage = completion.usage;
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
-        apply_reply(
-            &mut doc,
-            &completion.content,
-            cfg.merge_strategy,
-            &cfg.allow_reserved,
-        );
+        apply_outcome(&mut doc, &read_choice(choice), cfg)?;
         Ok(doc)
+    }
+}
+
+/// Write one document's outcome into it: the reply (see [`apply_reply`]), or, when the
+/// provider declined, [`DECLINED_FIELD`] under `on_refusal: keep` and a step failure
+/// under `on_refusal: fail`.
+fn apply_outcome(
+    doc: &mut Document,
+    outcome: &Result<String, Declined>,
+    cfg: &LlmEnricherConfig,
+) -> Result<(), PluginError> {
+    match outcome {
+        Ok(reply) => {
+            apply_reply(doc, reply, cfg.merge_strategy, &cfg.allow_reserved);
+            Ok(())
+        }
+        Err(reason) if cfg.on_refusal == OnRefusal::Fail => Err(reason.into_error()),
+        Err(reason) => {
+            tracing::warn!(plugin = NAME, id = %doc.id, reason = reason.as_str(), "the LLM declined a document; kept un-enriched");
+            doc.fields.insert(
+                DECLINED_FIELD.into(),
+                serde_json::Value::String(reason.as_str().into()),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -577,9 +691,13 @@ pub async fn chat_completion_with_usage(
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<Completion, PluginError> {
-    complete(http, base_url, api_key, body, None)
+    let (choice, usage) = complete(http, base_url, api_key, body, None)
         .await
-        .map_err(Failure::into_error)
+        .map_err(Failure::into_error)?;
+    let content = choice.and_then(|c| c.message.content).ok_or_else(|| {
+        PluginError::non_retryable("LLM response has no choices[0].message.content")
+    })?;
+    Ok(Completion { content, usage })
 }
 
 /// The one chat-completions call behind [`chat_completion_with_usage`] and the plugin.
@@ -588,13 +706,16 @@ pub async fn chat_completion_with_usage(
 ///
 /// A failure says whether it is transient (see [`transport_failure`] and
 /// [`http_failure`]), for the plugin's own retry; the public wrappers only surface it.
+///
+/// Returns the first choice (none when `choices` is empty) with the call's units: an
+/// answer without usable content is the caller's to judge (see [`read_choice`]).
 async fn complete(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
     lab: Option<&AiTarget>,
-) -> Result<Completion, Failure> {
+) -> Result<(Option<Choice>, UsageUnits), Failure> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = http
         .post(&url)
@@ -624,17 +745,7 @@ async fn complete(
         Some(u) => UsageUnits::llm(u.prompt_tokens, u.completion_tokens),
         None => request_without_token_counts(),
     };
-    let content = parsed
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .ok_or_else(|| {
-            Failure::Other(PluginError::non_retryable(
-                "LLM response has no choices[0].message.content",
-            ))
-        })?;
-    Ok(Completion { content, usage })
+    Ok((parsed.choices.into_iter().next(), usage))
 }
 
 /// A request that never got a full answer: `Retryable` either way, and retried in the
@@ -1096,6 +1207,89 @@ mod tests {
         assert_eq!(out[0].title, doc.title);
         assert_eq!(out[0].content, doc.content);
         assert_eq!(out[0].fields.len(), 1);
+    }
+
+    /// Declines the document whose content names a decline kind, enriches the others.
+    struct DeclineSome;
+    impl Respond for DeclineSome {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            let content = user.rsplit("\n\n").next().unwrap();
+            let reply = match content {
+                "filtered" => serde_json::json!({ "choices": [{ "finish_reason": "content_filter",
+                    "message": { "role": "assistant", "content": null } }] }),
+                "refused" => serde_json::json!({ "choices": [{ "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": null, "refusal": "I can't help with that." } }] }),
+                "blank" => chat_reply("  "),
+                "no choice" => serde_json::json!({ "choices": [] }),
+                _ => chat_reply(r#"{"summary":"s"}"#),
+            };
+            ResponseTemplate::new(200).set_body_json(reply)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declined_document_is_kept_unenriched_with_a_marker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DeclineSome)
+            .mount(&server)
+            .await;
+        let cases = [
+            ("filtered", "content_filter"),
+            ("refused", "refusal"),
+            ("blank", "empty"),
+            ("no choice", "empty"),
+        ];
+        for (content, reason) in cases {
+            let mut declined = Document::with_id("d1", content);
+            declined.title = Some("Q3 report".into());
+            let docs = vec![
+                Document::with_id("d0", "x"),
+                declined.clone(),
+                Document::with_id("d2", "y"),
+            ];
+            let ctx = ActivityContext::noop();
+            let out = plugin(&server)
+                .execute(&ctx, PluginInput::Documents(docs), serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("{content}: {e:?}"))
+                .into_documents()
+                .unwrap();
+            assert_eq!(out.len(), 3, "{content}");
+            assert_eq!(out[0].fields["summary"], "s");
+            assert_eq!(out[2].fields["summary"], "s");
+            assert_eq!(out[1].fields.len(), 1, "{content}: {:?}", out[1].fields);
+            assert_eq!(out[1].fields["llm_declined"], reason, "{content}");
+            assert_eq!(out[1].title, declined.title);
+            assert_eq!(out[1].content, declined.content);
+            // The provider answered, and bills the declined call too.
+            assert_eq!(ctx.usage().llm_requests, 3, "{content}");
+        }
+    }
+
+    #[tokio::test]
+    async fn on_refusal_fail_fails_the_step_on_a_declined_document() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DeclineSome)
+            .mount(&server)
+            .await;
+        let err = run(
+            &plugin(&server),
+            vec![
+                Document::with_id("d0", "x"),
+                Document::with_id("d1", "filtered"),
+            ],
+            serde_json::json!({ "on_refusal": "fail" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("content_filter")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1648,7 +1842,8 @@ mod tests {
     #[tokio::test]
     async fn llm_enricher_lab_403_is_final_and_keeps_the_key() {
         // Lumen's 403s are filtered content (LM-2013) or platform-only routes, not a
-        // refused key.
+        // refused key. Even under the default `on_refusal: keep` a 403 stays final:
+        // only a 200 without usable content is a declined document.
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
