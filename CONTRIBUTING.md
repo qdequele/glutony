@@ -43,8 +43,9 @@ Releases are automated; nobody edits a version or pushes a tag by hand.
    any `feat`: minor; otherwise patch), or `patch`, `minor`, `major`, or an
    exact `X.Y.Z`. It runs `scripts/prepare-release.sh`, which bumps
    `[workspace.package] version` and the pinned `version` of the internal path
-   dependencies in `Cargo.toml`, the workspace crates in `Cargo.lock` and
-   `info.version` in `docs/openapi.yaml`, and folds `Unreleased` into
+   dependencies in `Cargo.toml`, the workspace crates in `Cargo.lock`,
+   `info.version` in `docs/openapi.yaml` and the image `newTag` in
+   `k8s/kustomization.yaml` (`X.Y.Z`, no `v`), and folds `Unreleased` into
    `## [X.Y.Z] - YYYY-MM-DD`. It opens or refreshes the PR
    `chore(release): vX.Y.Z` and dispatches CI on it.
 3. **Merge the release PR** on green. `release-on-merge.yml` tags the merge
@@ -57,7 +58,9 @@ Releases are automated; nobody edits a version or pushes a tag by hand.
 Locally, `scripts/prepare-release.sh` with no argument prints the suggested
 bump; `scripts/prepare-release.sh patch` prepares the same commit the workflow
 makes (re-running it is safe: bumps count from the last tag).
-`scripts/prepare-release.sh --check` is CI's `version sync` job.
+`scripts/prepare-release.sh --check` is CI's `version sync` job;
+`scripts/prepare-release.sh --sync` puts the crate version back into
+`k8s/kustomization.yaml` when `--check` reports its `newTag` (it bumps nothing).
 
 A tag pushed with `GITHUB_TOKEN` triggers no workflow, so
 `release-on-merge.yml` calls `release.yml` as a reusable workflow; a tag pushed

@@ -84,7 +84,9 @@ One version, kept in sync by `scripts/prepare-release.sh` and enforced by
 CI's `version sync` job: `[workspace.package] version` and the pinned
 `meili-ingest-plugin-sdk` version in `Cargo.toml`, the workspace crates in
 `Cargo.lock`, `info.version` in `docs/openapi.yaml` (the Pipelines contract
-the Lab vendors), and the newest `CHANGELOG.md` section.
+the Lab vendors), the image `newTag` in `k8s/kustomization.yaml` (`X.Y.Z`,
+never `latest`; `scripts/prepare-release.sh --sync` restores it), and the
+newest `CHANGELOG.md` section.
 
 - **Every PR**: add its entries under `Unreleased` in `CHANGELOG.md`, in the
   same PR. Leave every version alone: only the release script writes them.
@@ -106,8 +108,9 @@ the Lab vendors), and the newest `CHANGELOG.md` section.
   `GLUTONY_REQUIRED_CHECKS` in qdq-server follows. It `pg_dump`s the `glutony`
   database first; the control plane applies `migrations/` (sqlx) at boot,
   forward-only, and a rollback restores the dump when `migrations/` changed.
-  Kubernetes: pin `newTag` in `k8s/kustomization.yaml` to the release, then
-  `kubectl apply -k k8s/` (`docs/deployment/kubernetes.mdx`, "Upgrades").
+  Kubernetes: `k8s/kustomization.yaml` pins `newTag` to the release (the
+  release script writes it), so `kubectl apply -k k8s/` from the release's
+  tree deploys it (`docs/deployment/kubernetes.mdx`, "Upgrades").
 - **Before merging a change that needs config**: a new required env var or
   secret goes into `/etc/glutony/glutony.env` on the box (and
   `docs/deployment/environment-variables.mdx`) first; an auth change that the

@@ -20,7 +20,7 @@ kubectl -n meili-ingest get pods
 | `gateway.yaml` | gateway `Deployment` (2–10 replicas via the HPA), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
 | `workers.yaml` | `workers-general` `Deployment` with a KEDA `ScaledObject` |
 | `temporal.yaml` | **reference only** single-pod Temporal (`auto-setup`) + Postgres + UI |
-| `kustomization.yaml` | ties it together; pin the image tag here |
+| `kustomization.yaml` | ties it together; pins the image to the release (`newTag`, written by the release script) |
 | `secrets.example.yaml` | **example only**, not in the kustomization: every key of the `meili-ingest-secrets` `Secret` |
 
 ## Prerequisites
@@ -280,8 +280,14 @@ http://localhost:8080/ingest`.
 
 ## Upgrades
 
-Pin the image tag in `kustomization.yaml` (`newTag: 0.2.0`: release images are
-tagged without the `v`) and `kubectl apply -k k8s/`. The `Secret` is not in the
+`kustomization.yaml` pins the image to the release its tree belongs to
+(`newTag: 0.2.0`: release images are tagged without the `v`, never `latest`, which
+nodes would keep cached under `imagePullPolicy: IfNotPresent`). Check out the
+release's tag (`git checkout v0.2.0`) and `kubectl apply -k k8s/`: the new tag
+changes the pod template, so every `Deployment` rolls to it. The release script
+writes `newTag` with each release, so `main` right after a release names the new
+image a few minutes before the release workflow has pushed it; apply a tag, not
+`main`, to avoid an `ImagePullBackOff` in that window. The `Secret` is not in the
 kustomization, so this never resets it; add any new key with `kubectl patch secret`
 and restart the pods. Control-plane migrations run automatically at boot
 (`sqlx::migrate!`). Workflows in flight keep running: the workflow code is versioned

@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   # The release invariant: the crate version (Cargo.toml package and pinned
-  # path dependencies, Cargo.lock) and docs/openapi.yaml info.version agree.
+  # path dependencies, Cargo.lock), docs/openapi.yaml info.version and the
+  # k8s/kustomization.yaml image newTag agree.
   # Also tests the release script itself (scripts/test-prepare-release.sh).
   version-sync:
     name: version sync

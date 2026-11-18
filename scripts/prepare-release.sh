@@ -6,7 +6,8 @@
 #   scripts/prepare-release.sh auto            apply that suggestion
 #   scripts/prepare-release.sh patch|minor|major|X.Y.Z
 #                                              prepare that release
-#   scripts/prepare-release.sh --check         fail when Cargo.toml, Cargo.lock and docs/openapi.yaml disagree
+#   scripts/prepare-release.sh --check         fail when Cargo.toml, Cargo.lock, docs/openapi.yaml and k8s/kustomization.yaml disagree
+#   scripts/prepare-release.sh --sync          write the crate version into k8s/kustomization.yaml (changes nothing else)
 #   scripts/prepare-release.sh --notes X.Y.Z   print the CHANGELOG section of X.Y.Z
 #   scripts/prepare-release.sh --verify-tag vX.Y.Z
 #                                              fail unless the tree is a consistent X.Y.Z release
@@ -16,7 +17,10 @@
 #      path dependencies in `[workspace.dependencies]`, and the workspace
 #      crates in Cargo.lock;
 #   2. docs/openapi.yaml `info.version` (the Pipelines contract the Lab vendors);
-#   3. CHANGELOG.md: `## [Unreleased]` becomes `## [X.Y.Z] - YYYY-MM-DD` under a
+#   3. k8s/kustomization.yaml `newTag` of the glutony image (no `v`: image tags
+#      are `X.Y.Z`), so the shipped manifests deploy the release, never the
+#      moving `latest` that nodes with `imagePullPolicy: IfNotPresent` keep cached;
+#   4. CHANGELOG.md: `## [Unreleased]` becomes `## [X.Y.Z] - YYYY-MM-DD` under a
 #      fresh empty [Unreleased] (and the compare-link footer, if there is one).
 #
 # Bumps are computed from the last `vX.Y.Z` tag, not from Cargo.toml, so the
@@ -37,13 +41,15 @@ cd "$(dirname "$0")/.."
 CARGO_TOML=Cargo.toml
 CARGO_LOCK=Cargo.lock
 OPENAPI=docs/openapi.yaml
+KUSTOMIZATION=k8s/kustomization.yaml
+IMAGE=ghcr.io/qdequele/glutony
 CHANGELOG=CHANGELOG.md
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 die() { echo "prepare-release: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- readers -----------------------------------------------------------------
@@ -62,6 +68,29 @@ openapi_version() {
     /^[^ \t#]/ { inside = 0 }
     inside && /^  version:/ { v = $2; gsub(/["\047]/, "", v); print v; exit }
   ' "$OPENAPI"
+}
+
+# `newTag` of $IMAGE under `images:` in the kustomization.
+kustomize_tag() {
+  awk -v img="$IMAGE" '
+    /^images:/ { inside = 1; next }
+    /^[^ \t#]/ { inside = 0 }
+    inside && $1 == "-" && $2 == "name:" { cur = $3; next }
+    inside && $1 == "name:" { cur = $2; next }
+    inside && cur == img && $1 == "newTag:" { v = $2; gsub(/["\047]/, "", v); print v; exit }
+  ' "$KUSTOMIZATION"
+}
+
+# The kustomization with $IMAGE's `newTag` set to $1, on stdout.
+kustomize_with_tag() {
+  awk -v img="$IMAGE" -v ver="$1" '
+    /^images:/ { inside = 1; print; next }
+    /^[^ \t#]/ { inside = 0 }
+    inside && $1 == "-" && $2 == "name:" { cur = $3 }
+    inside && $1 == "name:" { cur = $2 }
+    inside && cur == img && !done && $1 == "newTag:" { sub(/newTag:.*$/, "newTag: " ver); done = 1 }
+    { print }
+  ' "$KUSTOMIZATION"
 }
 
 # "name version" for every Cargo.lock package without a `source`: the
@@ -170,12 +199,17 @@ suggest_bump() {
 # --- commands ----------------------------------------------------------------
 
 cmd_check() {
-  local crate api status=0 name ver
+  local crate api tag status=0 name ver
   crate="$(crate_version)"
   api="$(openapi_version)"
   [ -n "$crate" ] || die "no [workspace.package] version in $CARGO_TOML"
   if [ "$api" != "$crate" ]; then
     echo "::error file=$OPENAPI::info.version is '$api' but the crate version ($CARGO_TOML) is '$crate'; run scripts/prepare-release.sh or fix it by hand" >&2
+    status=1
+  fi
+  tag="$(kustomize_tag)"
+  if [ "$tag" != "$crate" ]; then
+    echo "::error file=$KUSTOMIZATION::newTag of $IMAGE is '$tag' but the crate version is '$crate'; run scripts/prepare-release.sh --sync" >&2
     status=1
   fi
   while read -r name ver; do
@@ -196,7 +230,7 @@ EOF
   done <<EOF
 $(lock_workspace_versions)
 EOF
-  [ "$status" -eq 0 ] && echo "version $crate is consistent across $CARGO_TOML (package and path dependencies), $CARGO_LOCK and $OPENAPI"
+  [ "$status" -eq 0 ] && echo "version $crate is consistent across $CARGO_TOML (package and path dependencies), $CARGO_LOCK, $OPENAPI and $KUSTOMIZATION"
   return "$status"
 }
 
@@ -296,6 +330,8 @@ cmd_prepare() {
       { print }
     ' "$OPENAPI" >"$tmp/openapi.yaml"
 
+    kustomize_with_tag "$target" >"$tmp/kustomization.yaml"
+
     if $fold_changelog; then
       url="$(sed -n 's|^\[Unreleased\]: \(.*\)/compare/.*$|\1|p' "$CHANGELOG" | head -n 1)"
       awk -v ver="$target" -v date="$date" -v url="$url" -v prev="$tag" '
@@ -320,6 +356,7 @@ cmd_prepare() {
       die "could not set the path dependency versions in $CARGO_TOML"
     fi
     grep -q "^  version: $target\$" "$tmp/openapi.yaml" || die "could not set info.version in $OPENAPI"
+    [ "$(KUSTOMIZATION="$tmp/kustomization.yaml" kustomize_tag)" = "$target" ] || die "could not set newTag in $KUSTOMIZATION"
     CHANGELOG="$tmp/CHANGELOG.md" has_section "$target" || die "could not fold [Unreleased] in $CHANGELOG"
     while read -r name _; do
       [ -n "$name" ] || continue
@@ -336,9 +373,10 @@ EOF
     mv "$tmp/Cargo.toml" "$CARGO_TOML"
     mv "$tmp/Cargo.lock" "$CARGO_LOCK"
     mv "$tmp/openapi.yaml" "$OPENAPI"
+    mv "$tmp/kustomization.yaml" "$KUSTOMIZATION"
     mv "$tmp/CHANGELOG.md" "$CHANGELOG"
     echo "prepared v$target (was $crate; last tag ${tag:-none}):"
-    echo "  $CARGO_TOML, $CARGO_LOCK, $OPENAPI -> $target"
+    echo "  $CARGO_TOML, $CARGO_LOCK, $OPENAPI, $KUSTOMIZATION -> $target"
     if $fold_changelog; then echo "  $CHANGELOG: [Unreleased] -> [$target] - $date"; fi
   fi
 
@@ -347,6 +385,24 @@ EOF
     { echo "version=$target"; echo "tag=v$target"; } >>"$GITHUB_OUTPUT"
   fi
   echo "next: commit, open the release PR titled 'chore(release): v$target', merge it; the tag and release follow."
+}
+
+# Writes the crate version into the copies that only follow it (the
+# kustomization's newTag), for a tree whose copy was edited by hand or predates
+# it. Never bumps anything: the version comes from Cargo.toml as it is.
+cmd_sync() {
+  local crate tmp
+  crate="$(crate_version)"
+  [[ "$crate" =~ $SEMVER_RE ]] || die "cannot read the crate version from $CARGO_TOML"
+  if [ "$(kustomize_tag)" = "$crate" ]; then
+    echo "$KUSTOMIZATION already deploys $crate"
+    return 0
+  fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/prepare-release.XXXXXX")"
+  kustomize_with_tag "$crate" >"$tmp"
+  [ "$(KUSTOMIZATION="$tmp" kustomize_tag)" = "$crate" ] || { rm -f "$tmp"; die "could not set newTag in $KUSTOMIZATION"; }
+  mv "$tmp" "$KUSTOMIZATION"
+  echo "$KUSTOMIZATION: newTag -> $crate"
 }
 
 cmd_notes() {
@@ -382,6 +438,7 @@ case "${1:-}" in
   "") cmd_suggest ;;
   -h | --help) usage ;;
   --check) cmd_check ;;
+  --sync) cmd_sync ;;
   --notes) cmd_notes "${2:-}" ;;
   --verify-tag) cmd_verify_tag "${2:-}" ;;
   -*) usage >&2; exit 2 ;;

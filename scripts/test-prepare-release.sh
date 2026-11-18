@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for scripts/prepare-release.sh, run by CI's `version sync` job. Each
 # case works on a throwaway copy of the files the script reads (Cargo.toml,
-# Cargo.lock, docs/openapi.yaml) in its own git repository, so the working tree
+# Cargo.lock, docs/openapi.yaml, k8s/kustomization.yaml) in its own git repository, so the working tree
 # is never touched. The CHANGELOG is the fixture's own: the repository's has an
 # empty [Unreleased] on every release PR and on main right after a release, and
 # the cases must not depend on what is in it.
@@ -25,10 +25,11 @@ crate="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version[ \t]
 fixture() {
   local dir="$work/$1" entry="- A change worth releasing."
   [ "${2:-}" = empty ] && entry=""
-  mkdir -p "$dir/scripts" "$dir/docs"
+  mkdir -p "$dir/scripts" "$dir/docs" "$dir/k8s"
   cp "$root/scripts/prepare-release.sh" "$dir/scripts/"
   cp "$root/Cargo.toml" "$root/Cargo.lock" "$dir/"
   cp "$root/docs/openapi.yaml" "$dir/docs/"
+  cp "$root/k8s/kustomization.yaml" "$dir/k8s/"
   printf '# Changelog\n\n## [Unreleased]\n\n%s\n\n## [%s] - 2026-01-01\n\n- The last release.\n' \
     "$entry" "$crate" >"$dir/CHANGELOG.md"
   (
@@ -91,6 +92,35 @@ dir="$(fixture nosection)"
 (cd "$dir" && RELEASE_DATE=2026-01-02 scripts/prepare-release.sh 9.8.7 >/dev/null)
 sed -i.bak 's/^## \[9\.8\.7\] - 2026-01-02$//' "$dir/CHANGELOG.md"
 expect_fail "--verify-tag refuses a tag with no CHANGELOG section" "$dir" "no \[9.8.7\] section" --verify-tag v9.8.7
+
+# --- k8s/kustomization.yaml: the deployed image tag is a version copy ---------
+
+# The shipped kustomization pins the release, never the moving `latest` (nodes
+# that cached `latest` never pull a newer one with imagePullPolicy IfNotPresent).
+dir="$(fixture k8s)"
+expect_ok "--check accepts the kustomization at the crate version" "$dir" --check
+sed -i.bak 's/^\(    newTag:\).*$/\1 latest/' "$dir/k8s/kustomization.yaml"
+expect_fail "--check refuses a kustomization newTag that is not the crate version" "$dir" "newTag" --check
+expect_fail "--verify-tag refuses a kustomization newTag that is not the crate version" "$dir" "disagree" --verify-tag "v$crate"
+expect_ok "--sync writes the crate version into the kustomization" "$dir" --sync
+if grep -qx "    newTag: $crate" "$dir/k8s/kustomization.yaml"; then pass "--sync pins newTag to $crate"; else
+  fail "--sync pins newTag to $crate"
+  grep -n newTag "$dir/k8s/kustomization.yaml" | sed 's/^/     /' >&2
+fi
+expect_ok "--check accepts the synced kustomization" "$dir" --check
+if (cd "$dir" && git diff --quiet -- Cargo.toml Cargo.lock docs/openapi.yaml CHANGELOG.md); then pass "--sync changes nothing else"; else
+  fail "--sync changes nothing else"
+fi
+
+dir="$(fixture k8sprepare)"
+(cd "$dir" && RELEASE_DATE=2026-01-02 scripts/prepare-release.sh 9.8.7 >/dev/null)
+if grep -qx "    newTag: 9.8.7" "$dir/k8s/kustomization.yaml"; then pass "prepare pins the kustomization newTag to the release"; else
+  fail "prepare pins the kustomization newTag to the release"
+  grep -n newTag "$dir/k8s/kustomization.yaml" | sed 's/^/     /' >&2
+fi
+if (cd "$dir" && git diff -U0 -- k8s/kustomization.yaml | grep '^[-+] ' | grep -vq 'newTag:'); then
+  fail "prepare changes only newTag in the kustomization"
+else pass "prepare changes only newTag in the kustomization"; fi
 
 # --- prepare: bumps count from the last tag, never reuse one -----------------
 
