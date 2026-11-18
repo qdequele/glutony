@@ -440,8 +440,10 @@ impl StepActivities {
         let started = Instant::now();
         let plugin = self.registry.resolve(&input.plugin)?;
         let manifest = plugin.manifest();
+        // A tenant's job is not told the fetch allowlist; a standalone one is.
         let resolved = self
             .blob
+            .with_guard_disclosure(input.tenant_id.is_none())
             .resolve_input(input.input, &self.http)
             .await
             .map_err(|e| match e {
@@ -1710,6 +1712,34 @@ mod tests {
         assert!(internal.received_requests().await.unwrap().is_empty());
     }
 
+    /// A tenant's step error says the host is not allowed, not which hosts are; a
+    /// standalone job's error still lists them for the operator.
+    #[tokio::test]
+    async fn a_tenant_step_refused_by_the_allowlist_does_not_see_it() {
+        let a = guarded_acts("files.internal:8080,exports.corp.lan");
+        let mut input = step_input("echo", url_input("http://anything.test/x".into()));
+        input.tenant_id = Some("tenant-1".into());
+        let err = a.run_step(&PluginContext::noop(), input).await.unwrap_err();
+        assert!(matches!(err, PluginError::NonRetryable(_)), "{err:?}");
+        let err = err.to_string();
+        assert!(err.contains("not an allowed host"), "{err}");
+        assert!(err.contains("SOURCE_FETCH_HOSTS"), "{err}");
+        for internal in ["files.internal", "exports.corp.lan", "HostPort"] {
+            assert!(!err.contains(internal), "{internal} leaked: {err}");
+        }
+
+        let err = a
+            .run_step(
+                &PluginContext::noop(),
+                step_input("echo", url_input("http://anything.test/x".into())),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("files.internal:8080"), "{err}");
+        assert!(!err.contains("HostPort"), "no Debug of the policy: {err}");
+    }
+
     #[tokio::test]
     async fn an_allowlisted_host_is_fetched() {
         use wiremock::matchers::{method, path};
@@ -1777,7 +1807,7 @@ mod tests {
         use meili_ingest_blob::UrlCheck as _;
         let check = crate::fetch_guard::PolicyCheck(meili_ingest_source::HostPolicy::Public);
         check
-            .check(&url::Url::parse("https://1.1.1.1/doc.pdf").unwrap())
+            .check(&url::Url::parse("https://1.1.1.1/doc.pdf").unwrap(), true)
             .await
             .unwrap();
         for blocked in [
@@ -1788,7 +1818,7 @@ mod tests {
         ] {
             assert!(
                 check
-                    .check(&url::Url::parse(blocked).unwrap())
+                    .check(&url::Url::parse(blocked).unwrap(), false)
                     .await
                     .is_err(),
                 "{blocked} must be refused under `public`"

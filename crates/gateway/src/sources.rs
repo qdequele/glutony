@@ -306,18 +306,23 @@ impl SourceView {
 /// Check a location can be fetched: its template renders (known tokens, known
 /// timezone), the result is a URL, and the host passes `SOURCE_FETCH_HOSTS`. The fetch
 /// re-checks the host at every run and every redirect; this is the early, friendly
-/// failure.
+/// failure. A tenant's refusal does not name the allowlist (see
+/// [`HostPolicy::check_disclosing`]); a standalone caller's does.
 pub async fn validate_location(
     location: &Location,
     timezone: &str,
     policy: &HostPolicy,
+    tenant_id: Option<&str>,
 ) -> Result<(), GatewayError> {
     let Location::Url { url, .. } = location;
     let rendered = render(url, Utc::now(), timezone).map_err(unprocessable)?;
     let parsed = Url::parse(&rendered).map_err(|e| {
         GatewayError::Unprocessable(format!("location {rendered:?} is not a URL: {e}"))
     })?;
-    policy.check(&parsed).await.map_err(unprocessable)
+    policy
+        .check_disclosing(&parsed, tenant_id.is_none())
+        .await
+        .map_err(unprocessable)
 }
 
 /// Whether a stored fetch credential may follow a source from `old` to `new`: only when
@@ -529,6 +534,7 @@ mod tests {
             &url("https://x.example/{{ nope }}"),
             "UTC",
             &HostPolicy::Any,
+            None,
         )
         .await
         .expect_err("unknown token");
@@ -541,6 +547,7 @@ mod tests {
             &url("https://x.example/a"),
             "Mars/Olympus",
             &HostPolicy::Any,
+            None,
         )
         .await
         .expect_err("unknown tz");
@@ -553,6 +560,7 @@ mod tests {
             &url("http://files.internal/export.json"),
             "UTC",
             &HostPolicy::Public,
+            None,
         )
         .await
         .expect_err("public-only rejects http");
@@ -561,9 +569,28 @@ mod tests {
             &url("http://files.internal/export_{{ date:%Y }}.json"),
             "UTC",
             &HostPolicy::parse("files.internal").expect("policy"),
+            None,
         )
         .await
         .expect("an allowlisted host is accepted");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_source_refused_by_the_allowlist_does_not_see_it() {
+        let policy = HostPolicy::parse("files.internal:8080,exports.corp.lan").expect("policy");
+        let location = url("http://anything.test/x.json");
+        let err = validate_location(&location, "UTC", &policy, Some("tenant-1"))
+            .await
+            .expect_err("not allowed")
+            .to_string();
+        assert!(err.contains("not an allowed host"), "{err}");
+        assert!(!err.contains("files.internal"), "{err}");
+        assert!(!err.contains("exports.corp.lan"), "{err}");
+        let err = validate_location(&location, "UTC", &policy, None)
+            .await
+            .expect_err("not allowed")
+            .to_string();
+        assert!(err.contains("files.internal:8080"), "{err}");
     }
 
     #[test]

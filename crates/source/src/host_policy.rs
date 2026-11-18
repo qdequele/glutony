@@ -86,7 +86,19 @@ impl HostPolicy {
     ///
     /// Called when a connection is saved **and** again before each use, because DNS can
     /// change between the two.
+    ///
+    /// An allowlist rejection names the allowed hosts. See [`HostPolicy::check_disclosing`]
+    /// for a caller that must not learn them.
     pub async fn check(&self, url: &Url) -> Result<(), SourceError> {
+        self.check_disclosing(url, true).await
+    }
+
+    /// [`HostPolicy::check`], where `list_allowed` says whether an allowlist rejection
+    /// may name the allowed hosts. A tenant's request passes `false`: the allowlist is
+    /// deployment config (internal hostnames and ports), and the tenant only learns
+    /// that its host is not on it. A standalone caller is the operator, who passes
+    /// `true` to see what to fix.
+    pub async fn check_disclosing(&self, url: &Url, list_allowed: bool) -> Result<(), SourceError> {
         match self {
             HostPolicy::Public => UrlGuard::default().check_url(url).await,
             HostPolicy::Any => check_http_scheme(url),
@@ -102,6 +114,10 @@ impl HostPolicy {
                     .any(|e| e.host == host && e.port.is_none_or(|p| Some(p) == port));
                 if allowed {
                     Ok(())
+                } else if !list_allowed {
+                    Err(SourceError::Blocked(format!(
+                        "{url} is not an allowed host"
+                    )))
                 } else {
                     Err(SourceError::Blocked(format!(
                         "{url} is not an allowed host; allowed: {}",
@@ -268,5 +284,23 @@ mod tests {
             .to_string();
         assert!(err.contains("meilisearch:7700"), "{err}");
         assert!(err.contains("allowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_rejection_for_a_tenant_names_no_allowed_host() {
+        let p = HostPolicy::parse("files.internal:8080,exports.corp.lan").expect("parses");
+        let err = p
+            .check_disclosing(&url("http://other.test/x"), false)
+            .await
+            .expect_err("rejected");
+        assert!(matches!(err, SourceError::Blocked(_)), "{err:?}");
+        let err = err.to_string();
+        assert!(err.contains("not an allowed host"), "{err}");
+        assert!(!err.contains("files.internal"), "{err}");
+        assert!(!err.contains("exports.corp.lan"), "{err}");
+        // An allowed host is still allowed.
+        p.check_disclosing(&url("http://exports.corp.lan/a"), false)
+            .await
+            .expect("allowed");
     }
 }

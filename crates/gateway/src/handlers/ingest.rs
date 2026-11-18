@@ -162,8 +162,12 @@ pub async fn submit_one(
     if let IngestPayload::Url { url, .. } = &payload {
         let parsed = url::Url::parse(url)
             .map_err(|e| GatewayError::BadRequest(format!("invalid url {url:?}: {e}")))?;
-        if let Err(e @ meili_ingest_source::SourceError::Blocked(_)) =
-            state.fetch_policy.check(&parsed).await
+        // A tenant is not told the allowlist (internal hosts); a standalone caller is.
+        let list_allowed = ctx.tenant_id.is_none();
+        if let Err(e @ meili_ingest_source::SourceError::Blocked(_)) = state
+            .fetch_policy
+            .check_disclosing(&parsed, list_allowed)
+            .await
         {
             return Err(GatewayError::Unprocessable(format!(
                 "{e} (URL refs obey SOURCE_FETCH_HOSTS)"
@@ -1007,6 +1011,49 @@ mod tests {
             );
         }
         assert!(starter.inputs().is_empty());
+    }
+
+    /// A tenant learns only that the host is not allowed; a standalone caller (the
+    /// operator) still sees the allowlist, to fix the request or the config.
+    #[tokio::test]
+    async fn a_tenant_refused_by_the_fetch_allowlist_does_not_see_it() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let config = GatewayConfig {
+            control_plane_url: server.uri(),
+            ..GatewayConfig::default()
+        };
+        let mut state = AppState::new(
+            config,
+            std::sync::Arc::new(FakeStarter::default()),
+            meili_ingest_blob::BlobStore::memory(),
+            reqwest::Client::new(),
+        );
+        state.fetch_policy =
+            meili_ingest_source::HostPolicy::parse("files.internal:8080,exports.corp.lan").unwrap();
+        let app = crate::router(state);
+        let body = || json!({"url": "http://anything.test/x"}).to_string().into();
+
+        let mut req = standalone_request("/ingest", "application/json", body());
+        req.headers_mut()
+            .insert("x-meili-tenant-id", "tenant-1".parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = json_body(resp).await["error"].as_str().unwrap().to_owned();
+        assert!(error.contains("not an allowed host"), "{error}");
+        assert!(error.contains("SOURCE_FETCH_HOSTS"), "{error}");
+        for internal in ["files.internal", "exports.corp.lan"] {
+            assert!(!error.contains(internal), "{internal} leaked: {error}");
+        }
+
+        let resp = app
+            .oneshot(standalone_request("/ingest", "application/json", body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = json_body(resp).await["error"].as_str().unwrap().to_owned();
+        assert!(error.contains("files.internal:8080"), "{error}");
     }
 
     #[tokio::test]

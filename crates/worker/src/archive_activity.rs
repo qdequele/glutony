@@ -60,6 +60,10 @@ pub struct ExpandArchiveInput {
     pub job_id: Uuid,
     /// The archive itself (a reference).
     pub input: PluginInput,
+    /// The job's tenant: a tenant is not told the fetch allowlist when its URL is
+    /// refused. Absent from histories recorded before it existed (then standalone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Output of [`ArchiveActivities::expand_archive`].
@@ -259,8 +263,10 @@ impl ArchiveActivities {
         input: &ExpandArchiveInput,
     ) -> Result<ExpandArchiveOutput, PluginError> {
         let blob = match &input.input {
+            // A tenant's archive is not told the fetch allowlist; a standalone one is.
             PluginInput::Ref(r) => self
                 .blob()
+                .with_guard_disclosure(input.tenant_id.is_none())
                 .fetch_ref(r, &self.base.http)
                 .await
                 .map_err(|e| from_blob_error("fetching the archive", e))?,
@@ -769,7 +775,11 @@ mod tests {
         ]);
         let input = staged_archive(&a, job_id, data).await;
         let out = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         assert_eq!(out.files, 2);
@@ -810,7 +820,11 @@ mod tests {
         .with_origin(Some("https://a.example/q3.zip".into()));
         let input = a.blob().stage_upload(job_id, archive, 0).await.unwrap();
         let out = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         let entries: Vec<ManifestEntry> =
@@ -833,7 +847,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = PluginInput::Bytes(Blob::new(b"hello".to_vec(), "text/plain", None));
         let err = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap_err();
         assert!(!err.is_retryable(), "{err}");
@@ -850,7 +868,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"a"), ("b.txt", b"b")])).await;
         let err = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap_err();
         assert!(!err.is_retryable(), "{err}");
@@ -880,6 +902,7 @@ mod tests {
                 mime: Some("application/zip".into()),
                 filename: Some("q3.zip".into()),
             }),
+            tenant_id: None,
         };
         let cancelled = async {
             while server
@@ -902,6 +925,7 @@ mod tests {
         let input = ExpandArchiveInput {
             job_id,
             input: staged_archive(&a, job_id, zip_of(&[("a.txt", b"a")])).await,
+            tenant_id: None,
         };
         let out = a
             .expand_unless(&input, std::future::pending())
@@ -949,7 +973,11 @@ mod tests {
         ]);
         let input = staged_archive(&a, job_id, data).await;
         let expanded = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
 
@@ -1013,7 +1041,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"hello")])).await;
         let expanded = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         let forced = ForcedPipeline {
@@ -1099,7 +1131,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"hello")])).await;
         let expanded = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         let mut pinned = pipeline("pinned", None);

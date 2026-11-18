@@ -157,7 +157,13 @@ pub async fn create_source(
     let tenant_id = scope.tenant_id.clone();
 
     check_cron(&req.cron)?;
-    validate_location(&req.location, &req.timezone, &state.fetch_policy).await?;
+    validate_location(
+        &req.location,
+        &req.timezone,
+        &state.fetch_policy,
+        tenant_id.as_deref(),
+    )
+    .await?;
     schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
     let fetch_auth = req.auth.as_ref().map(|a| seal(key, a)).transpose()?;
 
@@ -311,7 +317,13 @@ pub async fn patch_source(
     }
     if req.location.is_some() || req.timezone.is_some() {
         let location = req.location.as_ref().unwrap_or(&d.location);
-        validate_location(location, &timezone, &state.fetch_policy).await?;
+        validate_location(
+            location,
+            &timezone,
+            &state.fetch_policy,
+            tenant_id.as_deref(),
+        )
+        .await?;
     }
     if let Some(pipeline) = &req.pipeline {
         schedulable_pipeline(&state, pipeline, tenant_id.as_deref()).await?;

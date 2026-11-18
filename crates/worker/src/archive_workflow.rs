@@ -254,6 +254,7 @@ impl ArchiveWorkflow {
                 ExpandArchiveInput {
                     job_id: input.job_id,
                     input: input.input.clone(),
+                    tenant_id: input.context.tenant_id.clone(),
                 },
                 expand_options(),
             )

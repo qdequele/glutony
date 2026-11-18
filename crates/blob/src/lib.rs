@@ -382,8 +382,10 @@ async fn tenant_store(
 /// the policy's crate.
 #[async_trait::async_trait]
 pub trait UrlCheck: Send + Sync {
-    /// `Err(reason)` refuses the URL.
-    async fn check(&self, url: &Url) -> Result<(), String>;
+    /// `Err(reason)` refuses the URL. `list_allowed` says whether the reason may
+    /// describe the policy (what is allowed): `false` for a tenant's fetch, see
+    /// [`BlobStore::with_guard_disclosure`].
+    async fn check(&self, url: &Url, list_allowed: bool) -> Result<(), String>;
 }
 
 /// Guarded fetching of [`ContentRef::Url`]: a [`UrlCheck`] plus a client that never
@@ -393,6 +395,8 @@ pub struct FetchGuard {
     check: Arc<dyn UrlCheck>,
     http: reqwest::Client,
     max_redirects: usize,
+    /// Passed to [`UrlCheck::check`]; `true` unless set for a tenant's fetch.
+    list_allowed: bool,
 }
 
 impl fmt::Debug for FetchGuard {
@@ -426,6 +430,7 @@ impl FetchGuard {
             // redirects to without the check ever seeing it.
             http: guard_client(FETCH_CONNECT_TIMEOUT, FETCH_READ_TIMEOUT),
             max_redirects: 5,
+            list_allowed: true,
         }
     }
 
@@ -442,7 +447,7 @@ impl FetchGuard {
         let mut hops = 0usize;
         loop {
             self.check
-                .check(&current)
+                .check(&current, self.list_allowed)
                 .await
                 .map_err(BlobError::Blocked)?;
             let response = self
@@ -598,6 +603,18 @@ impl BlobStore {
     pub fn with_fetch_guard(mut self, guard: FetchGuard) -> Self {
         self.fetch_guard = Some(guard);
         self
+    }
+
+    /// This store, with its fetch guard told whether a refusal may describe the policy
+    /// (`list_allowed`, passed to [`UrlCheck::check`]). A worker fetching for a tenant
+    /// passes `false`: the allowlist is deployment config the tenant does not see.
+    /// Cheap: a clone sharing the same store and client.
+    pub fn with_guard_disclosure(&self, list_allowed: bool) -> Self {
+        let mut store = self.clone();
+        if let Some(guard) = &mut store.fetch_guard {
+            guard.list_allowed = list_allowed;
+        }
+        store
     }
 
     /// Read tenant object refs ([`ContentRef::S3`]) under `policy`. Without this, the
@@ -1285,7 +1302,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl UrlCheck for AllowOnly {
-        async fn check(&self, url: &Url) -> Result<(), String> {
+        async fn check(&self, url: &Url, _list_allowed: bool) -> Result<(), String> {
             let authority = format!(
                 "{}:{}",
                 url.host_str().unwrap_or_default(),

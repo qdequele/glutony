@@ -18,13 +18,15 @@ pub struct PolicyCheck(pub HostPolicy);
 
 #[async_trait::async_trait]
 impl UrlCheck for PolicyCheck {
-    async fn check(&self, url: &Url) -> Result<(), String> {
-        self.0.check(url).await.map_err(|e| {
-            format!(
-                "{e} (URL refs obey SOURCE_FETCH_HOSTS, currently {:?})",
-                self.0
-            )
-        })
+    /// The refusal names the variable, not its value beyond what
+    /// [`HostPolicy::check_disclosing`] says: the allowed hosts for a standalone job, and
+    /// nothing for a tenant's (`list_allowed == false`). The worker logs the policy at
+    /// boot for the operator.
+    async fn check(&self, url: &Url, list_allowed: bool) -> Result<(), String> {
+        self.0
+            .check_disclosing(url, list_allowed)
+            .await
+            .map_err(|e| format!("{e} (URL refs obey SOURCE_FETCH_HOSTS)"))
     }
 }
 
