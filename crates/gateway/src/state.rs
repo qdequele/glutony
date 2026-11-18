@@ -832,6 +832,7 @@ impl ControlPlaneClient {
         match status {
             StatusCode::NOT_FOUND => GatewayError::NotFound(msg),
             StatusCode::FORBIDDEN => GatewayError::Forbidden(msg),
+            StatusCode::CONFLICT => GatewayError::Conflict(msg),
             StatusCode::BAD_REQUEST => GatewayError::BadRequest(msg),
             StatusCode::UNPROCESSABLE_ENTITY => GatewayError::Invalid(msg),
             StatusCode::PAYLOAD_TOO_LARGE => GatewayError::TooLarge(msg),

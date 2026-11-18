@@ -123,7 +123,7 @@ async fn deleting_a_pipeline_archives_its_sources_and_still_succeeds() {
         "a source on another pipeline is untouched"
     );
 
-    // Credentials survive so the source can be repointed and unarchived.
+    // Credentials survive with the row (archive is one-way: it never runs again).
     let kept = sources
         .get("casc-arch-s1", Some(proj))
         .await

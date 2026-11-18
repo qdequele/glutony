@@ -196,6 +196,9 @@ upstream stays in the index.
 `DELETE /sources/{uid}` removes the schedule and the source. Deleting the
 **pipeline** a source uses does not fail; the source is archived instead:
 its schedule is removed, it shows `archived_at`, and it can no longer be run.
+Archiving is one-way, and an archived source keeps its `uid`: `GET /sources`
+hides it (add `?include_archived=true`), and creating another source with that
+`uid` answers `409` naming the archived one. Delete it to reuse the name.
 Deleting a global pipeline also archives the sources of the tenants that used
 it, except those of a tenant with a pipeline of its own under the same `uid`.
 

@@ -171,7 +171,7 @@ async fn archive_for_pipeline_stamps_and_hides() {
         .collect();
     assert!(with_archived.contains(&"tr-arch-p1".to_string()));
 
-    // The credentials survive, so the source can be repointed and unarchived.
+    // The credentials survive with the row (archive is one-way: it never runs again).
     let kept = repo
         .get("tr-arch-p1", Some("proj-4"))
         .await
@@ -183,6 +183,56 @@ async fn archive_for_pipeline_stamps_and_hides() {
         "the sealed credential is retained"
     );
     assert!(kept.definition.archived_at.is_some());
+}
+
+/// An archived source keeps its uid: creating another one with that uid is a 409 that
+/// names the archived holder, since the default list hides it. A live duplicate is
+/// still the plain 422.
+#[tokio::test]
+async fn an_archived_source_keeps_its_uid_and_says_so() {
+    use meili_ingest_control_plane::CpError;
+
+    let Some(repo) = repo("tr-held").await else {
+        return;
+    };
+    repo.insert(&new_source("tr-held-1", Some("proj-9"), "doomed.pipeline"))
+        .await
+        .expect("insert");
+    repo.insert(&new_source("tr-held-2", Some("proj-9"), "safe.pipeline"))
+        .await
+        .expect("insert");
+    repo.archive_for_pipeline("doomed.pipeline", Some("proj-9"))
+        .await
+        .expect("archive");
+
+    let err = repo
+        .insert(&new_source("tr-held-1", Some("proj-9"), "safe.pipeline"))
+        .await
+        .expect_err("the uid is held");
+    assert!(matches!(err, CpError::Conflict(_)), "{err:?}");
+    assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+    let msg = err.to_string();
+    for needle in [
+        "\"tr-held-1\"",
+        "archived",
+        "\"doomed.pipeline\"",
+        "keep their uid",
+    ] {
+        assert!(msg.contains(needle), "{needle} missing from {msg}");
+    }
+
+    let err = repo
+        .insert(&new_source("tr-held-2", Some("proj-9"), "safe.pipeline"))
+        .await
+        .expect_err("live duplicate");
+    assert!(matches!(err, CpError::Validation(_)), "{err:?}");
+    // Another tenant, or the global scope, may still use the uid.
+    repo.insert(&new_source("tr-held-1", Some("proj-10"), "safe.pipeline"))
+        .await
+        .expect("other tenant");
+    repo.insert(&new_source("tr-held-1", None, "safe.pipeline"))
+        .await
+        .expect("global");
 }
 
 #[tokio::test]

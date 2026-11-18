@@ -136,9 +136,11 @@ impl PipelineRepo {
     /// archived, so the caller can delete their Temporal schedules.
     ///
     /// Deleting is **never blocked** by a source referencing the pipeline. Archiving
-    /// rather than cascade-deleting the sources keeps the credentials a tenant supplied
-    /// by hand: destroying those as a side effect of an unrelated delete is not
-    /// recoverable, whereas an archived source can be repointed and unarchived.
+    /// rather than cascade-deleting the sources keeps each source, its run history and
+    /// the credentials a tenant supplied by hand visible (`GET /sources/{uid}`,
+    /// `include_archived`) instead of destroying them as a side effect of an unrelated
+    /// delete. Archive is one-way: an archived source never runs again and keeps its uid
+    /// until it is deleted (creating another source with that uid is a 409).
     ///
     /// A source resolves its pipeline like [`PipelineRepo::get`]: the tenant's own row,
     /// then the global one. Deleting a **global** pipeline therefore also archives the

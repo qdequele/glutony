@@ -3,9 +3,10 @@
 //! Every handler returns `Result<_, GatewayError>`; the [`IntoResponse`] impl turns the
 //! error into `{"error": "<message>", "code": "<snake_case>"}` with the status code from
 //! the plan (400 missing context / bad request, 401 unauthorized, 402 insufficient credits,
-//! 403 forbidden, 404 not found, 409 job already finished, 413 too large, 415 no pipeline
-//! for the MIME type, 422 invalid pipeline, 502 upstream, 503 lab unavailable or upload
-//! budget full, 500 internal). Messages never contain API keys: they are built from our own strings, from
+//! 403 forbidden, 404 not found, 409 job already finished or name taken, 413 too large,
+//! 415 no pipeline for the MIME type, 422 invalid pipeline, 502 upstream, 503 lab
+//! unavailable or upload budget full, 500 internal). Messages never contain API keys:
+//! they are built from our own strings, from
 //! control-plane error bodies, or from transport errors that carry URLs but no
 //! credentials.
 
@@ -51,6 +52,10 @@ pub enum GatewayError {
     /// cancelled (409).
     #[error("{0}")]
     AlreadyFinished(String),
+    /// The name is taken by something the caller does not see by default, e.g. an
+    /// archived source holding a source uid (409).
+    #[error("{0}")]
+    Conflict(String),
     /// Upload larger than the configured limit (413).
     #[error("{0}")]
     TooLarge(String),
@@ -89,7 +94,7 @@ impl GatewayError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
-            GatewayError::AlreadyFinished(_) => StatusCode::CONFLICT,
+            GatewayError::AlreadyFinished(_) | GatewayError::Conflict(_) => StatusCode::CONFLICT,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             GatewayError::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             GatewayError::Invalid(_) | GatewayError::Unprocessable(_) => {
@@ -114,6 +119,7 @@ impl GatewayError {
             GatewayError::Overloaded(_) => "overloaded",
             GatewayError::NotFound(_) => "not_found",
             GatewayError::AlreadyFinished(_) => "already_finished",
+            GatewayError::Conflict(_) => "conflict",
             GatewayError::TooLarge(_) => "payload_too_large",
             GatewayError::Unsupported(_) => "unsupported_media_type",
             GatewayError::Invalid(_) => "invalid_pipeline",
@@ -253,6 +259,10 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
+            GatewayError::Conflict("x".into()).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
             GatewayError::TooLarge("x".into()).status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
@@ -301,6 +311,7 @@ mod tests {
             GatewayError::LabUnavailable("x".into()),
             GatewayError::NotFound("x".into()),
             GatewayError::AlreadyFinished("x".into()),
+            GatewayError::Conflict("x".into()),
             GatewayError::TooLarge("x".into()),
             GatewayError::Unsupported("x".into()),
             GatewayError::Invalid("x".into()),

@@ -335,7 +335,7 @@ impl SourceRepo {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12) \
              RETURNING {SOURCE_COLUMNS}"
         );
-        let row: SourceRow = sqlx::query_as(AssertSqlSafe(sql))
+        let inserted = sqlx::query_as::<_, SourceRow>(AssertSqlSafe(sql))
             .bind(new.id)
             .bind(&new.uid)
             .bind(&new.name)
@@ -349,22 +349,42 @@ impl SourceRepo {
             .bind(new.fetch_auth.as_deref())
             .bind(&new.schedule_id)
             .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                let duplicate = matches!(
-                    &e,
-                    sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
-                );
-                if duplicate {
-                    CpError::Validation(format!(
-                        "a source named {:?} already exists for this tenant",
-                        new.uid
-                    ))
-                } else {
-                    CpError::Db(e)
-                }
-            })?;
-        Ok(SourceRecord::from(row))
+            .await;
+        match inserted {
+            Ok(row) => Ok(SourceRecord::from(row)),
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+                Err(self.duplicate_uid(new).await)
+            }
+            Err(e) => Err(CpError::Db(e)),
+        }
+    }
+
+    /// The error for an insert whose uid is already taken in its scope. An archived
+    /// holder is hidden from the default list, so the answer names it (409); archive is
+    /// one-way and an archived source keeps its uid until it is deleted.
+    async fn duplicate_uid(&self, new: &NewSource) -> CpError {
+        let holder: Result<Option<(String, Option<DateTime<Utc>>)>, sqlx::Error> = sqlx::query_as(
+            "SELECT pipeline_uid, archived_at FROM sources \
+                 WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
+        )
+        .bind(&new.uid)
+        .bind(new.tenant_id.as_deref())
+        .fetch_optional(&self.pool)
+        .await;
+        match holder {
+            Ok(Some((pipeline_uid, Some(archived_at)))) => CpError::Conflict(format!(
+                "a source named {:?} already exists for this tenant: it was archived on {} \
+                 when its pipeline {pipeline_uid:?} was deleted, and archived sources keep \
+                 their uid. Delete it (DELETE /sources/{}) to reuse the name, or pick another uid",
+                new.uid,
+                archived_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                new.uid
+            )),
+            _ => CpError::Validation(format!(
+                "a source named {:?} already exists for this tenant",
+                new.uid
+            )),
+        }
     }
 
     /// Apply a partial update to the row in exactly `tenant_id`'s scope. `None` when no

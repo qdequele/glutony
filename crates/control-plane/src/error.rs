@@ -20,6 +20,10 @@ pub enum CpError {
     /// No pipeline matches the request (404, `no_pipeline`).
     #[error("{0}")]
     NoPipeline(String),
+    /// The name is held by a row the caller cannot see by default, e.g. an archived
+    /// source (409, `conflict`).
+    #[error("{0}")]
+    Conflict(String),
     /// Pipeline failed structural validation (422, `validation`).
     #[error("{0}")]
     Validation(String),
@@ -72,6 +76,7 @@ impl CpError {
             CpError::NotFound(_) | CpError::NoPipeline(_) | CpError::NoGateway(_) => {
                 StatusCode::NOT_FOUND
             }
+            CpError::Conflict(_) => StatusCode::CONFLICT,
             CpError::Validation(_) | CpError::UnknownPlugin(_) => StatusCode::UNPROCESSABLE_ENTITY,
             CpError::Db(_) | CpError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -85,6 +90,7 @@ impl CpError {
             CpError::Builtin(_) => "builtin",
             CpError::NotFound(_) => "not_found",
             CpError::NoPipeline(_) => "no_pipeline",
+            CpError::Conflict(_) => "conflict",
             CpError::Validation(_) => "validation",
             CpError::UnknownPlugin(_) => "unknown_plugin",
             CpError::InsufficientCredits(_) => "insufficient_credits",
@@ -153,6 +159,11 @@ mod tests {
                 CpError::NoPipeline("x".into()),
                 StatusCode::NOT_FOUND,
                 "no_pipeline",
+            ),
+            (
+                CpError::Conflict("x".into()),
+                StatusCode::CONFLICT,
+                "conflict",
             ),
             (
                 CpError::Validation("x".into()),

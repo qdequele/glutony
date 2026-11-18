@@ -795,6 +795,36 @@ mod tests {
         );
     }
 
+    /// The control plane answers 409 when an archived source holds the uid; the
+    /// gateway passes it on with its message, and creates no schedule.
+    #[tokio::test]
+    async fn a_uid_held_by_an_archived_source_is_409() {
+        let cp = MockServer::start().await;
+        mount_pipeline(&cp, true).await;
+        let message = "a source named \"tmdb\" already exists for this tenant: it was archived \
+                       on 2026-11-02T09:00:00Z when its pipeline \"old\" was deleted, and \
+                       archived sources keep their uid";
+        Mock::given(method("POST"))
+            .and(path("/internal/sources"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({"error": message, "code": "conflict"})),
+            )
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let (status, body) = call(
+            &app(&cp, schedules.clone(), true),
+            req("POST", "/sources", create_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "conflict", "{body}");
+        assert_eq!(body["error"], message, "{body}");
+        assert!(schedules.calls().is_empty());
+        assert_matches_openapi("POST", "/sources", 409, &body);
+    }
+
     #[tokio::test]
     async fn a_host_outside_the_fetch_policy_is_422() {
         let cp = MockServer::start().await;

@@ -1110,6 +1110,17 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: |
+            The `uid` is held by an archived source of this tenant (its pipeline was
+            deleted). Archived sources keep their `uid` and are hidden from
+            `GET /sources` unless `include_archived=true`; delete it to reuse the
+            name. A live source with the same `uid` is a `422`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { "error": "a source named \"daily\" already exists for this tenant: it was archived on 2026-11-02T09:00:00Z when its pipeline \"movies\" was deleted, and archived sources keep their uid. Delete it (DELETE /sources/daily) to reuse the name, or pick another uid", "code": "conflict" }
         "422":
           $ref: "#/components/responses/Unprocessable"
         "501":
