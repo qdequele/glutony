@@ -99,6 +99,13 @@ Markdown (`pulldown-cmark`).
 CSV (`csv`). One document per row: header → `fields`, `content` = values
 joined by a space.
 
+A cell that is entirely an integer, a decimal number or `true`/`false` (any case)
+becomes a JSON number or boolean; anything else stays a string. Cells that look
+like identifiers keep their text, since a number would change them: a leading
+zero (`007`, `01234`), a leading `+` (`+33612345678`), an integer too wide for 64
+bits (`123456789012345678901234`) and exponent notation (`1E5`). Empty cells are
+left out of `fields`.
+
 | Key | Default | Description |
 |---|---|---|
 | `delimiter` | sniffed | Single-character field delimiter. When omitted, the one of `,` `;` tab `\|` that splits the first records (up to 100 or 64 KiB) into the most consistent number of fields; delimiters inside quoted fields do not count. Ties go to more fields, then to the delimiter less often followed by a space, then to that order. Falls back to `,`. |

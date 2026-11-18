@@ -182,13 +182,25 @@ fn sniff_delimiter(data: &[u8]) -> u8 {
 }
 
 /// Parse a cell into typed JSON: integer, float, boolean, or string.
-/// Leading-zero numerics (`007`, zip codes) stay strings.
+///
+/// Cells that look like identifiers rather than quantities keep their text, since
+/// turning them into numbers would change them: leading-zero numerics (`007`, zip
+/// codes), a leading `+` (`+33612345678`), integers too wide for 64 bits (an f64
+/// would round their digits) and exponent notation (`1E5`, a SKU as often as a
+/// number).
 fn typed_cell(cell: &str) -> Value {
-    let looks_like_leading_zero = {
-        let digits = cell.strip_prefix(['-', '+']).unwrap_or(cell);
-        digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.")
-    };
-    if !looks_like_leading_zero {
+    let unsigned = cell.strip_prefix('-').unwrap_or(cell);
+    let looks_like_leading_zero =
+        unsigned.len() > 1 && unsigned.starts_with('0') && !unsigned.starts_with("0.");
+    let looks_like_identifier = looks_like_leading_zero
+        || cell.starts_with('+')
+        || cell.contains(['e', 'E'])
+        // An integer neither i64 nor u64 holds stays text rather than an f64.
+        || (!unsigned.is_empty()
+            && unsigned.bytes().all(|b| b.is_ascii_digit())
+            && cell.parse::<i64>().is_err()
+            && cell.parse::<u64>().is_err());
+    if !looks_like_identifier {
         if let Ok(i) = cell.parse::<i64>() {
             return Value::from(i);
         }
@@ -629,6 +641,46 @@ mod tests {
         assert_eq!(docs[0].fields["v"], json!(7));
         let docs = run("zip, v\n 01234 , 7 \n", None, json!({"trim": false})).await;
         assert_eq!(docs[0].fields[" v"], json!(" 7 "));
+    }
+
+    #[tokio::test]
+    async fn identifier_like_cells_keep_their_text() {
+        let docs = run(
+            "phone,order_ref,sku,neg_ref,small_e\n+33612345678,123456789012345678901234,1E5,-123456789012345678901234,2e3\n",
+            None,
+            json!({}),
+        )
+        .await;
+        let f = &docs[0].fields;
+        assert_eq!(f["phone"], json!("+33612345678"), "a leading + is kept");
+        assert_eq!(
+            f["order_ref"],
+            json!("123456789012345678901234"),
+            "an integer too wide for 64 bits is not rounded through a float"
+        );
+        assert_eq!(f["neg_ref"], json!("-123456789012345678901234"));
+        assert_eq!(f["sku"], json!("1E5"), "exponent notation is not expanded");
+        assert_eq!(f["small_e"], json!("2e3"));
+    }
+
+    #[test]
+    fn typed_cells_otherwise_parse_as_before() {
+        assert_eq!(typed_cell("42"), json!(42));
+        assert_eq!(typed_cell("-42"), json!(-42));
+        assert_eq!(typed_cell("18446744073709551615"), json!(u64::MAX));
+        assert_eq!(typed_cell("9.5"), json!(9.5));
+        assert_eq!(typed_cell("-0.25"), json!(-0.25));
+        assert_eq!(typed_cell("1.50"), json!(1.5));
+        assert_eq!(typed_cell(".5"), json!(0.5));
+        assert_eq!(typed_cell("0"), json!(0));
+        assert_eq!(typed_cell("0.5"), json!(0.5));
+        assert_eq!(typed_cell("007"), json!("007"));
+        assert_eq!(typed_cell("TRUE"), json!(true));
+        assert_eq!(typed_cell("false"), json!(false));
+        assert_eq!(typed_cell("inf"), json!("inf"));
+        assert_eq!(typed_cell("NaN"), json!("NaN"));
+        assert_eq!(typed_cell("+"), json!("+"));
+        assert_eq!(typed_cell("-"), json!("-"));
     }
 
     #[tokio::test]
