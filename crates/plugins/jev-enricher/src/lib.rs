@@ -9,8 +9,9 @@
 //! It follows the built-in plugin conventions of `llm_enricher` (the canonical
 //! example): env vars read only in [`JevEnricherPlugin::from_env`], a typed config
 //! with a matching JSON Schema, `Documents` and `Many` input, bounded concurrency with
-//! input order preserved, heartbeats, cancellation, per-call usage and precise error
-//! mapping.
+//! input order preserved, heartbeats, cancellation, per-call usage, precise error
+//! mapping, and a checkpoint of the documents already classified so that an activity
+//! retry resumes instead of paying for them again (see the `checkpoint` module).
 //!
 //! ## Pipeline usage
 //!
@@ -83,6 +84,8 @@ use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
+mod checkpoint;
+use checkpoint::{Checkpoint, MAX_CHECKPOINT_BYTES};
 mod retry;
 use retry::{Failure, RetryPolicy, with_retry};
 
@@ -287,6 +290,8 @@ pub struct JevEnricherPlugin {
     lab_http: Arc<OnceLock<reqwest::Client>>,
     /// In-plugin retry of one request's transient failures (see [`retry`]).
     retry: RetryPolicy,
+    /// Most bytes of results a checkpoint holds (see [`checkpoint`]).
+    checkpoint_budget: usize,
 }
 
 impl std::fmt::Debug for JevEnricherPlugin {
@@ -323,6 +328,7 @@ impl JevEnricherPlugin {
             client: None,
             lab_http: Arc::default(),
             retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -358,6 +364,7 @@ impl JevEnricherPlugin {
             }),
             lab_http: Arc::default(),
             retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -434,25 +441,70 @@ impl Plugin for JevEnricherPlugin {
         }
         tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, documents = total, questions = cfg.questions.len(), "classifying documents");
 
-        // Bounded concurrency; results are re-ordered by their original index.
+        // Resume: on an activity retry, the documents the previous attempt finished get
+        // their recorded answers back instead of a new (paid) call. Those calls were the
+        // failed attempt's, which is not billed, so nothing is metered here.
+        let (mut checkpoint, mut resumed) =
+            Checkpoint::resume(NAME, ctx.previous_progress(), &docs, self.checkpoint_budget);
         let mut slots: Vec<Option<Document>> =
             std::iter::repeat_with(|| None).take(total).collect();
-        let mut stream = futures::stream::iter(docs.into_iter().enumerate())
+        let mut pending = Vec::with_capacity(total);
+        let mut done = 0usize;
+        for (i, doc) in docs.into_iter().enumerate() {
+            let saved = resumed
+                .remove(&i)
+                .and_then(|r| serde_json::from_value::<BTreeMap<String, Answer>>(r).ok());
+            // A saved entry that does not answer every question is redone, from the
+            // document as it came in.
+            let applied = saved.and_then(|answers| {
+                let mut resumed_doc = doc.clone();
+                apply_answers(&mut resumed_doc, &cfg, &answers)
+                    .ok()
+                    .map(|()| resumed_doc)
+            });
+            match applied {
+                Some(resumed_doc) => {
+                    slots[i] = Some(resumed_doc);
+                    done += 1;
+                }
+                None => pending.push((i, doc)),
+            }
+        }
+        if done > 0 {
+            tracing::info!(job_id = %ctx.job_id(), plugin = NAME, resumed = done, documents = total, "resuming from the previous attempt's checkpoint");
+            ctx.heartbeat(format!("{NAME}: {done}/{total} documents resumed"));
+        }
+
+        // Bounded concurrency; results are re-ordered by their original index. Every
+        // finished document is checkpointed, so a retry after a failure resumes.
+        let mut stream = futures::stream::iter(pending)
             .map(|(i, doc)| {
                 let (cfg, client, retry) = (&cfg, &client, &self.retry);
                 async move { (i, client.enrich(ctx, cfg, retry, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
-        let mut done = 0usize;
         while let Some((i, result)) = stream.next().await {
             ctx.check_cancelled()?;
-            let doc = result?;
+            let (doc, answers) = match result {
+                Ok(finished) => finished,
+                Err(e) => {
+                    // Hand the retry everything finished so far.
+                    checkpoint.record(ctx);
+                    return Err(e);
+                }
+            };
+            checkpoint.push(
+                i,
+                &doc.id,
+                serde_json::to_value(&answers).unwrap_or_default(),
+            );
             if let Some(slot) = slots.get_mut(i) {
                 *slot = Some(doc);
             }
             done += 1;
             if done.is_multiple_of(10) || done == total {
+                checkpoint.record(ctx);
                 ctx.heartbeat(format!("{NAME}: {done}/{total} documents classified"));
             }
         }
@@ -559,16 +611,17 @@ struct SystemOneResponse {
     usage: Option<ApiUsage>,
 }
 
-/// One entry of `answers`. Only the field matching the question type is read.
-#[derive(Debug, Default, Deserialize)]
+/// One entry of `answers`. Only the field matching the question type is read. A
+/// checkpoint keeps the answers in this form too (see [`checkpoint`]).
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Answer {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     noul: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     choice: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     score: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     confidence: Option<f64>,
 }
 
@@ -595,7 +648,7 @@ impl JevClient {
         cfg: &JevEnricherConfig,
         retry: &RetryPolicy,
         mut doc: Document,
-    ) -> Result<Document, PluginError> {
+    ) -> Result<(Document, BTreeMap<String, Answer>), PluginError> {
         let model = cfg.model.as_deref().unwrap_or(&self.default_model);
         // The Lab's Gateway takes the id as written (`typesafe/jev`); TypeSafe called
         // directly gets it without its own `typesafe/` prefix.
@@ -621,7 +674,11 @@ impl JevClient {
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
         apply_answers(&mut doc, cfg, &reply.answers)?;
-        Ok(doc)
+        // Only the configured questions' answers matter, to this document and to a
+        // checkpoint.
+        let mut answers = reply.answers;
+        answers.retain(|key, _| cfg.questions.contains_key(key));
+        Ok((doc, answers))
     }
 
     /// POST `{base_url}/systemone` to TypeSafe, `{base_url}/decisions` to the Lab's
@@ -1004,6 +1061,101 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("quality")),
             "{err:?}"
         );
+    }
+
+    /// Answers [`three_answers`] with the state as the chosen category, except that it
+    /// is overloaded for the state `"busy"` while `busy` is set. Records each state.
+    #[derive(Clone, Default)]
+    struct BusyFor {
+        busy: Arc<AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Respond for BusyFor {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let state = body["state"].as_str().unwrap().to_string();
+            self.seen.lock().unwrap().push(state.clone());
+            if state == "busy" && self.busy.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(529);
+            }
+            let mut reply = three_answers();
+            reply["answers"]["category"]["choice"] = serde_json::json!(state);
+            ResponseTemplate::new(200).set_body_json(reply)
+        }
+    }
+
+    fn busy_docs() -> Vec<Document> {
+        ["a", "b", "busy", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Document::with_id(format!("d{i}"), *c))
+            .collect()
+    }
+
+    /// Attempt 1 with `busy` overloaded, then attempt 2 with it back, handed attempt
+    /// 1's checkpoint. Returns attempt 2's documents, the states it sent and its usage.
+    async fn fail_then_resume(p: &JevEnricherPlugin) -> (Vec<Document>, Vec<String>, UsageUnits) {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let mut p = p.clone();
+        p.client.as_mut().unwrap().base_url = server.uri();
+        // One at a time, so `a` and `b` are done when `busy` spends its retry budget.
+        let cfg = with_config(serde_json::json!({ "max_concurrent": 1 }));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "classify", 1, tx, Arc::default());
+        let err = p
+            .execute(&first, PluginInput::Documents(busy_docs()), cfg.clone())
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert_eq!(first.usage().llm_requests, 2);
+
+        responder.busy.store(false, Ordering::SeqCst);
+        responder.seen.lock().unwrap().clear();
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "classify", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(busy_docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        let seen = responder.seen.lock().unwrap().clone();
+        (out, seen, second.usage())
+    }
+
+    #[tokio::test]
+    async fn an_activity_retry_resumes_from_the_documents_already_classified() {
+        let server = MockServer::start().await;
+        let (out, seen, usage) = fail_then_resume(&plugin(&server)).await;
+        assert_eq!(seen, vec!["busy", "c"]);
+        assert_eq!(
+            out.iter()
+                .map(|d| d.fields["category"].clone())
+                .collect::<Vec<_>>(),
+            ["a", "b", "busy", "c"].map(|c| serde_json::json!(c))
+        );
+        // The resumed answers are applied exactly as fresh ones.
+        assert!(out.iter().all(|d| d.fields["is_outdated"] == false));
+        assert!(out.iter().all(|d| d.fields["quality"] == 1.5));
+        // The failed attempt is not billed again: only this attempt's calls are.
+        assert_eq!(usage.llm_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_past_its_budget_leaves_the_rest_to_redo() {
+        let server = MockServer::start().await;
+        let mut p = plugin(&server);
+        p.checkpoint_budget = 0;
+        let (out, seen, _) = fail_then_resume(&p).await;
+        assert_eq!(seen, vec!["a", "b", "busy", "c"]);
+        assert_eq!(out[1].fields["category"], "b");
     }
 
     #[tokio::test]

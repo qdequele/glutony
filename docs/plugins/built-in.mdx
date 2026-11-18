@@ -332,7 +332,15 @@ reply's first choice has `finish_reason: content_filter`, a `refusal`, or no
 usable content (none, `null` or blank), the document is kept as it came in, plus
 `fields.llm_declined` set to `content_filter`, `refusal` or `empty`, and the other
 documents go on (add `llm_declined` to the index's filterable attributes to find
-them). Set `on_refusal: fail` to
+them).
+
+A 429, a 5xx or a dropped connection is retried a few times per request, with
+backoff, before it fails the step. When the step still fails and Temporal retries
+it, the retry resumes: every document finished before the failure keeps its
+recorded reply and is not sent again. The replies travel in the step's Temporal
+heartbeat details, capped at 256 KiB per step; documents past the cap are simply
+redone. Only the attempt that succeeds is metered, so a resumed document is not
+billed twice, and the calls of a failed attempt are not billed. Set `on_refusal: fail` to
 fail the step instead. HTTP errors are not refusals: 401, 402 and 403 (including
 a Lab Gateway 403 for filtered content) and 400 still fail the step.
 
@@ -408,6 +416,12 @@ calls the team's Gateway on `POST /v1/decisions` (same TypeSafe body and answers
 
 HTTP 429, 529 (overloaded) and 5xx are retried; 401/403 (bad key) and 400/422
 (invalid questions) fail the step. Usage is reported as LLM tokens.
+
+When the step still fails on one document and Temporal retries it, the retry
+resumes: the documents already classified keep their recorded answers and are not
+sent again. The answers travel in the step's Temporal heartbeat details, capped at
+256 KiB per step; documents past the cap are redone. Only the attempt that
+succeeds is metered, so a resumed document is not billed twice.
 
 ## Sink (documents → indexed)
 

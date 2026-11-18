@@ -748,6 +748,19 @@ impl StepActivities {
         )
         .await;
         forwarder.abort();
+        // A plugin that checkpoints right before failing (an enricher whose last
+        // document spent its retry budget) may return before the forwarder sent that
+        // heartbeat. The failure carries the last heartbeat details to the retry, so
+        // send the final checkpoint now.
+        if let Err(e) = &result
+            && e.is_retryable()
+            && plugin_ctx.progress().is_some()
+            && let Err(hb) = ctx
+                .record_heartbeat(plugin_ctx.heartbeat_details("checkpoint before failing"))
+                .await
+        {
+            tracing::debug!(error = %hb, "final checkpoint heartbeat failed");
+        }
         result.map_err(to_activity_error)
     }
 
@@ -2267,6 +2280,58 @@ mod tests {
         assert_eq!(
             PluginContext::progress_from_heartbeat_details(sent.last().expect("heartbeats")),
             Some(serde_json::json!({ "done": 2 }))
+        );
+    }
+
+    /// Checkpoints, then fails at once: the shape of an enricher whose last document
+    /// spent its retry budget.
+    struct FailsAfterCheckpoint;
+    #[async_trait]
+    impl Plugin for FailsAfterCheckpoint {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("fails_after_checkpoint", "0")
+        }
+        async fn execute(
+            &self,
+            ctx: &PluginContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            ctx.record_progress(serde_json::json!({ "done": [0, 1] }));
+            Err(PluginError::retryable("upstream busy"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_attempt_hands_its_last_checkpoint_to_the_retry() {
+        use temporalio_sdk::testing::{ActivityEnvironment, TestActivityInfoOptions};
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let env = ActivityEnvironment::builder_with_default()
+            .info(TestActivityInfoOptions::builder().deadline(None).build())
+            .on_heartbeat(move |d| {
+                let d = d
+                    .downcast::<serde_json::Value>()
+                    .expect("heartbeat details are JSON");
+                sink.lock().expect("lock").push(*d);
+            })
+            .register_activities(acts(vec![Arc::new(FailsAfterCheckpoint)]))
+            .build();
+        env.run(
+            StepActivities::execute_step,
+            step_input("fails_after_checkpoint", PluginInput::Empty),
+        )
+        .await
+        .expect_err("the step fails");
+        // Temporal hands the retry the last heartbeat details of the failed attempt,
+        // so the checkpoint recorded just before the failure must be among them.
+        let sent = sent.lock().expect("lock").clone();
+        assert_eq!(
+            sent.last()
+                .and_then(PluginContext::progress_from_heartbeat_details),
+            Some(serde_json::json!({ "done": [0, 1] })),
+            "{sent:?}"
         );
     }
 

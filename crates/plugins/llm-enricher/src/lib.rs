@@ -26,6 +26,9 @@
 //! 7. A transient failure (429, 5xx, dropped connection) is retried per request a few
 //!    times with backoff before it fails the step (see the `retry` module), so one
 //!    rate-limited document does not restart the whole batch.
+//! 8. Every finished document's result is checkpointed (see the `checkpoint` module),
+//!    so when the step still fails, Temporal's retry of the activity resumes from the
+//!    documents already enriched instead of paying for them again.
 //!
 //! ## Pipeline usage
 //!
@@ -89,6 +92,8 @@ use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
 
+mod checkpoint;
+use checkpoint::{Checkpoint, MAX_CHECKPOINT_BYTES};
 mod retry;
 use retry::{Failure, RetryPolicy, with_retry};
 
@@ -281,6 +286,8 @@ pub struct LlmEnricherPlugin {
     lab_http: Arc<OnceLock<reqwest::Client>>,
     /// In-plugin retry of one request's transient failures (see [`retry`]).
     retry: RetryPolicy,
+    /// Most bytes of results a checkpoint holds (see [`checkpoint`]).
+    checkpoint_budget: usize,
 }
 
 impl std::fmt::Debug for LlmEnricherPlugin {
@@ -317,6 +324,7 @@ impl LlmEnricherPlugin {
             client: None,
             lab_http: Arc::default(),
             retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -359,6 +367,7 @@ impl LlmEnricherPlugin {
             }),
             lab_http: Arc::default(),
             retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -459,25 +468,59 @@ impl Plugin for LlmEnricherPlugin {
         }
         tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, documents = total, "enriching documents");
 
-        // 3. Bounded concurrency; results are re-ordered by their original index.
+        // 3. Resume: on an activity retry, the documents the previous attempt finished
+        //    get their recorded result back instead of a new (paid) call. Those calls
+        //    were the failed attempt's, which is not billed, so nothing is metered here.
+        let (mut checkpoint, mut resumed) =
+            Checkpoint::resume(NAME, ctx.previous_progress(), &docs, self.checkpoint_budget);
         let mut slots: Vec<Option<Document>> =
             std::iter::repeat_with(|| None).take(total).collect();
-        let mut stream = futures::stream::iter(docs.into_iter().enumerate())
+        let mut pending = Vec::with_capacity(total);
+        let mut done = 0usize;
+        for (i, mut doc) in docs.into_iter().enumerate() {
+            let saved = resumed
+                .remove(&i)
+                .and_then(|r| serde_json::from_value::<SavedOutcome>(r).ok());
+            match saved {
+                Some(saved) => {
+                    apply_outcome(&mut doc, &saved.into(), &cfg)?;
+                    slots[i] = Some(doc);
+                    done += 1;
+                }
+                None => pending.push((i, doc)),
+            }
+        }
+        if done > 0 {
+            tracing::info!(job_id = %ctx.job_id(), plugin = NAME, resumed = done, documents = total, "resuming from the previous attempt's checkpoint");
+            ctx.heartbeat(format!("{NAME}: {done}/{total} documents resumed"));
+        }
+
+        // 4. Bounded concurrency; results are re-ordered by their original index. Every
+        //    finished document is checkpointed, so a retry after a failure resumes.
+        let mut stream = futures::stream::iter(pending)
             .map(|(i, doc)| {
                 let (cfg, client, retry) = (&cfg, &client, &self.retry);
                 async move { (i, client.enrich(ctx, cfg, retry, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
-        let mut done = 0usize;
         while let Some((i, result)) = stream.next().await {
             ctx.check_cancelled()?;
-            let doc = result?;
+            let (doc, outcome) = match result {
+                Ok(finished) => finished,
+                Err(e) => {
+                    // Hand the retry everything finished so far.
+                    checkpoint.record(ctx);
+                    return Err(e);
+                }
+            };
+            checkpoint.push(i, &doc.id, SavedOutcome::from(outcome).to_value());
             if let Some(slot) = slots.get_mut(i) {
                 *slot = Some(doc);
             }
             done += 1;
             if done.is_multiple_of(10) || done == total {
+                checkpoint.record(ctx);
                 ctx.heartbeat(format!("{NAME}: {done}/{total} documents enriched"));
             }
         }
@@ -597,7 +640,7 @@ impl LlmClient {
         cfg: &LlmEnricherConfig,
         retry: &RetryPolicy,
         mut doc: Document,
-    ) -> Result<Document, PluginError> {
+    ) -> Result<(Document, Result<String, Declined>), PluginError> {
         let content = truncate_chars(&doc.content, cfg.max_input_chars);
         let user = format!("{}\n\n{}", cfg.prompt, content);
         let system = cfg
@@ -632,8 +675,43 @@ impl LlmClient {
         .await?;
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
-        apply_outcome(&mut doc, &read_choice(choice), cfg)?;
-        Ok(doc)
+        let outcome = read_choice(choice);
+        apply_outcome(&mut doc, &outcome, cfg)?;
+        Ok((doc, outcome))
+    }
+}
+
+/// One document's outcome as a checkpoint keeps it (see [`checkpoint`]): the raw reply,
+/// which [`apply_outcome`] turns back into the same enriched document, or the reason
+/// the provider declined.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SavedOutcome {
+    Reply(String),
+    Declined(Declined),
+}
+
+impl SavedOutcome {
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl From<Result<String, Declined>> for SavedOutcome {
+    fn from(outcome: Result<String, Declined>) -> Self {
+        match outcome {
+            Ok(reply) => Self::Reply(reply),
+            Err(reason) => Self::Declined(reason),
+        }
+    }
+}
+
+impl From<SavedOutcome> for Result<String, Declined> {
+    fn from(saved: SavedOutcome) -> Self {
+        match saved {
+            SavedOutcome::Reply(reply) => Ok(reply),
+            SavedOutcome::Declined(reason) => Err(reason),
+        }
     }
 }
 
@@ -995,6 +1073,168 @@ mod tests {
         assert_eq!(out[0].title.as_deref(), Some("New"));
         assert_eq!(out[0].fields["topic"], "model");
         assert_eq!(out[0].meta.language.as_deref(), Some("en"));
+    }
+
+    /// Answers `{"summary": "summary of <content>"}`, except that it is overloaded for
+    /// the document whose content is `"busy"` while `busy` is set. Counts requests per
+    /// document content.
+    #[derive(Clone, Default)]
+    struct BusyFor {
+        busy: Arc<AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Respond for BusyFor {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            let content = user.rsplit("\n\n").next().unwrap().to_string();
+            self.seen.lock().unwrap().push(content.clone());
+            if content == "busy" && self.busy.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(503);
+            }
+            ResponseTemplate::new(200).set_body_json(chat_reply(&format!(
+                r#"{{"summary":"summary of {content}"}}"#
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_activity_retry_resumes_from_the_documents_already_enriched() {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let docs = || {
+            ["a", "b", "busy", "c"]
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Document::with_id(format!("d{i}"), *c))
+                .collect::<Vec<_>>()
+        };
+        // One at a time, so `a` and `b` are done when `busy` spends its retry budget.
+        let cfg = serde_json::json!({ "max_concurrent": 1 });
+        let p = plugin(&server);
+
+        // Attempt 1 fails on `busy`, after paying for `a` and `b`.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, Arc::default());
+        let err = p
+            .execute(&first, PluginInput::Documents(docs()), cfg.clone())
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert_eq!(first.usage().llm_requests, 2);
+
+        // Attempt 2, with the provider back, only asks about what attempt 1 lacked.
+        responder.busy.store(false, Ordering::SeqCst);
+        responder.seen.lock().unwrap().clear();
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "enrich", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(*responder.seen.lock().unwrap(), vec!["busy", "c"]);
+        let summaries: Vec<_> = out.iter().map(|d| d.fields["summary"].clone()).collect();
+        assert_eq!(
+            summaries,
+            ["a", "b", "busy", "c"].map(|c| serde_json::json!(format!("summary of {c}")))
+        );
+        assert_eq!(
+            out.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["d0", "d1", "d2", "d3"]
+        );
+        // The failed attempt is not billed again: only this attempt's calls are.
+        assert_eq!(second.usage().llm_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn a_declined_document_is_resumed_as_declined() {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("filtered"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "finish_reason": "content_filter", "message": { "content": null } }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let docs = || {
+            vec![
+                Document::with_id("d0", "filtered"),
+                Document::with_id("d1", "busy"),
+            ]
+        };
+        let cfg = serde_json::json!({ "max_concurrent": 1 });
+        let p = plugin(&server);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, Arc::default());
+        p.execute(&first, PluginInput::Documents(docs()), cfg.clone())
+            .await
+            .unwrap_err();
+
+        responder.busy.store(false, Ordering::SeqCst);
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "enrich", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out[0].fields[DECLINED_FIELD], "content_filter");
+        assert_eq!(out[1].fields["summary"], "summary of busy");
+        assert_eq!(second.usage().llm_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_past_its_budget_leaves_the_rest_to_redo() {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let docs = || {
+            ["a", "b", "busy"]
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Document::with_id(format!("d{i}"), *c))
+                .collect::<Vec<_>>()
+        };
+        let cfg = serde_json::json!({ "max_concurrent": 1 });
+        let mut p = plugin(&server);
+        // Room for one result only.
+        p.checkpoint_budget = 60;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, Arc::default());
+        p.execute(&first, PluginInput::Documents(docs()), cfg.clone())
+            .await
+            .unwrap_err();
+
+        responder.busy.store(false, Ordering::SeqCst);
+        responder.seen.lock().unwrap().clear();
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "enrich", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(*responder.seen.lock().unwrap(), vec!["b", "busy"]);
+        assert_eq!(out[1].fields["summary"], "summary of b");
     }
 
     #[tokio::test]
