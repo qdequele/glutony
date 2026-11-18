@@ -512,9 +512,6 @@ impl Plugin for ImageCaptionerPlugin {
 /// Sentence appended to a JSON-mode prompt that does not mention JSON.
 const JSON_REPLY_HINT: &str = "Reply with a single JSON object.";
 
-/// The text part sent with the image. OpenAI refuses `response_format: json_object`
-/// unless a message names JSON, so in JSON mode a prompt that does not gets
-/// [`JSON_REPLY_HINT`] appended; any other prompt goes out exactly as configured.
 /// The document an image's caption goes into, with its id: the whole filename made
 /// id-safe and tagged with the origin, `image` tagged with the origin when there is no
 /// filename, or a fresh UUID for an upload without one.
@@ -526,6 +523,9 @@ fn empty_document(blob: &Blob) -> Document {
     }
 }
 
+/// The text part sent with the image. OpenAI refuses `response_format: json_object`
+/// unless a message names JSON, so in JSON mode a prompt that does not gets
+/// [`JSON_REPLY_HINT`] appended; any other prompt goes out exactly as configured.
 fn prompt_text(cfg: &ImageCaptionerConfig) -> String {
     if cfg.json && !cfg.prompt.to_ascii_lowercase().contains("json") {
         format!("{}\n\n{JSON_REPLY_HINT}", cfg.prompt.trim_end())
