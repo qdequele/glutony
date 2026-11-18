@@ -124,6 +124,10 @@ pub struct ArchiveActivities {
     expansions: Arc<Semaphore>,
     /// Decompressed files held in memory at once.
     budget: Arc<InflightBudget>,
+    /// Tests: counts the bytes of each file the walk hands over, measured apart from
+    /// the budget.
+    #[cfg(test)]
+    live_files: Option<Arc<tests::LiveFiles>>,
 }
 
 impl ArchiveActivities {
@@ -139,6 +143,8 @@ impl ArchiveActivities {
             limits,
             expansions: Arc::new(Semaphore::new(1)),
             budget,
+            #[cfg(test)]
+            live_files: None,
         }
     }
 
@@ -418,6 +424,8 @@ impl ArchiveActivities {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Walked, Option<Reservation>)>(4);
         let budget = Arc::clone(&self.budget);
         let handle = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let live_files = self.live_files.clone();
         let walker = tokio::task::spawn_blocking(move || {
             // The walk holds the archive: the next expansion starts once it is done.
             let _expansion = expansion;
@@ -445,6 +453,10 @@ impl ArchiveActivities {
                     Ok(())
                 },
                 &mut |e| {
+                    #[cfg(test)]
+                    if let (Some(live), Event::File { data, .. }) = (&live_files, &e) {
+                        live.produced(data.len());
+                    }
                     // A skipped entry frees its reservation right here.
                     let reserved = match &e {
                         Event::File { .. } => pending.take(),
@@ -1327,6 +1339,31 @@ mod tests {
         }
     }
 
+    /// Bytes of decompressed files alive between the walk and the store, counted
+    /// apart from the budget: up when the walk hands a file over, down when the store
+    /// is done writing it (and the file is dropped).
+    #[derive(Debug, Default)]
+    pub(super) struct LiveFiles {
+        now: AtomicU64,
+        high_water: AtomicU64,
+    }
+
+    impl LiveFiles {
+        pub(super) fn produced(&self, bytes: usize) {
+            let bytes = bytes as u64;
+            let now = self.now.fetch_add(bytes, Ordering::SeqCst) + bytes;
+            self.high_water.fetch_max(now, Ordering::SeqCst);
+        }
+
+        fn written(&self, bytes: usize) {
+            self.now.fetch_sub(bytes as u64, Ordering::SeqCst);
+        }
+
+        fn high_water(&self) -> u64 {
+            self.high_water.load(Ordering::SeqCst)
+        }
+    }
+
     /// An in-memory store whose writes each take `delay`, like a remote store that is
     /// slower than decompression.
     #[derive(Debug)]
@@ -1335,6 +1372,8 @@ mod tests {
         delay: Duration,
         /// Writes still to fail.
         failing: std::sync::atomic::AtomicUsize,
+        /// Told when a staged file is written (or refused).
+        live: Arc<LiveFiles>,
     }
 
     impl std::fmt::Display for SlowStore {
@@ -1356,13 +1395,21 @@ mod tests {
                 .failing
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
-            if fail {
-                return Err(object_store::Error::Generic {
+            // An archive's files are staged under `jobs/<file job>/input/`.
+            let file = location.as_ref().contains("/input/");
+            let len = payload.content_length();
+            let result = if fail {
+                Err(object_store::Error::Generic {
                     store: "SlowStore",
                     source: "write refused".into(),
-                });
+                })
+            } else {
+                self.inner.put_opts(location, payload, opts).await
+            };
+            if file {
+                self.live.written(len);
             }
-            self.inner.put_opts(location, payload, opts).await
+            result
         }
         async fn put_multipart_opts(
             &self,
@@ -1421,13 +1468,23 @@ mod tests {
         inflight: u64,
         failing: usize,
     ) -> ArchiveActivities {
+        let live = Arc::new(LiveFiles::default());
         let store = BlobStore::from_object_store(Arc::new(SlowStore {
             inner: object_store::memory::InMemory::new(),
             delay,
             failing: failing.into(),
+            live: Arc::clone(&live),
         }));
-        ArchiveActivities::new(SourceActivities::new(None, store), limits)
-            .with_inflight_bytes(inflight)
+        let mut a = ArchiveActivities::new(SourceActivities::new(None, store), limits)
+            .with_inflight_bytes(inflight);
+        a.live_files = Some(live);
+        a
+    }
+
+    fn live_files(a: &ArchiveActivities) -> &LiveFiles {
+        a.live_files
+            .as_deref()
+            .expect("a slow store counts live files")
     }
 
     const MIB: usize = 1024 * 1024;
@@ -1529,21 +1586,25 @@ mod tests {
     async fn decompressed_files_held_in_memory_stay_within_the_budget() {
         // Eight 1 MiB files that compress to almost nothing, a store that takes a
         // while to write each: decompression outruns staging. A 2 MiB budget holds two
-        // files at a time, however many the channel could queue.
+        // files at a time, however many the channel could queue. What is measured is
+        // the files themselves, from the walk handing one over to the store being done
+        // with it, not what the budget believes it lent.
         let limits = Limits {
             max_file_bytes: MIB as u64,
             ..Limits::default()
         };
-        let a = slow_activities(Duration::from_millis(40), limits, 2 * MIB as u64);
+        let a = slow_activities(Duration::from_millis(100), limits, 2 * MIB as u64);
         let data = mib_files_zip(8);
         assert!(data.len() < MIB / 10, "the zip is small: {}", data.len());
         let out = a.expand(&mib_files_input(data)).await.unwrap();
         assert_eq!(out.files, 8);
+        let held = live_files(&a).high_water();
         assert!(
-            a.budget().high_water() <= 2 * MIB as u64,
-            "{} bytes of files were held at once",
-            a.budget().high_water()
+            held <= 2 * MIB as u64,
+            "{held} bytes of files were held at once"
         );
+        // The store was slow enough for the walk to get ahead: the budget was full.
+        assert_eq!(held, 2 * MIB as u64, "two files were held at once");
     }
 
     #[tokio::test]
