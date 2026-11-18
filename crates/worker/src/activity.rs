@@ -249,16 +249,16 @@ impl StepActivities {
                 plugin_ctx.set_ai_target(target);
                 Ok(true)
             }
-            None => {
-                tracing::warn!(
-                    tenant,
-                    plugin,
-                    "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target \
-                     for this Lab account (it has no LAB_INSTANCE_* credentials?); the step \
-                     falls back to this worker's own provider key"
-                );
-                Ok(false)
-            }
+            // A Lab account's AI step always runs on the team's Gateway, never on this
+            // worker's own provider key. A control plane that served no target could not
+            // ask the Lab (a replica without `LAB_INSTANCE_*`, say mid-rollout): retryable,
+            // bounded by the step's retry policy. A team without a Gateway is the final
+            // `404 no_gateway` above.
+            None => Err(PluginError::Retryable(format!(
+                "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target for \
+                 this Lab account; {plugin} never runs on this worker's own provider key for \
+                 a Lab account (is LAB_INSTANCE_* set on every control plane replica?)"
+            ))),
         }
     }
 
@@ -1275,6 +1275,27 @@ mod tests {
             .expect_err("no Gateway");
         assert!(!err.is_retryable(), "{err:?}");
         assert!(err.to_string().contains("no Gateway"), "{err}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the plugin never runs");
+    }
+
+    /// A control plane that serves no target (no `LAB_INSTANCE_*` on that replica)
+    /// could not ask the Lab: the step fails retryably and never falls back to the
+    /// worker's own provider key.
+    #[tokio::test]
+    async fn a_null_target_fails_the_lab_step_instead_of_using_the_worker_key() {
+        let cp = ai_control_plane(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "target": null })),
+        )
+        .await;
+        let probe = Probe::new("llm_enricher");
+        let runs = probe.runs.clone();
+        let a = ai_acts(&cp, probe, true);
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("no target means no AI step for a Lab account");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("no Lab Gateway target"), "{err}");
         assert_eq!(runs.load(Ordering::SeqCst), 0, "the plugin never runs");
     }
 

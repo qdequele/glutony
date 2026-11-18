@@ -255,9 +255,10 @@ answer (`503 lab_unavailable`), or a control plane answering any other error (a 
 without `no_gateway`, for example a replica not yet running this route during a
 rolling deploy), is retried with the activity's retry policy. The route serves team
 keys, so it needs `CONTROL_PLANE_TOKEN`: with `CONTROL_PLANE_TOKEN_DISABLED=true` it
-answers `403 token_required` and the step fails for good. A control plane without
-`LAB_INSTANCE_*` serves no target, and the step uses the worker's own key (the
-worker logs a warning for a Lab account). Tenants that are not Lab account ids are
+answers `403 token_required` and the step fails for good. A Lab account's AI step
+never falls back to the worker's own key: a control plane without `LAB_INSTANCE_*`
+serves no target, so it could not ask the Lab, and the step fails retryably (then for
+good once the activity's retries run out). Tenants that are not Lab account ids are
 never looked up. On such a worker the AI plugins register even without their env
 key, so another tenant's AI step fails with `InvalidConfig` naming it
 (`LLM_API_KEY`, `TYPESAFE_API_KEY`).
