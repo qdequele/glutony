@@ -512,7 +512,7 @@ impl StepActivities {
                 &input.step_id,
                 input.branch,
                 output,
-                branch_spill_threshold(self.spill_threshold, input.branch_total),
+                branch_spill_threshold(self.spill_threshold, input.branch_total, input.merge_total),
             )
             .await
             .map_err(|e| PluginError::Retryable(format!("failed to spill step output: {e}")))?;
@@ -619,18 +619,28 @@ impl StepActivities {
 /// ([`PluginOutput::approx_size`] of a `Ref`).
 const SPILLED_REF_SIZE: usize = 256;
 
-/// Spill threshold of one output of a step running as `branch_total` branches.
+/// Spill threshold of one output of a step running as `branch_total` branches, whose
+/// output a later step merges with `merge_total - 1` others.
 ///
-/// The workflow merges the branch outputs into one `Many`, which is the single input
-/// of the next step: it is their sum that has to stay under the threshold, and the
-/// branches run in parallel without knowing each other's size. So each gets an equal
-/// share of the budget. A step that is not fanned out keeps the whole of it.
-fn branch_spill_threshold(threshold: usize, branch_total: Option<usize>) -> usize {
-    match branch_total {
-        // Never below a reference: spilling something smaller would only grow it.
-        Some(total) if total > 1 => (threshold / total).max(SPILLED_REF_SIZE),
-        _ => threshold,
+/// The workflow merges the branch outputs into one `Many`, and a step with several
+/// dependencies merges their outputs into another, which is the single input of that
+/// step: it is the sum that has to stay under the threshold, and the outputs are
+/// produced without knowing each other's size. So each gets an equal share of the
+/// budget. A step that is neither fanned out nor merged keeps the whole of it.
+fn branch_spill_threshold(
+    threshold: usize,
+    branch_total: Option<usize>,
+    merge_total: Option<usize>,
+) -> usize {
+    let shares = branch_total
+        .unwrap_or(1)
+        .max(1)
+        .saturating_mul(merge_total.unwrap_or(1).max(1));
+    if shares <= 1 {
+        return threshold;
     }
+    // Never below a reference: spilling something smaller would only grow it.
+    (threshold / shares).max(SPILLED_REF_SIZE)
 }
 
 /// Bytes a step actually consumed, for per-tenant metering.
@@ -883,6 +893,7 @@ mod tests {
             input,
             branch: None,
             branch_total: None,
+            merge_total: None,
             tenant_id: None,
         }
     }
@@ -2005,11 +2016,82 @@ mod tests {
 
     #[test]
     fn a_fanned_out_step_shares_the_spill_budget_between_its_branches() {
-        assert_eq!(branch_spill_threshold(1 << 20, None), 1 << 20);
-        assert_eq!(branch_spill_threshold(1 << 20, Some(1)), 1 << 20);
-        assert_eq!(branch_spill_threshold(1 << 20, Some(4)), 1 << 18);
+        assert_eq!(branch_spill_threshold(1 << 20, None, None), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, Some(1), None), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, Some(4), None), 1 << 18);
         // Never below what a reference weighs.
-        assert_eq!(branch_spill_threshold(64, Some(500)), SPILLED_REF_SIZE);
+        assert_eq!(
+            branch_spill_threshold(64, Some(500), None),
+            SPILLED_REF_SIZE
+        );
+    }
+
+    #[test]
+    fn a_merged_step_shares_the_spill_budget_with_the_other_merged_outputs() {
+        assert_eq!(branch_spill_threshold(1 << 20, None, Some(1)), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, None, Some(2)), 1 << 19);
+        // A fanned-out step merged with others: its branches share its share.
+        assert_eq!(branch_spill_threshold(1 << 20, Some(4), Some(2)), 1 << 17);
+        assert_eq!(
+            branch_spill_threshold(1 << 20, Some(usize::MAX), Some(2)),
+            SPILLED_REF_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn outputs_merged_by_a_step_with_several_dependencies_fit_the_threshold_together() {
+        let threshold = 1024 * 1024;
+        let a = acts(vec![Arc::new(Upper)]);
+        assert_eq!(a.spill_threshold, threshold);
+        let pipeline = PipelineDefinition {
+            uid: "p".into(),
+            name: "p".into(),
+            description: None,
+            version: 1,
+            trigger: None,
+            steps: vec![
+                StepDefinition::new("a", "upper"),
+                StepDefinition::new("b", "upper"),
+                StepDefinition::new("c", "upper"),
+                StepDefinition::new("index", "upper").depends_on(["a", "b", "c"]),
+            ],
+            builtin: false,
+            tenant_id: None,
+        };
+        // Each output alone is under the threshold, the three together are not.
+        let mut done = std::collections::HashMap::new();
+        for id in ["a", "b", "c"] {
+            let mut input = step_input(
+                "upper",
+                PluginInput::Documents(vec![Document::with_id(id, "x".repeat(400 * 1024))]),
+            );
+            input.step_id = id.into();
+            input.merge_total = crate::dag::merge_total(&pipeline, id);
+            let out = a
+                .run_step(&PluginContext::noop(), input)
+                .await
+                .expect("step runs");
+            done.insert(id.to_string(), out.output);
+        }
+        let merged = crate::dag::resolve_input(
+            pipeline.step("index").expect("step"),
+            &PluginInput::Empty,
+            &done,
+        );
+        assert!(
+            merged.approx_size() <= threshold,
+            "the merged input is {} bytes, over the {threshold} threshold",
+            merged.approx_size()
+        );
+        // Nothing is lost: the next step reads every document back.
+        let docs = a
+            .blob
+            .resolve_input(merged, &a.http)
+            .await
+            .expect("hydrate")
+            .into_documents()
+            .expect("documents");
+        assert_eq!(docs.len(), 3);
     }
 
     /// Answers with the checkpoint the previous attempt left (`null` without one), then

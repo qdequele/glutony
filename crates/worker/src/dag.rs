@@ -41,6 +41,20 @@ pub fn resolve_input(
     }
 }
 
+/// How many outputs the widest step consuming `step_id` merges into its input
+/// ([`resolve_input`] with several `depends_on`), or `None` when no consumer merges it
+/// with anything. The output of `step_id` gets that share of the spill threshold, so
+/// the merged input of every consumer stays under it.
+pub fn merge_total(pipeline: &PipelineDefinition, step_id: &str) -> Option<usize> {
+    pipeline
+        .steps
+        .iter()
+        .filter(|s| s.depends_on.iter().any(|d| d == step_id))
+        .map(|s| s.depends_on.len())
+        .filter(|&n| n > 1)
+        .max()
+}
+
 /// Result of expanding a fan-out step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FanOut {
@@ -375,6 +389,23 @@ mod tests {
         };
         p.normalize();
         p
+    }
+
+    #[test]
+    fn the_merge_total_is_the_widest_merge_consuming_a_step() {
+        let mut p = pipeline();
+        // `b` and `c` are merged by `d`; nothing merges `a` (each consumer has one dep)
+        // nor `d` (the last step).
+        assert_eq!(merge_total(&p, "a"), None);
+        assert_eq!(merge_total(&p, "b"), Some(2));
+        assert_eq!(merge_total(&p, "c"), Some(2));
+        assert_eq!(merge_total(&p, "d"), None);
+        // With a wider consumer, the widest one wins.
+        p.steps
+            .push(StepDefinition::new("e", "x").depends_on(["a", "b", "c"]));
+        p.normalize();
+        assert_eq!(merge_total(&p, "a"), Some(3));
+        assert_eq!(merge_total(&p, "b"), Some(3));
     }
 
     #[test]

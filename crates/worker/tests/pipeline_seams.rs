@@ -31,6 +31,7 @@ fn step_in(job: Uuid, step: &str, plugin: &str, input: PluginInput) -> StepActiv
         input,
         branch: None,
         branch_total: None,
+        merge_total: None,
         tenant_id: None,
     }
 }

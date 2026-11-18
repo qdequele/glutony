@@ -34,7 +34,7 @@ use temporalio_sdk::{
 use crate::activity::{FanOutActivityInput, JobStartedInput, StepActivities};
 use crate::dag::{
     BranchError, FanOut, RoundEnd, StepFailure, StepMetering, StepOutcome, fan_out_branches,
-    merge_branches, ready_steps, resolve_input, retry_params, settle_round,
+    merge_branches, merge_total, ready_steps, resolve_input, retry_params, settle_round,
 };
 
 /// Upper bound on parallel activities scheduled by one fan-out step (keeps the
@@ -391,6 +391,7 @@ impl PipelineWorkflow {
     ) -> Result<StepOutcome, StepFailure> {
         let opts = Self::activity_options(step);
         let config = Self::step_config(step, input);
+        let merge_total = merge_total(&input.pipeline, &step.id);
         let mk = |branch: Option<usize>, total: Option<usize>, branch_input: PluginInput| {
             StepActivityInput {
                 job_id: input.job_id,
@@ -400,6 +401,7 @@ impl PipelineWorkflow {
                 input: branch_input,
                 branch,
                 branch_total: total,
+                merge_total,
                 tenant_id: input.context.tenant_id.clone(),
             }
         };

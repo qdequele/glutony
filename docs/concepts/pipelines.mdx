@@ -116,7 +116,10 @@ are spilled there. A fanned-out step shares that budget: its branch inputs
 travel as one list and its branch outputs are merged into one input for the
 next step, so branches are spilled as needed to keep each of those under
 `PAYLOAD_SPILL_BYTES` as a whole (a branch output is spilled above
-`PAYLOAD_SPILL_BYTES` divided by the number of branches). This is invisible to
+`PAYLOAD_SPILL_BYTES` divided by the number of branches). The same goes for a
+step with several `depends_on`: their outputs are merged into its one input, so
+each of them is spilled above `PAYLOAD_SPILL_BYTES` divided by the number of
+outputs merged (and by its branches too, when fanned out). This is invisible to
 plugins and to pipeline authors: staged documents reach the first step as
 documents, exactly as inline ones do.
 

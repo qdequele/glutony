@@ -1741,6 +1741,12 @@ pub struct StepActivityInput {
     /// Total branches when fanned out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_total: Option<usize>,
+    /// When a later step merges this step's output with others (it has several
+    /// `depends_on`), how many outputs the widest such step merges; `None` otherwise.
+    /// The merged input is one activity payload, so the worker spills this output
+    /// against that share of its spill threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_total: Option<usize>,
     /// Tenant id for logging / scoping.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
     pub tenant_id: Option<String>,
@@ -2816,6 +2822,7 @@ steps:
             input: PluginInput::Documents(vec![]),
             branch: None,
             branch_total: None,
+            merge_total: None,
             tenant_id: Some("acme".into()),
         };
         let back: StepActivityInput =
@@ -2836,5 +2843,21 @@ steps:
         let config: IndexerConfig =
             serde_json::from_value(with_old_key(serde_json::to_value(&context).unwrap())).unwrap();
         assert_eq!(config.meili.tenant_id.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn a_step_input_recorded_before_merge_total_still_deserializes() {
+        // What a workflow history written by an older worker holds.
+        let old = serde_json::json!({
+            "job_id": uuid::Uuid::nil(),
+            "step_id": "a",
+            "plugin": "x",
+            "config": {},
+            "input": {"type": "empty"},
+        });
+        let step: StepActivityInput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(step.merge_total, None);
+        // And `None` adds nothing to the recorded input.
+        assert_eq!(serde_json::to_value(&step).unwrap(), old);
     }
 }
