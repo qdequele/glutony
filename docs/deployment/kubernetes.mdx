@@ -149,6 +149,11 @@ as env vars or a service account annotation, with `AWS_REGION` for S3. Tenants'
 `{"s3": …}` refs are not read with them unless `OBJECT_REF_AMBIENT_CREDENTIALS=true`
 (see [object refs](/deployment/environment-variables#object-refs)).
 
+The workers delete each finished job's blobs `BLOB_TTL_DAYS` (control plane, default
+7) after it ended, so their role also needs `s3:ListBucket` and `s3:DeleteObject` on
+`jobs/`. Add a lifecycle rule expiring `jobs/` after about 30 days on the bucket as a
+backstop ([Blob store retention](/deployment/environment-variables#blob-store-retention)).
+
 ## 2. Gateway
 
 - `RollingUpdate` with `maxUnavailable: 0`, spread across nodes.

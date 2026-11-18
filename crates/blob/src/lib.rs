@@ -505,6 +505,8 @@ pub struct BlobStore {
     ref_max_bytes: u64,
     /// The bucket this store lives in, refused to tenant object refs.
     own_bucket: Option<Bucket>,
+    /// The directory of a `file://` store, whose emptied job folders are removed.
+    local_root: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for BlobStore {
@@ -541,6 +543,7 @@ impl BlobStore {
                 object_refs: ObjectRefPolicy::default(),
                 ref_max_bytes: DEFAULT_REF_MAX_BYTES,
                 own_bucket: None,
+                local_root: None,
             });
         }
         if let Some(rest) = url.strip_prefix("file://") {
@@ -556,6 +559,7 @@ impl BlobStore {
                 object_refs: ObjectRefPolicy::default(),
                 ref_max_bytes: DEFAULT_REF_MAX_BYTES,
                 own_bucket: None,
+                local_root: Some(std::path::PathBuf::from(dir)),
             });
         }
         Self::from_cloud_url(url, &process_env())
@@ -594,6 +598,7 @@ impl BlobStore {
             object_refs: ObjectRefPolicy::default(),
             ref_max_bytes: DEFAULT_REF_MAX_BYTES,
             own_bucket,
+            local_root: None,
         })
     }
 
@@ -673,6 +678,7 @@ impl BlobStore {
             object_refs: ObjectRefPolicy::default(),
             ref_max_bytes: DEFAULT_REF_MAX_BYTES,
             own_bucket: None,
+            local_root: None,
         }
     }
 
@@ -728,6 +734,37 @@ impl BlobStore {
             .delete(&path)
             .await
             .map_err(BlobError::from_store)
+    }
+
+    /// Delete everything a job left in the store (`jobs/<job_id>/`): its staged input,
+    /// its spilled step outputs, an archive's manifest. Returns how many objects were
+    /// deleted. Idempotent: an object already gone is not an error.
+    pub async fn delete_job(&self, job_id: Uuid) -> Result<usize, BlobError> {
+        use futures::{StreamExt, TryStreamExt};
+        let prefix = self.full_path(&format!("jobs/{job_id}"));
+        let locations = self
+            .store
+            .list(Some(&prefix))
+            .map_ok(|meta| meta.location)
+            .boxed();
+        let mut results = self.store.delete_stream(locations);
+        let mut deleted = 0;
+        while let Some(result) = results.next().await {
+            match result {
+                Ok(_) => deleted += 1,
+                // Deleted meanwhile (another sweep): what was asked is done.
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(BlobError::Store(e)),
+            }
+        }
+        // A folder store keeps the directories it created for the job's keys.
+        if let Some(root) = &self.local_root {
+            let dir = prefix
+                .parts()
+                .fold(root.clone(), |dir, part| dir.join(part.as_ref()));
+            remove_empty_dirs(&dir);
+        }
+        Ok(deleted)
     }
 
     /// Fetch the content behind a [`ContentRef`].
@@ -1107,6 +1144,19 @@ impl BlobStore {
 }
 
 /// `type/subtype; params` → `type/subtype` (lower-cased); `None` when empty.
+/// Remove `dir` and the directories under it, as far as they are empty. Best effort:
+/// what cannot be removed (a file written meanwhile) stays.
+fn remove_empty_dirs(dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_dirs(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 fn strip_mime_params(value: &str) -> Option<String> {
     let essence = value
         .split(';')
@@ -1697,6 +1747,85 @@ mod tests {
             store.get("jobs/x/y.bin").await,
             Err(BlobError::NotFound(_))
         ));
+    }
+
+    /// What a job leaves in the store: a staged input, a spilled output and an archive
+    /// manifest, under `jobs/<job>/`.
+    async fn leave_job_objects(store: &BlobStore, job: Uuid) {
+        store
+            .stage_upload(
+                job,
+                Blob::new(vec![7; 32], "application/pdf", Some("q3/a.pdf".into())),
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &BlobStore::staged_key(job, "extract.json"),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &BlobStore::staged_key(job, "archive/manifest.json"),
+                Bytes::from_static(b"[]"),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn keys(store: &BlobStore) -> Vec<String> {
+        use futures::TryStreamExt;
+        let mut keys: Vec<String> = store
+            .store
+            .list(None)
+            .map_ok(|m| m.location.to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_removes_everything_under_its_prefix_and_nothing_else() {
+        for store in [
+            BlobStore::memory(),
+            BlobStore::from_url("memory:///tenant-a").unwrap(),
+        ] {
+            let (job, other) = (Uuid::new_v4(), Uuid::new_v4());
+            leave_job_objects(&store, job).await;
+            leave_job_objects(&store, other).await;
+            assert_eq!(keys(&store).await.len(), 6);
+
+            assert_eq!(store.delete_job(job).await.unwrap(), 3);
+            let left = keys(&store).await;
+            assert_eq!(left.len(), 3, "{left:?}");
+            assert!(
+                left.iter().all(|k| k.contains(&other.to_string())),
+                "{left:?}"
+            );
+            // Idempotent: a job already swept, or one that never staged anything.
+            assert_eq!(store.delete_job(job).await.unwrap(), 0);
+            assert_eq!(store.delete_job(Uuid::new_v4()).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_on_disk_leaves_no_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::from_url(&format!("file://{}", dir.path().display())).unwrap();
+        let (job, other) = (Uuid::new_v4(), Uuid::new_v4());
+        leave_job_objects(&store, job).await;
+        leave_job_objects(&store, other).await;
+        assert_eq!(store.delete_job(job).await.unwrap(), 3);
+        let jobs = dir.path().join("jobs");
+        assert!(!jobs.join(job.to_string()).exists());
+        assert!(jobs.join(other.to_string()).is_dir());
+        assert_eq!(keys(&store).await.len(), 3);
+        assert_eq!(store.delete_job(job).await.unwrap(), 0);
     }
 
     #[tokio::test]

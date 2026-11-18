@@ -19,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
         internal_token,
         lab: lab_config,
         jobs_retention_days,
+        blob_ttl_days,
     } = BootConfig::from_env()?;
     if let Some(config) = &lab_config {
         // Also before Postgres: wrong credentials abort boot (spec §3.6).
@@ -41,7 +42,16 @@ async fn main() -> anyhow::Result<()> {
     // The Lab seams mean tenants: a global pipeline may then pin no connection.
     let mut state = AppState::new(pool.clone())
         .with_internal_token(internal_token)
-        .with_tenants(lab_config.is_some());
+        .with_tenants(lab_config.is_some())
+        .with_blob_ttl_days(blob_ttl_days);
+    if blob_ttl_days == 0 {
+        tracing::info!("BLOB_TTL_DAYS=0: job blobs are kept until a bucket rule removes them");
+    } else {
+        tracing::info!(
+            days = blob_ttl_days,
+            "workers delete a job's blobs this many days after it ended"
+        );
+    }
     if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
         // Workers ask `GET /internal/lab/credits/{account}` before a source run and
         // `GET /internal/lab/ai/{account}` before an AI step. This client is on that

@@ -3317,6 +3317,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "futures",
  "meili-ingest-plugin-sdk",
  "mime_guess",
  "object_store",

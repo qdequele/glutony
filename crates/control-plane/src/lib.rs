@@ -6,7 +6,8 @@
 //!   the router crate;
 //! * MIME/filename → pipeline resolution (`POST /internal/resolve`);
 //! * plugin manifest registry (`/plugins`, `POST /internal/plugins`);
-//! * denormalized job cache (`/internal/jobs`);
+//! * denormalized job cache (`/internal/jobs`), and which jobs' blobs are due for
+//!   deletion (`/internal/blob-sweep/*`, `BLOB_TTL_DAYS`);
 //! * Meilisearch connections (`/internal/connections`), keys held sealed;
 //! * scheduled sources (`/internal/sources`, `/internal/sources-by-id`,
 //!   `/internal/source-runs`);
@@ -74,6 +75,9 @@ pub struct AppState {
     /// (`LAB_URL` + `LAB_INSTANCE_*`). A global pipeline may then pin no connection,
     /// since tenant jobs resolve a pinned name in their own scope only.
     pub tenants: bool,
+    /// Days after a job ended before its blobs are deleted (`BLOB_TTL_DAYS`); `0`
+    /// keeps them.
+    pub blob_ttl_days: u32,
 }
 
 impl AppState {
@@ -88,12 +92,19 @@ impl AppState {
             lab_credits: None,
             lab_ai: None,
             tenants: false,
+            blob_ttl_days: jobs::DEFAULT_BLOB_TTL_DAYS,
         }
     }
 
     /// Mark the deployment as serving tenants (see [`AppState::tenants`]).
     pub fn with_tenants(mut self, tenants: bool) -> Self {
         self.tenants = tenants;
+        self
+    }
+
+    /// Delete a job's blobs `days` after it ended (`0`: never).
+    pub fn with_blob_ttl_days(mut self, days: u32) -> Self {
+        self.blob_ttl_days = days;
         self
     }
 
@@ -280,6 +291,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/internal/jobs/{job_id}",
             get(jobs::get_job).patch(jobs::update_job),
+        )
+        .route(
+            "/internal/blob-sweep/claim",
+            post(jobs::claim_blob_sweep_route),
+        )
+        .route(
+            "/internal/blob-sweep/done",
+            post(jobs::blob_sweep_done_route),
         )
         .route(
             "/internal/connections",

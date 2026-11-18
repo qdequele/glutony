@@ -107,6 +107,7 @@ arrive in the workflow input as `MeiliContext`.
 | `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | — | This deployment's Lab credentials; sign each batch (`X-Lab-Signature` over `"<timestamp>.<body>"`) and answer the workers' credit pre-check of source runs (`GET /internal/lab/credits/{account}`). Required with `LAB_URL`. Credentials of another product's engine abort boot. Never logged. |
 | `CONTROL_PLANE_TOKEN` | — (required) | Bearer token callers must present on every control plane route except `/health` and `/metrics`. `CONTROL_PLANE_TOKEN_DISABLED=true` runs without it (dev, and step 2 of the [rollout order](/deployment/meilisearch-lab#rollout-order)); a set token is enforced whatever the flag. `CHANGE_ME` is refused at boot. |
 | `JOBS_RETENTION_DAYS` | — (keep forever) | Whole number of days. When set (and not `0`), an hourly pass deletes finished jobs (`succeeded`, `failed`, `cancelled`) and source runs that started more than that many days ago; queued and running jobs, and an archive job whose file jobs remain, are kept. A deleted job is gone from `GET /jobs` and `GET /jobs/{id}` answers `404` for a tenant, so keep it at least as long as the Temporal namespace's retention. |
+| `BLOB_TTL_DAYS` | `7` | Days after a job ended (succeeded, failed or cancelled) before the workers delete what it left in the blob store: its staged upload or source item, spilled step outputs, an archive's manifest and files. An archive's turn comes once every file job of it has ended. Until then a failed job can still be reset or re-run in Temporal. `0` keeps them (see [Blob store retention](#blob-store-retention)); anything but a whole number stops the control plane at boot. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 ## Object store credentials
@@ -124,8 +125,10 @@ ECS sets `AWS_REGION` in every task; an EC2 instance does not, so set it on a
 gateway or worker running directly on EC2. Gateway and workers must use the same
 `BLOB_STORE_URL`: the gateway stages uploads there and the workers read them back.
 Give each role only what it needs on that bucket and prefix: `s3:PutObject` for
-the gateway, `s3:GetObject` and `s3:PutObject` for the workers (they spill large
-step outputs there too).
+the gateway; `s3:GetObject` and `s3:PutObject` for the workers (they spill large
+step outputs there too), plus `s3:ListBucket` and `s3:DeleteObject` on `jobs/` to
+delete finished jobs' blobs. Without the last two, the deletion fails, is logged as a
+warning and retried every hour.
 
 ### Object refs
 
@@ -152,6 +155,29 @@ the worker, not the gateway, under these rules:
 
 Private tenant data is better passed as a presigned `https://` URL in a
 `{"url": …}` body, which `SOURCE_FETCH_HOSTS` governs.
+
+## Blob store retention
+
+Everything a job writes to the blob store is under `jobs/<job_id>/` (after the
+`BLOB_STORE_URL` prefix). Every ten minutes, each worker asks the control plane which
+jobs ended more than `BLOB_TTL_DAYS` ago (default 7), deletes their prefixes and
+reports them done; a job whose deletion fails is retried an hour later. On a
+`file://` store the emptied directories go too.
+
+The control plane only knows jobs that have a row, so add a backstop for the rest (a
+job whose row was never written or never got its final status): expire `jobs/` well after
+`BLOB_TTL_DAYS`, for example after 30 days. On S3:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket meili-ingest-blobs \
+  --lifecycle-configuration '{"Rules": [{"ID": "expire-job-blobs", "Status": "Enabled",
+    "Filter": {"Prefix": "jobs/"}, "Expiration": {"Days": 30}}]}'
+```
+
+GCS and Azure have the same rule (an age condition on the `jobs/` prefix). On a
+`file://` store, a daily `find /data/blobs/jobs -type f -mtime +30 -delete` does it.
+Keep the rule longer than your longest job, retries included: it deletes inputs of
+jobs still running.
 
 ## Temporal connection
 

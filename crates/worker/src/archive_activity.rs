@@ -532,7 +532,7 @@ impl ArchiveActivities {
     /// Giving up drops the expansion, which closes the channel its walk feeds: the walk
     /// stops at its next entry instead of staging the rest of an archive nobody wants
     /// any more. What was staged until then stays under the job's keys, as after any
-    /// failed expansion.
+    /// failed expansion, until the job's blobs are swept ([`crate::blob_sweep`]).
     pub async fn expand_unless(
         &self,
         input: &ExpandArchiveInput,

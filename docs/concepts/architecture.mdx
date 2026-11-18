@@ -105,7 +105,9 @@ A worker polls one task queue (`TASK_QUEUE`). The `execute_step` activity:
 
 `object_store`-backed (`file://`, `s3://`, `gs://`, `az://`, `memory://`).
 Holds staged uploads and spilled step outputs under `jobs/<job_id>/…`.
-Gateway and all workers must point at the same store.
+Gateway and all workers must point at the same store. The workers delete a job's
+prefix `BLOB_TTL_DAYS` (default 7) after the job ended, as the control plane's job
+table tells them ([Blob store retention](/deployment/environment-variables#blob-store-retention)).
 
 ## Repository layout
 

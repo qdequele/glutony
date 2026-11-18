@@ -105,7 +105,9 @@ docker run --rm -v meili-blobs:/data/blobs \
 Both containers mount the same named volume at `/data/blobs`, the image's default
 `BLOB_STORE_URL` (`file:///data/blobs`): uploads above `INLINE_MAX_BYTES` are staged
 there by the gateway and read back by the worker. Use a named volume rather than a
-host directory, which the image's non-root user (uid 10001) cannot write to.
+host directory, which the image's non-root user (uid 10001) cannot write to. The
+worker deletes each job's files there `BLOB_TTL_DAYS` (control plane, default 7) after
+the job ended ([Blob store retention](/deployment/environment-variables#blob-store-retention)).
 
 The production `Dockerfile` is multi-stage (cargo-chef dependency layer,
 `debian:bookworm-slim` runtime, non-root user) and contains all three binaries

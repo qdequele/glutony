@@ -186,6 +186,22 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("AI steps of Lab accounts run on the team's Gateway");
     }
 
+    // Finished jobs' blobs are deleted BLOB_TTL_DAYS (control plane) after they
+    // ended; the control plane's job table says which. Without one, they stay.
+    match &config.control_plane_url {
+        Some(cp) => {
+            let sweeper = meili_ingest_worker::blob_sweep::BlobSweeper::new(
+                cp,
+                config.control_plane_token.clone(),
+                blob.clone(),
+            );
+            tokio::spawn(sweeper.run(meili_ingest_worker::blob_sweep::SWEEP_INTERVAL));
+        }
+        None => {
+            tracing::warn!("CONTROL_PLANE_URL is not set: finished jobs' blobs are never deleted")
+        }
+    }
+
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)
         .with_usage(usage)
         .with_lab_events(config.lab_events_enabled)

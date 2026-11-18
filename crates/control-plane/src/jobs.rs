@@ -385,6 +385,126 @@ pub async fn get_job(
         .ok_or_else(|| CpError::NotFound(format!("job {job_id} not found")))
 }
 
+/// Default of `BLOB_TTL_DAYS`: how long after a job ended its blobs are deleted.
+pub const DEFAULT_BLOB_TTL_DAYS: u32 = 7;
+
+/// How long a claimed job stays with the worker that claimed it. A worker that dies
+/// mid-sweep leaves its jobs to the next claim after this.
+pub const BLOB_SWEEP_LEASE_SECS: i64 = 60 * 60;
+
+/// Body of `POST /internal/blob-sweep/claim`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlobSweepClaimRequest {
+    /// Most jobs to claim, 1..=500, default 100.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Answer of `POST /internal/blob-sweep/claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSweepClaim {
+    /// `false` when `BLOB_TTL_DAYS=0`: blobs are never deleted.
+    pub enabled: bool,
+    /// The jobs whose blobs the caller now deletes.
+    pub jobs: Vec<BlobSweepJob>,
+}
+
+/// One job to sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSweepJob {
+    /// Its blobs are under `jobs/<job_id>/`.
+    pub job_id: Uuid,
+    /// `archive` for an archive job, whose files were staged under their own ids.
+    pub pipeline_uid: String,
+}
+
+/// Body of `POST /internal/blob-sweep/done`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlobSweepDone {
+    /// Jobs whose blobs are gone.
+    pub job_ids: Vec<Uuid>,
+}
+
+/// Claim up to `limit` jobs whose blobs are due for deletion: over (succeeded, failed
+/// or cancelled) for more than `ttl_days`, not swept yet, not claimed by another
+/// worker in the last [`BLOB_SWEEP_LEASE_SECS`], and, for an archive, with no file
+/// job still running. Oldest first.
+pub async fn claim_blob_sweep(
+    pool: &PgPool,
+    ttl_days: u32,
+    limit: i64,
+) -> Result<Vec<BlobSweepJob>, CpError> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "UPDATE jobs SET blobs_claimed_at = now() \
+         WHERE job_id IN ( \
+             SELECT j.job_id FROM jobs j \
+             WHERE j.status IN ('succeeded', 'failed', 'cancelled') \
+               AND j.blobs_deleted_at IS NULL \
+               AND j.updated_at < now() - make_interval(days => $1) \
+               AND (j.blobs_claimed_at IS NULL \
+                    OR j.blobs_claimed_at < now() - make_interval(secs => $3)) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM jobs c \
+                   WHERE c.parent_job_id = j.job_id \
+                     AND c.status NOT IN ('succeeded', 'failed', 'cancelled')) \
+             ORDER BY j.updated_at \
+             LIMIT $2 \
+             FOR UPDATE SKIP LOCKED) \
+         RETURNING job_id, pipeline_uid",
+    )
+    .bind(i32::try_from(ttl_days).unwrap_or(i32::MAX))
+    .bind(limit)
+    .bind(BLOB_SWEEP_LEASE_SECS as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(job_id, pipeline_uid)| BlobSweepJob {
+            job_id,
+            pipeline_uid,
+        })
+        .collect())
+}
+
+/// Record that the blobs of `job_ids` are gone; they are never claimed again.
+pub async fn mark_blobs_deleted(pool: &PgPool, job_ids: &[Uuid]) -> Result<u64, CpError> {
+    let done = sqlx::query("UPDATE jobs SET blobs_deleted_at = now() WHERE job_id = ANY($1)")
+        .bind(job_ids)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
+
+/// `POST /internal/blob-sweep/claim` body [`BlobSweepClaimRequest`] → 200
+/// [`BlobSweepClaim`]. Workers call it on a timer and delete each job's blobs.
+pub async fn claim_blob_sweep_route(
+    State(state): State<AppState>,
+    JsonBody(req): JsonBody<BlobSweepClaimRequest>,
+) -> Result<Json<BlobSweepClaim>, CpError> {
+    if state.blob_ttl_days == 0 {
+        return Ok(Json(BlobSweepClaim {
+            enabled: false,
+            jobs: Vec::new(),
+        }));
+    }
+    let limit = req.limit.unwrap_or(100).clamp(1, 500);
+    let jobs = claim_blob_sweep(&state.pool, state.blob_ttl_days, limit).await?;
+    Ok(Json(BlobSweepClaim {
+        enabled: true,
+        jobs,
+    }))
+}
+
+/// `POST /internal/blob-sweep/done` body [`BlobSweepDone`] → 204.
+pub async fn blob_sweep_done_route(
+    State(state): State<AppState>,
+    JsonBody(done): JsonBody<BlobSweepDone>,
+) -> Result<StatusCode, CpError> {
+    let marked = mark_blobs_deleted(&state.pool, &done.job_ids).await?;
+    tracing::info!(jobs = marked, "job blobs deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

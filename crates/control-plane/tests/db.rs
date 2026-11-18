@@ -1248,5 +1248,169 @@ async fn retention_prunes_only_old_finished_jobs_and_runs() {
         !jobs.contains(&child) && !jobs.contains(&parent),
         "{jobs:?}"
     );
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn job_blobs_are_claimed_once_their_ttl_has_passed() {
+    use meili_ingest_control_plane::jobs::{BlobSweepClaim, BlobSweepDone};
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone()).with_blob_ttl_days(7);
+    let now = Utc::now();
+    let record = |status: JobStatus, pipeline: &str, parent: Option<Uuid>| {
+        let id = Uuid::new_v4();
+        JobRecord {
+            job_id: id,
+            workflow_id: format!("ingest-{id}"),
+            pipeline_uid: pipeline.into(),
+            tenant_id: Some("t1".into()),
+            index_name: None,
+            status,
+            current_step: None,
+            error: None,
+            started_at: now,
+            updated_at: now,
+            source_id: None,
+            parent_job_id: parent,
+        }
+    };
+    let old_ok = record(JobStatus::Succeeded, "builtin.pdf", None);
+    let old_failed = record(JobStatus::Failed, "builtin.pdf", None);
+    let old_cancelled = record(JobStatus::Cancelled, "builtin.pdf", None);
+    let old_running = record(JobStatus::Running, "builtin.pdf", None);
+    let recent_ok = record(JobStatus::Succeeded, "builtin.pdf", None);
+    // An archive over for long, one of whose files still runs: its turn comes later.
+    let archive = record(JobStatus::Failed, "archive", None);
+    let file_done = record(JobStatus::Succeeded, "builtin.pdf", Some(archive.job_id));
+    let file_running = record(JobStatus::Running, "builtin.pdf", Some(archive.job_id));
+    let old = [
+        &old_ok,
+        &old_failed,
+        &old_cancelled,
+        &old_running,
+        &archive,
+        &file_done,
+        &file_running,
+    ];
+    for row in old.iter().copied().chain([&recent_ok]) {
+        let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", row)).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let age = |ids: Vec<Uuid>| {
+        let pool = t.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE jobs SET updated_at = now() - interval '8 days' WHERE job_id = ANY($1)",
+            )
+            .bind(ids)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    age(old.iter().map(|r| r.job_id).collect()).await;
+    let claim = |state: AppState| async move {
+        let (status, body) = call(
+            app(state),
+            req_json(
+                "POST",
+                "/internal/blob-sweep/claim",
+                &serde_json::json!({"limit": 50}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let claim: BlobSweepClaim = json(&body);
+        let mut ids: Vec<Uuid> = claim.jobs.iter().map(|j| j.job_id).collect();
+        ids.sort();
+        (claim, ids)
+    };
+    let sorted = |ids: &[Uuid]| {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids
+    };
+
+    let (first, ids) = claim(state.clone()).await;
+    assert!(first.enabled);
+    assert_eq!(
+        ids,
+        sorted(&[
+            old_ok.job_id,
+            old_failed.job_id,
+            old_cancelled.job_id,
+            file_done.job_id
+        ]),
+        "terminal, over 7 days ago, and no file of theirs still running"
+    );
+    assert!(
+        first.jobs.iter().all(|j| j.pipeline_uid == "builtin.pdf"),
+        "{first:?}"
+    );
+    // Claimed: another worker gets none of them meanwhile.
+    let (_, again) = claim(state.clone()).await;
+    assert!(again.is_empty(), "{again:?}");
+
+    // Swept: never claimed again, even once the lease is over.
+    let (status, _) = call(
+        app(state.clone()),
+        req_json(
+            "POST",
+            "/internal/blob-sweep/done",
+            &BlobSweepDone {
+                job_ids: vec![old_ok.job_id, old_failed.job_id],
+            },
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    sqlx::query("UPDATE jobs SET blobs_claimed_at = now() - interval '2 hours'")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    // The last file finishes, and that was long ago too: the archive is due.
+    let done = JobUpdate {
+        status: Some(JobStatus::Succeeded),
+        ..JobUpdate::default()
+    };
+    let (status, _) = call(
+        app(state.clone()),
+        req_json(
+            "PATCH",
+            &format!("/internal/jobs/{}", file_running.job_id),
+            &done,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (second, ids) = claim(state.clone()).await;
+    assert_eq!(
+        ids,
+        sorted(&[old_cancelled.job_id, archive.job_id, file_done.job_id]),
+        "a lease that ran out is claimed again; the archive's files are all over"
+    );
+    assert!(
+        second
+            .jobs
+            .iter()
+            .any(|j| j.job_id == archive.job_id && j.pipeline_uid == "archive"),
+        "{second:?}"
+    );
+
+    // BLOB_TTL_DAYS=0: nothing is ever claimed.
+    sqlx::query("UPDATE jobs SET blobs_claimed_at = NULL")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    age(vec![file_running.job_id]).await;
+    let (off, ids) = claim(state.clone().with_blob_ttl_days(0)).await;
+    assert!(!off.enabled);
+    assert!(ids.is_empty());
+    // Back on, the file that just finished is due once aged.
+    let (_, ids) = claim(state.clone()).await;
+    assert!(ids.contains(&file_running.job_id), "{ids:?}");
+    assert!(!ids.contains(&recent_ok.job_id), "{ids:?}");
+
     t.drop_schema().await;
 }

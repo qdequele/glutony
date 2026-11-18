@@ -28,6 +28,9 @@ pub struct BootConfig {
     /// `JOBS_RETENTION_DAYS`: delete finished jobs and source runs older than this many
     /// days. `None` (unset, blank or `0`) keeps them forever.
     pub jobs_retention_days: Option<u32>,
+    /// `BLOB_TTL_DAYS`: days after a job ended before workers delete its blobs; `0`
+    /// keeps them.
+    pub blob_ttl_days: u32,
 }
 
 impl std::fmt::Debug for BootConfig {
@@ -51,6 +54,7 @@ impl std::fmt::Debug for BootConfig {
             )
             .field("lab", &self.lab)
             .field("jobs_retention_days", &self.jobs_retention_days)
+            .field("blob_ttl_days", &self.blob_ttl_days)
             .finish()
     }
 }
@@ -88,12 +92,19 @@ impl BootConfig {
                 (days > 0).then_some(days)
             }
         };
+        let blob_ttl_days = match nonblank("BLOB_TTL_DAYS") {
+            None => crate::jobs::DEFAULT_BLOB_TTL_DAYS,
+            Some(v) => v.trim().parse::<u32>().with_context(|| {
+                format!("BLOB_TTL_DAYS must be a whole number of days (0 keeps blobs), got {v:?}")
+            })?,
+        };
         Ok(Self {
             database_url,
             addr,
             internal_token,
             lab,
             jobs_retention_days,
+            blob_ttl_days,
         })
     }
 
@@ -167,6 +178,7 @@ mod tests {
         assert_eq!(c.internal_token.as_deref(), Some("t"));
         assert_eq!(c.lab.unwrap().credentials().instance_id(), "id");
         assert_eq!(c.jobs_retention_days, None, "history is kept by default");
+        assert_eq!(c.blob_ttl_days, crate::jobs::DEFAULT_BLOB_TTL_DAYS);
     }
 
     #[test]
@@ -187,6 +199,26 @@ mod tests {
         for bad in ["-1", "1.5", "week"] {
             let err = with(bad).unwrap_err().to_string();
             assert!(err.contains("JOBS_RETENTION_DAYS"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_blob_ttl_is_read_and_zero_keeps_blobs() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("CONTROL_PLANE_TOKEN", "t"),
+        ];
+        let ttl = |v: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("BLOB_TTL_DAYS", v));
+            boot(&vars)
+        };
+        assert_eq!(ttl(" 30 ").unwrap().blob_ttl_days, 30);
+        assert_eq!(ttl("0").unwrap().blob_ttl_days, 0);
+        assert_eq!(ttl("").unwrap().blob_ttl_days, 7);
+        for bad in ["-1", "a week", "1.5"] {
+            let err = ttl(bad).unwrap_err().to_string();
+            assert!(err.contains("BLOB_TTL_DAYS"), "{err}");
         }
     }
 
