@@ -69,20 +69,46 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      # Enables the control-plane DB tests (they are #[ignore]d without it).
+      # Enables the control-plane DB tests (they skip without it).
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/meili_ingest_test
+      # Enables the Temporal-backed tests (schedules_temporal, archive_temporal,
+      # source_run_temporal) against the dev server started below. They skip
+      # without it locally, and fail without it when `CI` is set.
+      TEMPORAL_TEST_URL: http://127.0.0.1:7233
+      TEMPORAL_CLI_VERSION: 1.10.1
+      TEMPORAL_CLI_SHA256: 4c1500e2ce2d4de136e5fe8852d9b7f82eb62f19b6b383b3e0c040519a9d20b1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      - name: Start Temporal dev server
+        # Started before the build so it is ready by the time the tests run. Its
+        # in-memory store is private to this job: no other worker polls its queues.
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/temporal.tar.gz" \
+            "https://github.com/temporalio/cli/releases/download/v${TEMPORAL_CLI_VERSION}/temporal_cli_${TEMPORAL_CLI_VERSION}_linux_amd64.tar.gz"
+          echo "${TEMPORAL_CLI_SHA256}  $RUNNER_TEMP/temporal.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/temporal.tar.gz" -C "$RUNNER_TEMP" temporal
+          nohup "$RUNNER_TEMP/temporal" server start-dev --headless --ip 127.0.0.1 --port 7233 \
+            --log-level warn >"$RUNNER_TEMP/temporal.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if "$RUNNER_TEMP/temporal" operator cluster health --address 127.0.0.1:7233 >/dev/null 2>&1; then
+              echo "temporal ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Temporal::the dev server did not become ready"
+          cat "$RUNNER_TEMP/temporal.log"
+          exit 1
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
         run: cargo test --workspace
-      - name: Test (DB-backed, ignored by default)
-        run: cargo test -p meili-ingest-control-plane -- --ignored
+      - name: Temporal server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/temporal.log" || true
 
   docker:
     name: docker build (${{ matrix.arch }})

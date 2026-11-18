@@ -1,7 +1,8 @@
 //! `ArchiveWorkflow` against a real Temporal server, with the control plane played by
 //! wiremock and each file's pipeline running for real.
 //!
-//! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`).
+//! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`),
+//! and fails instead when `CI` is set (the CI `test` job runs a Temporal dev server).
 //! The worker polls `workers-general`, the queue step activities are routed to, so run
 //! these against a Temporal server no other worker polls.
 //!
@@ -46,7 +47,15 @@ const QUEUE: &str = "workers-general";
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn client() -> Option<Client> {
-    let raw = std::env::var("TEMPORAL_TEST_URL").ok()?;
+    let Ok(raw) = std::env::var("TEMPORAL_TEST_URL") else {
+        // CI starts a Temporal dev server for these: a lost TEMPORAL_TEST_URL there
+        // must fail the run, not turn every test into a silent pass.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but TEMPORAL_TEST_URL is not: the Temporal tests would skip"
+        );
+        return None;
+    };
     let url = Url::from_str(&raw).expect("TEMPORAL_TEST_URL is a url");
     let connection = Connection::connect(ConnectionOptions::new(url).build())
         .await

@@ -15,7 +15,13 @@ cargo test --workspace
 DATABASE_URL=postgres://postgres:dev-password@localhost:5432/postgres cargo test -p meili-ingest-control-plane
 ```
 
-The control-plane DB tests skip without `DATABASE_URL`. `docs/openapi.yaml` is checked against the router by `crates/gateway/src/routes.rs`: a new route goes in `ROUTES`, `lib.rs` and the spec.
+The control-plane DB tests skip without `DATABASE_URL`. The Temporal-backed
+tests (`schedules_temporal`, `archive_temporal`, `source_run_temporal`) skip
+without `TEMPORAL_TEST_URL`: run them against a dev server no other worker
+polls (`temporal server start-dev --headless --port 57233`, then
+`TEMPORAL_TEST_URL=http://127.0.0.1:57233 cargo test --workspace`). CI's `test`
+job starts one, and with `CI` set a missing `TEMPORAL_TEST_URL` fails them
+instead of skipping. `docs/openapi.yaml` is checked against the router by `crates/gateway/src/routes.rs`: a new route goes in `ROUTES`, `lib.rs` and the spec.
 
 ## Rules
 
