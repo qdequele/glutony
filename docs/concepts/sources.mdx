@@ -79,6 +79,7 @@ A source starts **active**. Pause and resume it, or run it once off-schedule:
 curl -X POST $INGEST/sources/tmdb/pause
 curl -X POST $INGEST/sources/tmdb/unpause
 curl -X POST $INGEST/sources/tmdb/run      # 202; skipped if a run is in flight
+curl -X POST $INGEST/sources/tmdb/reset-state  # 204; the next run re-ingests in full
 ```
 
 ### Location
@@ -182,7 +183,13 @@ A source remembers the last `ETag`, `Last-Modified` and content hash, and sends
 tick. A `PATCH` that changes the `location`, `timezone`, `pipeline_uid`,
 `index_name` or `auth` forgets that state, so the next run fetches in full and
 ingests into the new destination even when the upstream file has not changed.
-An edit to the steps of the pipeline itself keeps it. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
+An edit to the steps of the pipeline itself keeps it: nothing is reset on its
+own, since re-ingesting every source of a pipeline can be costly. To re-ingest
+after such an edit, call `POST /sources/{uid}/reset-state` (`204`), which
+forgets the saved `ETag`, `Last-Modified` and hash without touching the
+schedule; the next run, scheduled or `POST /sources/{uid}/run`, then fetches in
+full and ingests. A run already in flight when you reset still saves the state
+it learns. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
 `GET /jobs/{id}`.
 
 Runs never overlap: if a run is still going when the next tick fires, that

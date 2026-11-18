@@ -508,6 +508,28 @@ impl SourceRepo {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    /// Forget the incremental state (ETag, Last-Modified, hash) of the source in exactly
+    /// `tenant_id`'s scope, so its next run fetches and ingests in full. `None` when no
+    /// such row exists. A run already in flight still saves the state it learns.
+    pub async fn reset_state(
+        &self,
+        uid: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<SourceRecord>, CpError> {
+        let sql = format!(
+            "UPDATE sources SET last_etag = NULL, last_modified = NULL, last_hash = NULL, \
+                                updated_at = now() \
+             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '') \
+             RETURNING {SOURCE_COLUMNS}"
+        );
+        let row: Option<SourceRow> = sqlx::query_as(AssertSqlSafe(sql))
+            .bind(uid)
+            .bind(tenant_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(SourceRecord::from))
+    }
+
     /// Persist the incremental state learned by a run.
     pub async fn save_state(&self, id: Uuid, state: &IncrementalState) -> Result<(), CpError> {
         sqlx::query(
@@ -707,6 +729,23 @@ pub async fn patch_source(
         .await?
         .map(Json)
         .ok_or_else(|| uid_not_found(&uid, tenant_id.as_deref()))
+}
+
+/// `POST /internal/sources/{uid}/reset-state?tenant_id=` → 200 [`SourceRecord`] with
+/// no incremental state, or 404 when no source is in exactly that scope.
+pub async fn reset_source_state(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<SourceScopeQuery>,
+    headers: HeaderMap,
+) -> Result<Json<SourceRecord>, CpError> {
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    let record = repo(&state)
+        .reset_state(&uid, tenant_id.as_deref())
+        .await?
+        .ok_or_else(|| uid_not_found(&uid, tenant_id.as_deref()))?;
+    tracing::info!(uid = %uid, tenant_id = ?tenant_id, "source incremental state reset");
+    Ok(Json(record))
 }
 
 /// `DELETE /internal/sources/{uid}?tenant_id=` → 204; its runs cascade.

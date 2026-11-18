@@ -305,6 +305,10 @@ pub fn app(state: AppState) -> Router {
                 .delete(sources::delete_source),
         )
         .route(
+            "/internal/sources/{uid}/reset-state",
+            post(sources::reset_source_state),
+        )
+        .route(
             "/internal/sources-by-id/{id}",
             get(sources::load_source_for_run),
         )

@@ -328,3 +328,62 @@ async fn an_unknown_id_is_404_on_the_worker_routes() {
         String::from_utf8_lossy(&body)
     );
 }
+
+/// `POST /internal/sources/{uid}/reset-state` forgets the ETag, Last-Modified and hash,
+/// so the next run fetches and ingests in full. Exact scope, like every write.
+#[tokio::test]
+async fn reset_state_forgets_the_incremental_state_in_exactly_the_scope() {
+    let Some(app) = setup("sr-reset").await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let created = create(&app, &new_source("sr-reset-1", "sp-r")).await;
+    let id = created.definition.id;
+    let learned = IncrementalState {
+        etag: Some("\"v1\"".into()),
+        last_modified: Some("Wed, 01 Oct 2026 10:00:00 GMT".into()),
+        hash: Some("abc".into()),
+    };
+    let (status, _) = call(
+        &app,
+        with_json(
+            "PUT",
+            &format!("/internal/sources-by-id/{id}/state"),
+            &learned,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Another tenant (or the global scope) cannot reach it, and the state stays.
+    for uri in [
+        "/internal/sources/sr-reset-1/reset-state?tenant_id=sp-other",
+        "/internal/sources/sr-reset-1/reset-state",
+    ] {
+        let (status, _) = call(&app, bare("POST", uri)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let (_, body) = call(&app, bare("GET", &format!("/internal/sources-by-id/{id}"))).await;
+    assert_eq!(json::<SourceRecord>(&body).state, learned);
+
+    let (status, body) = call(
+        &app,
+        bare(
+            "POST",
+            "/internal/sources/sr-reset-1/reset-state?tenant_id=sp-r",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        json::<SourceRecord>(&body).state,
+        IncrementalState::default()
+    );
+    let (_, body) = call(&app, bare("GET", &format!("/internal/sources-by-id/{id}"))).await;
+    let reloaded: SourceRecord = json(&body);
+    assert_eq!(reloaded.state, IncrementalState::default());
+    assert_eq!(
+        reloaded.definition.pipeline_uid, "movies",
+        "nothing else changes"
+    );
+}

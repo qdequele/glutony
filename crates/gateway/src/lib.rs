@@ -213,6 +213,10 @@ pub fn router(state: AppState) -> Router {
             post(handlers::sources::unpause_source),
         )
         .route("/sources/{uid}/run", post(handlers::sources::run_source))
+        .route(
+            "/sources/{uid}/reset-state",
+            post(handlers::sources::reset_source_state),
+        )
         .route("/sources/{uid}/runs", get(handlers::sources::list_runs))
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))

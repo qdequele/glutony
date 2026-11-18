@@ -454,6 +454,33 @@ pub async fn run_source(
     ))
 }
 
+/// `POST /sources/{uid}/reset-state` — forget the ETag, Last-Modified and content hash
+/// the last successful run saved, so the next run (scheduled or `POST .../run`) fetches
+/// in full and ingests even when upstream has not changed. Nothing is reset on its own
+/// when the pipeline's steps are edited: this is the explicit way to re-ingest.
+pub async fn reset_source_state(
+    State(state): State<AppState>,
+    scope: Scope,
+    Path(uid): Path<String>,
+) -> Result<StatusCode, GatewayError> {
+    state.connections.key()?;
+    check_uid(&uid)?;
+    let tenant_id = scope.tenant_id.clone();
+    owned(&state, &uid, tenant_id.as_deref()).await?;
+    match state
+        .control_plane
+        .reset_source_state(&uid, tenant_id.as_deref())
+        .await
+    {
+        Ok(()) => {}
+        // Deleted between the two calls.
+        Err(GatewayError::NotFound(_)) => return Err(not_found(&uid)),
+        Err(e) => return Err(e),
+    }
+    tracing::info!(uid = %uid, tenant_id = ?tenant_id, "source incremental state reset");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `DELETE /sources/{uid}` — the schedule first, so nothing fires against a row that
 /// is about to disappear.
 pub async fn delete_source(
@@ -1288,6 +1315,52 @@ mod tests {
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
         assert_eq!(body["code"], "insufficient_credits");
         assert!(schedules.calls().is_empty(), "nothing was triggered");
+    }
+
+    /// `POST /sources/{uid}/reset-state` asks the control plane to forget the source's
+    /// incremental state in the caller's own scope; the schedule is left alone.
+    #[tokio::test]
+    async fn reset_state_clears_the_incremental_state_of_an_owned_source() {
+        let cp = MockServer::start().await;
+        mount_source(&cp).await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sources/tmdb/reset-state"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record(false)))
+            .expect(1)
+            .mount(&cp)
+            .await;
+        let schedules = Arc::new(FakeSchedules::default());
+        let (status, body) = call(
+            &app(&cp, schedules.clone(), true),
+            Request::builder()
+                .method("POST")
+                .uri("/sources/tmdb/reset-state")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(schedules.calls().is_empty(), "{:?}", schedules.calls());
+        assert!(openapi_declares("POST", "/sources/{uid}/reset-state", 204));
+
+        // A tenant cannot reset a global source: 404 and nothing is asked.
+        let other = MockServer::start().await;
+        mount_source(&other).await;
+        Mock::given(method("POST"))
+            .and(path("/internal/sources/tmdb/reset-state"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record(false)))
+            .expect(0)
+            .mount(&other)
+            .await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sources/tmdb/reset-state")
+            .header("x-meili-project-id", "tenant-1")
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = call(&app(&other, schedules, true), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_matches_openapi("POST", "/sources/{uid}/reset-state", 404, &body);
     }
 
     #[tokio::test]

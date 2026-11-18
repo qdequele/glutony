@@ -473,6 +473,20 @@ impl ControlPlaneClient {
         self.send_empty(req, "delete source").await
     }
 
+    /// `POST /internal/sources/{uid}/reset-state`: forget the incremental state of the
+    /// source in exactly this scope.
+    pub async fn reset_source_state(
+        &self,
+        uid: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let req = self
+            .http
+            .post(self.source_url("sources", uid, "reset-state")?)
+            .query(&Self::tenant_query(tenant_id));
+        self.send_empty(req, "reset source state").await
+    }
+
     /// `PUT /internal/sources-by-id/{id}/paused`.
     pub async fn set_source_paused(&self, id: Uuid, paused: bool) -> Result<(), GatewayError> {
         let req = self

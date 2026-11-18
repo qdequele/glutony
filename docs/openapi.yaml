@@ -1287,6 +1287,38 @@ paths:
         "503":
           $ref: "#/components/responses/LabUnavailable"
 
+  /sources/{uid}/reset-state:
+    post:
+      tags: [Sources]
+      operationId: resetSourceState
+      summary: Forget a source's incremental state
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
+      description: >-
+        Clears the ETag, Last-Modified and content hash the last successful run saved,
+        so the next run (scheduled or `POST /sources/{uid}/run`) fetches in full and
+        ingests even when upstream has not changed. Use it after editing the steps of
+        the source's pipeline: that edit does not reset the state on its own. The
+        schedule is not touched and nothing runs now. A run already in flight still
+        saves the state it learns when it finishes. Only the caller's own sources.
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
+        - $ref: "#/components/parameters/SourceUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "204":
+          description: The state is cleared.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
   /sources/{uid}/runs:
     get:
       tags: [Sources]
