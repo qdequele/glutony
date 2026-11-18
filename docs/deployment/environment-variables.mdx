@@ -7,6 +7,12 @@ Configuration is environment-only. Variables are read once at startup
 (`from_env()` constructors and `main.rs`); nothing is read from the environment
 inside plugins or workflow code.
 
+**Boolean flags** (`WRITE_PREFLIGHT`, `OBJECT_REF_AMBIENT_CREDENTIALS`,
+`LAB_EVENTS_ENABLED`, `LAB_AI_GATEWAY`, `CONTROL_PLANE_TOKEN_DISABLED`) take
+`true`/`false`, `1`/`0`, `yes`/`no` or `on`/`off`, in any case. Unset or blank is
+`false`. Any other value is also `false`, and the service logs a warning naming the
+variable; it never stops a service at boot.
+
 ## Gateway (`meili-ingest-gateway`)
 
 | Variable | Default | Description |
@@ -71,7 +77,7 @@ inside plugins or workflow code.
 | `SOURCE_SECRET_KEY` | — | Same key as the gateway. Opens connection keys in the indexer activity and source credentials in the fetch activity. |
 | `MEILI_CONNECTION_HOSTS` | `public` | Same policy as the gateway, re-applied every time a connection is used. |
 | `SOURCE_FETCH_HOSTS` | `public` | Same policy as the gateway, re-applied at every fetch and every redirect hop (at most 5), for scheduled sources and for URL refs in step inputs alike. A refused URL fails the step as non-retryable. `s3://`/`gs://`/`az://` refs are **not** covered (other object-store schemes such as `file://` are refused outright): `OBJECT_REF_*` governs them. |
-| `OBJECT_REF_AMBIENT_CREDENTIALS` | `false` | `true` signs `s3://`/`gs://`/`az://` refs with the worker's ambient cloud credentials (task role, instance profile, `AWS_*` keys, ...). Off, they are read anonymously: public objects only. Only turn it on when every tenant may read everything those credentials reach, or with `OBJECT_REF_BUCKETS`. Any value other than `true`/`false`/`1`/`0` stops the worker. See [object refs](#object-refs). |
+| `OBJECT_REF_AMBIENT_CREDENTIALS` | `false` | `true` signs `s3://`/`gs://`/`az://` refs with the worker's ambient cloud credentials (task role, instance profile, `AWS_*` keys, ...). Off, they are read anonymously: public objects only. Only turn it on when every tenant may read everything those credentials reach, or with `OBJECT_REF_BUCKETS`. A value that is not a boolean flag (see above) leaves it off, with a warning. See [object refs](#object-refs). |
 | `OBJECT_REF_BUCKETS` | unset (any) | Comma-separated bucket (Azure: container) names object refs may name; a ref to any other fails the step as non-retryable. The blob store's own bucket is refused whatever this says. |
 | `REF_MAX_MB` | `512` | Largest content a `{"url": …}` or `{"s3": …}` ingest body may point at, in MiB. The worker reads it into memory: size it with the worker's memory limit in mind. A larger one fails the step as non-retryable (refused on its announced size when there is one, else as soon as the download passes the cap). Uploads are bounded by the gateway's `MAX_UPLOAD_MB` instead. A URL fetch also gives up, retryably, when the server sends nothing for 60 s (30 s to connect). `0` or a non-integer stops the worker at boot. |
 | `SHUTDOWN_GRACE_SECS` | `60` | On `SIGTERM`/`SIGINT` the worker stops polling at once and lets running activities finish for this long; then they are cancelled and reported to Temporal as retryable `WorkerShutdown` failures, so another worker retries them right away. A plugin that ignores the cancellation is abandoned 10 s later, and the process exits at the latest 30 s after the grace (90 s with the default, inside ECS's and the Kubernetes manifests' 120 s). |

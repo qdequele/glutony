@@ -1,6 +1,7 @@
 //! Worker configuration from environment variables (SPEC §13 "Worker").
 
 use anyhow::Context;
+use meili_ingest_plugin_sdk::env::flag;
 
 /// Runtime configuration of a worker process.
 #[derive(Clone)]
@@ -81,7 +82,9 @@ impl WorkerConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_concurrent_activities,
-            lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
+            lab_events_enabled: lab_events_enabled(
+                std::env::var("LAB_EVENTS_ENABLED").ok().as_deref(),
+            ),
             lab_ai_gateway: lab_ai_gateway(std::env::var("LAB_AI_GATEWAY").ok().as_deref()),
             shutdown_grace,
             archive_limits,
@@ -168,15 +171,14 @@ fn shutdown_grace(raw: Option<&str>) -> anyhow::Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
-/// `true`/`1` (any case) -> on; anything else or unset -> off.
-fn parse_flag(raw: Option<&str>) -> bool {
-    raw.map(str::trim)
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+/// `LAB_EVENTS_ENABLED`: a [`flag`], off unless set.
+fn lab_events_enabled(raw: Option<&str>) -> bool {
+    flag("LAB_EVENTS_ENABLED", raw)
 }
 
-/// `LAB_AI_GATEWAY`: a [`parse_flag`], off unless set.
+/// `LAB_AI_GATEWAY`: a [`flag`], off unless set.
 fn lab_ai_gateway(raw: Option<&str>) -> bool {
-    parse_flag(raw)
+    flag("LAB_AI_GATEWAY", raw)
 }
 
 /// Whether Lab events would be priced with the bundled placeholder list prices: they
@@ -232,20 +234,27 @@ mod tests {
             ("true", true),
             ("1", true),
             ("TRUE", true),
+            ("yes", true),
+            ("On", true),
             ("false", false),
             ("0", false),
+            ("off", false),
             ("", false),
+            ("enabled", false),
         ] {
-            assert_eq!(super::parse_flag(Some(raw)), expected, "{raw:?}");
+            assert_eq!(super::lab_events_enabled(Some(raw)), expected, "{raw:?}");
         }
-        assert!(!super::parse_flag(None));
+        assert!(!super::lab_events_enabled(None));
     }
 
     #[test]
     fn lab_ai_gateway_flag_parsing() {
         assert!(super::lab_ai_gateway(Some(" true\n")));
         assert!(super::lab_ai_gateway(Some("1")));
-        assert!(!super::lab_ai_gateway(Some("yes")));
+        assert!(super::lab_ai_gateway(Some("yes")));
+        assert!(super::lab_ai_gateway(Some("ON")));
+        assert!(!super::lab_ai_gateway(Some("no")));
+        assert!(!super::lab_ai_gateway(Some("y")), "unrecognised is off");
         assert!(!super::lab_ai_gateway(None), "off unless asked for");
     }
 

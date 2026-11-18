@@ -236,7 +236,11 @@ impl GatewayConfig {
             cors_allow_origins: env_opt("CORS_ALLOW_ORIGINS")
                 .map(|v| split_list(&v))
                 .unwrap_or_default(),
-            write_preflight: env_parse("WRITE_PREFLIGHT", d.write_preflight)?,
+            write_preflight: flag_or(
+                "WRITE_PREFLIGHT",
+                env_opt("WRITE_PREFLIGHT"),
+                d.write_preflight,
+            ),
             lab_service_token: env_opt("LAB_SERVICE_TOKEN"),
             admin_api_key: env_opt("ADMIN_API_KEY"),
         })
@@ -436,6 +440,13 @@ fn split_list(value: &str) -> Vec<String> {
 
 fn env_or(name: &str, default: &str) -> String {
     env_opt(name).unwrap_or_else(|| default.to_string())
+}
+
+/// A boolean flag ([`meili_ingest_plugin_sdk::env::flag`]); `default` when unset or blank.
+fn flag_or(name: &str, raw: Option<String>, default: bool) -> bool {
+    raw.map_or(default, |v| {
+        meili_ingest_plugin_sdk::env::flag(name, Some(&v))
+    })
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T>
@@ -1133,6 +1144,20 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_preflight_takes_every_boolean_spelling() {
+        let parse = |raw: Option<&str>| flag_or("WRITE_PREFLIGHT", raw.map(str::to_owned), false);
+        assert!(parse(Some("1")));
+        assert!(parse(Some("TRUE")));
+        assert!(parse(Some("on")));
+        assert!(!parse(Some("0")));
+        assert!(
+            !parse(Some("maybe")),
+            "unrecognised is off, not a boot error"
+        );
+        assert!(!parse(None));
+    }
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

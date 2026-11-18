@@ -205,18 +205,12 @@ impl ObjectRefPolicy {
         )
     }
 
-    /// Parse the two variables. An unrecognised flag value is an error rather than a
-    /// silent default: a typo must not decide whose credentials sign tenant reads.
+    /// Parse the two variables. The flag is a shared boolean
+    /// ([`meili_ingest_plugin_sdk::env::flag`]): an unrecognised value is off, with a
+    /// warning, so a typo never makes the ambient credentials sign tenant reads.
     pub fn parse(ambient: Option<&str>, buckets: Option<&str>) -> anyhow::Result<Self> {
-        let ambient_credentials = match ambient.map(str::trim).unwrap_or("") {
-            "" | "0" => false,
-            "1" => true,
-            v if v.eq_ignore_ascii_case("false") => false,
-            v if v.eq_ignore_ascii_case("true") => true,
-            other => anyhow::bail!(
-                "{OBJECT_REF_AMBIENT_CREDENTIALS_ENV} must be true or false, got {other:?}"
-            ),
-        };
+        let ambient_credentials =
+            meili_ingest_plugin_sdk::env::flag(OBJECT_REF_AMBIENT_CREDENTIALS_ENV, ambient);
         let buckets = match buckets.map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
             Some(list) => {
@@ -2634,7 +2628,7 @@ mod tests {
             ObjectRefPolicy::parse(None, None).unwrap(),
             ObjectRefPolicy::default()
         );
-        for on in ["true", "TRUE", "1", " true\n"] {
+        for on in ["true", "TRUE", "1", " true\n", "yes", "On"] {
             assert!(
                 ObjectRefPolicy::parse(Some(on), None)
                     .unwrap()
@@ -2642,7 +2636,8 @@ mod tests {
                 "{on:?}"
             );
         }
-        for off in ["", "false", "0", "False"] {
+        // Not a boolean: off (anonymous reads, the safe side), never a boot failure.
+        for off in ["", "false", "0", "False", "no", "off", "sure"] {
             assert!(
                 !ObjectRefPolicy::parse(Some(off), None)
                     .unwrap()
@@ -2650,7 +2645,6 @@ mod tests {
                 "{off:?}"
             );
         }
-        assert!(ObjectRefPolicy::parse(Some("yes"), None).is_err());
         let p = ObjectRefPolicy::parse(None, Some(" Exports, public-data ,,")).unwrap();
         assert_eq!(
             p.buckets,

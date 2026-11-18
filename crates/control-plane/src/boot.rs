@@ -66,9 +66,10 @@ impl BootConfig {
             .with_context(|| format!("BIND {bind:?} is not a valid socket address"))?;
         let internal_token = crate::control_plane_token_policy(
             get("CONTROL_PLANE_TOKEN"),
-            get("CONTROL_PLANE_TOKEN_DISABLED")
-                .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
-                .unwrap_or(false),
+            meili_ingest_plugin_sdk::env::flag(
+                "CONTROL_PLANE_TOKEN_DISABLED",
+                get("CONTROL_PLANE_TOKEN_DISABLED").as_deref(),
+            ),
         )?;
         let nonblank = |n: &str| get(n).filter(|v| !v.trim().is_empty());
         let lab = LabConfig::from_values(
@@ -245,6 +246,22 @@ mod tests {
         // asked: had it been, its "lumen" answer would have aborted boot too.
         identity(redirect).await.unwrap();
         elsewhere.verify().await;
+    }
+
+    #[test]
+    fn the_token_disabled_flag_takes_every_boolean_spelling() {
+        let db = ("DATABASE_URL", "postgres://x");
+        for on in ["true", "1", "yes", "ON"] {
+            let c = boot(&[db, ("CONTROL_PLANE_TOKEN_DISABLED", on)]).unwrap();
+            assert_eq!(c.internal_token, None, "{on:?}");
+        }
+        // Off, or not a boolean: the token stays required.
+        for off in ["false", "no", "", "disabled"] {
+            assert!(
+                boot(&[db, ("CONTROL_PLANE_TOKEN_DISABLED", off)]).is_err(),
+                "{off:?}"
+            );
+        }
     }
 
     #[test]
