@@ -49,14 +49,10 @@ transcription, LLM enrichment, …), and pushes the result to a Meilisearch inde
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                  workers-general               workers-io
-                  (pdf,docx,xlsx,               (s3_downloader)
-                   chunker,indexer,
-                   AI steps, ocr)
-                         │                           │
-                         └─────────────┬─────────────┘
+                                       ▼
+                                workers-general
+                         (pdf,docx,xlsx,chunker,indexer,
+                          AI steps, ocr, every plugin)
                                        │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
@@ -511,15 +507,15 @@ pub struct PipelineWorkflowInput {
 
 ### 8.3 Task queue routing
 
-The workflow dispatches activities to **typed task queues** based on plugin name.
-This allows specialized worker pools to each poll only their own queue.
+The workflow dispatches each activity to the task queue `plugin_task_queue`
+returns for its plugin, so a specialized worker pool could poll only its own queue.
+Today every plugin, `s3_downloader` included, runs on `workers-general`, the one
+queue every shipped layout polls (a step on an unpolled queue would wait forever).
+A `workers-io` pool for downloads is planned; until it ships, nothing routes there.
 
 ```rust
-fn plugin_task_queue(plugin: &str) -> &'static str {
-    match plugin {
-        "s3_downloader" => "workers-io",
-        _               => "workers-general",
-    }
+fn plugin_task_queue(_plugin: &str) -> &'static str {
+    "workers-general"
 }
 ```
 

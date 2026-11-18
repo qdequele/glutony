@@ -88,8 +88,8 @@ steps:
   succeeds with nothing; a `$.documents` fan-out over an output that is not
   documents (raw bytes, when the steps are in the wrong order) fails the step.
 - **Routing.** Each activity is scheduled on the task queue of its plugin
-  (`workers-general` / `workers-io`). AI steps call hosted APIs, so they run
-  on `workers-general` with parsing; downloads run on `workers-io`.
+  (today `workers-general` for every plugin). AI steps call hosted APIs, so they
+  run there with parsing.
 - **Failure.** A step that exhausts its retries, or returns a non-retryable
   error, fails the job with `status: failed` and the message in `error`.
   Already-completed steps are not rolled back (documents indexed by an

@@ -24,13 +24,11 @@ description: Gateway, control plane, Temporal and worker pools
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                  workers-general               workers-io
-                  (pdf,docx,xlsx,               (s3_downloader)
-                   chunker,indexer,
-                   AI steps, ocr)
-                         └─────────────┬─────────────┘
+                                       ▼
+                                workers-general
+                         (pdf,docx,xlsx,chunker,indexer,
+                          AI steps, ocr, every plugin)
+                                       │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
                         └──────────────────────────────────────────────┘
@@ -81,12 +79,8 @@ Internal JSON API (port 9000) backed by Postgres:
 Each job is one `PipelineWorkflow` execution. The workflow is deterministic:
 it walks the DAG in topological order, resolves each step's input from its
 dependencies, fans out when asked, and schedules one `execute_step` activity
-per branch on the task queue for that plugin:
-
-| Plugin | Task queue |
-|---|---|
-| `s3_downloader` | `workers-io` |
-| everything else | `workers-general` |
+per branch on the task queue for that plugin. Today every plugin, `s3_downloader`
+included, runs on `workers-general` (a `workers-io` pool for downloads is planned).
 
 No model runs inside a worker: AI steps (`llm_enricher`, `jev_enricher`,
 `image_captioner`, `whisper_transcriber`) call hosted APIs, so they share

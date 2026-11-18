@@ -468,7 +468,7 @@ and you can transcode them or register a gRPC plugin under the same name.
 | Plugin | Queue | Status |
 |---|---|---|
 | `ocr` | `workers-general` | Provide as a gRPC plugin. |
-| `s3_downloader` | `workers-io` | Reserved name; the worker already resolves `s3://` inputs itself. |
+| `s3_downloader` | `workers-general` | Reserved name; the worker already resolves `s3://` inputs itself. |
 
 A step naming an unregistered plugin fails with
 `plugin X is not registered on this worker; deploy a gRPC plugin`.

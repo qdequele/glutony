@@ -43,14 +43,10 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                  workers-general               workers-io
-                  (pdf,docx,xlsx,               (s3_downloader)
-                   chunker,indexer,
-                   AI steps, ocr)
-                         │                           │
-                         └─────────────┬─────────────┘
+                                       ▼
+                                workers-general
+                         (pdf,docx,xlsx,chunker,indexer,
+                          AI steps, ocr, every plugin)
                                        │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │

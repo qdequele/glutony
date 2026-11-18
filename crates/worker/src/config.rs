@@ -10,7 +10,7 @@ pub struct WorkerConfig {
     pub temporal_url: String,
     /// Temporal namespace.
     pub temporal_namespace: String,
-    /// Task queue this worker polls (`workers-general` or `workers-io`).
+    /// Task queue this worker polls (`workers-general`, where every plugin runs).
     pub task_queue: String,
     /// Control plane base URL, used to publish plugin manifests at boot.
     pub control_plane_url: Option<String>,

@@ -51,7 +51,7 @@ variable; it never stops a service at boot.
 |---|---|---|
 | `TEMPORAL_URL` | `http://temporal-frontend:7233` | Temporal frontend. |
 | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace. |
-| `TASK_QUEUE` | `workers-general` | Queue this worker polls: `workers-general` or `workers-io`. AI steps run on `workers-general`. |
+| `TASK_QUEUE` | `workers-general` | Queue this worker polls. Every plugin, AI steps and `s3_downloader` included, runs on `workers-general`; `workers-io` is reserved for a planned download pool and gets no work today. |
 | `CONTROL_PLANE_URL` | — | Plugin manifests are published there at boot (`POST /internal/plugins`). Required for Meilisearch connections and scheduled sources, which the worker loads from it. Each request to it is given 15 s, then fails and is retried. |
 | `CONTROL_PLANE_TOKEN` | — | Bearer token presented on every control-plane call. Required when the control plane enforces it (production). `CHANGE_ME` is refused at boot. |
 | `BLOB_STORE_URL` | `file://./blobs` | Same store as the gateway. |

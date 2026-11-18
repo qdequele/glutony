@@ -343,13 +343,13 @@ pub fn mime_to_default_index(mime: &str) -> &'static str {
 
 /// Temporal task queue that runs a plugin (SPEC §8.3).
 ///
-/// No model runs inside a worker: AI steps call a hosted API, so they share
-/// `workers-general` with every other plugin instead of needing their own pool.
-pub fn plugin_task_queue(plugin: &str) -> &'static str {
-    match plugin {
-        "s3_downloader" => "workers-io",
-        _ => "workers-general",
-    }
+/// Every plugin runs on `workers-general`, the queue every shipped worker layout
+/// polls. No model runs inside a worker: AI steps call a hosted API, so they need no
+/// pool of their own. `s3_downloader` stays there too until a `workers-io` pool ships:
+/// the Kubernetes manifests poll no other queue, and a step on an unpolled queue waits
+/// forever.
+pub fn plugin_task_queue(_plugin: &str) -> &'static str {
+    "workers-general"
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(plugin_task_queue("llm_enricher"), "workers-general");
         assert_eq!(plugin_task_queue("jev_enricher"), "workers-general");
         assert_eq!(plugin_task_queue("image_captioner"), "workers-general");
-        assert_eq!(plugin_task_queue("s3_downloader"), "workers-io");
+        assert_eq!(plugin_task_queue("s3_downloader"), "workers-general");
         assert_eq!(plugin_task_queue("pdf_extractor"), "workers-general");
         assert_eq!(plugin_task_queue("chunker"), "workers-general");
         assert_eq!(plugin_task_queue("meili_indexer"), "workers-general");

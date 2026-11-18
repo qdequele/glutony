@@ -133,14 +133,9 @@ it to the control plane like any built-in.
 
 ## Task queues
 
-A plugin's name decides which worker pool runs it:
-
-```rust
-match plugin {
-    "s3_downloader" => "workers-io",
-    _               => "workers-general",
-}
-```
+A plugin's name decides which worker pool runs it. Today every plugin runs on
+`workers-general`, `s3_downloader` included (a `workers-io` pool for downloads is
+planned; nothing routes there until it ships).
 
 No model runs inside a worker: AI steps call hosted APIs, so they share
 `workers-general` with every other plugin. External plugins run there too:

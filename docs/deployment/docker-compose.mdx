@@ -23,7 +23,7 @@ docker compose down -v        # stop and wipe volumes
 | `control-plane` | `Dockerfile.dev` | 9000 | `cargo watch -x "run --bin meili-ingest-control-plane"` |
 | `gateway` | `Dockerfile.dev` | 8080 | standalone mode → local Meilisearch |
 | `worker-general` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-general`; runs AI steps too, so it takes the API keys |
-| `worker-io` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-io` |
+| `worker-io` | `Dockerfile.dev` | — | `TASK_QUEUE=workers-io`; idle today (every plugin runs on `workers-general`), kept for the planned download pool |
 
 With OrbStack every container also answers on
 `<service>.meili-ingest.orb.local` (for example

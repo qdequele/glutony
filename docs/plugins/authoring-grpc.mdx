@@ -144,7 +144,7 @@ for about 30 seconds, so a sidecar starting with the worker is found; the
 manifest call itself must answer within 10 seconds per attempt. Bind the port
 only once the plugin can answer: a plugin still unreachable after that wait
 stays unavailable until the worker restarts, and each such entry delays the
-worker's start by that long. Every name except `s3_downloader` routes
+worker's start by that long. Every plugin name routes
 to `workers-general`, so declare external plugins on that pool. A plugin gets
 its own pool only if you add its name to `plugin_task_queue` in
 `crates/router/src/lib.rs` and deploy a worker polling that queue.
