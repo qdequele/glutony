@@ -1,6 +1,6 @@
 //! [`ActivityContext`]: what a plugin can do with the activity it runs inside of —
-//! heartbeat, observe cancellation, report billable usage, and reach the team's AI Gateway
-//! ([`AiTarget`]).
+//! heartbeat, checkpoint progress across retries, observe cancellation, report billable
+//! usage, and reach the team's AI Gateway ([`AiTarget`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,7 +27,18 @@ pub struct ActivityContext {
     cancelled: Arc<AtomicBool>,
     usage: Arc<Mutex<UsageUnits>>,
     ai_target: Arc<OnceLock<AiTarget>>,
+    /// What the previous attempt of this activity checkpointed (see
+    /// [`ActivityContext::previous_progress`]).
+    previous_progress: Option<Arc<serde_json::Value>>,
+    /// The latest checkpoint, repeated in every heartbeat of this attempt.
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
 }
+
+/// Key under which [`ActivityContext::heartbeat_details`] nests a checkpoint.
+const PROGRESS_KEY: &str = "progress";
+/// Key under which [`ActivityContext::heartbeat_details`] puts the free-text message
+/// next to a checkpoint.
+const MESSAGE_KEY: &str = "message";
 
 impl ActivityContext {
     /// Build a context wired to a heartbeat channel and a cancellation flag.
@@ -46,20 +57,46 @@ impl ActivityContext {
             cancelled,
             usage: Arc::new(Mutex::new(UsageUnits::default())),
             ai_target: Arc::new(OnceLock::new()),
+            previous_progress: None,
+            progress: Arc::new(Mutex::new(None)),
         }
     }
 
     /// A context that discards heartbeats and is never cancelled. Useful in tests.
     pub fn noop() -> Self {
+        Self::detached(Uuid::nil(), "test", 1)
+    }
+
+    /// A context carrying the real ids of a step, but that discards heartbeats and is
+    /// never cancelled. Used where no worker is listening, such as inside a WASM guest.
+    pub fn detached(job_id: Uuid, step_id: impl Into<String>, attempt: u32) -> Self {
         Self {
-            job_id: Uuid::nil(),
-            step_id: "test".into(),
-            attempt: 1,
+            job_id,
+            step_id: step_id.into(),
+            attempt,
             heartbeat_tx: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             usage: Arc::new(Mutex::new(UsageUnits::default())),
             ai_target: Arc::new(OnceLock::new()),
+            previous_progress: None,
+            progress: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Hand this attempt what the previous attempt checkpointed with
+    /// [`ActivityContext::record_progress`]. The worker calls it when it builds the
+    /// context of a retried activity; `None` leaves the context as it is.
+    ///
+    /// The checkpoint also becomes this attempt's current one, so the heartbeats of an
+    /// attempt that records nothing new keep carrying it to the next attempt.
+    pub fn with_previous_progress(mut self, previous: Option<serde_json::Value>) -> Self {
+        if let Some(previous) = previous {
+            if let Ok(mut current) = self.progress.lock() {
+                *current = Some(previous.clone());
+            }
+            self.previous_progress = Some(Arc::new(previous));
+        }
+        self
     }
 
     /// The job (workflow) this activity belongs to.
@@ -83,6 +120,61 @@ impl ActivityContext {
             // A closed receiver just means the worker stopped listening; ignore.
             let _ = tx.send(details.into());
         }
+    }
+
+    /// Checkpoint progress, so that a retry of this activity can pick up where this
+    /// attempt stopped instead of starting over (read it back with
+    /// [`ActivityContext::previous_progress`]).
+    ///
+    /// The value is opaque to the worker and replaces the previous checkpoint. It
+    /// travels in the Temporal heartbeat details, so keep it small (ids and counters,
+    /// never document content or secrets): it is visible in Temporal and bound by its
+    /// payload size limit. Cheap and non-blocking; it also sends a heartbeat.
+    ///
+    /// Heartbeats are throttled and best effort, so the next attempt may see an older
+    /// checkpoint, or none. Only skip work on a retry whose repetition would be harmless.
+    pub fn record_progress(&self, progress: serde_json::Value) {
+        if let Ok(mut current) = self.progress.lock() {
+            *current = Some(progress);
+        }
+        self.heartbeat("progress");
+    }
+
+    /// The checkpoint this attempt would hand to a retry: the last value given to
+    /// [`ActivityContext::record_progress`], else the one inherited from the previous
+    /// attempt.
+    pub fn progress(&self) -> Option<serde_json::Value> {
+        self.progress.lock().ok().and_then(|p| p.clone())
+    }
+
+    /// What the previous attempt of this activity checkpointed with
+    /// [`ActivityContext::record_progress`]. `None` on the first attempt, when the
+    /// previous attempt recorded nothing (or its last heartbeat was lost), in
+    /// [`ActivityContext::noop`] contexts and for WASM and gRPC plugins.
+    pub fn previous_progress(&self) -> Option<&serde_json::Value> {
+        self.previous_progress.as_deref()
+    }
+
+    /// The heartbeat details the worker sends to Temporal for `message`: the bare
+    /// message while nothing was checkpointed (as before checkpoints existed), else an
+    /// object holding the checkpoint and the message. Read them back with
+    /// [`ActivityContext::progress_from_heartbeat_details`].
+    pub fn heartbeat_details(&self, message: impl Into<String>) -> serde_json::Value {
+        match self.progress() {
+            None => serde_json::Value::String(message.into()),
+            Some(progress) => serde_json::json!({
+                PROGRESS_KEY: progress,
+                MESSAGE_KEY: message.into(),
+            }),
+        }
+    }
+
+    /// The checkpoint carried by heartbeat details that
+    /// [`ActivityContext::heartbeat_details`] produced, or `None` for a plain message.
+    pub fn progress_from_heartbeat_details(
+        details: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        details.as_object()?.get(PROGRESS_KEY).cloned()
     }
 
     /// Whether cancellation has been requested. Plugins should return
@@ -161,6 +253,73 @@ mod tests {
         assert_eq!(total.llm_input_tokens, 16);
         assert_eq!(total.llm_output_tokens, 6);
         assert_eq!(total.llm_requests, 2);
+    }
+
+    #[test]
+    fn a_noop_context_has_no_previous_progress() {
+        let ctx = ActivityContext::noop();
+        assert!(ctx.previous_progress().is_none());
+        assert!(ctx.progress().is_none());
+        // Recording works, it just has nowhere to go.
+        ctx.record_progress(serde_json::json!({ "sent": 2 }));
+        assert_eq!(ctx.progress(), Some(serde_json::json!({ "sent": 2 })));
+        assert!(ctx.previous_progress().is_none());
+    }
+
+    #[test]
+    fn heartbeat_details_stay_a_plain_message_until_progress_is_recorded() {
+        let ctx = ActivityContext::noop();
+        let details = ctx.heartbeat_details("keepalive");
+        assert_eq!(details, serde_json::json!("keepalive"));
+        assert!(ActivityContext::progress_from_heartbeat_details(&details).is_none());
+    }
+
+    #[test]
+    fn every_heartbeat_carries_the_latest_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ctx = ActivityContext::new(Uuid::nil(), "s", 1, tx, Arc::default());
+        ctx.record_progress(serde_json::json!({ "tasks": [1] }));
+        ctx.record_progress(serde_json::json!({ "tasks": [1, 2] }));
+        // Recording heartbeats, so the worker forwards the checkpoint promptly.
+        assert!(rx.try_recv().is_ok());
+        // A later free-text heartbeat (or the worker's keepalive) must not lose it:
+        // Temporal keeps only the last details.
+        let details = ctx.clone().heartbeat_details("waiting for task 2");
+        assert_eq!(details["message"], "waiting for task 2");
+        assert_eq!(
+            ActivityContext::progress_from_heartbeat_details(&details),
+            Some(serde_json::json!({ "tasks": [1, 2] }))
+        );
+    }
+
+    #[test]
+    fn previous_progress_is_carried_into_this_attempt() {
+        let previous = serde_json::json!({ "tasks": [7] });
+        let ctx = ActivityContext::detached(Uuid::nil(), "s", 2)
+            .with_previous_progress(Some(previous.clone()));
+        assert_eq!(ctx.previous_progress(), Some(&previous));
+        // An attempt that records nothing hands the same checkpoint to the next one.
+        assert_eq!(
+            ActivityContext::progress_from_heartbeat_details(&ctx.heartbeat_details("keepalive")),
+            Some(previous.clone())
+        );
+        // New progress replaces it for the next attempt, not for this one.
+        ctx.record_progress(serde_json::json!({ "tasks": [7, 8] }));
+        assert_eq!(ctx.previous_progress(), Some(&previous));
+        assert_eq!(ctx.progress(), Some(serde_json::json!({ "tasks": [7, 8] })));
+        // None changes nothing.
+        let first = ActivityContext::noop().with_previous_progress(None);
+        assert!(first.previous_progress().is_none() && first.progress().is_none());
+    }
+
+    #[test]
+    fn a_detached_context_keeps_its_ids() {
+        let job = Uuid::from_u128(42);
+        let ctx = ActivityContext::detached(job, "enrich", 3);
+        assert_eq!(ctx.job_id(), job);
+        assert_eq!(ctx.step_id(), "enrich");
+        assert_eq!(ctx.attempt(), 3);
+        ctx.heartbeat("discarded");
     }
 
     #[test]

@@ -655,9 +655,30 @@ pub fn to_activity_error(err: PluginError) -> ActivityError {
     }
 }
 
+/// The checkpoint the previous attempt of this activity recorded with
+/// [`PluginContext::record_progress`], read from the heartbeat details Temporal hands a
+/// retry. `None` on a first attempt, and for details that carry no checkpoint (a plain
+/// heartbeat message) or that cannot be decoded: the plugin then starts over.
+fn previous_progress(ctx: &ActivityContext) -> Option<serde_json::Value> {
+    match ctx.heartbeat_details().deserialize::<serde_json::Value>() {
+        Ok(details) => details
+            .as_ref()
+            .and_then(PluginContext::progress_from_heartbeat_details),
+        Err(e) => {
+            tracing::debug!(error = %e, "ignoring undecodable heartbeat details");
+            None
+        }
+    }
+}
+
 /// Wire the SDK [`ActivityContext`] to a plugin-facing context: heartbeats sent by the
 /// plugin are forwarded to Temporal, a keepalive heartbeat is sent periodically, and
 /// Temporal cancellation flips the shared flag the plugin polls.
+///
+/// Every heartbeat carries the plugin's latest checkpoint
+/// ([`PluginContext::heartbeat_details`]), because Temporal keeps only the last details,
+/// and the previous attempt's checkpoint is handed to the plugin
+/// ([`PluginContext::previous_progress`]).
 fn bridge_context(
     ctx: &ActivityContext,
     job_id: Uuid,
@@ -665,7 +686,11 @@ fn bridge_context(
 ) -> (PluginContext, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let plugin_ctx = PluginContext::new(job_id, step_id, ctx.info().attempt, tx, cancelled.clone());
+    let plugin_ctx = PluginContext::new(job_id, step_id, ctx.info().attempt, tx, cancelled.clone())
+        .with_previous_progress(previous_progress(ctx));
+    // Reads the checkpoint for each heartbeat. It holds a sender too, so the channel
+    // never closes on its own: `execute_step` aborts this task once the plugin returns.
+    let details = plugin_ctx.clone();
     let sdk_ctx = ctx.clone();
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(KEEPALIVE_HEARTBEAT);
@@ -673,15 +698,17 @@ fn bridge_context(
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(details) => {
-                        if let Err(e) = sdk_ctx.record_heartbeat(details).await {
+                    Some(message) => {
+                        let payload = details.heartbeat_details(message);
+                        if let Err(e) = sdk_ctx.record_heartbeat(payload).await {
                             tracing::debug!(error = %e, "heartbeat failed");
                         }
                     }
                     None => break,
                 },
                 _ = tick.tick() => {
-                    if let Err(e) = sdk_ctx.record_heartbeat("keepalive".to_string()).await {
+                    let payload = details.heartbeat_details("keepalive");
+                    if let Err(e) = sdk_ctx.record_heartbeat(payload).await {
                         tracing::debug!(error = %e, "keepalive heartbeat failed");
                     }
                 }
@@ -1983,6 +2010,101 @@ mod tests {
         assert_eq!(branch_spill_threshold(1 << 20, Some(4)), 1 << 18);
         // Never below what a reference weighs.
         assert_eq!(branch_spill_threshold(64, Some(500)), SPILLED_REF_SIZE);
+    }
+
+    /// Answers with the checkpoint the previous attempt left (`null` without one), then
+    /// checkpoints `{"done": attempt}`.
+    struct Checkpointer;
+    #[async_trait]
+    impl Plugin for Checkpointer {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("checkpointer", "0")
+        }
+        async fn execute(
+            &self,
+            ctx: &PluginContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            let previous = ctx.previous_progress().cloned().unwrap_or_default();
+            ctx.record_progress(serde_json::json!({ "done": ctx.attempt() }));
+            ctx.heartbeat("after the checkpoint");
+            // Let the forwarder send the heartbeats before the activity returns.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(PluginOutput::Documents(vec![Document::with_id(
+                "previous",
+                previous.to_string(),
+            )]))
+        }
+    }
+
+    /// Run `execute_step` on [`Checkpointer`] as attempt `attempt`, with `details` as the
+    /// previous attempt's heartbeat details. Returns what the plugin saw and the
+    /// heartbeat details sent to Temporal.
+    async fn run_checkpointer(
+        attempt: u32,
+        details: Option<serde_json::Value>,
+    ) -> (String, Vec<serde_json::Value>) {
+        use temporalio_sdk::testing::{ActivityEnvironment, TestActivityInfoOptions};
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let mut env = ActivityEnvironment::builder_with_default();
+        if let Some(details) = details {
+            env = env.heartbeat_details(details).expect("encode details");
+        }
+        let env = env
+            .info(
+                TestActivityInfoOptions::builder()
+                    .attempt(attempt)
+                    .deadline(None)
+                    .build(),
+            )
+            .on_heartbeat(move |d| {
+                let d = d
+                    .downcast::<serde_json::Value>()
+                    .expect("heartbeat details are JSON");
+                sink.lock().expect("lock").push(*d);
+            })
+            .register_activities(acts(vec![Arc::new(Checkpointer)]))
+            .build();
+        let out = env
+            .run(
+                StepActivities::execute_step,
+                step_input("checkpointer", PluginInput::Empty),
+            )
+            .await
+            .expect("step runs");
+        let seen = match out.output {
+            PluginOutput::Documents(d) => d[0].content.clone(),
+            other => panic!("{other:?}"),
+        };
+        let sent = sent.lock().expect("lock").clone();
+        (seen, sent)
+    }
+
+    #[tokio::test]
+    async fn a_retry_reads_the_progress_the_previous_attempt_heartbeated() {
+        // Attempt 1 has nothing to resume and checkpoints in every heartbeat.
+        let (seen, sent) = run_checkpointer(1, None).await;
+        assert_eq!(seen, "null");
+        let last = sent.last().expect("heartbeats were sent").clone();
+        assert_eq!(last["message"], "after the checkpoint");
+
+        // Attempt 2 is handed exactly what attempt 1 sent last.
+        let (seen, sent) = run_checkpointer(2, Some(last)).await;
+        assert_eq!(seen, r#"{"done":1}"#);
+        assert_eq!(
+            PluginContext::progress_from_heartbeat_details(sent.last().expect("heartbeats")),
+            Some(serde_json::json!({ "done": 2 }))
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_heartbeat_details_carry_no_progress() {
+        // What a worker without checkpoints (or a plugin recording none) leaves behind.
+        let (seen, _) = run_checkpointer(2, Some(serde_json::json!("keepalive"))).await;
+        assert_eq!(seen, "null");
     }
 
     #[test]

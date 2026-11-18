@@ -87,6 +87,19 @@ ctx.heartbeat("page 12/300");   // every ~10 items; resets the 60 s heartbeat ti
 ctx.check_cancelled()?;         // returns PluginError::Cancelled after POST /jobs/:id/cancel
 ```
 
+A built-in plugin can checkpoint its progress so that a retry of the step resumes
+instead of starting over:
+
+```rust
+if let Some(done) = ctx.previous_progress() { /* skip what the last attempt finished */ }
+ctx.record_progress(serde_json::json!({ "sent": 3 })); // small and opaque: ids, counters
+```
+
+The checkpoint travels in the Temporal heartbeat details, which every later heartbeat
+repeats. Heartbeats are best effort, so a retry can see an older checkpoint or none,
+and only work that is safe to repeat should be skipped. `previous_progress()` is
+always `None` on the first attempt and for WASM and gRPC plugins.
+
 ## Errors
 
 ```rust
