@@ -7,7 +7,10 @@
 //!   (`{"input": PluginInput, "config": {...}, "job_id": "...", "step_id": "...",
 //!   "attempt": 1}`), output is a JSON [`ExecuteReply`]
 //!   (`{"ok": PluginOutput}` or `{"error": {"message": "...", "retryable": bool}}`).
-//! * `manifest() -> bytes` (optional): a JSON `PluginManifest`.
+//! * `manifest() -> bytes`: a JSON `PluginManifest`. Required for modules the worker
+//!   loads from `EXTERNAL_PLUGINS`, which has no way to supply a manifest: a module
+//!   without this export fails to load. Only a host using `meili-ingest-plugin-runtime`
+//!   directly can do without it, by passing a manifest override to `WasmPlugin::from_file`.
 //!
 //! [`run_plugin`] and [`manifest_json`] implement both so a guest only has to wrap them
 //! in `#[extism_pdk::plugin_fn]` exports:
