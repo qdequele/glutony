@@ -53,7 +53,7 @@ impl SourceConnector for UrlConnector {
         let mut hops = 0usize;
         let response = loop {
             if let Some(policy) = &rt.policy {
-                policy.check(&current).await?;
+                policy.check_disclosing(&current, rt.list_allowed).await?;
             }
             let mut req = rt
                 .http
@@ -414,6 +414,7 @@ mod tests {
         ResolveRuntime {
             http: ResolveRuntime::http_client(),
             policy: None,
+            list_allowed: false,
             limits: UrlGuard::default(),
             scheduled_at,
             timezone: "UTC".to_string(),

@@ -436,7 +436,10 @@ impl SourceActivities {
             self.fetch_policy.clone(),
             input.scheduled_at,
             d.timezone.clone(),
-        );
+        )
+        // A tenant's run error reaches the tenant (the source's last_error): it is told
+        // only that a host is not allowed, never which hosts are.
+        .listing_allowed_hosts(d.tenant_id.is_none());
         let connector = match &d.location {
             Location::Url { .. } => UrlConnector,
         };
@@ -1017,6 +1020,60 @@ mod tests {
             .await
             .expect_err("forbidden host");
         assert!(matches!(err, PluginError::NonRetryable(_)), "{err:?}");
+    }
+
+    /// A source on `files` (allowed) whose URL redirects to a host the policy does not
+    /// allow, owned by `tenant`. Returns the run error and the allowed `host:port`.
+    async fn redirected_to_a_forbidden_host(tenant: Option<&str>) -> (String, String) {
+        let files = MockServer::start().await;
+        let forbidden = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/secret", forbidden.uri())),
+            )
+            .mount(&files)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("internal"))
+            .expect(0)
+            .mount(&forbidden)
+            .await;
+        let mut row = source_row(&format!("{}/feed.json", files.uri()), None);
+        match tenant {
+            Some(t) => row["tenant_id"] = serde_json::json!(t),
+            None => {
+                row.as_object_mut().expect("object").remove("tenant_id");
+            }
+        }
+        let cp = control_plane(row, pipeline(true)).await;
+        let err = activities(&cp, &files)
+            .resolve(&input())
+            .await
+            .expect_err("the redirect target is forbidden");
+        let PluginError::NonRetryable(message) = err else {
+            panic!("a forbidden host is non-retryable: {err:?}");
+        };
+        let allowed = files.uri().trim_start_matches("http://").to_string();
+        (message, allowed)
+    }
+
+    #[tokio::test]
+    async fn a_tenant_source_redirected_to_a_forbidden_host_does_not_see_the_allowlist() {
+        let (message, allowed) = redirected_to_a_forbidden_host(Some("tenant-1")).await;
+        assert!(message.contains("not an allowed host"), "{message}");
+        assert!(!message.contains(&allowed), "{message}");
+        assert!(!message.contains("allowed:"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_standalone_source_redirected_to_a_forbidden_host_sees_the_allowlist() {
+        let (message, allowed) = redirected_to_a_forbidden_host(None).await;
+        assert!(
+            message.contains(&format!("allowed: {allowed}")),
+            "{message}"
+        );
     }
 
     #[tokio::test]
