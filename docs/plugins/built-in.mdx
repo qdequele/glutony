@@ -79,9 +79,12 @@ HTML (`scraper`). One document: `title` from `<title>`, `content` from
 `<body>` minus `script`/`style`/`nav`/`footer`.
 
 Bytes are decoded from a byte order mark, else as UTF-8 when they are valid
-UTF-8, else with the charset a `<meta charset>` (or `<meta http-equiv="Content-Type">`)
-in the first 1024 bytes declares, such as `windows-1252` or `Shift_JIS`. The
-`charset` of an HTTP `Content-Type` header is not used yet.
+UTF-8, else with the `charset` of the HTTP `Content-Type` the page was fetched
+with (URL ingests and scheduled sources), else with the charset a `<meta charset>`
+(or `<meta http-equiv="Content-Type">`) in the first 1024 bytes declares, such as
+`windows-1252` or `Shift_JIS`. As in the HTML standard, the header wins over
+`<meta>`; unknown labels are skipped. Uploads carry no header charset, so only
+the byte order mark and `<meta>` apply to them.
 
 | Key | Default | Description |
 |---|---|---|

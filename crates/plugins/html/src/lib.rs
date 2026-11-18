@@ -132,9 +132,13 @@ const PRESCAN_BYTES: usize = 1024;
 ///
 /// In order: a byte order mark; then UTF-8 when the bytes are valid UTF-8 (servers
 /// and templates often declare a legacy charset for pages that are really UTF-8,
-/// and honouring it would garble them); then the charset a `<meta>` in the first
+/// and honouring it would garble them); then `transport_charset`, the `charset` of
+/// the HTTP `Content-Type` the page was served with ([`Blob::charset`]), which the
+/// HTML standard ranks above `<meta>`; then the charset a `<meta>` in the first
 /// [`PRESCAN_BYTES`] declares; and lossy UTF-8 when nothing usable is declared.
-fn decode_html(bytes: &[u8]) -> String {
+/// Unknown labels are skipped. A UTF-16 `Content-Type` is honoured, while a `<meta>`
+/// declaring UTF-16 is read as UTF-8, as the spec says.
+fn decode_html(bytes: &[u8], transport_charset: Option<&str>) -> String {
     if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
         return encoding
             .decode_without_bom_handling(&bytes[bom_len..])
@@ -144,7 +148,9 @@ fn decode_html(bytes: &[u8]) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_owned();
     }
-    match declared_charset(&bytes[..bytes.len().min(PRESCAN_BYTES)]) {
+    let transport =
+        transport_charset.and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()));
+    match transport.or_else(|| declared_charset(&bytes[..bytes.len().min(PRESCAN_BYTES)])) {
         Some(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
         None => String::from_utf8_lossy(bytes).into_owned(),
     }
@@ -377,7 +383,7 @@ impl Plugin for HtmlExtractorPlugin {
         let blob = input.into_bytes()?;
         let base = base_id(&blob);
         let mut meta = base_meta(&blob);
-        let source = decode_html(&blob.data);
+        let source = decode_html(&blob.data, blob.charset.as_deref());
 
         let mut doc = Html::parse_document(&source);
         ctx.check_cancelled()?;
@@ -676,6 +682,73 @@ mod tests {
         )
         .await;
         assert_eq!(doc.content, "naïve");
+    }
+
+    async fn extract_served_as(bytes: &[u8], charset: &str) -> Document {
+        let blob =
+            Blob::new(bytes.to_vec(), "text/html", None).with_charset(Some(charset.to_owned()));
+        let out = HtmlExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(blob),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        out.into_documents().unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn the_http_content_type_charset_decodes_an_undeclared_page() {
+        let doc = extract_served_as(
+            b"<html><head><title>Caf\xE9</title></head><body><p>r\xE9sum\xE9</p></body></html>",
+            "windows-1252",
+        )
+        .await;
+        assert_eq!(doc.title.as_deref(), Some("Café"));
+        assert_eq!(doc.content, "résumé");
+    }
+
+    #[tokio::test]
+    async fn the_http_content_type_charset_wins_over_a_meta_declaration() {
+        // Shift_JIS bytes for 日本語, served as Shift_JIS by a page whose template
+        // wrongly says windows-1252.
+        let doc = extract_served_as(
+            b"<html><head><meta charset=\"windows-1252\"></head>\
+              <body><p>\x93\xfa\x96{\x8c\xea</p></body></html>",
+            "shift_jis",
+        )
+        .await;
+        assert_eq!(doc.content, "日本語");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_http_charset_falls_back_to_the_meta_declaration() {
+        let page =
+            b"<html><head><meta charset=\"windows-1252\"></head><body><p>Caf\xE9</p></body></html>";
+        assert_eq!(extract_served_as(page, "x-made-up").await.content, "Café");
+    }
+
+    #[tokio::test]
+    async fn a_utf16_page_without_bom_is_decoded_with_the_http_charset() {
+        let page: Vec<u8> = "<html><body><p>日本語</p></body></html>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(extract_served_as(&page, "utf-16le").await.content, "日本語");
+    }
+
+    #[tokio::test]
+    async fn valid_utf8_and_a_bom_win_over_the_http_charset() {
+        let page = "<html><body><p>Café</p></body></html>".as_bytes();
+        assert_eq!(extract_served_as(page, "shift_jis").await.content, "Café");
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(page);
+        assert_eq!(
+            extract_served_as(&bytes, "windows-1252").await.content,
+            "Café"
+        );
     }
 
     #[tokio::test]
