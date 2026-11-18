@@ -174,6 +174,8 @@ fn column_names(headers: &[String], width: usize) -> Vec<String> {
     let header = |col: usize| headers.get(col).filter(|h| !h.is_empty());
     let mut taken: HashSet<String> = (0..headers.len()).filter_map(header).cloned().collect();
     let mut first_use: HashSet<&str> = HashSet::new();
+    let mut next_suffix: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     (0..width.max(headers.len()))
         .map(|col| {
             if let Some(h) = header(col)
@@ -185,10 +187,13 @@ fn column_names(headers: &[String], width: usize) -> Vec<String> {
                 .cloned()
                 .unwrap_or_else(|| format!("col_{}", col + 1));
             let mut name = base.clone();
-            let mut k = 2;
+            // Resume from the last suffix tried for this base: names are never freed,
+            // so every smaller one is still taken, and a row of identical headers is
+            // named in linear time.
+            let k = next_suffix.entry(base.clone()).or_insert(2usize);
             while taken.contains(&name) {
                 name = format!("{base}_{k}");
-                k += 1;
+                *k += 1;
             }
             taken.insert(name.clone());
             name
@@ -575,6 +580,19 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn a_row_of_one_repeated_header_is_named_in_linear_time() {
+        // The widest sheet a spreadsheet format allows, every header the same.
+        let headers = vec!["n".to_string(); 16_384];
+        let started = std::time::Instant::now();
+        let names = column_names(&headers, headers.len());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(names[0], "n");
+        assert_eq!(names[1], "n_2");
+        assert_eq!(names[16_383], "n_16384");
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+    }
     #[test]
     fn manifest_is_well_formed() {
         let m = XlsxExtractorPlugin::new().manifest();
