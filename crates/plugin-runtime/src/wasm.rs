@@ -365,7 +365,7 @@ impl Plugin for WasmPlugin {
     ) -> Result<PluginOutput, PluginError> {
         ctx.check_cancelled()?;
         let name = self.manifest.name.clone();
-        let payload = serde_json::to_vec(&ExecuteEnvelope { input, config })?;
+        let payload = serde_json::to_vec(&ExecuteEnvelope::for_step(ctx, input, config))?;
 
         // Wait for the instance without holding a thread, and stop waiting when the
         // activity is cancelled: another job's call may never finish.
