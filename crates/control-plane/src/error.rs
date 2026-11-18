@@ -26,7 +26,7 @@ pub enum CpError {
     /// Pipeline references a plugin nobody knows about (422, `unknown_plugin`).
     #[error("{0}")]
     UnknownPlugin(String),
-    /// Missing or wrong `CONTROL_PLANE_TOKEN` on an internal route (401, `unauthorized`).
+    /// Missing or wrong `CONTROL_PLANE_TOKEN` on a guarded route (401, `unauthorized`).
     #[error("missing or invalid control plane token")]
     Unauthorized,
     /// A Lab account is out of credits or inactive (402, `insufficient_credits`).

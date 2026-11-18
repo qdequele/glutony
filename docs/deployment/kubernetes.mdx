@@ -82,10 +82,9 @@ kubectl -n meili-ingest rollout restart deployment/meili-control-plane \
   deployment/meili-gateway deployment/workers-general
 ```
 
-`CONTROL_PLANE_TOKEN` guards the control plane's `/internal/*` routes only:
-`/pipelines`, `/jobs` and `/plugins` on port 9000 stay open. Keep the
-`meili-control-plane` `Service` a `ClusterIP` and never expose port 9000 outside the
-cluster network.
+`CONTROL_PLANE_TOKEN` guards every control plane route except `/health` (the
+probes) and `/metrics` (the Prometheus scrape). Keep the `meili-control-plane`
+`Service` a `ClusterIP` and never expose port 9000 outside the cluster network.
 
 The control plane runs two replicas; its outbox sender leases rows with
 `SKIP LOCKED`, so both deliver without duplicates. Each replica keeps its own
@@ -293,6 +292,24 @@ remove the `replicas` line from the last applied configuration first:
 kubectl -n meili-ingest apply edit-last-applied deployment/meili-gateway
 kubectl -n meili-ingest apply edit-last-applied deployment/workers-general
 ```
+
+### Upgrading to a control plane that guards every route
+
+Earlier releases checked `CONTROL_PLANE_TOKEN` on `/internal/*` only; `/pipelines`,
+`/pipelines/validate`, `/pipelines/{uid}`, `/jobs` and `/plugins` answered anyone who
+reached port 9000. They now answer `401 unauthorized` without the bearer. `/health` and
+`/metrics` stay open, so the probes and the Prometheus scrape need no change.
+
+The gateway and the workers already send the token on every control plane request,
+so they need no change and no particular order. Roll out in this order:
+
+1. Find anything else that calls port 9000 directly on those routes (operator
+   scripts, cron jobs, dashboards) and give it `Authorization: Bearer
+   $CONTROL_PLANE_TOKEN`, or point it at the gateway's API instead.
+2. Upgrade as usual (`newTag`, then `kubectl apply -k k8s/`).
+
+A control plane running with `CONTROL_PLANE_TOKEN_DISABLED=true` and no token keeps
+every route open, as before.
 
 ### Upgrading to Lab contract v2
 

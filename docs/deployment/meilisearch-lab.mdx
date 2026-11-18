@@ -285,9 +285,9 @@ reason and retried on the next tick.
   use its own connections".
 - A request that carries a tenant never falls back to `MEILI_URL` / `MEILI_API_KEY`:
   it brings its own `X-Meili-Host` / key, or its pipeline is pinned to a connection.
-- The control plane's `/internal/*` routes require `CONTROL_PLANE_TOKEN`. That token
-  guards `/internal/*` only: `/pipelines`, `/jobs` and `/plugins` on port 9000 stay
-  open, so port 9000 must never be reachable from outside the cluster network.
+- Every control plane route except `/health` and `/metrics` requires
+  `CONTROL_PLANE_TOKEN`. Port 9000 must still never be reachable from outside the
+  cluster network.
 
 Before upgrading, copy any global connection a tenant pipeline relies on into that
 tenant, and deploy the control plane before the workers (a new worker against an old

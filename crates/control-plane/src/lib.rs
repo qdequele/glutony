@@ -60,7 +60,8 @@ pub struct AppState {
     pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
     /// Prometheus metrics served at `GET /metrics`.
     pub metrics: metrics::LabMetrics,
-    /// Bearer token internal callers (gateway, workers) present on `/internal/*`; `None` leaves them open (dev only).
+    /// Bearer token internal callers (gateway, workers) present on every route but
+    /// `/health` and `/metrics`; `None` leaves them all open (dev only).
     pub internal_token: Option<String>,
     /// Lab account lookups behind `GET /internal/lab/credits/{account_id}`; `None`
     /// when the control plane has no Lab instance credentials (nothing is checked).
@@ -99,7 +100,7 @@ impl AppState {
         self
     }
 
-    /// Require `Authorization: Bearer <token>` on every `/internal/*` route.
+    /// Require `Authorization: Bearer <token>` on every route but `/health` and `/metrics`.
     pub fn with_internal_token(mut self, token: Option<String>) -> Self {
         self.internal_token = token
             .map(|t| t.trim().to_string())
@@ -136,18 +137,23 @@ pub fn control_plane_token_policy(
         Some(t) => Ok(Some(t)),
         None if disabled => {
             tracing::warn!(
-                "CONTROL_PLANE_TOKEN_DISABLED=true: /internal/* routes are open; never expose this port"
+                "CONTROL_PLANE_TOKEN_DISABLED=true: every control plane route is open; never expose this port"
             );
             Ok(None)
         }
         None => anyhow::bail!(
-            "CONTROL_PLANE_TOKEN is not set: the gateway and workers authenticate to /internal/* with it. \
+            "CONTROL_PLANE_TOKEN is not set: the gateway and workers authenticate to the control plane with it. \
              Set it (openssl rand -hex 32) on all three services, or set CONTROL_PLANE_TOKEN_DISABLED=true in dev"
         ),
     }
 }
 
-/// Middleware: `/internal/*` needs the configured bearer token; everything else passes.
+/// The only routes that answer without the token: the liveness/readiness probe and the
+/// Prometheus scrape. Matched exactly, so no prefix of them is open.
+pub const OPEN_PATHS: [&str; 2] = ["/health", "/metrics"];
+
+/// Middleware: with a configured token, every route but [`OPEN_PATHS`] needs it as a
+/// bearer; with none (`CONTROL_PLANE_TOKEN_DISABLED=true`), everything passes.
 pub async fn require_internal_token(
     State(state): State<AppState>,
     req: Request,
@@ -156,7 +162,7 @@ pub async fn require_internal_token(
     let Some(expected) = &state.internal_token else {
         return next.run(req).await;
     };
-    if !req.uri().path().starts_with("/internal/") {
+    if OPEN_PATHS.contains(&req.uri().path()) {
         return next.run(req).await;
     }
     let presented = req

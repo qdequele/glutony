@@ -102,7 +102,7 @@ pub struct GatewayConfig {
     pub temporal_namespace: String,
     /// Internal control plane base URL (`CONTROL_PLANE_URL`).
     pub control_plane_url: String,
-    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    /// Bearer token for the control plane, sent on every request (`CONTROL_PLANE_TOKEN`).
     pub control_plane_token: Option<String>,
     /// Standalone fallback Meilisearch host (`MEILI_URL`).
     pub meili_url: Option<String>,
@@ -1583,6 +1583,48 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{cfg:?}").contains("cp-token-value"));
+    }
+
+    /// The control plane guards every route but `/health` and `/metrics`, so the
+    /// registry, job list and plugin calls must carry the bearer too.
+    #[tokio::test]
+    async fn the_control_plane_token_is_sent_on_the_registry_routes() {
+        let server = MockServer::start().await;
+        let bearer = || wiremock::matchers::header("authorization", "Bearer cp-token");
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plugins"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jobs"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/pipelines/p"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new())
+            .with_token(Some("cp-token".into()));
+        cp.list_pipelines(None).await.unwrap();
+        cp.list_plugins().await.unwrap();
+        cp.list_jobs(&[]).await.unwrap();
+        cp.delete_pipeline("p", None).await.unwrap();
     }
 
     #[tokio::test]

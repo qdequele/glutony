@@ -393,6 +393,70 @@ async fn internal_routes_need_the_control_plane_token() {
 }
 
 #[tokio::test]
+async fn every_route_but_health_and_metrics_needs_the_control_plane_token() {
+    let app = app(state().with_internal_token(Some("cp-token".into())));
+    let def = serde_json::to_string(&pipeline("p", &["echo"])).unwrap();
+    let requests = || {
+        vec![
+            Request::get("/pipelines").body(Body::empty()).unwrap(),
+            post_json("/pipelines", def.clone()),
+            post_json("/pipelines/validate", def.clone()),
+            Request::get("/pipelines/builtin.pdf")
+                .body(Body::empty())
+                .unwrap(),
+            Request::delete("/pipelines/x").body(Body::empty()).unwrap(),
+            Request::get("/jobs").body(Body::empty()).unwrap(),
+            Request::get("/plugins").body(Body::empty()).unwrap(),
+            // Exact paths only: a prefix of an open route is not open.
+            Request::get("/healthx").body(Body::empty()).unwrap(),
+            Request::get("/metrics/x").body(Body::empty()).unwrap(),
+        ]
+    };
+    for req in requests() {
+        let path = req.uri().path().to_string();
+        let (status, body) = call(app.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "unauthorized", "{path}");
+    }
+    // With the token every one of them gets past the gate.
+    for mut req in requests() {
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer cp-token".parse().unwrap());
+        let path = req.uri().path().to_string();
+        let (status, _) = call(app.clone(), req).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // Probes and the scrape stay open.
+    let (status, _) = call(
+        app.clone(),
+        Request::get("/health").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "health is open");
+    let (status, _) = call(app, Request::get("/metrics").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn without_a_configured_token_every_route_stays_open() {
+    let (status, _) = call(
+        app(state()),
+        Request::get("/plugins").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(
+        app(state()),
+        Request::get("/pipelines/builtin.pdf")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn without_a_configured_token_internal_routes_stay_open() {
     let (status, _) = call(
         app(state()),

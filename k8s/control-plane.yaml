@@ -6,9 +6,9 @@
 # secrets.example.yaml and docs/deployment/kubernetes.mdx), so re-applying the
 # kustomization never overwrites real values.
 #
-# Port 9000 must never be reachable from outside the cluster network:
-# CONTROL_PLANE_TOKEN only guards /internal/*; /pipelines, /jobs and /plugins
-# on this port are open.
+# Port 9000 must never be reachable from outside the cluster network.
+# CONTROL_PLANE_TOKEN guards every route on it except /health (probes) and
+# /metrics (Prometheus scrape).
 ---
 apiVersion: v1
 kind: ConfigMap
