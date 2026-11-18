@@ -127,9 +127,11 @@ impl ActivityContext {
     /// [`ActivityContext::previous_progress`]).
     ///
     /// The value is opaque to the worker and replaces the previous checkpoint. It
-    /// travels in the Temporal heartbeat details, so keep it small (ids and counters,
-    /// never document content or secrets): it is visible in Temporal and bound by its
-    /// payload size limit. Cheap and non-blocking; it also sends a heartbeat.
+    /// travels in the Temporal heartbeat details, where it is visible and bound by
+    /// Temporal's payload size limit (2 MB). Ids, counters and per-document results
+    /// (for example a model's reply) are fine as long as the plugin caps the total
+    /// size well under that limit; never put secrets in it, and prefer results over
+    /// raw document content. Cheap and non-blocking; it also sends a heartbeat.
     ///
     /// Heartbeats are throttled and best effort, so the next attempt may see an older
     /// checkpoint, or none. Only skip work on a retry whose repetition would be harmless.
