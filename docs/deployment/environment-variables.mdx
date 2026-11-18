@@ -99,6 +99,7 @@ arrive in the workflow input as `MeiliContext`.
 | `LAB_URL` | — | Meilisearch Lab base URL (no path or query). Enables the sender that posts Lab events to `{LAB_URL}/internal/events`. Must be `https` unless the host is loopback or private. |
 | `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | — | This deployment's Lab credentials; sign each batch (`X-Lab-Signature` over `"<timestamp>.<body>"`) and answer the workers' credit pre-check of source runs (`GET /internal/lab/credits/{account}`). Required with `LAB_URL`. Credentials of another product's engine abort boot. Never logged. |
 | `CONTROL_PLANE_TOKEN` | — (required) | Bearer token callers must present on every control plane route except `/health` and `/metrics`. `CONTROL_PLANE_TOKEN_DISABLED=true` runs without it (dev, and step 2 of the [rollout order](/deployment/meilisearch-lab#rollout-order)); a set token is enforced whatever the flag. `CHANGE_ME` is refused at boot. |
+| `JOBS_RETENTION_DAYS` | — (keep forever) | Whole number of days. When set (and not `0`), an hourly pass deletes finished jobs (`succeeded`, `failed`, `cancelled`) and source runs that started more than that many days ago; queued and running jobs, and an archive job whose file jobs remain, are kept. A deleted job is gone from `GET /jobs` and `GET /jobs/{id}` answers `404` for a tenant, so keep it at least as long as the Temporal namespace's retention. |
 | `RUST_LOG` | `info` | Tracing filter. |
 
 ## Object store credentials

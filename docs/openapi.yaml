@@ -1725,7 +1725,12 @@ components:
         jobs: { type: array, items: { $ref: "#/components/schemas/JobRecord" } }
         limit: { type: integer }
         offset: { type: integer }
-        total: { type: integer, description: "Rows matching the filters, ignoring paging." }
+        total:
+          type: integer
+          maximum: 10000
+          description: >-
+            Rows matching the filters, ignoring paging, capped at 10000: counting
+            stops there, so `10000` means "10000 or more".
     ValidationResult:
       type: object
       required: [valid, order, normalized]

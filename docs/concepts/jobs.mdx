@@ -67,7 +67,12 @@ Temporal is the source of truth. The gateway writes a row to the control
 plane's `jobs` table when it starts a job and refreshes it each time
 `GET /jobs/:id` is served. When Temporal no longer knows the workflow
 (retention expired, typically after days) the cached row is returned instead,
-so status never 404s for a job that existed.
+so status never 404s for a job that existed. Rows are kept forever unless the
+control plane sets `JOBS_RETENTION_DAYS`, which deletes finished jobs (and source
+runs) older than that many days.
+
+`GET /jobs` returns one page and a `total` of matching jobs. Counting stops at
+10 000, so `total: 10000` means "10 000 or more".
 
 ## Cancellation
 

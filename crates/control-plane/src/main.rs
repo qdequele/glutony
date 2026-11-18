@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
         addr,
         internal_token,
         lab: lab_config,
+        jobs_retention_days,
     } = BootConfig::from_env()?;
     if let Some(config) = &lab_config {
         // Also before Postgres: wrong credentials abort boot (spec §3.6).
@@ -80,6 +81,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let retention = jobs_retention_days.map(|days| {
+        tracing::info!(days, "job and source-run history retention enabled");
+        tokio::spawn(
+            meili_ingest_control_plane::retention::Retention::new(pool.clone(), days)
+                .run(cancel.clone()),
+        )
+    });
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
@@ -91,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         .context("http server")?;
 
     cancel.cancel();
-    if let Some(handle) = sender {
+    for handle in [sender, retention].into_iter().flatten() {
         let _ = handle.await;
     }
 

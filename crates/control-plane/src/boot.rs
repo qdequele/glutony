@@ -25,6 +25,9 @@ pub struct BootConfig {
     pub internal_token: Option<String>,
     /// `LAB_URL` + `LAB_INSTANCE_*`, when the deployment reports to a Lab.
     pub lab: Option<LabConfig>,
+    /// `JOBS_RETENTION_DAYS`: delete finished jobs and source runs older than this many
+    /// days. `None` (unset, blank or `0`) keeps them forever.
+    pub jobs_retention_days: Option<u32>,
 }
 
 impl std::fmt::Debug for BootConfig {
@@ -47,6 +50,7 @@ impl std::fmt::Debug for BootConfig {
                 &self.internal_token.as_ref().map(|_| "<redacted>"),
             )
             .field("lab", &self.lab)
+            .field("jobs_retention_days", &self.jobs_retention_days)
             .finish()
     }
 }
@@ -74,11 +78,21 @@ impl BootConfig {
             nonblank("LAB_EVENTS_SECRET"),
         )
         .context("invalid Lab events configuration")?;
+        let jobs_retention_days = match nonblank("JOBS_RETENTION_DAYS") {
+            None => None,
+            Some(v) => {
+                let days: u32 = v.trim().parse().with_context(|| {
+                    format!("JOBS_RETENTION_DAYS {v:?} is not a whole number of days")
+                })?;
+                (days > 0).then_some(days)
+            }
+        };
         Ok(Self {
             database_url,
             addr,
             internal_token,
             lab,
+            jobs_retention_days,
         })
     }
 
@@ -151,6 +165,28 @@ mod tests {
         assert_eq!(c.addr.to_string(), DEFAULT_BIND);
         assert_eq!(c.internal_token.as_deref(), Some("t"));
         assert_eq!(c.lab.unwrap().credentials().instance_id(), "id");
+        assert_eq!(c.jobs_retention_days, None, "history is kept by default");
+    }
+
+    #[test]
+    fn jobs_retention_is_opt_in_in_whole_days() {
+        let base = [
+            ("DATABASE_URL", "postgres://x"),
+            ("CONTROL_PLANE_TOKEN", "t"),
+        ];
+        let with = |v: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("JOBS_RETENTION_DAYS", v));
+            boot(&vars)
+        };
+        assert_eq!(with("30").unwrap().jobs_retention_days, Some(30));
+        assert_eq!(with(" 7 ").unwrap().jobs_retention_days, Some(7));
+        assert_eq!(with("0").unwrap().jobs_retention_days, None);
+        assert_eq!(with("").unwrap().jobs_retention_days, None);
+        for bad in ["-1", "1.5", "week"] {
+            let err = with(bad).unwrap_err().to_string();
+            assert!(err.contains("JOBS_RETENTION_DAYS"), "{bad}: {err}");
+        }
     }
 
     async fn identity(resp: wiremock::ResponseTemplate) -> anyhow::Result<()> {

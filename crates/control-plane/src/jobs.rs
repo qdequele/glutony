@@ -296,11 +296,14 @@ pub struct JobList {
     pub limit: i64,
     /// Offset that was applied.
     pub offset: i64,
-    /// Total rows matching the filters, ignoring paging. Lets a client show a page
-    /// count and disable "next" on the real last page instead of guessing from
-    /// whether the page came back full.
+    /// Total rows matching the filters, ignoring paging, capped at [`TOTAL_CAP`]. Lets a
+    /// client show a page count and disable "next" on the real last page instead of
+    /// guessing from whether the page came back full; at the cap there may be more.
     pub total: i64,
 }
+
+/// `JobList::total` stops counting here.
+pub const TOTAL_CAP: i64 = 10_000;
 
 /// `GET /jobs?tenant_id=&status=&pipeline_uid=&parent_job_id=&limit=&offset=` → newest
 /// first.
@@ -344,17 +347,22 @@ pub async fn list_jobs(
         .map(JobRecord::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Counting stops at TOTAL_CAP rows, so a page request costs at most that many
+    // index entries however long the history is.
     let (total,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM jobs \
-         WHERE ($1::text IS NULL OR tenant_id = $1) \
-           AND ($2::text IS NULL OR status = $2) \
-           AND ($3::text IS NULL OR pipeline_uid = $3) \
-           AND ($4::uuid IS NULL OR parent_job_id = $4)",
+        "SELECT count(*) FROM ( \
+             SELECT 1 FROM jobs \
+             WHERE ($1::text IS NULL OR tenant_id = $1) \
+               AND ($2::text IS NULL OR status = $2) \
+               AND ($3::text IS NULL OR pipeline_uid = $3) \
+               AND ($4::uuid IS NULL OR parent_job_id = $4) \
+             LIMIT $5) AS capped",
     )
     .bind(tenant_id.as_deref())
     .bind(q.status.as_deref())
     .bind(q.pipeline_uid.as_deref())
     .bind(q.parent_job_id)
+    .bind(TOTAL_CAP)
     .fetch_one(&state.pool)
     .await?;
 

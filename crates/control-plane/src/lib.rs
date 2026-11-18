@@ -32,6 +32,7 @@ pub mod metrics;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
+pub mod retention;
 pub mod sources;
 
 use axum::extract::{FromRequest, Request, State};

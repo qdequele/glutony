@@ -1108,3 +1108,145 @@ async fn a_global_pinned_pipeline_is_standalone_only() {
 
     t.drop_schema().await;
 }
+
+/// `total` stops counting at 10 000: a tenant with more rows gets 10 000, so a page
+/// request never walks the whole history. Smaller sets stay exact (tests above).
+#[tokio::test]
+async fn the_job_total_is_capped_at_10000() {
+    let Some(t) = setup().await else { return };
+    sqlx::query(
+        "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, status) \
+         SELECT gen_random_uuid(), 'wf-' || g, 'builtin.pdf', 'big', 'succeeded' \
+         FROM generate_series(1, 10001) AS g",
+    )
+    .execute(&t.pool)
+    .await
+    .unwrap();
+    let state = AppState::new(t.pool.clone());
+    let (status, body) = call(app(state.clone()), get("/jobs?tenant_id=big&limit=5")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let page: serde_json::Value = json(&body);
+    assert_eq!(page["total"], 10_000);
+    assert_eq!(page["jobs"].as_array().unwrap().len(), 5);
+    // Under the cap the count is exact.
+    sqlx::query("DELETE FROM jobs WHERE job_id IN (SELECT job_id FROM jobs LIMIT 2)")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    let (_, body) = call(app(state), get("/jobs?tenant_id=big&limit=5")).await;
+    assert_eq!(json::<serde_json::Value>(&body)["total"], 9_999);
+    t.drop_schema().await;
+}
+
+async fn insert_job(pool: &PgPool, status: &str, age: &str, parent: Option<Uuid>) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, status, \
+                           started_at, updated_at, parent_job_id) \
+         VALUES ($1, 'wf', 'builtin.pdf', 't1', $2, now() - $3::interval, \
+                 now() - $3::interval, $4)",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(age)
+    .bind(parent)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn insert_run(pool: &PgPool, source_id: Uuid, age: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO source_runs (run_id, source_id, started_at, finished_at, outcome) \
+         VALUES ($1, $2, now() - $3::interval, now() - $3::interval, 'unchanged')",
+    )
+    .bind(id)
+    .bind(source_id)
+    .bind(age)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// The opt-in retention deletes finished jobs and source runs older than the window,
+/// and nothing else: running jobs, recent rows, and an archive job whose file jobs are
+/// still there all stay.
+#[tokio::test]
+async fn retention_prunes_only_old_finished_jobs_and_runs() {
+    use meili_ingest_control_plane::retention::Retention;
+    use meili_ingest_control_plane::sources::{NewSource, SourceRepo};
+
+    let Some(t) = setup().await else { return };
+    let pool = &t.pool;
+    let old_done = insert_job(pool, "succeeded", "31 days", None).await;
+    let old_failed = insert_job(pool, "failed", "31 days", None).await;
+    let old_cancelled = insert_job(pool, "cancelled", "31 days", None).await;
+    let old_running = insert_job(pool, "running", "31 days", None).await;
+    let recent_done = insert_job(pool, "succeeded", "29 days", None).await;
+    // An archive whose file job is still running keeps its row until the file job goes.
+    let parent = insert_job(pool, "succeeded", "31 days", None).await;
+    let child = insert_job(pool, "running", "31 days", Some(parent)).await;
+
+    let source = NewSource {
+        id: Uuid::new_v4(),
+        uid: "s".into(),
+        name: "s".into(),
+        description: None,
+        tenant_id: Some("t1".into()),
+        pipeline_uid: "p".into(),
+        location: meili_ingest_source::model::Location::Url {
+            url: "https://files.example/a.json".into(),
+            method: None,
+            headers: Default::default(),
+        },
+        cron: "* * * * *".into(),
+        timezone: "UTC".into(),
+        index_name: None,
+        fetch_auth: None,
+        schedule_id: "source-s".into(),
+    };
+    SourceRepo::new(pool.clone()).insert(&source).await.unwrap();
+    insert_run(pool, source.id, "31 days").await;
+    let recent_run = insert_run(pool, source.id, "1 day").await;
+
+    let retention = Retention::new(pool.clone(), 30);
+    let pruned = retention.prune_once().await.unwrap();
+    assert_eq!((pruned.jobs, pruned.source_runs), (3, 1), "{pruned:?}");
+
+    let jobs: Vec<Uuid> = sqlx::query_scalar("SELECT job_id FROM jobs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    for gone in [old_done, old_failed, old_cancelled] {
+        assert!(!jobs.contains(&gone), "{gone} should be pruned");
+    }
+    for kept in [old_running, recent_done, parent, child] {
+        assert!(jobs.contains(&kept), "{kept} should be kept");
+    }
+    let runs: Vec<Uuid> = sqlx::query_scalar("SELECT run_id FROM source_runs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(runs, vec![recent_run]);
+
+    // Once the file job is finished too, it goes, and the archive job after it.
+    sqlx::query("UPDATE jobs SET status = 'succeeded' WHERE job_id = $1")
+        .bind(child)
+        .execute(pool)
+        .await
+        .unwrap();
+    retention.prune_once().await.unwrap();
+    retention.prune_once().await.unwrap();
+    let jobs: Vec<Uuid> = sqlx::query_scalar("SELECT job_id FROM jobs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(
+        !jobs.contains(&child) && !jobs.contains(&parent),
+        "{jobs:?}"
+    );
+    t.drop_schema().await;
+}
