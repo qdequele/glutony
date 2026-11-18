@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{Query, QueryParams, query_param, read_payload};
-use crate::context::{require_destination, resolve_index, resolve_request_context};
+use crate::context::{
+    lists_fetch_allowlist, require_destination, resolve_index, resolve_request_context,
+};
 use crate::error::{ErrorBody, GatewayError};
 use crate::extract::{BatchItem, Extracted, IngestPayload};
 use crate::state::{AppState, JobRecord};
@@ -162,8 +164,9 @@ pub async fn submit_one(
     if let IngestPayload::Url { url, .. } = &payload {
         let parsed = url::Url::parse(url)
             .map_err(|e| GatewayError::BadRequest(format!("invalid url {url:?}: {e}")))?;
-        // A tenant is not told the allowlist (internal hosts); a standalone caller is.
-        let list_allowed = ctx.tenant_id.is_none();
+        // A tenant-enabled deployment never tells the allowlist (internal hosts); a
+        // standalone one tells its caller.
+        let list_allowed = lists_fetch_allowlist(&state.config, ctx.tenant_id.as_deref());
         if let Err(e @ meili_ingest_source::SourceError::Blocked(_)) = state
             .fetch_policy
             .check_disclosing(&parsed, list_allowed)
@@ -1054,6 +1057,44 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let error = json_body(resp).await["error"].as_str().unwrap().to_owned();
         assert!(error.contains("files.internal:8080"), "{error}");
+    }
+
+    /// The allowlist is a deployment-level secret: a gateway behind a tenant edge
+    /// (`ENVOY_TRUSTED_HEADER` set) never lists it, not even to a request without the
+    /// edge secret, which it otherwise treats as standalone.
+    #[tokio::test]
+    async fn a_tenant_edge_gateway_hides_the_fetch_allowlist_from_unproven_requests() {
+        let server = MockServer::start().await;
+        mount_resolve(&server, "builtin.pdf", None).await;
+        mount_jobs_ok(&server).await;
+        let config = GatewayConfig {
+            control_plane_url: server.uri(),
+            envoy_trusted_header: Some("edge-secret".into()),
+            ..GatewayConfig::default()
+        };
+        let mut state = AppState::new(
+            config,
+            std::sync::Arc::new(FakeStarter::default()),
+            meili_ingest_blob::BlobStore::memory(),
+            reqwest::Client::new(),
+        );
+        state.fetch_policy =
+            meili_ingest_source::HostPolicy::parse("files.internal:8080,exports.corp.lan").unwrap();
+        let app = crate::router(state);
+        let resp = app
+            .oneshot(standalone_request(
+                "/ingest",
+                "application/json",
+                json!({"url": "http://anything.test/x"}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = json_body(resp).await["error"].as_str().unwrap().to_owned();
+        assert!(error.contains("not an allowed host"), "{error}");
+        for internal in ["files.internal", "exports.corp.lan"] {
+            assert!(!error.contains(internal), "{internal} leaked: {error}");
+        }
     }
 
     #[tokio::test]

@@ -58,6 +58,14 @@ pub fn envoy_headers_trusted(headers: &HeaderMap, config: &GatewayConfig) -> boo
     }
 }
 
+/// Whether a `SOURCE_FETCH_HOSTS` refusal may name the allowed hosts: only on a
+/// standalone deployment (no tenant edge, `ENVOY_TRUSTED_HEADER` unset) and for a request
+/// without a tenant. Behind a tenant edge, a request without the edge secret resolves no
+/// tenant but is still not the operator, so it is not told the allowlist either.
+pub fn lists_fetch_allowlist(config: &GatewayConfig, tenant_id: Option<&str>) -> bool {
+    tenant_id.is_none() && config.envoy_trusted_header.is_none()
+}
+
 /// Compare a received credential with a configured secret in constant time, so the
 /// time a mismatch takes says nothing about how much of the secret was right.
 pub(crate) fn secret_eq(expected: &str, got: &str) -> bool {

@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::auth::Scope;
 use crate::connections::valid_uid;
+use crate::context::lists_fetch_allowlist;
 use crate::error::GatewayError;
 use crate::handlers::Query;
 use crate::schedules::SourceSchedule;
@@ -161,7 +162,7 @@ pub async fn create_source(
         &req.location,
         &req.timezone,
         &state.fetch_policy,
-        tenant_id.as_deref(),
+        lists_fetch_allowlist(&state.config, tenant_id.as_deref()),
     )
     .await?;
     schedulable_pipeline(&state, &req.pipeline, tenant_id.as_deref()).await?;
@@ -321,7 +322,7 @@ pub async fn patch_source(
             location,
             &timezone,
             &state.fetch_policy,
-            tenant_id.as_deref(),
+            lists_fetch_allowlist(&state.config, tenant_id.as_deref()),
         )
         .await?;
     }
@@ -875,6 +876,38 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Behind a tenant edge (`ENVOY_TRUSTED_HEADER` set), a source save refused by the
+    /// allowlist never names it, even without the edge secret (no tenant resolved).
+    #[tokio::test]
+    async fn a_tenant_edge_gateway_hides_the_fetch_allowlist_on_source_save() {
+        let cp = MockServer::start().await;
+        let config = GatewayConfig {
+            control_plane_url: cp.uri(),
+            envoy_trusted_header: Some("edge-secret".into()),
+            ..GatewayConfig::default()
+        };
+        let state = AppState::new(
+            config,
+            Arc::new(FakeStarter::default()),
+            BlobStore::memory(),
+            reqwest::Client::new(),
+        )
+        .with_connections(ConnectionConfig::new(Some(key()), HostPolicy::Any))
+        .with_sources(
+            Arc::new(FakeSchedules::default()),
+            HostPolicy::parse("files.example,other.example").expect("policy"),
+        );
+        let mut body = create_body();
+        body["location"]["url"] = serde_json::json!("http://anything.test/x.json");
+        let (status, body) = call(&crate::router(state), req("POST", "/sources", body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let error = body["error"].as_str().expect("error").to_owned();
+        assert!(error.contains("not an allowed host"), "{error}");
+        for internal in ["files.example", "other.example"] {
+            assert!(!error.contains(internal), "{internal} leaked: {error}");
+        }
     }
 
     #[tokio::test]
