@@ -559,7 +559,7 @@ and encodes 16 kHz mono 16-bit WAV with `hound` — 100% Rust, no ffmpeg. Feeds
 |---|---|---|
 | `sample_rate` | `16000` | Output rate in Hz. |
 | `mono` | `true` | Downmix all channels to one. |
-| `max_duration_secs` | `null` | Stop decoding after this many seconds. |
+| `max_duration_secs` | `null` | Keep only the first this many seconds. Unset or `null` means a 4-hour ceiling: longer audio fails the step (non-retryable) instead of being truncated. An explicit value may be larger. |
 | `track` | `null` | Decode this track id instead of the default audio track. |
 
 Supported: MP4/MOV, MKV/WebM, OGG, WAV, FLAC, AIFF and CAF containers with

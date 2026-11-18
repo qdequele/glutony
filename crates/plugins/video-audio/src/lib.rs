@@ -26,6 +26,12 @@
 //! not the decoded source PCM. A two-hour 48 kHz stereo track is never held as
 //! gigabytes of f32 samples.
 //!
+//! The output still grows with the audio's length, so it is bounded too: with
+//! `max_duration_secs` unset (or `null`), audio longer than
+//! [`DEFAULT_MAX_DURATION_SECS`] (four hours) fails the step with a non-retryable
+//! error instead of being truncated. An explicit `max_duration_secs` keeps the first
+//! that many seconds, and may be larger than the default.
+//!
 //! # Usage reporting
 //!
 //! The step records no usage units. The decode is local and costs no third-party
@@ -57,6 +63,11 @@ pub const NAME: &str = "video_audio_extractor";
 /// Default output sample rate: what speech-to-text models expect.
 pub const DEFAULT_SAMPLE_RATE: u32 = 16_000;
 
+/// Longest audio decoded when `max_duration_secs` is not set: four hours. Longer
+/// audio fails the step rather than being truncated, so a decompression bomb or an
+/// unexpectedly long recording cannot grow the output without bound.
+pub const DEFAULT_MAX_DURATION_SECS: u64 = 4 * 3_600;
+
 /// Containers and codecs this plugin can decode, for error messages and docs.
 pub const SUPPORTED: &str = "containers MP4/MOV, MKV/WebM, OGG, WAV, FLAC, AIFF, CAF \
                              and codecs AAC-LC, MP1/MP2/MP3, ALAC, FLAC, Vorbis, PCM, ADPCM";
@@ -75,7 +86,8 @@ pub struct VideoAudioConfig {
     pub sample_rate: u32,
     /// Downmix every channel into one. When false the source channel count is kept.
     pub mono: bool,
-    /// Stop decoding after this many seconds of audio.
+    /// Stop decoding after this many seconds of audio. Unset (or `null`) means
+    /// [`DEFAULT_MAX_DURATION_SECS`], and audio longer than that fails the step.
     pub max_duration_secs: Option<u64>,
     /// Decode this track id instead of the container's default audio track.
     pub track: Option<u32>,
@@ -112,6 +124,23 @@ impl VideoAudioConfig {
         }
         Ok(cfg)
     }
+
+    /// How much audio this step decodes.
+    fn duration_limit(&self) -> DurationLimit {
+        match self.max_duration_secs {
+            Some(secs) => DurationLimit::Truncate(secs),
+            None => DurationLimit::Reject(DEFAULT_MAX_DURATION_SECS),
+        }
+    }
+}
+
+/// What happens to audio past a duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationLimit {
+    /// An explicit `max_duration_secs`: keep the first this many seconds.
+    Truncate(u64),
+    /// The default ceiling: audio longer than this many seconds fails the step.
+    Reject(u64),
 }
 
 /// Extracts a video's audio track as WAV.
@@ -171,7 +200,7 @@ impl Plugin for VideoAudioExtractorPlugin {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "default": null,
-                        "description": "Stop decoding after this many seconds. Unlimited when unset."
+                        "description": "Keep only the first this many seconds. When unset (or null), audio longer than 14400 seconds (4 hours) fails the step."
                     },
                     "track": {
                         "type": ["integer", "null"],
@@ -231,12 +260,14 @@ impl Plugin for VideoAudioExtractorPlugin {
         let data = blob.data;
         let mime_for_hint = mime.clone();
         let cfg_for_decode = cfg.clone();
+        let limit = cfg.duration_limit();
         let extracted = run_blocking(move || {
             extract(
                 data,
                 &mime_for_hint,
                 extension.as_deref(),
                 &cfg_for_decode,
+                limit,
                 &cancelled,
             )
         })
@@ -289,6 +320,7 @@ fn extract(
     mime: &str,
     extension: Option<&str>,
     cfg: &VideoAudioConfig,
+    limit: DurationLimit,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Extracted, PluginError> {
     let mss = MediaSourceStream::new(Box::new(Cursor::new(data)), Default::default());
@@ -351,8 +383,11 @@ fn extract(
     let mut decoded_samples = 0usize;
     let mut kept_samples = 0usize;
     let mut keep_limit = usize::MAX;
-    let max_frames = cfg
-        .max_duration_secs
+    let truncate_secs = match limit {
+        DurationLimit::Truncate(secs) => Some(secs),
+        DurationLimit::Reject(_) => None,
+    };
+    let max_frames = truncate_secs
         .map(|secs| secs.saturating_mul(u64::from(audio_params.sample_rate.unwrap_or(48_000))));
 
     loop {
@@ -387,13 +422,23 @@ fn extract(
                     rate = spec.rate();
                 }
                 decoded_samples += interleaved.len();
+                if let DurationLimit::Reject(secs) = limit
+                    && channels > 0
+                    && (decoded_samples / channels) as u64 > secs.saturating_mul(u64::from(rate))
+                {
+                    return Err(PluginError::non_retryable(format!(
+                        "the audio is longer than max_duration_secs ({secs} s, the default); \
+                         set max_duration_secs to a larger value to extract all of it, or \
+                         split the file"
+                    )));
+                }
                 if channels > 0
                     && rate > 0
                     && let Some(out) = wav_slot.take()
                 {
                     // Honour max_duration exactly: the loop stops at a packet boundary,
                     // so only the samples within the limit are passed on.
-                    if let Some(max) = cfg.max_duration_secs {
+                    if let Some(max) = truncate_secs {
                         keep_limit =
                             (max.saturating_mul(u64::from(rate)) as usize).saturating_mul(channels);
                     }
@@ -948,6 +993,124 @@ mod tests {
         assert!(secs > 0.9, "truncated too aggressively: {secs}s");
     }
 
+    /// `secs` seconds of silence as 1 kHz mono 16-bit WAV, written directly so a
+    /// four-hour clip stays cheap to build (29 MB). At 1 kHz with `sample_rate: 1000`
+    /// the extractor passes the samples through without resampling.
+    fn long_silence_wav(secs: u64) -> Vec<u8> {
+        let data_len = (secs * 1_000 * 2) as u32;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&1_000u32.to_le_bytes());
+        out.extend_from_slice(&2_000u32.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        out
+    }
+
+    #[tokio::test]
+    async fn audio_longer_than_the_default_ceiling_fails_instead_of_buffering() {
+        let source = long_silence_wav(DEFAULT_MAX_DURATION_SECS + 1);
+        let plugin = VideoAudioExtractorPlugin::new();
+        // Unset and an explicit null both mean the default ceiling, not unlimited.
+        for cfg in [
+            serde_json::json!({"sample_rate": 1_000}),
+            serde_json::json!({"sample_rate": 1_000, "max_duration_secs": null}),
+        ] {
+            let err = plugin
+                .execute(
+                    &ActivityContext::noop(),
+                    PluginInput::Bytes(Blob::new(
+                        source.clone(),
+                        "audio/wav",
+                        Some("long.wav".into()),
+                    )),
+                    cfg.clone(),
+                )
+                .await
+                .expect_err("over the default ceiling");
+            let PluginError::NonRetryable(msg) = &err else {
+                panic!("expected NonRetryable for {cfg}, got {err:?}");
+            };
+            assert!(msg.contains("max_duration_secs"), "{msg}");
+            assert!(msg.contains("14400"), "{msg}");
+        }
+
+        // An explicit larger value is honoured: the whole clip comes out.
+        let out = run(
+            source,
+            "audio/wav",
+            "long.wav",
+            serde_json::json!({"sample_rate": 1_000, "max_duration_secs": DEFAULT_MAX_DURATION_SECS + 10}),
+        )
+        .await;
+        let PluginOutput::Bytes(blob) = out else {
+            panic!("expected bytes");
+        };
+        let frames = (blob.data.len() - 44) / 2;
+        assert_eq!(frames as u64, (DEFAULT_MAX_DURATION_SECS + 1) * 1_000);
+    }
+
+    #[test]
+    fn the_ceiling_rejects_only_audio_past_it() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cfg = VideoAudioConfig::default();
+        let input = wav_frames(2 * 44_100 + 1, 44_100, 2);
+        let err = extract(
+            input,
+            "audio/wav",
+            Some("wav"),
+            &cfg,
+            DurationLimit::Reject(2),
+            &cancelled,
+        )
+        .expect_err("one frame past the ceiling");
+        assert!(matches!(err, PluginError::NonRetryable(_)), "{err:?}");
+        // Exactly at the ceiling is fine, and the output is not truncated.
+        let input = wav_frames(2 * 44_100, 44_100, 2);
+        let expected = reference::extract(input.clone(), &cfg);
+        let got = extract(
+            input,
+            "audio/wav",
+            Some("wav"),
+            &cfg,
+            DurationLimit::Reject(2),
+            &cancelled,
+        )
+        .expect("at the ceiling");
+        assert!(got.wav == expected);
+    }
+
+    #[test]
+    fn unset_means_the_default_ceiling_and_a_value_truncates() {
+        assert_eq!(
+            VideoAudioConfig::parse(serde_json::Value::Null)
+                .expect("config")
+                .duration_limit(),
+            DurationLimit::Reject(DEFAULT_MAX_DURATION_SECS)
+        );
+        assert_eq!(
+            VideoAudioConfig::parse(serde_json::json!({"max_duration_secs": null}))
+                .expect("config")
+                .duration_limit(),
+            DurationLimit::Reject(DEFAULT_MAX_DURATION_SECS)
+        );
+        assert_eq!(
+            VideoAudioConfig::parse(serde_json::json!({"max_duration_secs": 30}))
+                .expect("config")
+                .duration_limit(),
+            DurationLimit::Truncate(30)
+        );
+        assert_eq!(DEFAULT_MAX_DURATION_SECS, 4 * 3_600);
+    }
+
     #[tokio::test]
     async fn decoding_records_no_usage() {
         // The transcription step downstream reports the seconds it was billed for;
@@ -1232,6 +1395,7 @@ mod tests {
             "audio/wav",
             Some("wav"),
             cfg,
+            cfg.duration_limit(),
             &Arc::new(AtomicBool::new(false)),
         )
         .expect("extraction succeeds")
