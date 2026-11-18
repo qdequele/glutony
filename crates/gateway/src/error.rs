@@ -4,8 +4,8 @@
 //! error into `{"error": "<message>", "code": "<snake_case>"}` with the status code from
 //! the plan (400 missing context / bad request, 401 unauthorized, 402 insufficient credits,
 //! 403 forbidden, 404 not found, 409 job already finished, 413 too large, 415 no pipeline
-//! for the MIME type, 422 invalid pipeline, 502 upstream, 503 lab unavailable, 500
-//! internal). Messages never contain API keys: they are built from our own strings, from
+//! for the MIME type, 422 invalid pipeline, 502 upstream, 503 lab unavailable or upload
+//! budget full, 500 internal). Messages never contain API keys: they are built from our own strings, from
 //! control-plane error bodies, or from transport errors that carry URLs but no
 //! credentials.
 
@@ -40,6 +40,10 @@ pub enum GatewayError {
     /// unreachable for longer than the stale window (503, retry later).
     #[error("{0}")]
     LabUnavailable(String),
+    /// The ingest routes already hold as much request body as `MAX_INFLIGHT_UPLOAD_MB`
+    /// allows (503, with `Retry-After`).
+    #[error("{0}")]
+    Overloaded(String),
     /// Unknown pipeline, job or resource (404).
     #[error("{0}")]
     NotFound(String),
@@ -81,7 +85,9 @@ impl GatewayError {
             GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             GatewayError::Forbidden(_) => StatusCode::FORBIDDEN,
             GatewayError::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
-            GatewayError::LabUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            GatewayError::LabUnavailable(_) | GatewayError::Overloaded(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::AlreadyFinished(_) => StatusCode::CONFLICT,
             GatewayError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -105,6 +111,7 @@ impl GatewayError {
             GatewayError::Forbidden(_) => "forbidden",
             GatewayError::PaymentRequired(_) => "insufficient_credits",
             GatewayError::LabUnavailable(_) => "lab_unavailable",
+            GatewayError::Overloaded(_) => "overloaded",
             GatewayError::NotFound(_) => "not_found",
             GatewayError::AlreadyFinished(_) => "already_finished",
             GatewayError::TooLarge(_) => "payload_too_large",
@@ -155,7 +162,14 @@ impl IntoResponse for GatewayError {
             code: self.code().to_string(),
         };
         let is_unauthorized = status == StatusCode::UNAUTHORIZED;
+        let is_overloaded = matches!(self, GatewayError::Overloaded(_));
         let mut response = (status, Json(body)).into_response();
+        if is_overloaded {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(crate::state::OVERLOADED_RETRY_AFTER_SECS),
+            );
+        }
         if is_unauthorized {
             response.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,

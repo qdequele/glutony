@@ -112,6 +112,10 @@ pub struct GatewayConfig {
     pub default_index: String,
     /// Maximum upload size in MiB (`MAX_UPLOAD_MB`, default 500).
     pub max_upload_mb: usize,
+    /// Request body the ingest routes may hold in memory at once, in MiB
+    /// (`MAX_INFLIGHT_UPLOAD_MB`). `None` is twice `max_upload_mb`, `Some(0)` turns the
+    /// budget off. See [`UploadBudget`].
+    pub max_inflight_upload_mb: Option<usize>,
     /// Shared secret that must be carried in `X-Meili-Envoy-Secret` for the `X-Meili-*`
     /// headers to be honoured (`ENVOY_TRUSTED_HEADER`). `None` = trust everyone (dev mode).
     pub envoy_trusted_header: Option<String>,
@@ -158,6 +162,7 @@ impl std::fmt::Debug for GatewayConfig {
             )
             .field("default_index", &self.default_index)
             .field("max_upload_mb", &self.max_upload_mb)
+            .field("max_inflight_upload_mb", &self.max_inflight_upload_mb)
             .field(
                 "envoy_trusted_header",
                 &self.envoy_trusted_header.as_ref().map(|_| "<redacted>"),
@@ -191,6 +196,7 @@ impl Default for GatewayConfig {
             meili_api_key: None,
             default_index: "documents".into(),
             max_upload_mb: 500,
+            max_inflight_upload_mb: None,
             envoy_trusted_header: None,
             blob_store_url: "file://./blobs".into(),
             inline_max_bytes: 1_048_576,
@@ -217,6 +223,12 @@ impl GatewayConfig {
             meili_api_key: env_opt("MEILI_API_KEY"),
             default_index: env_or("DEFAULT_INDEX", &d.default_index),
             max_upload_mb: env_parse("MAX_UPLOAD_MB", d.max_upload_mb)?,
+            max_inflight_upload_mb: env_opt("MAX_INFLIGHT_UPLOAD_MB")
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|e| anyhow::anyhow!("invalid MAX_INFLIGHT_UPLOAD_MB={v:?}: {e}"))
+                })
+                .transpose()?,
             envoy_trusted_header: env_opt("ENVOY_TRUSTED_HEADER"),
             blob_store_url: env_or("BLOB_STORE_URL", &d.blob_store_url),
             inline_max_bytes: env_parse("INLINE_MAX_BYTES", d.inline_max_bytes)?,
@@ -272,6 +284,127 @@ impl GatewayConfig {
     /// Maximum request body size in bytes.
     pub fn max_upload_bytes(&self) -> usize {
         self.max_upload_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// Bytes of request body the ingest routes may hold at once, or `None` when the
+    /// budget is off (`MAX_INFLIGHT_UPLOAD_MB=0`). Never less than one maximum-size
+    /// upload, so an idle gateway always admits any request it would accept.
+    pub fn inflight_upload_bytes(&self) -> Option<usize> {
+        let mb = self
+            .max_inflight_upload_mb
+            .unwrap_or_else(|| self.max_upload_mb.saturating_mul(2));
+        if mb == 0 {
+            return None;
+        }
+        Some(mb.max(self.max_upload_mb).saturating_mul(1024 * 1024))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-flight upload budget
+// ---------------------------------------------------------------------------
+
+/// How long a request waits for room in the [`UploadBudget`] before a 503.
+pub const UPLOAD_BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `Retry-After` of a 503 [`GatewayError::Overloaded`], in seconds.
+pub const OVERLOADED_RETRY_AFTER_SECS: u32 = 5;
+
+/// The budget is counted in KiB, so a `u32` permit count covers any body.
+const BUDGET_UNIT: usize = 1024;
+
+/// A byte-weighted bound on the request bodies the ingest routes hold at once.
+///
+/// The ingest routes buffer the whole body before anything else, so without a bound a
+/// few concurrent maximum-size uploads exhaust the gateway's memory. Each request is
+/// charged its declared `Content-Length`, or the whole upload limit when it declares
+/// none, before its body is read, and holds that charge until its response is built.
+/// One that does not fit waits up to [`UPLOAD_BUDGET_WAIT`] (in arrival order), then
+/// is refused with a 503. The budget is never smaller than the upload limit, so an
+/// idle gateway always admits one request.
+#[derive(Clone)]
+pub struct UploadBudget {
+    permits: Option<Arc<tokio::sync::Semaphore>>,
+    total_units: u32,
+    max_charge: usize,
+    wait: std::time::Duration,
+}
+
+impl std::fmt::Debug for UploadBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadBudget")
+            .field("enabled", &self.permits.is_some())
+            .field("total_kib", &self.total_units)
+            .field("max_charge", &self.max_charge)
+            .field("wait", &self.wait)
+            .finish()
+    }
+}
+
+fn budget_units(bytes: usize) -> u32 {
+    u32::try_from(bytes.div_ceil(BUDGET_UNIT)).unwrap_or(u32::MAX)
+}
+
+impl UploadBudget {
+    /// A budget of `total` bytes (`None`: unbounded) for bodies of at most `max_charge`
+    /// bytes. `total` is raised to `max_charge` if it is smaller.
+    pub fn new(total: Option<usize>, max_charge: usize, wait: std::time::Duration) -> Self {
+        let total_units = total.map_or(0, |t| budget_units(t.max(max_charge)));
+        Self {
+            permits: total.map(|_| Arc::new(tokio::sync::Semaphore::new(total_units as usize))),
+            total_units,
+            max_charge,
+            wait,
+        }
+    }
+
+    /// The budget [`GatewayConfig`] asks for.
+    pub fn from_config(config: &GatewayConfig) -> Self {
+        if let Some(mb) = config.max_inflight_upload_mb
+            && mb != 0
+            && mb < config.max_upload_mb
+        {
+            tracing::warn!(
+                max_inflight_upload_mb = mb,
+                max_upload_mb = config.max_upload_mb,
+                "MAX_INFLIGHT_UPLOAD_MB is below MAX_UPLOAD_MB; raised to it so one \
+                 maximum-size upload always fits"
+            );
+        }
+        Self::new(
+            config.inflight_upload_bytes(),
+            config.max_upload_bytes(),
+            UPLOAD_BUDGET_WAIT,
+        )
+    }
+
+    /// The same budget with another wait, for tests.
+    pub fn with_wait(mut self, wait: std::time::Duration) -> Self {
+        self.wait = wait;
+        self
+    }
+
+    /// Reserve room for a body that declares `declared` bytes (`None`: unknown, charged
+    /// the whole upload limit). The reservation is released when the guard drops.
+    pub async fn admit(
+        &self,
+        declared: Option<u64>,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, GatewayError> {
+        let Some(permits) = &self.permits else {
+            return Ok(None);
+        };
+        let bytes = declared.map_or(self.max_charge, |d| {
+            usize::try_from(d).map_or(self.max_charge, |d| d.min(self.max_charge))
+        });
+        let units = budget_units(bytes).min(self.total_units);
+        match tokio::time::timeout(self.wait, permits.clone().acquire_many_owned(units)).await {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            // The semaphore is never closed.
+            Ok(Err(e)) => Err(GatewayError::Internal(format!("upload budget: {e}"))),
+            Err(_) => Err(GatewayError::Overloaded(
+                "the gateway is holding as many uploads as it can; retry later".into(),
+            )),
+        }
     }
 }
 
@@ -920,6 +1053,9 @@ pub struct AppState {
     pub probe_http: reqwest::Client,
     /// The Lab, when this deployment reports to one (`LAB_URL` + `LAB_INSTANCE_*`).
     pub lab: Option<Arc<crate::lab::LabClient>>,
+    /// Bound on the request bodies the ingest routes hold at once
+    /// (`MAX_INFLIGHT_UPLOAD_MB`).
+    pub upload_budget: UploadBudget,
 }
 
 impl std::fmt::Debug for AppState {
@@ -930,6 +1066,7 @@ impl std::fmt::Debug for AppState {
             .field("blob", &self.blob)
             .field("connections", &self.connections)
             .field("lab", &self.lab)
+            .field("upload_budget", &self.upload_budget)
             .finish_non_exhaustive()
     }
 }
@@ -944,7 +1081,9 @@ impl AppState {
     ) -> Self {
         let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone())
             .with_token(config.control_plane_token.clone());
+        let upload_budget = UploadBudget::from_config(&config);
         Self {
+            upload_budget,
             config: Arc::new(config),
             temporal,
             control_plane,
@@ -974,6 +1113,12 @@ impl AppState {
     /// they answer 501, so a key is never stored unsealed by accident.
     pub fn with_connections(mut self, connections: crate::connections::ConnectionConfig) -> Self {
         self.connections = connections;
+        self
+    }
+
+    /// Replace the in-flight upload budget (tests use a shorter wait).
+    pub fn with_upload_budget(mut self, upload_budget: UploadBudget) -> Self {
+        self.upload_budget = upload_budget;
         self
     }
 
@@ -1096,6 +1241,83 @@ mod tests {
         assert!(!dbg.contains("lab-secret-value"));
         assert!(!dbg.contains("admin-secret-value"));
         assert_eq!(cfg.max_upload_bytes(), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_inflight_budget_defaults_to_twice_the_upload_limit_and_never_below_it() {
+        const MIB: usize = 1024 * 1024;
+        let with = |max_upload_mb, max_inflight_upload_mb| GatewayConfig {
+            max_upload_mb,
+            max_inflight_upload_mb,
+            ..Default::default()
+        };
+        assert_eq!(
+            GatewayConfig::default().inflight_upload_bytes(),
+            Some(1000 * MIB)
+        );
+        assert_eq!(with(10, Some(64)).inflight_upload_bytes(), Some(64 * MIB));
+        assert_eq!(
+            with(10, Some(3)).inflight_upload_bytes(),
+            Some(10 * MIB),
+            "raised so one maximum-size upload always fits"
+        );
+        assert_eq!(with(10, Some(0)).inflight_upload_bytes(), None, "off");
+    }
+
+    #[tokio::test]
+    async fn the_upload_budget_admits_what_fits_and_refuses_the_rest() {
+        use std::time::Duration;
+        const MIB: usize = 1024 * 1024;
+        let wait = Duration::from_millis(20);
+        // Configured below the upload limit: an idle gateway still admits a maximum one.
+        let budget = UploadBudget::new(Some(MIB / 2), MIB, wait);
+        let full = budget
+            .admit(Some(MIB as u64))
+            .await
+            .expect("idle admits the max");
+        let err = budget.admit(Some(1)).await.expect_err("nothing left");
+        assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "overloaded");
+        drop(full);
+        budget
+            .admit(Some(1))
+            .await
+            .expect("room again once released");
+
+        // A body that declares no length is charged the whole limit.
+        let budget = UploadBudget::new(Some(2 * MIB), MIB, wait);
+        let unknown = budget.admit(None).await.expect("first");
+        let small = budget
+            .admit(Some(1000))
+            .await
+            .expect("small fits beside it");
+        budget
+            .admit(None)
+            .await
+            .expect_err("a second unknown does not");
+        drop((unknown, small));
+
+        // A declared length over the limit (refused with 413 before this) is capped.
+        UploadBudget::new(Some(MIB), MIB, wait)
+            .admit(Some(u64::MAX))
+            .await
+            .expect("capped at the limit");
+
+        // Off: everything is admitted.
+        let off = UploadBudget::new(None, MIB, wait);
+        let held: Vec<_> = admit_unbounded(&off, 8).await;
+        assert!(held.iter().all(Option::is_none));
+    }
+
+    async fn admit_unbounded(
+        budget: &UploadBudget,
+        n: usize,
+    ) -> Vec<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let mut held = Vec::new();
+        for _ in 0..n {
+            held.push(budget.admit(None).await.expect("unbounded"));
+        }
+        held
     }
 
     #[test]

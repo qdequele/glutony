@@ -185,7 +185,7 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
 
   /ingest/batch:
     post:
@@ -230,6 +230,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/IngestUnavailable"
 
   /ingest/pipeline/{name}:
     post:
@@ -308,7 +310,7 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
 
   /indexes/{index_uid}/ingest:
     post:
@@ -369,7 +371,7 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
 
   /indexes/{index_uid}/ingest/batch:
     post:
@@ -407,6 +409,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/IngestUnavailable"
 
   /indexes/{index_uid}/ingest/pipeline/{name}:
     post:
@@ -466,7 +470,7 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
 
   /jobs:
     get:
@@ -1613,6 +1617,27 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
           example: { "error": "the Lab has been unreachable for more than 300s; cannot check account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61's credits", "code": "lab_unavailable" }
+    IngestUnavailable:
+      description: |
+        Nothing was queued or started; retry later. Either:
+
+        - `code: overloaded`: the gateway already holds as much request body as
+          `MAX_INFLIGHT_UPLOAD_MB` allows (by default twice `MAX_UPLOAD_MB`), and
+          no room freed up within 2 s. A request is charged its `Content-Length`,
+          or the whole upload limit when it sends none. Comes with `Retry-After`.
+        - `code: lab_unavailable` (hosted Lab engine only): the account's credits
+          could not be checked. The Lab has not yet confirmed this deployment's
+          credentials, or it cannot answer and there is no answer for the account
+          from the last 300 s.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying. Set on `overloaded`.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the gateway is holding as many uploads as it can; retry later", "code": "overloaded" }
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
@@ -1694,7 +1719,7 @@ components:
         code:
           type: string
           description: Stable snake_case error code.
-          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, internal_error]
+          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, overloaded, internal_error]
 
     JobStatus:
       type: string

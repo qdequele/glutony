@@ -119,13 +119,27 @@ async fn refuse_declared_oversize(limit: usize, req: Request, next: Next) -> Res
     next.run(req).await
 }
 
+/// Hold a share of the in-flight upload budget (`MAX_INFLIGHT_UPLOAD_MB`) from before
+/// an ingest route reads its body until its response is built, or answer 503.
+async fn admit_upload(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let declared = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    match state.upload_budget.admit(declared).await {
+        Ok(_reservation) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Build the axum router with every route of SPEC §4 plus `GET /health`, the body
-/// limits (`MAX_UPLOAD_MB`) and request tracing.
+/// limits (`MAX_UPLOAD_MB`, `MAX_INFLIGHT_UPLOAD_MB`) and request tracing.
 pub fn router(state: AppState) -> Router {
     let limit = state.config.max_upload_bytes();
     let cors = cors_layer(&state.config.cors_allow_origins);
-    let router = Router::new()
-        .route("/health", get(health))
+    // The routes that buffer a whole upload, behind the in-flight body budget.
+    let ingest = Router::new()
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/ingest/batch", post(handlers::ingest::ingest_batch))
         .route(
@@ -146,6 +160,13 @@ pub fn router(state: AppState) -> Router {
             "/indexes/{index_uid}/ingest/pipeline/{name}",
             post(handlers::pipeline::ingest_into_index_with_pipeline),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admit_upload,
+        ));
+    let router = Router::new()
+        .route("/health", get(health))
+        .merge(ingest)
         .route("/jobs", get(handlers::jobs::list_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))
@@ -583,6 +604,64 @@ mod tests {
         let body = json_body(resp).await;
         assert_eq!(body["code"], "payload_too_large", "{body}");
         assert!(body["error"].is_string(), "{body}");
+    }
+
+    /// A raw upload of `len` bytes that says how big it is.
+    fn sized_upload(len: usize) -> Request<Body> {
+        let mut req = standalone_request("/ingest", "text/plain", vec![b'a'; len]);
+        req.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(len),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn uploads_past_the_in_flight_budget_get_a_json_503() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        // `MAX_UPLOAD_MB=1` and the default budget of twice that: two maximum-size
+        // uploads in flight fill it, and a third request, however small, has to wait.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(
+                        serde_json::json!({"pipeline": sample_pipeline("builtin.text", None)}),
+                    )
+                    // Holds the first two requests (and their buffered bodies) in flight.
+                    .set_delay(std::time::Duration::from_secs(4)),
+            )
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let cfg = GatewayConfig {
+            max_upload_mb: 1,
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, cfg).await;
+        let full = 1024 * 1024;
+        let held: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(app.clone().oneshot(sized_upload(full))))
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let resp = app.clone().oneshot(sized_upload(10)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "{:?}",
+            resp.headers()
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "overloaded", "{body}");
+        assert_matches_openapi("POST", "/ingest", 503, &body);
+
+        for h in held {
+            let resp = h.await.unwrap().unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "admitted while idle");
+        }
     }
 
     #[tokio::test]
