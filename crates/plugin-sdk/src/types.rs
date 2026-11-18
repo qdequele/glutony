@@ -1146,6 +1146,20 @@ pub enum PipelineError {
         /// The path.
         path: String,
     },
+    /// A `meili_indexer` step sets `prune: true` and fans out over parts of its
+    /// input: each branch would see only some documents of a parent and delete the
+    /// ones its sibling branches just added.
+    #[error(
+        "step {step:?} sets `prune` on meili_indexer with fan_out {path:?}: each branch \
+         would delete the documents its sibling branches add; remove fan_out (or use \"$\") \
+         or turn prune off"
+    )]
+    PruneWithFanOut {
+        /// The step.
+        step: String,
+        /// The fan-out path.
+        path: String,
+    },
     /// `trigger.filename_pattern` is longer than [`MAX_FILENAME_PATTERN_LEN`].
     #[error("trigger.filename_pattern is {len} characters long, the maximum is {max}")]
     FilenamePatternTooLong {
@@ -1261,6 +1275,16 @@ impl PipelineDefinition {
                 }
                 if !matches!(path.as_str(), "$.documents" | "$.many" | "$") {
                     return Err(PipelineError::FanOutPath {
+                        step: s.id.clone(),
+                        path: path.clone(),
+                    });
+                }
+                // `prune` assumes the step sees every current document of a parent.
+                if s.plugin == INDEXER_PLUGIN
+                    && path != "$"
+                    && s.config.get("prune") == Some(&serde_json::Value::Bool(true))
+                {
+                    return Err(PipelineError::PruneWithFanOut {
                         step: s.id.clone(),
                         path: path.clone(),
                     });
@@ -1837,7 +1861,8 @@ pub struct IndexerConfig {
     /// shorter version of a document no longer produces. Off by default: the indexer
     /// never deletes unless asked. Needs `wait_for_completion`, a key allowed to delete
     /// documents, and `_meta.parent_id` plus the primary key in the index's
-    /// filterable attributes.
+    /// filterable attributes. A step with `prune` and a `fan_out` other than `$` is
+    /// rejected ([`PipelineError::PruneWithFanOut`]).
     #[serde(default)]
     pub prune: bool,
 }
@@ -2291,6 +2316,50 @@ mod tests {
                 .fan_out("$.documents"),
         ]);
         assert_eq!(p.validate(), Err(PipelineError::FanOutArity("c".into())));
+    }
+
+    #[test]
+    fn prune_cannot_be_combined_with_a_fan_out_that_splits_the_indexer_input() {
+        // Each branch would see only some chunks of a parent and delete the ones its
+        // sibling branches just added.
+        let indexer = |fan_out: Option<&str>, config: serde_json::Value| {
+            let mut s = StepDefinition::new("i", INDEXER_PLUGIN)
+                .depends_on(["a"])
+                .config(config);
+            s.fan_out = fan_out.map(str::to_owned);
+            pipeline(vec![step("a", &[]), s])
+        };
+        let prune = serde_json::json!({"prune": true});
+        for path in ["$.documents", "$.many"] {
+            assert_eq!(
+                indexer(Some(path), prune.clone()).validate(),
+                Err(PipelineError::PruneWithFanOut {
+                    step: "i".into(),
+                    path: path.into(),
+                }),
+                "{path}"
+            );
+        }
+        // `$` hands the whole upstream output to one activity, and without prune a
+        // fanned-out indexer only adds.
+        assert!(indexer(Some("$"), prune.clone()).validate().is_ok());
+        assert!(indexer(None, prune).validate().is_ok());
+        assert!(
+            indexer(Some("$.documents"), serde_json::json!({"prune": false}))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            indexer(Some("$.documents"), serde_json::json!({}))
+                .validate()
+                .is_ok()
+        );
+        // Another plugin's `prune` key means nothing here.
+        let mut other = StepDefinition::new("o", "x")
+            .depends_on(["a"])
+            .config(serde_json::json!({"prune": true}));
+        other.fan_out = Some("$.documents".into());
+        assert!(pipeline(vec![step("a", &[]), other]).validate().is_ok());
     }
 
     #[test]

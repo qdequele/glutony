@@ -446,7 +446,14 @@ What it covers: documents that carry `meta.parent_id` (`chunker` output,
 parent that disappeared entirely, such as a PDF page or a Markdown section that
 no longer exists, is not in the step, so its chunks stay. Documents without a
 parent are never deleted. All the derived documents of a parent must reach the
-same indexer step, which is how the built-in pipelines work. Two uploads with
+same indexer invocation, which is how the built-in pipelines work. So `prune`
+cannot be combined with fan-out on the indexer step: a pipeline whose
+`meili_indexer` step has `prune: true` and a `fan_out` other than `$` is
+rejected, since each branch would delete the chunks its sibling branches just
+added. As a second guard, a parent whose chunks carry `meta.chunk_total` is
+pruned only when the step holds exactly that many of them (and they agree on
+the total); otherwise it is skipped with a warning and its stale chunks stay.
+Two uploads with
 the same filename and no origin already share ids, so they count as the same
 parent.
 

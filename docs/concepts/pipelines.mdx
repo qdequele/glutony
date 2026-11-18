@@ -100,7 +100,8 @@ steps:
   activities are cancelled, no new step starts, status becomes `cancelled`.
 - **Validation** at creation time (and by `POST /pipelines/validate`, which
   saves nothing): unique ids, known dependencies, no cycles (Kahn's algorithm),
-  `fan_out` arity/path, a `trigger.filename_pattern` of at most 256 characters,
+  `fan_out` arity/path (a `meili_indexer` step with `prune: true` accepts no
+  `fan_out` other than `$`), a `trigger.filename_pattern` of at most 256 characters,
   known plugins, each step's `config` against its plugin's
   `config_schema` from `GET /plugins` (unknown keys and wrong types are `422`),
   and each `meili_indexer` `connection` against the tenant's connections (its

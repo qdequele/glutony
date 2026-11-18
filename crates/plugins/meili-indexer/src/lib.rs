@@ -34,6 +34,8 @@
 //!    that got shorter. The index must have `_meta.parent_id` and its primary key
 //!    filterable and the key must be allowed to delete documents; the indexer never
 //!    changes index settings, so a missing one fails the step (non-retryable) saying so;
+//!    a parent whose documents carry `_meta.chunk_total` is pruned only when the step
+//!    holds all of them (a pipeline that fans the indexer out with `prune` is rejected);
 //! 6. return [`PluginOutput::Indexed`] with the [`IndexReport`].
 //!
 //! Network failures, timeouts and 5xx responses are [`PluginError::Retryable`];
@@ -444,6 +446,62 @@ fn prune_filters(children: &[(String, Value)], primary_key: &str, max_ids: usize
     filters
 }
 
+/// The `(parent id, primary key value)` of every document of `payloads` that has a
+/// parent, in input order, leaving out the parents this step does not see whole.
+///
+/// A parent whose documents carry `_meta.chunk_total` is kept only when they all
+/// agree on it and this step holds exactly that many distinct ids: otherwise some of
+/// its current documents went to another invocation (a split input), and pruning
+/// would delete them. Such a parent is skipped with a warning. A parent without
+/// `chunk_total` cannot be checked and is kept.
+fn complete_children(payloads: &[Value], primary_key: &str) -> Vec<(String, Value)> {
+    let children: Vec<(&str, Value, Option<u64>)> = payloads
+        .iter()
+        .filter_map(|p| {
+            let meta = p.get("_meta")?;
+            let parent = meta.get("parent_id")?.as_str()?;
+            let id = p.get(primary_key).cloned().unwrap_or(Value::Null);
+            let total = meta.get("chunk_total").and_then(Value::as_u64);
+            Some((parent, id, total))
+        })
+        .collect();
+
+    // Per parent: the totals its documents announce, and the distinct ids present.
+    let mut seen: HashMap<&str, (HashSet<Option<u64>>, HashSet<String>)> = HashMap::new();
+    for (parent, id, total) in &children {
+        let (totals, ids) = seen.entry(parent).or_default();
+        totals.insert(*total);
+        ids.insert(id.to_string());
+    }
+    let partial: HashSet<&str> = seen
+        .into_iter()
+        .filter(
+            |(_, (totals, ids))| match totals.iter().collect::<Vec<_>>()[..] {
+                [None] => false,
+                [Some(total)] => usize::try_from(*total).ok() != Some(ids.len()),
+                _ => true,
+            },
+        )
+        .map(|(parent, (totals, ids))| {
+            tracing::warn!(
+                plugin = NAME,
+                parent_id = %parent,
+                present = ids.len(),
+                chunk_total = ?totals,
+                "prune: this step does not hold every document of this parent; \
+                 its stale documents are left in place"
+            );
+            parent
+        })
+        .collect();
+
+    children
+        .into_iter()
+        .filter(|(parent, _, _)| !partial.contains(parent))
+        .map(|(parent, id, _)| (parent.to_owned(), id))
+        .collect()
+}
+
 /// Add what `prune` needs to a non-retryable error of its deletion.
 fn with_prune_hint(err: PluginError, primary_key: &str) -> PluginError {
     match err {
@@ -467,14 +525,7 @@ async fn prune(
     primary_key: &str,
     timeout: Duration,
 ) -> Result<(), PluginError> {
-    let children: Vec<(String, Value)> = payloads
-        .iter()
-        .filter_map(|p| {
-            let parent = p.get("_meta")?.get("parent_id")?.as_str()?;
-            let id = p.get(primary_key).cloned().unwrap_or(Value::Null);
-            Some((parent.to_owned(), id))
-        })
-        .collect();
+    let children = complete_children(payloads, primary_key);
     let mut tasks = Vec::new();
     for filter in prune_filters(&children, primary_key, PRUNE_IDS_PER_FILTER) {
         ctx.check_cancelled()?;
@@ -853,7 +904,7 @@ impl Plugin for MeiliIndexerPlugin {
                     "prune": {
                         "type": "boolean",
                         "default": false,
-                        "description": "After the additions succeed, delete the documents that share a _meta.parent_id with a document of this step but were not sent by it (stale chunks of a document that got shorter). Needs wait_for_completion, a key allowed to delete documents, and _meta.parent_id plus the primary key in the index's filterableAttributes."
+                        "description": "After the additions succeed, delete the documents that share a _meta.parent_id with a document of this step but were not sent by it (stale chunks of a document that got shorter). Needs wait_for_completion, a key allowed to delete documents, and _meta.parent_id plus the primary key in the index's filterableAttributes. Cannot be combined with a fan_out other than $ on this step; a parent whose chunks are not all in the step (per meta.chunk_total) is skipped."
                     }
                 }
             }))
@@ -1456,6 +1507,75 @@ mod tests {
             .unwrap();
         let addition_done = order.iter().position(|r| r == "GET /tasks/2").unwrap();
         assert!(addition_done < delete, "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn prune_skips_a_parent_whose_chunks_did_not_all_reach_the_step() {
+        // Parent `a` was cut into 3 chunks but only 2 are here (the input was split
+        // across invocations): pruning it would delete the third, fresh chunk. Parent
+        // `b` is complete (its one chunk, sent twice) and is pruned.
+        let chunk = |id: &str, parent: &str, total: usize| {
+            let mut d = Document::with_id(id, "text");
+            d.meta.parent_id = Some(parent.into());
+            d.meta.chunk_total = Some(total);
+            d
+        };
+        let docs = vec![
+            chunk("a_0", "a", 3),
+            chunk("a_2", "a", 3),
+            chunk("b_0", "b", 1),
+            chunk("b_0", "b", 1),
+        ];
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        mount_prune(
+            &server,
+            r#"_meta.parent_id IN ["b"] AND NOT id IN ["b_0", "b_0"]"#,
+            3,
+            1,
+        )
+        .await;
+        mount_task(&server, 3, "succeeded", None).await;
+        run(
+            &server,
+            PluginInput::Documents(docs),
+            prune_config(&server.uri()),
+        )
+        .await
+        .unwrap();
+        let deletions = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/documents/delete"))
+            .count();
+        assert_eq!(deletions, 1, "only parent b is pruned");
+
+        // Chunks of one parent that disagree on the total are not a complete view
+        // either, whatever their count.
+        let disagreeing = vec![chunk("c_0", "c", 2), chunk("c_1", "c", 3)];
+        let server = MockServer::start().await;
+        mount_existing_index(&server).await;
+        mount_documents_add(&server, 2, 1, None).await;
+        mount_task(&server, 2, "succeeded", None).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{INDEX}/documents/delete")))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(task_info(3, "documentDeletion")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        run(
+            &server,
+            PluginInput::Documents(disagreeing),
+            prune_config(&server.uri()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
