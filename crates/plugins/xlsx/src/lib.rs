@@ -334,7 +334,7 @@ fn extract_rows(
     };
     let names = column_names(&headers, cells.width());
     let header_offset = usize::from(cfg.has_headers);
-    let sheet_id = sanitize_id(sheet);
+    let sheet_id = name_id_part(sheet);
     let page = u32::try_from(sheet_index + 1).ok();
 
     let mut docs = Vec::new();
@@ -409,7 +409,7 @@ fn extract_sheet(
     if lines.is_empty() {
         return Ok(None);
     }
-    let mut doc = Document::with_id(format!("{base}_{}", sanitize_id(sheet)), lines.join("\n"));
+    let mut doc = Document::with_id(format!("{base}_{}", name_id_part(sheet)), lines.join("\n"));
     doc.title = Some(sheet.to_owned());
     doc.fields
         .insert("_rows".into(), serde_json::Value::from(lines.len()));
@@ -628,6 +628,34 @@ mod tests {
         assert_eq!(note.id, "data_Team_Roster_Notes_r2");
         assert_eq!(note.fields["note"], "hello world");
         assert_eq!(note.meta.page, Some(2));
+    }
+
+    #[tokio::test]
+    async fn sheets_with_non_ascii_names_get_distinct_ids() {
+        let mut wb = Workbook::new();
+        for name in ["売上", "在庫"] {
+            let ws = wb.add_worksheet();
+            ws.set_name(name).unwrap();
+            ws.write_string(0, 0, "item").unwrap();
+            ws.write_string(1, 0, name).unwrap();
+        }
+        let bytes = wb.save_to_buffer().unwrap();
+        for mode in ["row", "sheet"] {
+            let docs = XlsxExtractorPlugin::new()
+                .execute(
+                    &ActivityContext::noop(),
+                    input(bytes.clone()),
+                    serde_json::json!({ "mode": mode }),
+                )
+                .await
+                .unwrap()
+                .into_documents()
+                .unwrap();
+            assert_eq!(docs.len(), 2, "{mode}");
+            assert_ne!(docs[0].id, docs[1].id, "{mode}");
+            let tag = origin_tag("売上");
+            assert!(docs[0].id.contains(&tag), "{mode}: {}", docs[0].id);
+        }
     }
 
     #[tokio::test]

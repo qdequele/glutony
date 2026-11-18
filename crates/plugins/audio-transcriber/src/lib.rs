@@ -525,7 +525,7 @@ fn base_id(blob: &Blob) -> String {
         // `sanitize_id("")` generates a fresh UUID, which is exactly the fallback we want.
         (true, false) => sanitize_id(""),
         (true, true) => blob.tag_id("audio"),
-        (false, _) => blob.tag_id(sanitize_id(stem)),
+        (false, _) => blob.tag_id(name_id_part(stem)),
     }
 }
 
@@ -1001,6 +1001,13 @@ mod tests {
         assert!(first.len() <= 511 && second.len() <= 511);
         assert!(first.ends_with("_t0"), "{first}");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn non_ascii_filenames_get_distinct_ids() {
+        let id = |name: &str| base_id(&Blob::new(vec![], "audio/mpeg", Some(name.into())));
+        assert_ne!(id("会議.mp3"), id("面談.mp3"));
+        assert_eq!(id("team standup.mp3"), "team_standup");
     }
     #[tokio::test]
     async fn happy_path_uploads_multipart_and_uses_the_transcript() {

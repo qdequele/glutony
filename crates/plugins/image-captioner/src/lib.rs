@@ -482,11 +482,7 @@ impl Plugin for ImageCaptionerPlugin {
         ProviderCosts::global().apply(NAME, model, &mut units);
         ctx.record_usage(units);
 
-        let mut doc = match blob.filename.as_deref() {
-            Some(name) if !name.is_empty() => Document::with_id(blob.tag_id(sanitize_id(name)), ""),
-            _ if blob.origin.is_some() => Document::with_id(blob.tag_id("image"), ""),
-            _ => Document::new(""),
-        };
+        let mut doc = empty_document(&blob);
         doc.meta.mime = Some(blob.mime.clone());
         doc.meta.filename = blob.filename.clone();
         doc.meta.source = blob.filename.clone();
@@ -519,6 +515,17 @@ const JSON_REPLY_HINT: &str = "Reply with a single JSON object.";
 /// The text part sent with the image. OpenAI refuses `response_format: json_object`
 /// unless a message names JSON, so in JSON mode a prompt that does not gets
 /// [`JSON_REPLY_HINT`] appended; any other prompt goes out exactly as configured.
+/// The document an image's caption goes into, with its id: the whole filename made
+/// id-safe and tagged with the origin, `image` tagged with the origin when there is no
+/// filename, or a fresh UUID for an upload without one.
+fn empty_document(blob: &Blob) -> Document {
+    match blob.filename.as_deref() {
+        Some(name) if !name.is_empty() => Document::with_id(blob.tag_id(name_id_part(name)), ""),
+        _ if blob.origin.is_some() => Document::with_id(blob.tag_id("image"), ""),
+        _ => Document::new(""),
+    }
+}
+
 fn prompt_text(cfg: &ImageCaptionerConfig) -> String {
     if cfg.json && !cfg.prompt.to_ascii_lowercase().contains("json") {
         format!("{}\n\n{JSON_REPLY_HINT}", cfg.prompt.trim_end())
@@ -797,6 +804,13 @@ mod tests {
             "image/png",
             Some("cat photo.png".into()),
         ))
+    }
+
+    #[test]
+    fn non_ascii_filenames_get_distinct_ids() {
+        let id = |name: &str| empty_document(&Blob::new(vec![], "image/png", Some(name.into()))).id;
+        assert_ne!(id("猫.png"), id("犬.png"));
+        assert_eq!(id("cat photo.png"), "cat_photo_png");
     }
 
     #[tokio::test]

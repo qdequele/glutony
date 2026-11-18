@@ -180,8 +180,10 @@ impl Document {
 }
 
 /// The stem a document id is built from: the filename without its extension, with
-/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), sanitized like
-/// [`sanitize_id`]. Files of the same name in different folders of an archive thus get
+/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), made id-safe by
+/// [`name_id_part`]: sanitized like [`sanitize_id`], plus a short hash of the path when
+/// it has non-ASCII characters (`報告.pdf` → `___<hash>`), so that two non-Latin
+/// names never share a stem. Files of the same name in different folders of an archive thus get
 /// different ids, while a plain filename gives the stem it always did. A Windows
 /// path sent by an old browser (`C:\\docs\\a.pdf`) keeps only its last part.
 /// `None` when nothing is left.
@@ -210,7 +212,26 @@ pub fn filename_id_stem(filename: Option<&str>) -> Option<String> {
         (true, false) => stem.to_string(),
         (false, false) => format!("{dir}/{stem}"),
     };
-    Some(bounded_stem(&joined))
+    Some(bound_stem(name_id_part(&joined), &joined))
+}
+
+/// A name (a filename stem, a sheet name) made into a part of a generated document
+/// id: [`sanitize_id`] of it, followed by `_` and a short hash of the original
+/// ([`origin_tag`]) when it has non-ASCII characters. [`sanitize_id`] turns each of
+/// those into `_`, so `売上` and `在庫` would otherwise both become `__` and their
+/// documents overwrite each other. An ASCII name gives exactly [`sanitize_id`]'s
+/// result, so its ids stay what they always were.
+///
+/// Use it for names that ids are generated from, not for ids a user picked (an
+/// `id_field` value), which must stay as given.
+pub fn name_id_part(raw: &str) -> String {
+    let mut part = sanitize_id(raw);
+    if !raw.is_ascii() {
+        truncate_at_char_boundary(&mut part, MAX_ID_LEN - ORIGIN_TAG_LEN - 1);
+        part.push('_');
+        part.push_str(&origin_tag(raw));
+    }
+    part
 }
 
 /// Make an arbitrary string a valid Meilisearch document id
@@ -242,7 +263,12 @@ const MAX_STEM_LEN: usize = 400;
 /// and ends with a short hash of the whole of `raw`, so that long stems sharing a
 /// prefix stay distinct.
 fn bounded_stem(raw: &str) -> String {
-    let mut stem = sanitize_id(raw);
+    bound_stem(sanitize_id(raw), raw)
+}
+
+/// `stem`, the id-safe form of `raw`, cut to [`MAX_STEM_LEN`] bytes as
+/// [`bounded_stem`] does.
+fn bound_stem(mut stem: String, raw: &str) -> String {
     if stem.len() > MAX_STEM_LEN {
         let hash = origin_tag(raw);
         truncate_at_char_boundary(&mut stem, MAX_STEM_LEN - hash.len() - 1);
@@ -2094,10 +2120,12 @@ mod tests {
             filename_id_stem(Some(&format!("{longest}.pdf"))).as_deref(),
             Some(longest.as_str())
         );
-        // The bound is on the sanitized stem: 300 two-byte characters are 300 bytes of id.
+        // The bound is on the sanitized stem: 300 two-byte characters are 300 bytes of
+        // id, plus the hash a non-ASCII name carries.
+        let accented = "é".repeat(300);
         assert_eq!(
-            filename_id_stem(Some(&format!("{}.pdf", "é".repeat(300)))),
-            Some("_".repeat(300))
+            filename_id_stem(Some(&format!("{accented}.pdf"))),
+            Some(format!("{}_{}", "_".repeat(300), origin_tag(&accented)))
         );
         assert_eq!(json_blob(None, None).tag_id(longest.clone()), longest);
         assert_eq!(json_blob(None, None).tag_id("a b"), "a b");
@@ -2193,6 +2221,39 @@ mod tests {
         assert_eq!(stem("dir/").as_deref(), None);
         assert_eq!(stem(""), None);
         assert_eq!(filename_id_stem(None), None);
+    }
+
+    #[test]
+    fn non_ascii_names_get_distinct_ids() {
+        let stem = |f: &str| filename_id_stem(Some(f)).unwrap();
+        assert_ne!(stem("報告.pdf"), stem("計画.pdf"));
+        assert_ne!(stem("docs/報告.pdf"), stem("docs/計画.pdf"));
+        // Readable where it can be, and stable: the hash is of the original name.
+        assert_eq!(stem("Café.pdf"), format!("Caf__{}", origin_tag("Café")));
+        assert_eq!(stem("Café.pdf"), stem("Café.docx"));
+        assert_eq!(name_id_part("売上"), format!("___{}", origin_tag("売上")));
+        assert_ne!(name_id_part("売上"), name_id_part("在庫"));
+        // Still within the stem budget for a long non-ASCII path.
+        let long = format!("{}.pdf", "報".repeat(300));
+        let s = stem(&long);
+        assert!(s.len() <= MAX_STEM_LEN, "{}", s.len());
+        assert_ne!(s, stem(&format!("{}計.pdf", "報".repeat(299))));
+    }
+
+    #[test]
+    fn ascii_names_keep_their_ids() {
+        // Pinned: an ASCII name, punctuation included, gives the id it always did, so
+        // re-ingesting such a file still replaces its documents.
+        for (name, id) in [
+            ("Annual Report.pdf", "Annual_Report"),
+            ("Q1 (a).xlsx", "Q1__a_"),
+            ("reports/eu/a.b.c.pdf", "reports_eu_a_b_c"),
+        ] {
+            assert_eq!(filename_id_stem(Some(name)).as_deref(), Some(id));
+            assert_eq!(name_id_part(name), sanitize_id(name));
+        }
+        let blob = Blob::new(vec![], "application/pdf", Some("Annual Report.pdf".into()));
+        assert_eq!(blob.id_stem(""), "Annual_Report");
     }
 
     #[test]

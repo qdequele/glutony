@@ -11,6 +11,9 @@ block; every key is optional unless stated otherwise.
 Documents produced by extractors set `meta.source`, `meta.filename` and
 `meta.mime` from the input blob, and derive ids from the sanitised filename
 without its extension plus a page/row suffix (`report_p3`, `data_r42`).
+A filename or sheet name with non-ASCII characters also ends with a 12-character
+hash of the original name (`報告.pdf` gives `___<hash>_p1`), so two non-Latin
+names never share ids; ASCII names give the ids they always did.
 
 Content fetched rather than uploaded (a URL or object-ref ingest, a scheduled
 source, and the files of such an archive) also carries a 12-character hash of

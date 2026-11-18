@@ -77,6 +77,10 @@ Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes). The stem of a generated id
 (`Blob::id_stem`, the file path without its extension) is kept to 400 bytes: a
 longer one is cut and ends with a short hash of the whole path, so the
 `_<index>` or `_p<page>` suffix always fits and long paths stay distinct.
+Sanitising turns every non-ASCII character into `_`, so a file path or sheet name
+with any (`報告.pdf`, a sheet `売上`) also gets `_` and a 12-character hash of the
+original appended (`name_id_part` in the SDK): `報告.pdf` and `計画.pdf` get
+different ids. A pure-ASCII name is only sanitised, as before.
 
 ## ActivityContext
 
