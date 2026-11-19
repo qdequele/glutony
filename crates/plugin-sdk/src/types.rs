@@ -1,6 +1,7 @@
 //! Shared data types: tenant context, documents, plugin I/O, pipeline definitions
-//! and workflow payloads. Every public type derives `Debug`, `Clone`, `Serialize`,
-//! `Deserialize` so it can travel through Temporal payloads unchanged.
+//! and workflow payloads. Every public type is `Debug`, `Clone`, `Serialize` and
+//! `Deserialize` so it can travel through Temporal payloads unchanged. `Debug` is
+//! derived except on [`MeiliContext`], whose own impl redacts the API key.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -22,7 +23,10 @@ use crate::error::PluginError;
 /// a Meilisearch **connection** takes its destination from that connection, not from
 /// the request — and a scheduled source run has no request at all. The `Option`
 /// fields still deserialize the plain strings recorded in older workflow histories.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` prints `<redacted>` in place of the API key, here and in every type that
+/// carries a context.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeiliContext {
     /// Tenant id (from `X-Meili-Tenant-Id` or `X-Meili-Project-Id`).
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
@@ -39,6 +43,18 @@ pub struct MeiliContext {
     /// Region tag for observability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+}
+
+impl std::fmt::Debug for MeiliContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeiliContext")
+            .field("tenant_id", &self.tenant_id)
+            .field("host", &self.host)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("index", &self.index)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl MeiliContext {
@@ -135,18 +151,21 @@ impl Document {
 
     /// Flatten into the JSON object sent to Meilisearch.
     pub fn to_index_json(&self) -> serde_json::Value {
+        self.clone().into_index_json()
+    }
+
+    /// [`Document::to_index_json`], moving the document's strings and fields into the
+    /// result instead of copying them.
+    pub fn into_index_json(self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
-        obj.insert("id".into(), serde_json::Value::String(self.id.clone()));
-        if let Some(t) = &self.title {
-            obj.insert("title".into(), serde_json::Value::String(t.clone()));
+        obj.insert("id".into(), serde_json::Value::String(self.id));
+        if let Some(t) = self.title {
+            obj.insert("title".into(), serde_json::Value::String(t));
         }
-        obj.insert(
-            "content".into(),
-            serde_json::Value::String(self.content.clone()),
-        );
-        for (k, v) in &self.fields {
+        obj.insert("content".into(), serde_json::Value::String(self.content));
+        for (k, v) in self.fields {
             if k != "id" && k != "content" && k != "_meta" {
-                obj.insert(k.clone(), v.clone());
+                obj.insert(k, v);
             }
         }
         // No provenance at all (e.g. JSON records) → no `_meta` key, rather than an
@@ -161,11 +180,17 @@ impl Document {
 }
 
 /// The stem a document id is built from: the filename without its extension, with
-/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), sanitized by
-/// [`sanitize_id`]. Files of the same name in different folders of an archive thus get
+/// its folders kept (`reports/eu/a.pdf` → `reports_eu_a`), made id-safe by
+/// [`name_id_part`]: sanitized like [`sanitize_id`], plus a short hash of the path when
+/// it has non-ASCII characters (`報告.pdf` → `___<hash>`), so that two non-Latin
+/// names never share a stem. Files of the same name in different folders of an archive thus get
 /// different ids, while a plain filename gives the stem it always did. A Windows
 /// path sent by an old browser (`C:\\docs\\a.pdf`) keeps only its last part.
 /// `None` when nothing is left.
+///
+/// A stem longer than 400 bytes (a deeply nested archive member) is cut and ends with
+/// a short hash of the whole path instead, so the `_<index>` / `_p<page>` suffix a
+/// plugin appends always fits in an id and two long paths never share a stem.
 pub fn filename_id_stem(filename: Option<&str>) -> Option<String> {
     let name = filename?;
     let name = name
@@ -187,7 +212,26 @@ pub fn filename_id_stem(filename: Option<&str>) -> Option<String> {
         (true, false) => stem.to_string(),
         (false, false) => format!("{dir}/{stem}"),
     };
-    Some(sanitize_id(&joined))
+    Some(bound_stem(name_id_part(&joined), &joined))
+}
+
+/// A name (a filename stem, a sheet name) made into a part of a generated document
+/// id: [`sanitize_id`] of it, followed by `_` and a short hash of the original
+/// ([`origin_tag`]) when it has non-ASCII characters. [`sanitize_id`] turns each of
+/// those into `_`, so `売上` and `在庫` would otherwise both become `__` and their
+/// documents overwrite each other. An ASCII name gives exactly [`sanitize_id`]'s
+/// result, so its ids stay what they always were.
+///
+/// Use it for names that ids are generated from, not for ids a user picked (an
+/// `id_field` value), which must stay as given.
+pub fn name_id_part(raw: &str) -> String {
+    let mut part = sanitize_id(raw);
+    if !raw.is_ascii() {
+        truncate_at_char_boundary(&mut part, MAX_ID_LEN - ORIGIN_TAG_LEN - 1);
+        part.push('_');
+        part.push_str(&origin_tag(raw));
+    }
+    part
 }
 
 /// Make an arbitrary string a valid Meilisearch document id
@@ -206,8 +250,58 @@ pub fn sanitize_id(raw: &str) -> String {
     if out.is_empty() {
         out = Uuid::new_v4().to_string();
     }
-    truncate_at_char_boundary(&mut out, 511);
+    truncate_at_char_boundary(&mut out, MAX_ID_LEN);
     out
+}
+
+/// Longest stem of a generated id, so that an origin tag and the plugin's `_<index>` /
+/// `_p<page>` / `_<sheet>_r<row>` suffixes always fit in Meilisearch's 511 bytes.
+const MAX_STEM_LEN: usize = 400;
+
+/// `raw` sanitized like [`sanitize_id`] and at most [`MAX_STEM_LEN`] bytes long. A
+/// stem within the bound is returned as [`sanitize_id`] gives it; a longer one is cut
+/// and ends with a short hash of the whole of `raw`, so that long stems sharing a
+/// prefix stay distinct.
+fn bounded_stem(raw: &str) -> String {
+    bound_stem(sanitize_id(raw), raw)
+}
+
+/// `stem`, the id-safe form of `raw`, cut to [`MAX_STEM_LEN`] bytes as
+/// [`bounded_stem`] does.
+fn bound_stem(mut stem: String, raw: &str) -> String {
+    if stem.len() > MAX_STEM_LEN {
+        let hash = origin_tag(raw);
+        truncate_at_char_boundary(&mut stem, MAX_STEM_LEN - hash.len() - 1);
+        stem.push('_');
+        stem.push_str(&hash);
+    }
+    stem
+}
+
+/// Meilisearch's limit on a document id, in bytes.
+const MAX_ID_LEN: usize = 511;
+
+/// `base` followed by `suffix` (`suffixed_id("report_p3", "_0")` → `report_p3_0`),
+/// always within Meilisearch's 511-byte id limit.
+///
+/// While the two fit, this is plain concatenation, so ids that were valid stay
+/// exactly as they were. When they do not, `base` is shortened and followed by a
+/// short hash of the whole of it (`<shortened base>_<hash><suffix>`), so the suffix
+/// is never cut off (which would give every `_<index>` the same id) and two long
+/// bases sharing a prefix still get different ids. Both parts are expected to be
+/// id-safe already (see [`sanitize_id`]).
+pub fn suffixed_id(base: &str, suffix: &str) -> String {
+    if base.len() + suffix.len() <= MAX_ID_LEN {
+        return format!("{base}{suffix}");
+    }
+    let mut short = base.to_owned();
+    truncate_at_char_boundary(
+        &mut short,
+        MAX_ID_LEN.saturating_sub(suffix.len() + 1 + ORIGIN_TAG_LEN),
+    );
+    let mut id = format!("{short}_{}{suffix}", origin_tag(base));
+    truncate_at_char_boundary(&mut id, MAX_ID_LEN);
+    id
 }
 
 /// Shorten `s` to at most `max` bytes. Sanitized ids are ASCII, so this never splits a
@@ -246,11 +340,14 @@ pub struct Blob {
     /// alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// The character encoding the server declared for the bytes: the `charset`
+    /// parameter of the HTTP `Content-Type` they were fetched with, lower-cased
+    /// (`windows-1252`, `shift_jis`). A declaration only: the bytes are not decoded or
+    /// checked against it, and servers are sometimes wrong. `None` for uploads and
+    /// when no charset was declared. [`Blob::mime`] never carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
 }
-
-/// Longest filename stem kept in an id that also carries an origin tag, so the tag and
-/// the plugin's `_<index>` / `_p<page>` suffixes always fit in Meilisearch's 511 bytes.
-const MAX_TAGGED_STEM_LEN: usize = 400;
 
 /// Hex characters of the origin hash kept in ids (48 bits).
 const ORIGIN_TAG_LEN: usize = 12;
@@ -272,12 +369,22 @@ impl Blob {
             mime: mime.into(),
             filename,
             origin: None,
+            charset: None,
         }
     }
 
     /// Set (or clear) [`Blob::origin`]. An empty origin counts as none.
     pub fn with_origin(mut self, origin: Option<String>) -> Self {
         self.origin = origin.filter(|o| !o.is_empty());
+        self
+    }
+
+    /// Set (or clear) [`Blob::charset`]. The label is trimmed and lower-cased; an empty
+    /// one counts as none.
+    pub fn with_charset(mut self, charset: Option<String>) -> Self {
+        self.charset = charset
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty());
         self
     }
 
@@ -290,17 +397,15 @@ impl Blob {
     }
 
     /// `stem` with this blob's origin tag appended (`<stem>_<tag>`), or `stem` unchanged
-    /// when the blob has no origin. The stem is shortened first so the tag survives
-    /// [`sanitize_id`]'s 511-byte cap.
+    /// when the blob has no origin. A stem longer than 400 bytes is shortened first
+    /// (cut, and ended with a short hash of the whole stem), so the tag and the suffix
+    /// a plugin appends survive [`sanitize_id`]'s 511-byte cap.
     pub fn tag_id(&self, stem: impl Into<String>) -> String {
         let stem = stem.into();
         match self.origin_tag() {
+            None if stem.len() > MAX_STEM_LEN => bounded_stem(&stem),
             None => stem,
-            Some(tag) => {
-                let mut stem = sanitize_id(&stem);
-                truncate_at_char_boundary(&mut stem, MAX_TAGGED_STEM_LEN);
-                format!("{stem}_{tag}")
-            }
+            Some(tag) => format!("{}_{tag}", bounded_stem(&stem)),
         }
     }
 
@@ -373,6 +478,9 @@ pub enum ContentRef {
         /// fetched archive). `None` for uploads.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// [`Blob::charset`] of the staged bytes, so it survives staging.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charset: Option<String>,
     },
 }
 
@@ -463,7 +571,8 @@ impl PluginInput {
         }
     }
 
-    /// Approximate serialized size in bytes (used to decide spilling to blob storage).
+    /// Approximate size in bytes of the content carried: ids, titles, text and fields
+    /// (used for metering; document metadata and JSON escaping are not counted).
     pub fn approx_size(&self) -> usize {
         match self {
             PluginInput::Bytes(b) => b.data.len() * 4 / 3,
@@ -559,7 +668,10 @@ impl PluginOutput {
         }
     }
 
-    /// Approximate serialized size in bytes.
+    /// Approximate size in bytes of the content carried: ids, titles, text and fields.
+    /// Used for metering. It leaves out document metadata and JSON escaping, so it is
+    /// not the size of the serialized value: see
+    /// [`PluginOutput::serialized_size_exceeds`] for that.
     pub fn approx_size(&self) -> usize {
         match self {
             PluginOutput::Bytes(b) => b.data.len() * 4 / 3,
@@ -569,6 +681,54 @@ impl PluginOutput {
             PluginOutput::Indexed(_) => 128,
             PluginOutput::Empty => 8,
         }
+    }
+
+    /// Whether this output serializes to more than `limit` bytes of JSON, the form it
+    /// takes in a Temporal payload. Exact (metadata, escaping and nesting included),
+    /// without building the JSON, and it stops as soon as the limit is passed.
+    ///
+    /// An output that cannot be serialized at all also returns `true`: the caller's
+    /// own serialization then reports the error.
+    pub fn serialized_size_exceeds(&self, limit: usize) -> bool {
+        // Binary content is base64-encoded in one piece: rule out the large ones from
+        // their length alone, before any of it is encoded.
+        if self.base64_len() > limit {
+            return true;
+        }
+        serde_json::to_writer(LimitedCounter { left: limit }, self).is_err()
+    }
+
+    /// Bytes the base64 of every [`PluginOutput::Bytes`] in here takes once serialized.
+    fn base64_len(&self) -> usize {
+        match self {
+            PluginOutput::Bytes(b) => b.data.len().div_ceil(3).saturating_mul(4),
+            PluginOutput::Many(m) => m
+                .iter()
+                .map(PluginOutput::base64_len)
+                .fold(0, usize::saturating_add),
+            _ => 0,
+        }
+    }
+}
+
+/// A writer that keeps nothing and fails once more than `left` bytes went through.
+struct LimitedCounter {
+    left: usize,
+}
+
+impl std::io::Write for LimitedCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.left.checked_sub(buf.len()) {
+            Some(left) => {
+                self.left = left;
+                Ok(buf.len())
+            }
+            None => Err(std::io::Error::other("size limit exceeded")),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -936,7 +1096,8 @@ pub struct PipelineTrigger {
     /// MIME types (exact match, or `type/*` wildcard).
     #[serde(default)]
     pub content_types: Vec<String>,
-    /// Glob on the filename (e.g. `contract_*.pdf`).
+    /// Glob on the filename (e.g. `contract_*.pdf`), at most
+    /// [`MAX_FILENAME_PATTERN_LEN`] characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename_pattern: Option<String>,
     /// Index to write to when this pipeline is selected (overrides header/query).
@@ -1011,6 +1172,28 @@ pub enum PipelineError {
         /// The path.
         path: String,
     },
+    /// A `meili_indexer` step sets `prune: true` and fans out over parts of its
+    /// input: each branch would see only some documents of a parent and delete the
+    /// ones its sibling branches just added.
+    #[error(
+        "step {step:?} sets `prune` on meili_indexer with fan_out {path:?}: each branch \
+         would delete the documents its sibling branches add; remove fan_out (or use \"$\") \
+         or turn prune off"
+    )]
+    PruneWithFanOut {
+        /// The step.
+        step: String,
+        /// The fan-out path.
+        path: String,
+    },
+    /// `trigger.filename_pattern` is longer than [`MAX_FILENAME_PATTERN_LEN`].
+    #[error("trigger.filename_pattern is {len} characters long, the maximum is {max}")]
+    FilenamePatternTooLong {
+        /// Length of the pattern, in characters.
+        len: usize,
+        /// The maximum.
+        max: usize,
+    },
 }
 
 impl PipelineDefinition {
@@ -1054,9 +1237,37 @@ impl PipelineDefinition {
         }
     }
 
+    /// [`validate`](Self::validate) plus the checks that only apply when a pipeline is
+    /// created or updated: a `trigger.filename_pattern` longer than
+    /// [`MAX_FILENAME_PATTERN_LEN`] is rejected.
+    ///
+    /// The save paths call this one. The worker calls `validate` at the start of every
+    /// job and on replay, so a pipeline stored before such a check existed keeps
+    /// running and is only refused on its next save.
+    pub fn validate_for_save(&self) -> Result<Vec<String>, PipelineError> {
+        let order = self.validate()?;
+        if let Some(pattern) = self
+            .trigger
+            .as_ref()
+            .and_then(|t| t.filename_pattern.as_deref())
+        {
+            let len = pattern.chars().count();
+            if len > MAX_FILENAME_PATTERN_LEN {
+                return Err(PipelineError::FilenamePatternTooLong {
+                    len,
+                    max: MAX_FILENAME_PATTERN_LEN,
+                });
+            }
+        }
+        Ok(order)
+    }
+
     /// Validate structure and return a topological order (Kahn's algorithm). Steps
     /// with no mutual dependency are ordered by their position in `steps` for
     /// determinism.
+    ///
+    /// Structure only: the worker runs it on every job, so a check that a stored
+    /// pipeline may predate belongs in [`validate_for_save`](Self::validate_for_save).
     pub fn validate(&self) -> Result<Vec<String>, PipelineError> {
         if self.uid.is_empty()
             || !self
@@ -1090,6 +1301,16 @@ impl PipelineDefinition {
                 }
                 if !matches!(path.as_str(), "$.documents" | "$.many" | "$") {
                     return Err(PipelineError::FanOutPath {
+                        step: s.id.clone(),
+                        path: path.clone(),
+                    });
+                }
+                // `prune` assumes the step sees every current document of a parent.
+                if s.plugin == INDEXER_PLUGIN
+                    && path != "$"
+                    && s.config.get("prune") == Some(&serde_json::Value::Bool(true))
+                {
+                    return Err(PipelineError::PruneWithFanOut {
                         step: s.id.clone(),
                         path: path.clone(),
                     });
@@ -1241,21 +1462,53 @@ pub fn mime_matches(pattern: &str, mime: &str) -> bool {
     pattern == mime
 }
 
+/// Longest `trigger.filename_pattern` a pipeline may be saved with, in characters.
+pub const MAX_FILENAME_PATTERN_LEN: usize = 256;
+
+/// Longest filename (its last path segment, in bytes) [`glob_match`] compares against a
+/// pattern. A longer name matches no pattern. Filesystems stop at 255 bytes; the
+/// filename of an ingest request is only bounded by the request body.
+pub const MAX_GLOB_NAME_BYTES: usize = 1024;
+
 /// Minimal glob: `*` (any run) and `?` (one char), case-insensitive on the basename.
+///
+/// Runs in `O(pattern x name)` time at worst and constant stack, whatever the number
+/// of `*`: both strings come from tenants. The name is bounded by
+/// [`MAX_GLOB_NAME_BYTES`], and [`PipelineDefinition::validate_for_save`] bounds the
+/// pattern.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if name.len() > MAX_GLOB_NAME_BYTES {
+        return false;
+    }
     let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some('*'), _) => rec(&p[1..], n) || (!n.is_empty() && rec(p, &n[1..])),
-            (Some('?'), Some(_)) => rec(&p[1..], &n[1..]),
-            (Some(a), Some(b)) if a == b => rec(&p[1..], &n[1..]),
-            _ => false,
+    let (mut pi, mut ni) = (0, 0);
+    // The last `*` seen, and the name position it is currently assumed to end at. A
+    // mismatch after it makes that `*` swallow one more character; an earlier `*`
+    // never needs revisiting, because the latest one can absorb anything it could.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        match p.get(pi) {
+            Some('*') => {
+                star = Some((pi, ni));
+                pi += 1;
+            }
+            Some(&c) if c == '?' || c == n[ni] => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((star_pi, star_ni)) => {
+                    star = Some((star_pi, star_ni + 1));
+                    pi = star_pi + 1;
+                    ni = star_ni + 1;
+                }
+                None => return false,
+            },
         }
     }
-    rec(&p, &n)
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1811,12 @@ pub struct StepActivityInput {
     /// Total branches when fanned out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_total: Option<usize>,
+    /// When a later step merges this step's output with others (it has several
+    /// `depends_on`), how many outputs the widest such step merges; `None` otherwise.
+    /// The merged input is one activity payload, so the worker spills this output
+    /// against that share of its spill threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_total: Option<usize>,
     /// Tenant id for logging / scoping.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "project_id")]
     pub tenant_id: Option<String>,
@@ -1601,7 +1860,9 @@ pub struct IndexerConfig {
     /// has one keeps its own.
     #[serde(default = "default_primary_key")]
     pub primary_key: String,
-    /// Create the index if missing.
+    /// Create the index if missing. When `false`, a missing index fails the step
+    /// (non-retryable) and no documents are sent: an addition would have Meilisearch
+    /// create the index implicitly.
     #[serde(default = "default_true")]
     pub auto_create_index: bool,
     /// Maximum documents per `addDocuments` request.
@@ -1621,6 +1882,15 @@ pub struct IndexerConfig {
     /// `timeout_secs`, or Temporal cuts the activity first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_timeout_secs: Option<u64>,
+    /// After the additions succeed, delete the derived documents of every parent this
+    /// step indexed (same `_meta.parent_id`) that this step did not send: the chunks a
+    /// shorter version of a document no longer produces. Off by default: the indexer
+    /// never deletes unless asked. Needs `wait_for_completion`, a key allowed to delete
+    /// documents, and `_meta.parent_id` plus the primary key in the index's
+    /// filterable attributes. A step with `prune` and a `fan_out` other than `$` is
+    /// rejected ([`PipelineError::PruneWithFanOut`]).
+    #[serde(default)]
+    pub prune: bool,
 }
 
 fn default_primary_key() -> String {
@@ -1660,7 +1930,7 @@ pub fn pinned_connection(config: &serde_json::Value) -> Option<&str> {
 ///   step set — exactly the behaviour pipelines relied on before connections existed.
 ///
 /// Every other key (`tenant_id`, `index`, `region`) only fills what the step left
-/// unset, in both cases.
+/// unset (absent, `null` or a blank string), in both cases.
 pub fn inject_meili_context(config: &mut serde_json::Value, ctx: &MeiliContext) {
     if !config.is_object() {
         *config = serde_json::Value::Object(Default::default());
@@ -1678,9 +1948,20 @@ pub fn inject_meili_context(config: &mut serde_json::Value, ctx: &MeiliContext) 
         if destination && pinned {
             continue;
         }
-        if destination || !obj.contains_key(&k) {
+        if destination || obj.get(&k).is_none_or(is_unset) {
             obj.insert(k, v);
         }
+    }
+}
+
+/// Whether a step-config value counts as not set: `null` or a blank string. The same
+/// rule as [`PipelineDefinition::step_indexes`] and [`pinned_connection`], so the
+/// gateway and the workflow agree on which index a step names.
+fn is_unset(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        _ => false,
     }
 }
 
@@ -1790,6 +2071,110 @@ mod tests {
     }
 
     #[test]
+    fn a_long_upload_path_keeps_the_per_record_suffix() {
+        // No origin: an archive member whose path is longer than an id can be.
+        let name = format!("{}a.pdf", "d/".repeat(300));
+        let blob = Blob::new(vec![], "application/pdf", Some(name));
+        let stem = blob.id_stem("");
+        assert!(stem.len() <= MAX_STEM_LEN, "{}", stem.len());
+        let id = |suffix: &str| Document::with_id(format!("{stem}{suffix}"), "").id;
+        assert!(id("_p1").ends_with("_p1"), "{}", id("_p1"));
+        assert_ne!(id("_p1"), id("_p2"));
+        assert_ne!(id("_p1"), id("_p10"));
+        // The longest suffix a plugin appends: an XLSX sheet name and row number.
+        let row = format!("_{}_r1048576", "s".repeat(31));
+        assert!(id(&row).ends_with(&row), "{}", id(&row));
+        // The same path gives the same stem on every run.
+        let again = Blob::new(vec![], "application/pdf", blob.filename.clone());
+        assert_eq!(stem, again.id_stem(""));
+    }
+
+    #[test]
+    fn long_paths_that_share_a_prefix_get_different_stems() {
+        let prefix = "d/".repeat(250);
+        let path = |leaf: &str| Some(format!("{prefix}{leaf}.json"));
+        for origin in [None, Some("https://a.example/export.zip")] {
+            let a = json_blob(path("january").as_deref(), origin).id_stem("json");
+            let b = json_blob(path("february").as_deref(), origin).id_stem("json");
+            assert_ne!(a, b, "origin {origin:?}");
+            let id = Document::with_id(format!("{a}_123456"), "").id;
+            assert!(id.ends_with("_123456"), "{id}");
+        }
+        // Stems built by a plugin itself and passed to `tag_id` are bounded the same way.
+        for origin in [None, Some("source:/s")] {
+            let blob = json_blob(None, origin);
+            let a = blob.tag_id(format!("{}_a", "x".repeat(500)));
+            let b = blob.tag_id(format!("{}_b", "x".repeat(500)));
+            assert_ne!(a, b, "origin {origin:?}");
+            let id = Document::with_id(format!("{a}_t10"), "").id;
+            assert!(id.ends_with("_t10"), "{id}");
+        }
+    }
+
+    #[test]
+    fn stems_within_the_bound_are_unchanged() {
+        // Ids already indexed are built from these: only a stem too long to leave room
+        // for a suffix is shortened.
+        let longest = "x".repeat(MAX_STEM_LEN);
+        assert_eq!(
+            filename_id_stem(Some(&format!("{longest}.pdf"))).as_deref(),
+            Some(longest.as_str())
+        );
+        // The bound is on the sanitized stem: 300 two-byte characters are 300 bytes of
+        // id, plus the hash a non-ASCII name carries.
+        let accented = "é".repeat(300);
+        assert_eq!(
+            filename_id_stem(Some(&format!("{accented}.pdf"))),
+            Some(format!("{}_{}", "_".repeat(300), origin_tag(&accented)))
+        );
+        assert_eq!(json_blob(None, None).tag_id(longest.clone()), longest);
+        assert_eq!(json_blob(None, None).tag_id("a b"), "a b");
+        let tagged = json_blob(None, Some("source:/s")).tag_id(longest.clone());
+        assert_eq!(tagged, format!("{longest}_{}", origin_tag("source:/s")));
+    }
+
+    #[test]
+    fn serialized_size_is_measured_exactly() {
+        let mut doc = Document::with_id("a\"b", "line\nbreak \u{1} é");
+        doc.title = Some("t".into());
+        doc.fields.insert("k".into(), serde_json::json!([1, "two"]));
+        doc.meta.source = Some("s3://bucket/key".into());
+        doc.meta
+            .extra
+            .insert("raw".into(), serde_json::json!({"nested": "x".repeat(100)}));
+        let outputs = [
+            PluginOutput::Empty,
+            PluginOutput::Documents(vec![]),
+            PluginOutput::Documents(vec![doc.clone(), doc.clone()]),
+            PluginOutput::Bytes(Blob::new(vec![7; 1000], "audio/wav", Some("a.wav".into()))),
+            PluginOutput::Many(vec![
+                PluginOutput::Documents(vec![doc]),
+                PluginOutput::Bytes(Blob::new(vec![7; 10], "audio/wav", None)),
+                PluginOutput::Indexed(IndexReport::default()),
+            ]),
+        ];
+        for out in outputs {
+            let exact = serde_json::to_vec(&out).unwrap().len();
+            assert!(!out.serialized_size_exceeds(exact), "{out:?}");
+            assert!(!out.serialized_size_exceeds(usize::MAX), "{out:?}");
+            assert!(out.serialized_size_exceeds(exact - 1), "{out:?}");
+            assert!(out.serialized_size_exceeds(0), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn serialized_size_counts_what_approx_size_leaves_out() {
+        // Metadata is not metered, but it is part of the payload.
+        let mut doc = Document::with_id("a", "tiny");
+        doc.meta
+            .extra
+            .insert("raw".into(), serde_json::json!("x".repeat(3_000_000)));
+        let out = PluginOutput::Documents(vec![doc]);
+        assert!(out.approx_size() < 1024);
+        assert!(out.serialized_size_exceeds(1024 * 1024));
+    }
+
+    #[test]
     fn payloads_without_an_origin_still_deserialize() {
         // Workflow histories recorded before the field existed.
         let blob: Blob =
@@ -1806,6 +2191,24 @@ mod tests {
     }
 
     #[test]
+    fn suffixed_ids_always_fit_and_stay_distinct() {
+        assert_eq!(suffixed_id("report_p1", "_0"), "report_p1_0");
+        let long = "a".repeat(511);
+        let ids: Vec<String> = (0..12)
+            .map(|i| suffixed_id(&long, &format!("_{i}")))
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            assert!(id.len() <= 511, "{}", id.len());
+            assert!(id.ends_with(&format!("_{i}")), "{id}");
+        }
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+        // Two long bases sharing a prefix do not collide once shortened.
+        let other = format!("{}b", "a".repeat(510));
+        assert_ne!(suffixed_id(&long, "_0"), suffixed_id(&other, "_0"));
+    }
+
+    #[test]
     fn id_stems_keep_folders_and_drop_the_extension() {
         let stem = |f: &str| filename_id_stem(Some(f));
         assert_eq!(stem("Annual Report.pdf").as_deref(), Some("Annual_Report"));
@@ -1818,6 +2221,39 @@ mod tests {
         assert_eq!(stem("dir/").as_deref(), None);
         assert_eq!(stem(""), None);
         assert_eq!(filename_id_stem(None), None);
+    }
+
+    #[test]
+    fn non_ascii_names_get_distinct_ids() {
+        let stem = |f: &str| filename_id_stem(Some(f)).unwrap();
+        assert_ne!(stem("報告.pdf"), stem("計画.pdf"));
+        assert_ne!(stem("docs/報告.pdf"), stem("docs/計画.pdf"));
+        // Readable where it can be, and stable: the hash is of the original name.
+        assert_eq!(stem("Café.pdf"), format!("Caf__{}", origin_tag("Café")));
+        assert_eq!(stem("Café.pdf"), stem("Café.docx"));
+        assert_eq!(name_id_part("売上"), format!("___{}", origin_tag("売上")));
+        assert_ne!(name_id_part("売上"), name_id_part("在庫"));
+        // Still within the stem budget for a long non-ASCII path.
+        let long = format!("{}.pdf", "報".repeat(300));
+        let s = stem(&long);
+        assert!(s.len() <= MAX_STEM_LEN, "{}", s.len());
+        assert_ne!(s, stem(&format!("{}計.pdf", "報".repeat(299))));
+    }
+
+    #[test]
+    fn ascii_names_keep_their_ids() {
+        // Pinned: an ASCII name, punctuation included, gives the id it always did, so
+        // re-ingesting such a file still replaces its documents.
+        for (name, id) in [
+            ("Annual Report.pdf", "Annual_Report"),
+            ("Q1 (a).xlsx", "Q1__a_"),
+            ("reports/eu/a.b.c.pdf", "reports_eu_a_b_c"),
+        ] {
+            assert_eq!(filename_id_stem(Some(name)).as_deref(), Some(id));
+            assert_eq!(name_id_part(name), sanitize_id(name));
+        }
+        let blob = Blob::new(vec![], "application/pdf", Some("Annual Report.pdf".into()));
+        assert_eq!(blob.id_stem(""), "Annual_Report");
     }
 
     #[test]
@@ -1944,6 +2380,50 @@ mod tests {
     }
 
     #[test]
+    fn prune_cannot_be_combined_with_a_fan_out_that_splits_the_indexer_input() {
+        // Each branch would see only some chunks of a parent and delete the ones its
+        // sibling branches just added.
+        let indexer = |fan_out: Option<&str>, config: serde_json::Value| {
+            let mut s = StepDefinition::new("i", INDEXER_PLUGIN)
+                .depends_on(["a"])
+                .config(config);
+            s.fan_out = fan_out.map(str::to_owned);
+            pipeline(vec![step("a", &[]), s])
+        };
+        let prune = serde_json::json!({"prune": true});
+        for path in ["$.documents", "$.many"] {
+            assert_eq!(
+                indexer(Some(path), prune.clone()).validate(),
+                Err(PipelineError::PruneWithFanOut {
+                    step: "i".into(),
+                    path: path.into(),
+                }),
+                "{path}"
+            );
+        }
+        // `$` hands the whole upstream output to one activity, and without prune a
+        // fanned-out indexer only adds.
+        assert!(indexer(Some("$"), prune.clone()).validate().is_ok());
+        assert!(indexer(None, prune).validate().is_ok());
+        assert!(
+            indexer(Some("$.documents"), serde_json::json!({"prune": false}))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            indexer(Some("$.documents"), serde_json::json!({}))
+                .validate()
+                .is_ok()
+        );
+        // Another plugin's `prune` key means nothing here.
+        let mut other = StepDefinition::new("o", "x")
+            .depends_on(["a"])
+            .config(serde_json::json!({"prune": true}));
+        other.fan_out = Some("$.documents".into());
+        assert!(pipeline(vec![step("a", &[]), other]).validate().is_ok());
+    }
+
+    #[test]
     fn normalize_makes_linear_pipeline_sequential() {
         let mut p = pipeline(vec![step("a", &[]), step("b", &[]), step("c", &[])]);
         p.normalize();
@@ -2022,6 +2502,109 @@ steps:
         assert!(glob_match("*.csv", "data.csv"));
         assert!(glob_match("report_?.md", "report_1.md"));
         assert!(!glob_match("report_?.md", "report_10.md"));
+    }
+
+    #[test]
+    fn glob_matching_stays_fast_on_patterns_with_many_stars() {
+        // Backtracking over every star made this take ~C(100,12) steps: run it on a
+        // thread so a regression fails the test rather than hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let name = "a".repeat(100);
+            let miss = glob_match("*a*a*a*a*a*a*a*a*a*a*a*a*b", &name);
+            let hit = glob_match("*a*a*a*a*a*a*a*a*a*a*a*a*", &name);
+            let _ = tx.send((miss, hit));
+        });
+        let (miss, hit) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("glob_match must not take exponential time");
+        assert!(!miss);
+        assert!(hit);
+    }
+
+    #[test]
+    fn glob_matching_handles_stars_question_marks_and_edges() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("***", "anything.bin"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("a*b*c", "aXbXbXc"));
+        assert!(!glob_match("a*b*c", "aXbXbX"));
+        assert!(glob_match("*.tar.gz", "a.tar.tar.gz"));
+        assert!(!glob_match("*.tar.gz", "a.tar.gz.bak"));
+        assert!(glob_match("a?c*", "abc"));
+        assert!(!glob_match("a?c*", "ac"));
+        assert!(glob_match("*é?.txt", "cafés.txt"));
+        // Only the basename is matched, whichever separator the path uses.
+        assert!(glob_match("*.csv", "C:\\exports\\Data.CSV"));
+        assert!(!glob_match("exports*", "exports/data.csv"));
+    }
+
+    #[test]
+    fn glob_matching_never_matches_an_oversized_filename() {
+        // The filename is caller-sized (a JSON or multipart field): past the bound it
+        // matches no pattern, so the match time stays bounded.
+        let long = format!("{}.pdf", "a".repeat(MAX_GLOB_NAME_BYTES));
+        assert!(!glob_match("*.pdf", &long));
+        assert!(!glob_match("*", &long));
+        let at_limit = format!("{}.pdf", "a".repeat(MAX_GLOB_NAME_BYTES - 4));
+        assert!(glob_match("*.pdf", &at_limit));
+        // The bound is on the basename, not on the folders before it.
+        let nested = format!("{}/a.pdf", "d".repeat(MAX_GLOB_NAME_BYTES));
+        assert!(glob_match("*.pdf", &nested));
+    }
+
+    #[test]
+    fn saving_rejects_an_oversized_filename_pattern() {
+        let with_pattern = |pattern: String| {
+            let mut p = pipeline_with(vec![StepDefinition::new("p", "json_parser")]);
+            p.trigger = Some(PipelineTrigger {
+                filename_pattern: Some(pattern),
+                ..Default::default()
+            });
+            p
+        };
+        let at_limit = format!("*{}", "a".repeat(MAX_FILENAME_PATTERN_LEN - 1));
+        assert_eq!(
+            with_pattern(at_limit).validate_for_save().unwrap(),
+            vec!["p"]
+        );
+        // Counted in characters, like the `maxLength` of the OpenAPI schema.
+        let multibyte = "é".repeat(MAX_FILENAME_PATTERN_LEN);
+        assert!(with_pattern(multibyte).validate_for_save().is_ok());
+        let too_long = format!("*{}", "a".repeat(MAX_FILENAME_PATTERN_LEN));
+        assert_eq!(
+            with_pattern(too_long).validate_for_save(),
+            Err(PipelineError::FilenamePatternTooLong {
+                len: MAX_FILENAME_PATTERN_LEN + 1,
+                max: MAX_FILENAME_PATTERN_LEN,
+            })
+        );
+        // A structural error is still reported on save.
+        let mut empty = with_pattern("*.pdf".into());
+        empty.steps.clear();
+        assert_eq!(empty.validate_for_save(), Err(PipelineError::Empty));
+    }
+
+    #[test]
+    fn a_stored_oversized_filename_pattern_still_yields_the_step_order() {
+        // The worker runs `validate` at the start of every job (and on every replay) to
+        // get the step order. A pipeline saved before the cap keeps running: only its
+        // next save is refused.
+        let mut p = pipeline_with(vec![
+            StepDefinition::new("p", "json_parser"),
+            StepDefinition::new("i", "meili_indexer").depends_on(["p"]),
+        ]);
+        p.trigger = Some(PipelineTrigger {
+            filename_pattern: Some("*a".repeat(MAX_FILENAME_PATTERN_LEN)),
+            ..Default::default()
+        });
+        assert_eq!(p.validate().unwrap(), vec!["p", "i"]);
+        assert!(matches!(
+            p.validate_for_save(),
+            Err(PipelineError::FilenamePatternTooLong { .. })
+        ));
     }
 
     #[test]
@@ -2163,6 +2746,30 @@ steps:
     }
 
     #[test]
+    fn a_blank_or_null_step_index_is_filled_from_the_request() {
+        // `step_indexes` (the gateway's view) ignores these, so the request's index was
+        // accepted up front: it has to reach the indexer.
+        for blank in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::Value::Null,
+        ] {
+            let mut config = serde_json::json!({ "index": blank, "region": blank });
+            inject_meili_context(&mut config, &request_ctx());
+            assert_eq!(config["index"], "from-request", "index was {blank:?}");
+            assert_eq!(config["region"], "eu", "region was {blank:?}");
+
+            let mut pinned = serde_json::json!({ "connection": "prod", "index": blank });
+            inject_meili_context(&mut pinned, &request_ctx());
+            assert_eq!(pinned["index"], "from-request", "index was {blank:?}");
+        }
+        // A blank the request cannot fill stays as the step wrote it.
+        let mut config = serde_json::json!({ "index": "" });
+        inject_meili_context(&mut config, &MeiliContext::default());
+        assert_eq!(config["index"], "");
+    }
+
+    #[test]
     fn without_a_connection_the_request_still_overwrites_host_and_key() {
         // Today's behaviour, unchanged: an inline host/key in the step config is replaced.
         let mut config = serde_json::json!({ "host": "https://inline.example", "api_key": "x" });
@@ -2231,6 +2838,7 @@ steps:
         assert_eq!(v["content"], "hello");
         assert_eq!(v["price"], 3);
         assert_eq!(v["_meta"]["page"], 2);
+        assert_eq!(d.into_index_json(), v);
     }
 
     #[test]
@@ -2240,6 +2848,36 @@ steps:
         let v = d.to_index_json();
         assert!(v.get("_meta").is_none(), "{v}");
         assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        let ctx = MeiliContext {
+            host: Some("https://ms.example".into()),
+            api_key: Some("SECRET".into()),
+            index: Some("movies".into()),
+            ..Default::default()
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        // Everything else, and whether a key is set at all, stays visible.
+        assert!(shown.contains("https://ms.example") && shown.contains("movies"));
+        assert!(shown.contains(r#"api_key: Some("<redacted>")"#), "{shown}");
+        assert!(format!("{:?}", MeiliContext::default()).contains("api_key: None"));
+        assert!(!format!("{ctx:#?}").contains("SECRET"));
+
+        // The types that carry a context are covered by it.
+        let input = PipelineWorkflowInput {
+            job_id: Uuid::nil(),
+            pipeline: pipeline_with(vec![StepDefinition::new("i", INDEXER_PLUGIN)]),
+            input: PluginInput::Empty,
+            context: ctx.clone(),
+        };
+        assert!(!format!("{input:?}").contains("SECRET"));
+        let config: IndexerConfig =
+            serde_json::from_value(serde_json::to_value(&ctx).unwrap()).unwrap();
+        assert_eq!(config.meili.api_key.as_deref(), Some("SECRET"));
+        assert!(!format!("{config:?}").contains("SECRET"));
     }
 
     #[test]
@@ -2344,6 +2982,7 @@ steps:
             input: PluginInput::Documents(vec![]),
             branch: None,
             branch_total: None,
+            merge_total: None,
             tenant_id: Some("acme".into()),
         };
         let back: StepActivityInput =
@@ -2364,5 +3003,44 @@ steps:
         let config: IndexerConfig =
             serde_json::from_value(with_old_key(serde_json::to_value(&context).unwrap())).unwrap();
         assert_eq!(config.meili.tenant_id.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn a_blob_charset_is_optional_on_the_wire() {
+        // No charset: the JSON is what it was before the field existed.
+        let blob = Blob::new(b"x".to_vec(), "text/html", None);
+        let json = serde_json::to_value(&blob).unwrap();
+        assert!(json.get("charset").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<Blob>(json).unwrap(), blob);
+
+        let blob = blob.with_charset(Some(" Windows-1252 ".into()));
+        assert_eq!(blob.charset.as_deref(), Some("windows-1252"));
+        assert_eq!(blob.mime, "text/html");
+        let json = serde_json::to_value(&blob).unwrap();
+        assert_eq!(json["charset"], "windows-1252");
+        assert_eq!(serde_json::from_value::<Blob>(json).unwrap(), blob);
+        assert_eq!(blob.with_charset(Some(String::new())).charset, None);
+
+        // A staged ref written before the field existed still reads.
+        let old = serde_json::json!({"kind": "staged", "uri": "jobs/j/input/a"});
+        let staged: ContentRef = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(staged, ContentRef::Staged { charset: None, .. }));
+        assert_eq!(serde_json::to_value(&staged).unwrap(), old);
+    }
+
+    #[test]
+    fn a_step_input_recorded_before_merge_total_still_deserializes() {
+        // What a workflow history written by an older worker holds.
+        let old = serde_json::json!({
+            "job_id": uuid::Uuid::nil(),
+            "step_id": "a",
+            "plugin": "x",
+            "config": {},
+            "input": {"type": "empty"},
+        });
+        let step: StepActivityInput = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(step.merge_total, None);
+        // And `None` adds nothing to the recorded input.
+        assert_eq!(serde_json::to_value(&step).unwrap(), old);
     }
 }

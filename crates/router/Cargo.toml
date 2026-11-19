@@ -13,3 +13,8 @@ infer.workspace = true
 mime_guess.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Builds real OLE compound files for the detection tests; already in the tree
+# through `infer`.
+cfb = "0.14"

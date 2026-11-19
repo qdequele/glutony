@@ -15,14 +15,12 @@
 //! and the Lab. [`authorize_job_read`] accepts either, and with auth on refuses a caller
 //! that is neither rather than showing it every tenant's jobs.
 
+use crate::context::{bearer_token, header, resolve_tenant_id, secret_eq};
+use crate::error::GatewayError;
+use crate::state::{AppState, GatewayConfig};
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
-use subtle::ConstantTimeEq;
-
-use crate::context::{bearer_token, header, resolve_tenant_id};
-use crate::error::GatewayError;
-use crate::state::{AppState, GatewayConfig};
 
 /// Header the Lab (or an operator) names the tenant with.
 pub const H_GLUTONY_TENANT_ID: &str = "x-glutony-tenant-id";
@@ -104,7 +102,7 @@ pub fn authorize_job_read(
     if !management_auth_enabled(config) {
         return resolve_tenant_id(headers, config);
     }
-    if bearer_token(headers).is_some_and(|token| management_principal(config, &token).is_some()) {
+    if bearer_token(headers).is_some_and(|token| is_management_token(config, &token)) {
         return Ok(authorize(headers, config)?.tenant_id);
     }
     match resolve_tenant_id(headers, config)? {
@@ -113,6 +111,12 @@ pub fn authorize_job_read(
             "missing or invalid management token, and no trusted edge tenant".into(),
         )),
     }
+}
+
+/// Whether `token` is one of the configured management secrets (`LAB_SERVICE_TOKEN`,
+/// `ADMIN_API_KEY`), and so not a Meilisearch key.
+pub(crate) fn is_management_token(config: &GatewayConfig, token: &str) -> bool {
+    management_principal(config, token).is_some()
 }
 
 /// The management principal a bearer token authenticates, if any.
@@ -128,7 +132,7 @@ fn management_principal(config: &GatewayConfig, token: &str) -> Option<Principal
 
 /// Constant-time comparison against a configured secret.
 fn token_matches(expected: Option<&str>, got: &str) -> bool {
-    expected.is_some_and(|e| bool::from(e.as_bytes().ct_eq(got.as_bytes())))
+    expected.is_some_and(|e| secret_eq(e, got))
 }
 
 impl FromRequestParts<AppState> for Scope {

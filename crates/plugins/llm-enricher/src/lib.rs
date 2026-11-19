@@ -23,6 +23,12 @@
 //! 6. Precise error mapping: transient upstream failures → [`PluginError::Retryable`],
 //!    everything the operator must fix → `NonRetryable` / `InvalidConfig` /
 //!    `InvalidInput`. Never leak secrets into errors or logs.
+//! 7. A transient failure (429, 5xx, dropped connection) is retried per request a few
+//!    times with backoff before it fails the step (see the `retry` module), so one
+//!    rate-limited document does not restart the whole batch.
+//! 8. Every finished document's result is checkpointed (see the `checkpoint` module),
+//!    so when the step still fails, Temporal's retry of the activity resumes from the
+//!    documents already enriched instead of paying for them again.
 //!
 //! ## Pipeline usage
 //!
@@ -60,13 +66,23 @@
 //! |---|---|
 //! | `title` (string) | `Document::title` (only if the document has none, unless `merge_strategy: replace`) |
 //! | `language` (string) | `DocumentMeta::language` (same rule) |
+//! | `title` / `language` (any other type, e.g. `null`) | ignored |
 //! | `summary`, `keywords`, any other key | `Document::fields` (existing keys kept under `merge`, overwritten under `replace`) |
+//! | any key starting with `_` (`_geo`, `_vectors`, …) | dropped, unless the step lists it in `allow_reserved` (then as any other key) |
 //!
 //! A reply that is not a JSON object is stored verbatim in `fields.llm_raw` and the
 //! document is otherwise left unchanged; a single bad reply never fails the batch.
+//!
+//! A document the provider declines (a 200 whose first choice has
+//! `finish_reason: content_filter`, a `message.refusal`, or no usable content) is kept
+//! un-enriched with [`DECLINED_FIELD`] (`fields.llm_declined`) set to
+//! `content_filter`, `refusal` or `empty`, and the batch goes on. `on_refusal: fail`
+//! fails the step instead. HTTP errors (401, 402, 403, 400, …) are not refusals and
+//! keep their classes above.
 
 #![forbid(unsafe_code)]
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -75,6 +91,11 @@ use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
+
+mod checkpoint;
+use checkpoint::{Checkpoint, MAX_CHECKPOINT_BYTES};
+mod retry;
+use retry::{Failure, RetryPolicy, with_retry};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "llm_enricher";
@@ -106,6 +127,53 @@ pub enum MergeStrategy {
     Replace,
 }
 
+/// What a document the provider declines to answer for does to the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRefusal {
+    /// Keep the document un-enriched, with [`DECLINED_FIELD`] naming the reason, and
+    /// go on with the batch.
+    #[default]
+    Keep,
+    /// Fail the step (`NonRetryable`).
+    Fail,
+}
+
+/// Field set on a document the provider declined to enrich, holding the
+/// [`Declined`] reason (`content_filter`, `refusal` or `empty`).
+pub const DECLINED_FIELD: &str = "llm_declined";
+
+/// Why a completion carries no usable reply for one document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Declined {
+    /// `finish_reason: content_filter`: the provider's filter stopped the reply.
+    ContentFilter,
+    /// The model refused (`message.refusal`).
+    Refusal,
+    /// No choice, or a null, absent or blank `message.content` (a tool call, say).
+    Empty,
+}
+
+impl Declined {
+    /// The value written into [`DECLINED_FIELD`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentFilter => "content_filter",
+            Self::Refusal => "refusal",
+            Self::Empty => "empty",
+        }
+    }
+
+    /// The step failure under `on_refusal: fail`.
+    fn into_error(self) -> PluginError {
+        PluginError::non_retryable(format!(
+            "LLM declined the document ({}); set on_refusal: keep to index it un-enriched",
+            self.as_str()
+        ))
+    }
+}
+
 /// The step `config:` block. Every field has a default so `config: {}` is valid.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmEnricherConfig {
@@ -133,6 +201,15 @@ pub struct LlmEnricherConfig {
     /// System prompt; defaults to [`DEFAULT_SYSTEM_PROMPT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    /// Reply keys starting with `_` that may reach the document (for example
+    /// `["_geo"]`). Every other `_` key is dropped: Meilisearch reserves them, and a
+    /// malformed one (`"_geo": "Paris"`) makes it reject the whole batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_reserved: Vec<String>,
+    /// What a document the provider declines (content filter, refusal, empty reply)
+    /// does: kept un-enriched with a marker (default), or fails the step.
+    #[serde(default)]
+    pub on_refusal: OnRefusal,
 }
 
 fn default_prompt() -> String {
@@ -156,6 +233,8 @@ impl Default for LlmEnricherConfig {
             max_input_chars: default_max_input_chars(),
             merge_strategy: MergeStrategy::Merge,
             system_prompt: None,
+            allow_reserved: Vec::new(),
+            on_refusal: OnRefusal::Keep,
         }
     }
 }
@@ -201,6 +280,14 @@ struct LlmClient {
 #[derive(Clone)]
 pub struct LlmEnricherPlugin {
     client: Option<LlmClient>,
+    /// HTTP client for the Lab's target when there is no env client, built on first use
+    /// and shared by clones, so a keyless worker keeps one connection pool across steps.
+    /// The team key travels per request, so sharing the pool shares no credential.
+    lab_http: Arc<OnceLock<reqwest::Client>>,
+    /// In-plugin retry of one request's transient failures (see [`retry`]).
+    retry: RetryPolicy,
+    /// Most bytes of results a checkpoint holds (see [`checkpoint`]).
+    checkpoint_budget: usize,
 }
 
 impl std::fmt::Debug for LlmEnricherPlugin {
@@ -233,7 +320,12 @@ impl LlmEnricherPlugin {
 
     /// An instance whose `execute` always fails with `InvalidConfig("LLM_API_KEY not set")`.
     pub fn disabled() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
+        }
     }
 
     /// Read `LLM_API_KEY` (required), `LLM_BASE_URL`, `LLM_MODEL` from the environment.
@@ -273,6 +365,9 @@ impl LlmEnricherPlugin {
                 http,
                 lab: None,
             }),
+            lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -287,12 +382,7 @@ impl LlmEnricherPlugin {
         if let Some(target) = ctx.ai_target() {
             let http = match &self.client {
                 Some(c) => c.http.clone(),
-                None => reqwest::Client::builder()
-                    .timeout(DEFAULT_TIMEOUT)
-                    .build()
-                    .map_err(|e| {
-                        PluginError::non_retryable(format!("cannot build HTTP client: {e}"))
-                    })?,
+                None => self.lab_http()?,
             };
             return Ok(LlmClient {
                 base_url: target.base_url.trim_end_matches('/').to_string(),
@@ -305,6 +395,19 @@ impl LlmEnricherPlugin {
         self.client
             .clone()
             .ok_or_else(|| PluginError::invalid_config("LLM_API_KEY not set"))
+    }
+
+    /// The shared client for the Lab's target (see `lab_http`), built on first use.
+    fn lab_http(&self) -> Result<reqwest::Client, PluginError> {
+        if let Some(http) = self.lab_http.get() {
+            return Ok(http.clone());
+        }
+        let built = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(|e| PluginError::non_retryable(format!("cannot build HTTP client: {e}")))?;
+        // Two first steps racing both build; one wins and both use the winner.
+        Ok(self.lab_http.get_or_init(|| built).clone())
     }
 }
 
@@ -328,7 +431,19 @@ impl Plugin for LlmEnricherPlugin {
                     "max_tokens": { "type": "integer", "minimum": 1 },
                     "max_input_chars": { "type": "integer", "minimum": 1, "default": 12000 },
                     "merge_strategy": { "type": "string", "enum": ["merge", "replace"], "default": "merge" },
-                    "system_prompt": { "type": "string", "default": DEFAULT_SYSTEM_PROMPT }
+                    "system_prompt": { "type": "string", "default": DEFAULT_SYSTEM_PROMPT },
+                    "allow_reserved": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^_" },
+                        "description": "Reply keys starting with _ to keep, e.g. [\"_geo\"]; any other is dropped",
+                        "default": []
+                    },
+                    "on_refusal": {
+                        "type": "string",
+                        "enum": ["keep", "fail"],
+                        "default": "keep",
+                        "description": "A document the provider declines: keep it un-enriched with llm_declined set, or fail the step"
+                    }
                 }
             }))
     }
@@ -353,25 +468,59 @@ impl Plugin for LlmEnricherPlugin {
         }
         tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, documents = total, "enriching documents");
 
-        // 3. Bounded concurrency; results are re-ordered by their original index.
+        // 3. Resume: on an activity retry, the documents the previous attempt finished
+        //    get their recorded result back instead of a new (paid) call. Those calls
+        //    were the failed attempt's, which is not billed, so nothing is metered here.
+        let (mut checkpoint, mut resumed) =
+            Checkpoint::resume(NAME, ctx.previous_progress(), &docs, self.checkpoint_budget);
         let mut slots: Vec<Option<Document>> =
             std::iter::repeat_with(|| None).take(total).collect();
-        let mut stream = futures::stream::iter(docs.into_iter().enumerate())
+        let mut pending = Vec::with_capacity(total);
+        let mut done = 0usize;
+        for (i, mut doc) in docs.into_iter().enumerate() {
+            let saved = resumed
+                .remove(&i)
+                .and_then(|r| serde_json::from_value::<SavedOutcome>(r).ok());
+            match saved {
+                Some(saved) => {
+                    apply_outcome(&mut doc, &saved.into(), &cfg)?;
+                    slots[i] = Some(doc);
+                    done += 1;
+                }
+                None => pending.push((i, doc)),
+            }
+        }
+        if done > 0 {
+            tracing::info!(job_id = %ctx.job_id(), plugin = NAME, resumed = done, documents = total, "resuming from the previous attempt's checkpoint");
+            ctx.heartbeat(format!("{NAME}: {done}/{total} documents resumed"));
+        }
+
+        // 4. Bounded concurrency; results are re-ordered by their original index. Every
+        //    finished document is checkpointed, so a retry after a failure resumes.
+        let mut stream = futures::stream::iter(pending)
             .map(|(i, doc)| {
-                let (cfg, client) = (&cfg, &client);
-                async move { (i, client.enrich(ctx, cfg, doc).await) }
+                let (cfg, client, retry) = (&cfg, &client, &self.retry);
+                async move { (i, client.enrich(ctx, cfg, retry, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
-        let mut done = 0usize;
         while let Some((i, result)) = stream.next().await {
             ctx.check_cancelled()?;
-            let doc = result?;
+            let (doc, outcome) = match result {
+                Ok(finished) => finished,
+                Err(e) => {
+                    // Hand the retry everything finished so far.
+                    checkpoint.record(ctx);
+                    return Err(e);
+                }
+            };
+            checkpoint.push(i, &doc.id, SavedOutcome::from(outcome).to_value());
             if let Some(slot) = slots.get_mut(i) {
                 *slot = Some(doc);
             }
             done += 1;
             if done.is_multiple_of(10) || done == total {
+                checkpoint.record(ctx);
                 ctx.heartbeat(format!("{NAME}: {done}/{total} documents enriched"));
             }
         }
@@ -400,12 +549,41 @@ struct ChatCompletion {
 }
 #[derive(Deserialize)]
 struct Choice {
+    #[serde(default)]
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
+    /// OpenAI's structured refusal, set instead of `content`.
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+/// What the first choice of a completion says about the document: the reply, or why
+/// the provider declined to give one.
+fn read_choice(choice: Option<Choice>) -> Result<String, Declined> {
+    let Some(choice) = choice else {
+        return Err(Declined::Empty);
+    };
+    if choice.finish_reason.as_deref() == Some("content_filter") {
+        return Err(Declined::ContentFilter);
+    }
+    if choice
+        .message
+        .refusal
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+    {
+        return Err(Declined::Refusal);
+    }
+    match choice.message.content {
+        Some(c) if !c.trim().is_empty() => Ok(c),
+        _ => Err(Declined::Empty),
+    }
 }
 
 /// The `usage` object of an OpenAI-compatible chat completion.
@@ -452,12 +630,17 @@ impl LlmClient {
     /// Records the call's usage on `ctx` before returning. This runs inside the
     /// `buffer_unordered` fan-out of [`Plugin::execute`], and the accumulator behind
     /// `ctx` is shared by clones, so concurrent documents sum into one total.
+    ///
+    /// A transient failure (429, 5xx, dropped connection) is retried here under `retry`
+    /// before it fails the step, so one rate-limited document does not throw away the
+    /// completions already paid for.
     async fn enrich(
         &self,
         ctx: &ActivityContext,
         cfg: &LlmEnricherConfig,
+        retry: &RetryPolicy,
         mut doc: Document,
-    ) -> Result<Document, PluginError> {
+    ) -> Result<(Document, Result<String, Declined>), PluginError> {
         let content = truncate_chars(&doc.content, cfg.max_input_chars);
         let user = format!("{}\n\n{}", cfg.prompt, content);
         let system = cfg
@@ -478,20 +661,82 @@ impl LlmClient {
             body["max_tokens"] = serde_json::json!(max);
         }
 
-        // A failed call records nothing: `?` returns before `record_usage`.
-        let completion = complete(
-            &self.http,
-            &self.base_url,
-            &self.api_key,
-            &body,
-            self.lab.as_ref(),
-        )
+        // A failed call records nothing: `?` returns before `record_usage`. A declined
+        // one was answered, and billed, like any other.
+        let (choice, mut usage) = with_retry(retry, ctx, NAME, || {
+            complete(
+                &self.http,
+                &self.base_url,
+                &self.api_key,
+                &body,
+                self.lab.as_ref(),
+            )
+        })
         .await?;
-        let mut usage = completion.usage;
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
-        apply_reply(&mut doc, &completion.content, cfg.merge_strategy);
-        Ok(doc)
+        let outcome = read_choice(choice);
+        apply_outcome(&mut doc, &outcome, cfg)?;
+        Ok((doc, outcome))
+    }
+}
+
+/// One document's outcome as a checkpoint keeps it (see [`checkpoint`]): the raw reply,
+/// which [`apply_outcome`] turns back into the same enriched document, or the reason
+/// the provider declined.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SavedOutcome {
+    Reply(String),
+    Declined(Declined),
+}
+
+impl SavedOutcome {
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl From<Result<String, Declined>> for SavedOutcome {
+    fn from(outcome: Result<String, Declined>) -> Self {
+        match outcome {
+            Ok(reply) => Self::Reply(reply),
+            Err(reason) => Self::Declined(reason),
+        }
+    }
+}
+
+impl From<SavedOutcome> for Result<String, Declined> {
+    fn from(saved: SavedOutcome) -> Self {
+        match saved {
+            SavedOutcome::Reply(reply) => Ok(reply),
+            SavedOutcome::Declined(reason) => Err(reason),
+        }
+    }
+}
+
+/// Write one document's outcome into it: the reply (see [`apply_reply`]), or, when the
+/// provider declined, [`DECLINED_FIELD`] under `on_refusal: keep` and a step failure
+/// under `on_refusal: fail`.
+fn apply_outcome(
+    doc: &mut Document,
+    outcome: &Result<String, Declined>,
+    cfg: &LlmEnricherConfig,
+) -> Result<(), PluginError> {
+    match outcome {
+        Ok(reply) => {
+            apply_reply(doc, reply, cfg.merge_strategy, &cfg.allow_reserved);
+            Ok(())
+        }
+        Err(reason) if cfg.on_refusal == OnRefusal::Fail => Err(reason.into_error()),
+        Err(reason) => {
+            tracing::warn!(plugin = NAME, id = %doc.id, reason = reason.as_str(), "the LLM declined a document; kept un-enriched");
+            doc.fields.insert(
+                DECLINED_FIELD.into(),
+                serde_json::Value::String(reason.as_str().into()),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -524,19 +769,31 @@ pub async fn chat_completion_with_usage(
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<Completion, PluginError> {
-    complete(http, base_url, api_key, body, None).await
+    let (choice, usage) = complete(http, base_url, api_key, body, None)
+        .await
+        .map_err(Failure::into_error)?;
+    let content = choice.and_then(|c| c.message.content).ok_or_else(|| {
+        PluginError::non_retryable("LLM response has no choices[0].message.content")
+    })?;
+    Ok(Completion { content, usage })
 }
 
 /// The one chat-completions call behind [`chat_completion_with_usage`] and the plugin.
 /// When `lab` is the Lab's Gateway target, [`gateway_failure`] gets the first say: 401
 /// marks the target rejected and is `Retryable`, 402 is a final "budget exhausted".
+///
+/// A failure says whether it is transient (see [`transport_failure`] and
+/// [`http_failure`]), for the plugin's own retry; the public wrappers only surface it.
+///
+/// Returns the first choice (none when `choices` is empty) with the call's units: an
+/// answer without usable content is the caller's to judge (see [`read_choice`]).
 async fn complete(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     body: &serde_json::Value,
     lab: Option<&AiTarget>,
-) -> Result<Completion, PluginError> {
+) -> Result<(Option<Choice>, UsageUnits), Failure> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = http
         .post(&url)
@@ -544,36 +801,59 @@ async fn complete(
         .json(body)
         .send()
         .await
-        .map_err(|e| PluginError::retryable(format!("LLM request to {url} failed: {e}")))?;
+        .map_err(|e| transport_failure(&e, format!("LLM request to {url} failed: {e}")))?;
 
     let status = resp.status();
+    let retry_after = retry::retry_after(resp.headers());
     let text = resp
         .text()
         .await
-        .map_err(|e| PluginError::retryable(format!("LLM response body unreadable: {e}")))?;
+        .map_err(|e| transport_failure(&e, format!("LLM response body unreadable: {e}")))?;
     if !status.is_success() {
-        return Err(map_http_failure(status.as_u16(), &text, lab));
+        return Err(http_failure(status.as_u16(), retry_after, &text, lab));
     }
 
     let parsed: ChatCompletion = serde_json::from_str(&text).map_err(|e| {
-        PluginError::non_retryable(format!(
+        Failure::Other(PluginError::non_retryable(format!(
             "LLM response is not a chat completion ({e}): {}",
             truncate_chars(&text, 512)
-        ))
+        )))
     })?;
     let usage = match parsed.usage {
         Some(u) => UsageUnits::llm(u.prompt_tokens, u.completion_tokens),
         None => request_without_token_counts(),
     };
-    let content = parsed
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .ok_or_else(|| {
-            PluginError::non_retryable("LLM response has no choices[0].message.content")
-        })?;
-    Ok(Completion { content, usage })
+    Ok((parsed.choices.into_iter().next(), usage))
+}
+
+/// A request that never got a full answer: `Retryable` either way, and retried in the
+/// plugin unless it timed out (another full timeout would eat the step's budget).
+fn transport_failure(e: &reqwest::Error, message: String) -> Failure {
+    let error = PluginError::retryable(message);
+    if e.is_timeout() {
+        Failure::Other(error)
+    } else {
+        Failure::Transient {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// A non-2xx answer: 429 and 5xx are transient; everything else, including the Lab
+/// Gateway's 401 (only a fresh key helps, and the worker fetches it), is not.
+fn http_failure(
+    code: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+    lab: Option<&AiTarget>,
+) -> Failure {
+    let error = map_http_failure(code, body, lab);
+    if matches!(code, 429 | 500..=599) && error.is_retryable() {
+        Failure::Transient { error, retry_after }
+    } else {
+        Failure::Other(error)
+    }
 }
 
 fn map_http_failure(code: u16, body: &str, lab: Option<&AiTarget>) -> PluginError {
@@ -602,7 +882,14 @@ fn map_http_failure(code: u16, body: &str, lab: Option<&AiTarget>) -> PluginErro
 // ---------------------------------------------------------------------------
 
 /// Merge the model's raw reply into `doc` (see the crate docs for the mapping).
-pub fn apply_reply(doc: &mut Document, raw: &str, strategy: MergeStrategy) {
+///
+/// A reply key starting with `_` is dropped unless `allow_reserved` lists it.
+pub fn apply_reply(
+    doc: &mut Document,
+    raw: &str,
+    strategy: MergeStrategy,
+    allow_reserved: &[String],
+) {
     let Some(obj) = parse_json_object(raw) else {
         doc.fields
             .insert("llm_raw".into(), serde_json::Value::String(raw.to_string()));
@@ -620,6 +907,15 @@ pub fn apply_reply(doc: &mut Document, raw: &str, strategy: MergeStrategy) {
                 if replace || doc.meta.language.is_none() {
                     doc.meta.language = Some(l.clone());
                 }
+            }
+            // `title` and `language` have a home of their own; anything but a string
+            // there (`null` for "none found" is common) is no answer, and written into
+            // `fields` it would overwrite the real title when the document is indexed.
+            ("title" | "language", _) => {}
+            // Meilisearch reserves `_` keys (`_geo`, `_vectors`, ...): only the ones the
+            // step asked for get through.
+            (k, _) if k.starts_with('_') && !allow_reserved.iter().any(|a| a == k) => {
+                tracing::debug!(plugin = NAME, key = k, "dropping reserved reply key");
             }
             _ => {
                 if replace {
@@ -669,7 +965,7 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -681,13 +977,16 @@ mod tests {
         })
     }
 
+    /// The env-configured plugin, retrying transient failures without waiting.
     fn plugin(server: &MockServer) -> LlmEnricherPlugin {
-        LlmEnricherPlugin::with_client(
+        let mut p = LlmEnricherPlugin::with_client(
             server.uri(),
             "test-key",
             "test-model",
             reqwest::Client::new(),
-        )
+        );
+        p.retry = RetryPolicy::IMMEDIATE;
+        p
     }
 
     async fn run(
@@ -776,6 +1075,290 @@ mod tests {
         assert_eq!(out[0].meta.language.as_deref(), Some("en"));
     }
 
+    /// Answers `{"summary": "summary of <content>"}`, except that it is overloaded for
+    /// the document whose content is `"busy"` while `busy` is set. Counts requests per
+    /// document content.
+    #[derive(Clone, Default)]
+    struct BusyFor {
+        busy: Arc<AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Respond for BusyFor {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            let content = user.rsplit("\n\n").next().unwrap().to_string();
+            self.seen.lock().unwrap().push(content.clone());
+            if content == "busy" && self.busy.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(503);
+            }
+            ResponseTemplate::new(200).set_body_json(chat_reply(&format!(
+                r#"{{"summary":"summary of {content}"}}"#
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_activity_retry_resumes_from_the_documents_already_enriched() {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let docs = || {
+            ["a", "b", "busy", "c"]
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Document::with_id(format!("d{i}"), *c))
+                .collect::<Vec<_>>()
+        };
+        // One at a time, so `a` and `b` are done when `busy` spends its retry budget.
+        let cfg = serde_json::json!({ "max_concurrent": 1 });
+        let p = plugin(&server);
+
+        // Attempt 1 fails on `busy`, after paying for `a` and `b`.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, Arc::default());
+        let err = p
+            .execute(&first, PluginInput::Documents(docs()), cfg.clone())
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert_eq!(first.usage().llm_requests, 2);
+
+        // Attempt 2, with the provider back, only asks about what attempt 1 lacked.
+        responder.busy.store(false, Ordering::SeqCst);
+        responder.seen.lock().unwrap().clear();
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "enrich", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(*responder.seen.lock().unwrap(), vec!["busy", "c"]);
+        let summaries: Vec<_> = out.iter().map(|d| d.fields["summary"].clone()).collect();
+        assert_eq!(
+            summaries,
+            ["a", "b", "busy", "c"].map(|c| serde_json::json!(format!("summary of {c}")))
+        );
+        assert_eq!(
+            out.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["d0", "d1", "d2", "d3"]
+        );
+        // The failed attempt is not billed again: only this attempt's calls are.
+        assert_eq!(second.usage().llm_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn a_declined_document_is_resumed_as_declined() {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_string_contains("filtered"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "finish_reason": "content_filter", "message": { "content": null } }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let docs = || {
+            vec![
+                Document::with_id("d0", "filtered"),
+                Document::with_id("d1", "busy"),
+            ]
+        };
+        let cfg = serde_json::json!({ "max_concurrent": 1 });
+        let p = plugin(&server);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, Arc::default());
+        p.execute(&first, PluginInput::Documents(docs()), cfg.clone())
+            .await
+            .unwrap_err();
+
+        responder.busy.store(false, Ordering::SeqCst);
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "enrich", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out[0].fields[DECLINED_FIELD], "content_filter");
+        assert_eq!(out[1].fields["summary"], "summary of busy");
+        assert_eq!(second.usage().llm_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_past_its_budget_leaves_the_rest_to_redo() {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let docs = || {
+            ["a", "b", "busy"]
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Document::with_id(format!("d{i}"), *c))
+                .collect::<Vec<_>>()
+        };
+        let cfg = serde_json::json!({ "max_concurrent": 1 });
+        let mut p = plugin(&server);
+        // Room for one result only.
+        p.checkpoint_budget = 60;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, Arc::default());
+        p.execute(&first, PluginInput::Documents(docs()), cfg.clone())
+            .await
+            .unwrap_err();
+
+        responder.busy.store(false, Ordering::SeqCst);
+        responder.seen.lock().unwrap().clear();
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "enrich", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(*responder.seen.lock().unwrap(), vec!["b", "busy"]);
+        assert_eq!(out[1].fields["summary"], "summary of b");
+    }
+
+    #[tokio::test]
+    async fn one_rate_limited_document_is_retried_without_failing_the_batch() {
+        let server = MockServer::start().await;
+        // The first request is refused once; every other one succeeds.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_reply(r#"{"summary":"s"}"#)),
+            )
+            .mount(&server)
+            .await;
+        let docs: Vec<Document> = (0..3)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let ctx = ActivityContext::noop();
+        let out = plugin(&server)
+            .execute(&ctx, PluginInput::Documents(docs), serde_json::json!({}))
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|d| d.fields["summary"] == "s"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        // Only the calls that answered are metered.
+        assert_eq!(ctx.usage().llm_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_rate_limit_is_retried_a_bounded_number_of_times() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .expect(u64::from(RetryPolicy::IMMEDIATE.attempts))
+            .mount(&server)
+            .await;
+        let err = run(
+            &plugin(&server),
+            vec![Document::with_id("a", "x")],
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_cap_goes_straight_to_the_activity_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3600"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut p = plugin(&server);
+        p.retry = RetryPolicy::DEFAULT;
+        let err = run(&p, vec![Document::with_id("a", "x")], serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_within_the_cap_is_waited_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0.2"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .mount(&server)
+            .await;
+        let mut p = plugin(&server);
+        p.retry = RetryPolicy::DEFAULT;
+        let started = std::time::Instant::now();
+        run(&p, vec![Document::with_id("a", "x")], serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_ends_a_backoff_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let ctx = ActivityContext::new(uuid::Uuid::nil(), "enrich", 1, tx, cancelled.clone());
+        let mut p = plugin(&server);
+        p.retry = RetryPolicy {
+            attempts: 4,
+            base_delay: Duration::from_secs(20),
+            max_delay: Duration::from_secs(20),
+            max_total_wait: Duration::from_secs(60),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let err = p
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![Document::with_id("a", "x")]),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn rate_limit_is_retryable() {
         let server = MockServer::start().await;
@@ -799,9 +1382,10 @@ mod tests {
     #[tokio::test]
     async fn server_error_is_retryable_and_auth_error_is_not() {
         let server = MockServer::start().await;
+        // Enough 503s to spend the in-plugin retry budget of the first run.
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(1)
+            .up_to_n_times(RetryPolicy::IMMEDIATE.attempts as u64)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -863,6 +1447,89 @@ mod tests {
         assert_eq!(out[0].title, doc.title);
         assert_eq!(out[0].content, doc.content);
         assert_eq!(out[0].fields.len(), 1);
+    }
+
+    /// Declines the document whose content names a decline kind, enriches the others.
+    struct DeclineSome;
+    impl Respond for DeclineSome {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            let content = user.rsplit("\n\n").next().unwrap();
+            let reply = match content {
+                "filtered" => serde_json::json!({ "choices": [{ "finish_reason": "content_filter",
+                    "message": { "role": "assistant", "content": null } }] }),
+                "refused" => serde_json::json!({ "choices": [{ "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": null, "refusal": "I can't help with that." } }] }),
+                "blank" => chat_reply("  "),
+                "no choice" => serde_json::json!({ "choices": [] }),
+                _ => chat_reply(r#"{"summary":"s"}"#),
+            };
+            ResponseTemplate::new(200).set_body_json(reply)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declined_document_is_kept_unenriched_with_a_marker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DeclineSome)
+            .mount(&server)
+            .await;
+        let cases = [
+            ("filtered", "content_filter"),
+            ("refused", "refusal"),
+            ("blank", "empty"),
+            ("no choice", "empty"),
+        ];
+        for (content, reason) in cases {
+            let mut declined = Document::with_id("d1", content);
+            declined.title = Some("Q3 report".into());
+            let docs = vec![
+                Document::with_id("d0", "x"),
+                declined.clone(),
+                Document::with_id("d2", "y"),
+            ];
+            let ctx = ActivityContext::noop();
+            let out = plugin(&server)
+                .execute(&ctx, PluginInput::Documents(docs), serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("{content}: {e:?}"))
+                .into_documents()
+                .unwrap();
+            assert_eq!(out.len(), 3, "{content}");
+            assert_eq!(out[0].fields["summary"], "s");
+            assert_eq!(out[2].fields["summary"], "s");
+            assert_eq!(out[1].fields.len(), 1, "{content}: {:?}", out[1].fields);
+            assert_eq!(out[1].fields["llm_declined"], reason, "{content}");
+            assert_eq!(out[1].title, declined.title);
+            assert_eq!(out[1].content, declined.content);
+            // The provider answered, and bills the declined call too.
+            assert_eq!(ctx.usage().llm_requests, 3, "{content}");
+        }
+    }
+
+    #[tokio::test]
+    async fn on_refusal_fail_fails_the_step_on_a_declined_document() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(DeclineSome)
+            .mount(&server)
+            .await;
+        let err = run(
+            &plugin(&server),
+            vec![
+                Document::with_id("d0", "x"),
+                Document::with_id("d1", "filtered"),
+            ],
+            serde_json::json!({ "on_refusal": "fail" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("content_filter")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1282,6 +1949,83 @@ mod tests {
         run_with(&p, &ctx, serde_json::json!({})).await.unwrap();
     }
 
+    /// A keep-alive HTTP/1.1 server that answers every request with `reply` and counts
+    /// the TCP connections it accepted. wiremock does not expose connection counts.
+    async fn counting_server(reply: serde_json::Value) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let body = reply.to_string();
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // One request: headers, then `Content-Length` bytes of body.
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        while buf.len() < head_end + len {
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        buf.drain(..head_end + len);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), accepted)
+    }
+
+    #[tokio::test]
+    async fn a_disabled_plugin_reuses_its_lab_connection_across_steps() {
+        let (base_url, accepted) = counting_server(chat_reply("{}")).await;
+        let target = AiTarget::new(
+            base_url,
+            "lab-key",
+            "key-1",
+            "lab-model",
+            "lab-vision",
+            None,
+        );
+        let p = LlmEnricherPlugin::disabled();
+        for _ in 0..2 {
+            // Each step gets a fresh context, as the worker builds one per activity.
+            run_with(&p, &ctx_with_target(target.clone()), serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "one pooled connection");
+    }
+
     #[tokio::test]
     async fn llm_enricher_disabled_without_target_names_the_env_key() {
         let ctx = ActivityContext::noop();
@@ -1297,10 +2041,12 @@ mod tests {
     #[tokio::test]
     async fn llm_enricher_lab_401_marks_the_target_rejected() {
         let lab = MockServer::start().await;
+        // Only a fresh key helps, which the worker fetches: never retried in-plugin.
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
             )
+            .expect(1)
             .mount(&lab)
             .await;
         let ctx = ctx_with_target(lab_target(&lab));
@@ -1313,9 +2059,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_enricher_lab_rate_limit_is_retried_with_the_same_key() {
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&lab)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer lab-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("{}")))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab));
+        let mut p = LlmEnricherPlugin::disabled();
+        p.retry = RetryPolicy::IMMEDIATE;
+        run_with(&p, &ctx, serde_json::json!({})).await.unwrap();
+        assert!(!ctx.ai_target().unwrap().is_rejected());
+    }
+
+    #[tokio::test]
     async fn llm_enricher_lab_403_is_final_and_keeps_the_key() {
         // Lumen's 403s are filtered content (LM-2013) or platform-only routes, not a
-        // refused key.
+        // refused key. Even under the default `on_refusal: keep` a 403 stays final:
+        // only a 200 without usable content is a declined document.
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
@@ -1367,6 +2135,73 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("LLM_API_KEY")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_non_string_title_or_language_never_reaches_the_fields() {
+        // `{"title": null}` is a common JSON-mode answer for "no heading"; written into
+        // `fields` it would overwrite the real title when the document is flattened.
+        for strategy in [MergeStrategy::Merge, MergeStrategy::Replace] {
+            let mut doc = Document::with_id("d1", "x");
+            doc.title = Some("Q3 report".into());
+            doc.meta.language = Some("en".into());
+            apply_reply(
+                &mut doc,
+                r#"{"title":null,"summary":"s","language":["fr"]}"#,
+                strategy,
+                &[],
+            );
+            assert!(!doc.fields.contains_key("title"), "{strategy:?}");
+            assert!(!doc.fields.contains_key("language"), "{strategy:?}");
+            assert_eq!(doc.title.as_deref(), Some("Q3 report"), "{strategy:?}");
+            assert_eq!(doc.meta.language.as_deref(), Some("en"), "{strategy:?}");
+            assert_eq!(doc.fields["summary"], "s");
+            assert_eq!(doc.to_index_json()["title"], "Q3 report", "{strategy:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_reply_keys_are_dropped_unless_allowed() {
+        // `_geo: "Paris"` (model-chosen or prompt-injected from the document text) would
+        // make Meilisearch reject the whole batch.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply(
+                r#"{"summary":"s","_geo":{"lat":48.8,"lng":2.3},"_vectors":{"x":[1]},"_meta":1}"#,
+            )))
+            .mount(&server)
+            .await;
+        let p = plugin(&server);
+        for strategy in ["merge", "replace"] {
+            let out = run(
+                &p,
+                vec![Document::with_id("d1", "x")],
+                serde_json::json!({ "merge_strategy": strategy }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out[0].fields["summary"], "s");
+            assert!(
+                out[0].fields.keys().all(|k| !k.starts_with('_')),
+                "{strategy}: {:?}",
+                out[0].fields
+            );
+
+            // A pipeline that asks for `_geo` on purpose lists it.
+            let out = run(
+                &p,
+                vec![Document::with_id("d1", "x")],
+                serde_json::json!({ "merge_strategy": strategy, "allow_reserved": ["_geo"] }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                out[0].fields["_geo"],
+                serde_json::json!({"lat": 48.8, "lng": 2.3})
+            );
+            assert!(!out[0].fields.contains_key("_vectors"), "{strategy}");
+            assert!(!out[0].fields.contains_key("_meta"), "{strategy}");
+        }
     }
 
     #[test]

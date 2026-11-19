@@ -6,18 +6,36 @@
 //! float or boolean), and `content` is the space-joined text of the
 //! configured content columns.
 //!
+//! Field names are unique, so no cell overwrites another: a repeated header gets
+//! the first free `_2`, `_3`, … suffix (`name,name` → `name`, `name_2`), and the row
+//! number, normally `_row`, moves to `_row_2` when the file has a `_row` column.
+//!
 //! Configuration (all keys optional):
 //!
 //! | key               | default            | meaning |
 //! |-------------------|--------------------|---------|
-//! | `delimiter`       | sniffed            | single ASCII character; sniffed among `,` `;` `\t` `\|` from the first line |
+//! | `delimiter`       | sniffed            | single ASCII character; sniffed among `,` `;` `\t` `\|` as the one that splits the first records into the most consistent number of fields (quoted fields ignored) |
 //! | `has_headers`     | `true`             | first row is the header; otherwise columns are named `col_1`, `col_2`, ... |
 //! | `id_column`       | none               | column whose value becomes the document id (sanitized) |
 //! | `content_columns` | all columns        | columns joined by a space into `content` |
 //! | `max_rows`        | unlimited          | stop after this many data rows |
 //! | `trim`            | `true`             | trim whitespace around headers and cells |
+//! | `encoding`        | detected           | character encoding of the file, as a WHATWG label (`windows-1252`, `iso-8859-15`, `shift_jis`, `utf-16le`, …) |
+//!
+//! Without `encoding`, the bytes are decoded by the first rule that applies: a
+//! byte order mark (UTF-8, UTF-16LE, UTF-16BE); UTF-8 when the whole file is valid
+//! UTF-8; the charset the server declared ([`Blob::charset`]) unless it is UTF-8,
+//! which the bytes just contradicted; else windows-1252, which maps every byte, so
+//! an Excel export in a Western European locale reads right and no file fails on a
+//! stray byte. A forced `encoding` replaces bytes it cannot map with U+FFFD.
 
-use csv::{ReaderBuilder, StringRecord, Trim};
+use std::borrow::Cow;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+
+use encoding_rs::Encoding;
+
+use csv::{ByteRecord, ReaderBuilder, StringRecord, Trim};
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -30,6 +48,13 @@ const HEARTBEAT_EVERY: usize = 100;
 
 /// Delimiters tried by the sniffer, in order of preference on ties.
 const CANDIDATE_DELIMITERS: [u8; 4] = *b",;\t|";
+
+/// At most this many bytes from the start of the payload are sampled to sniff
+/// the delimiter.
+const SNIFF_BYTES: usize = 64 * 1024;
+
+/// At most this many records are sampled to sniff the delimiter.
+const SNIFF_RECORDS: usize = 100;
 
 /// The CSV parser plugin. Stateless; construct with [`CsvParserPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -52,6 +77,7 @@ struct Config {
     content_columns: Option<Vec<String>>,
     max_rows: Option<usize>,
     trim: bool,
+    encoding: Option<String>,
 }
 
 impl Default for Config {
@@ -63,6 +89,7 @@ impl Default for Config {
             content_columns: None,
             max_rows: None,
             trim: true,
+            encoding: None,
         }
     }
 }
@@ -86,34 +113,158 @@ impl Config {
                 "{NAME}: `max_rows` must be greater than zero when set"
             )));
         }
+        cfg.forced_encoding()?;
         Ok(cfg)
+    }
+
+    /// The encoding `encoding` names, when set.
+    fn forced_encoding(&self) -> Result<Option<&'static Encoding>, PluginError> {
+        self.encoding
+            .as_deref()
+            .map(|label| {
+                Encoding::for_label(label.trim().as_bytes()).ok_or_else(|| {
+                    PluginError::InvalidConfig(format!(
+                        "{NAME}: `encoding` {label:?} is not a known character encoding \
+                         (try utf-8, windows-1252, iso-8859-15, shift_jis, utf-16le)"
+                    ))
+                })
+            })
+            .transpose()
     }
 }
 
-/// Pick the delimiter by counting candidate characters on the first line.
-/// Falls back to `,` when nothing matches.
-fn sniff_delimiter(data: &[u8]) -> u8 {
-    let first_line = data.split(|b| *b == b'\n').next().unwrap_or(data);
-    let mut best = b',';
-    let mut best_count = 0usize;
-    for cand in CANDIDATE_DELIMITERS {
-        let count = first_line.iter().filter(|b| **b == cand).count();
-        if count > best_count {
-            best = cand;
-            best_count = count;
+/// Encoding of a file that is not valid UTF-8 and declares nothing usable.
+const FALLBACK_ENCODING: &Encoding = encoding_rs::WINDOWS_1252;
+
+/// The file's bytes as UTF-8, borrowed when they already are. See the module docs
+/// for the detection order; `forced` (the `encoding` option) skips it.
+fn decode_text<'a>(
+    data: &'a [u8],
+    declared: Option<&str>,
+    forced: Option<&'static Encoding>,
+) -> Cow<'a, [u8]> {
+    let utf8 = |text: Cow<'a, str>| match text {
+        Cow::Borrowed(t) => Cow::Borrowed(t.as_bytes()),
+        Cow::Owned(t) => Cow::Owned(t.into_bytes()),
+    };
+    if let Some(encoding) = forced {
+        return utf8(encoding.decode_with_bom_removal(data).0);
+    }
+    if let Some((encoding, bom_len)) = Encoding::for_bom(data) {
+        return utf8(encoding.decode_without_bom_handling(&data[bom_len..]).0);
+    }
+    if std::str::from_utf8(data).is_ok() {
+        return Cow::Borrowed(data);
+    }
+    let encoding = declared
+        .and_then(|label| Encoding::for_label(label.as_bytes()))
+        .filter(|e| *e != encoding_rs::UTF_8)
+        .unwrap_or(FALLBACK_ENCODING);
+    utf8(encoding.decode_without_bom_handling(data).0)
+}
+
+/// How a candidate delimiter splits the sample. Compared field by field: the
+/// higher score wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DelimiterScore {
+    /// Records with the modal field count, as a share of all sampled records
+    /// (in thousandths, so scores compare exactly).
+    consistency: usize,
+    /// The modal field count itself.
+    fields: usize,
+    /// Fields that start with a space, fewer is better: a delimiter followed by a
+    /// space is more likely prose punctuation (`Address, City`) than a separator.
+    leading_spaces: Reverse<usize>,
+}
+
+/// Score `delimiter` over the sample, parsing it with the same quoting rules as
+/// the real reader so delimiters inside quoted fields do not count. `None` when it
+/// never yields more than one field per record.
+fn score_delimiter(sample: &[u8], truncated: bool, delimiter: u8) -> Option<DelimiterScore> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(sample);
+    let mut records: Vec<(usize, usize)> = Vec::new();
+    let mut record = ByteRecord::new();
+    while records.len() < SNIFF_RECORDS {
+        match reader.read_byte_record(&mut record) {
+            Ok(true) => {
+                let leading = record.iter().skip(1).filter(|f| f.first() == Some(&b' '));
+                records.push((record.len(), leading.count()));
+            }
+            Ok(false) | Err(_) => break,
         }
     }
-    best
+    // A sample cut short ends mid-record; that record says nothing reliable.
+    if truncated && records.len() > 1 && reader.is_done() {
+        records.pop();
+    }
+    if records.is_empty() {
+        return None;
+    }
+
+    let mut counts: Vec<(usize, usize)> = Vec::new(); // (field count, records)
+    for (len, _) in &records {
+        match counts.iter_mut().find(|(n, _)| n == len) {
+            Some((_, seen)) => *seen += 1,
+            None => counts.push((*len, 1)),
+        }
+    }
+    let (fields, seen) = counts
+        .into_iter()
+        .max_by_key(|&(n, seen)| (seen, n))
+        .expect("at least one record");
+    if fields < 2 {
+        return None;
+    }
+    let leading: usize = records.iter().map(|(_, l)| l).sum();
+    Some(DelimiterScore {
+        consistency: seen * 1000 / records.len(),
+        fields,
+        leading_spaces: Reverse(leading),
+    })
+}
+
+/// Pick the delimiter that splits the first records (up to [`SNIFF_RECORDS`] or
+/// [`SNIFF_BYTES`]) into the most consistent number of fields, ignoring delimiters
+/// inside quoted fields. Ties go to more fields, then to the candidate less often
+/// followed by a space, then to the order of [`CANDIDATE_DELIMITERS`]. Falls back
+/// to `,` when no candidate yields more than one field.
+fn sniff_delimiter(data: &[u8]) -> u8 {
+    let truncated = data.len() > SNIFF_BYTES;
+    let sample = &data[..data.len().min(SNIFF_BYTES)];
+    let mut best = (b',', None);
+    for cand in CANDIDATE_DELIMITERS {
+        let score = score_delimiter(sample, truncated, cand);
+        if score > best.1 {
+            best = (cand, score);
+        }
+    }
+    best.0
 }
 
 /// Parse a cell into typed JSON: integer, float, boolean, or string.
-/// Leading-zero numerics (`007`, zip codes) stay strings.
+///
+/// Cells that look like identifiers rather than quantities keep their text, since
+/// turning them into numbers would change them: leading-zero numerics (`007`, zip
+/// codes), a leading `+` (`+33612345678`), integers too wide for 64 bits (an f64
+/// would round their digits) and exponent notation (`1E5`, a SKU as often as a
+/// number).
 fn typed_cell(cell: &str) -> Value {
-    let looks_like_leading_zero = {
-        let digits = cell.strip_prefix(['-', '+']).unwrap_or(cell);
-        digits.len() > 1 && digits.starts_with('0') && !digits.starts_with("0.")
-    };
-    if !looks_like_leading_zero {
+    let unsigned = cell.strip_prefix('-').unwrap_or(cell);
+    let looks_like_leading_zero =
+        unsigned.len() > 1 && unsigned.starts_with('0') && !unsigned.starts_with("0.");
+    let looks_like_identifier = looks_like_leading_zero
+        || cell.starts_with('+')
+        || cell.contains(['e', 'E'])
+        // An integer neither i64 nor u64 holds stays text rather than an f64.
+        || (!unsigned.is_empty()
+            && unsigned.bytes().all(|b| b.is_ascii_digit())
+            && cell.parse::<i64>().is_err()
+            && cell.parse::<u64>().is_err());
+    if !looks_like_identifier {
         if let Ok(i) = cell.parse::<i64>() {
             return Value::from(i);
         }
@@ -139,11 +290,89 @@ fn id_stem(blob: &Blob) -> String {
     blob.id_stem("csv")
 }
 
-fn column_name(headers: &[String], idx: usize) -> String {
-    headers
-        .get(idx)
-        .cloned()
-        .unwrap_or_else(|| format!("col_{}", idx + 1))
+/// The field name of every column, unique so that no cell overwrites another.
+///
+/// A column is named after its header, or `col_<n>` (1-based) when the header is
+/// empty, missing (a cell past the header row) or there are no headers. The first
+/// column with a given name keeps it; a later one whose name is taken, by a repeated
+/// header or by a real header that looks like a fallback (`col_3`), gets the first
+/// free `<name>_<k>` (`k` from 2). Real headers are reserved first, so
+/// `name,name,name_2` names the second column `name_3`. The row number goes under
+/// `_row`, or the first free `_row_<k>` when the file has a `_row` column of its own.
+/// Same rules as `xlsx_extractor`.
+struct Columns {
+    names: Vec<String>,
+    taken: Taken,
+    /// Key of the row number.
+    row_key: String,
+}
+
+impl Columns {
+    fn new(headers: &[String]) -> Self {
+        let mut taken = Taken {
+            names: headers.iter().filter(|h| !h.is_empty()).cloned().collect(),
+            next: HashMap::new(),
+        };
+        let mut first_use: HashSet<&str> = HashSet::new();
+        let mut names = Vec::with_capacity(headers.len());
+        for (i, h) in headers.iter().enumerate() {
+            if !h.is_empty() && first_use.insert(h.as_str()) {
+                names.push(h.clone());
+                continue;
+            }
+            let base = if h.is_empty() {
+                format!("col_{}", i + 1)
+            } else {
+                h.clone()
+            };
+            names.push(taken.free_name(base));
+        }
+        let row_key = taken.free_name("_row".to_owned());
+        Self {
+            names,
+            taken,
+            row_key,
+        }
+    }
+
+    /// Name of column `idx`, naming the columns past the header row on first use.
+    fn name(&mut self, idx: usize) -> &str {
+        while self.names.len() <= idx {
+            let base = format!("col_{}", self.names.len() + 1);
+            let name = self.taken.free_name(base);
+            self.names.push(name);
+        }
+        &self.names[idx]
+    }
+}
+
+/// The field names given out so far.
+struct Taken {
+    names: HashSet<String>,
+    /// Per base name, the next suffix to try: every `<base>_<k>` below it is
+    /// taken already, so `n` repeats of one header cost `O(n)` lookups, not
+    /// `O(n^2)`. Names are never released, so that stays true.
+    next: HashMap<String, usize>,
+}
+
+impl Taken {
+    /// `base`, or the first `<base>_<k>` (`k` from 2) not taken, which it takes.
+    fn free_name(&mut self, base: String) -> String {
+        if self.names.insert(base.clone()) {
+            return base;
+        }
+        let mut k = self.next.get(&base).copied().unwrap_or(2);
+        let name = loop {
+            let name = format!("{base}_{k}");
+            if !self.names.contains(&name) {
+                break name;
+            }
+            k += 1;
+        };
+        self.names.insert(name.clone());
+        self.next.insert(base, k + 1);
+        name
+    }
 }
 
 /// Resolve a configured column name to its index, or fail with `InvalidConfig`.
@@ -176,7 +405,7 @@ impl Plugin for CsvParserPlugin {
                         "minLength": 1,
                         "maxLength": 1,
                         "default": null,
-                        "description": "Field delimiter (single ASCII char). Sniffed among , ; tab | when omitted."
+                        "description": "Field delimiter (single ASCII char). When omitted, sniffed among , ; tab | as the one that splits the first records into the most consistent number of fields, ignoring quoted fields."
                     },
                     "has_headers": {
                         "type": "boolean",
@@ -204,6 +433,11 @@ impl Plugin for CsvParserPlugin {
                         "type": "boolean",
                         "default": true,
                         "description": "Trim whitespace around headers and cells."
+                    },
+                    "encoding": {
+                        "type": ["string", "null"],
+                        "default": null,
+                        "description": "Character encoding of the file, as a WHATWG label (windows-1252, iso-8859-15, shift_jis, utf-16le, ...). When omitted: a byte order mark, else UTF-8 when the file is valid UTF-8, else the charset the server declared, else windows-1252."
                     }
                 }
             }))
@@ -217,121 +451,130 @@ impl Plugin for CsvParserPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let blob = input.into_bytes()?;
-
-        let delimiter = match cfg.delimiter {
-            Some(c) => c as u8,
-            None => sniff_delimiter(&blob.data),
-        };
-        let mut reader = ReaderBuilder::new()
-            .delimiter(delimiter)
-            .has_headers(cfg.has_headers)
-            .flexible(true)
-            .trim(if cfg.trim { Trim::All } else { Trim::None })
-            .from_reader(blob.data.as_slice());
-
-        let headers: Vec<String> = if cfg.has_headers {
-            reader
-                .headers()
-                .map_err(|e| PluginError::InvalidInput(format!("{NAME}: invalid CSV header: {e}")))?
-                .iter()
-                .enumerate()
-                .map(|(i, h)| {
-                    if h.is_empty() {
-                        format!("col_{}", i + 1)
-                    } else {
-                        h.to_owned()
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Resolve configured columns up front so typos fail fast.
-        let id_idx = match &cfg.id_column {
-            Some(name) if cfg.has_headers => Some(column_index(&headers, name, "id_column")?),
-            Some(name) => Some(parse_positional(name, "id_column")?),
-            None => None,
-        };
-        let content_idx: Option<Vec<usize>> = match &cfg.content_columns {
-            Some(cols) if cfg.has_headers => Some(
-                cols.iter()
-                    .map(|c| column_index(&headers, c, "content_columns"))
-                    .collect::<Result<_, _>>()?,
-            ),
-            Some(cols) => Some(
-                cols.iter()
-                    .map(|c| parse_positional(c, "content_columns"))
-                    .collect::<Result<_, _>>()?,
-            ),
-            None => None,
-        };
-
-        let stem = id_stem(&blob);
-        let meta = DocumentMeta {
-            source: blob.filename.clone(),
-            filename: blob.filename.clone(),
-            mime: Some(blob.mime.clone()),
-            ..Default::default()
-        };
-
-        let mut docs = Vec::new();
-        let mut record = StringRecord::new();
-        let mut row: usize = 0;
-        loop {
-            ctx.check_cancelled()?;
-            if cfg.max_rows.is_some_and(|max| row >= max) {
-                break;
-            }
-            let more = reader.read_record(&mut record).map_err(|e| {
-                PluginError::InvalidInput(format!("{NAME}: invalid CSV at row {}: {e}", row + 1))
-            })?;
-            if !more {
-                break;
-            }
-            row += 1;
-            if row.is_multiple_of(HEARTBEAT_EVERY) {
-                ctx.heartbeat(format!("{NAME}: {row} rows"));
-            }
-
-            let mut fields = Map::new();
-            let mut content_parts: Vec<&str> = Vec::new();
-            for (i, cell) in record.iter().enumerate() {
-                if cell.is_empty() {
-                    continue;
-                }
-                fields.insert(column_name(&headers, i), typed_cell(cell));
-                let include = match &content_idx {
-                    Some(idx) => idx.contains(&i),
-                    None => true,
-                };
-                if include {
-                    content_parts.push(cell);
-                }
-            }
-            if fields.is_empty() {
-                // Blank line: nothing to index.
-                continue;
-            }
-
-            let id = id_idx
-                .and_then(|i| record.get(i))
-                .filter(|v| !v.is_empty())
-                .map(sanitize_id)
-                .unwrap_or_else(|| format!("{stem}_r{row}"));
-            fields.insert("_row".into(), Value::from(row));
-
-            docs.push(Document {
-                id,
-                title: None,
-                content: content_parts.join(" "),
-                fields,
-                meta: meta.clone(),
-            });
-        }
-
+        // Parsing is CPU-bound: keep it off the async runtime.
+        let ctx = ctx.clone();
+        let docs = run_blocking(move || parse_csv(&ctx, &blob, &cfg)).await??;
         Ok(PluginOutput::Documents(docs))
     }
+}
+
+/// Parse `blob` into one document per row. Synchronous and CPU-bound: run it with
+/// [`run_blocking`]. It polls cancellation per row, since a blocking task cannot
+/// be aborted from outside.
+fn parse_csv(
+    ctx: &ActivityContext,
+    blob: &Blob,
+    cfg: &Config,
+) -> Result<Vec<Document>, PluginError> {
+    let data = decode_text(&blob.data, blob.charset.as_deref(), cfg.forced_encoding()?);
+    let delimiter = match cfg.delimiter {
+        Some(c) => c as u8,
+        None => sniff_delimiter(&data),
+    };
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(cfg.has_headers)
+        .flexible(true)
+        .trim(if cfg.trim { Trim::All } else { Trim::None })
+        .from_reader(&*data);
+
+    let raw_headers: Vec<String> = if cfg.has_headers {
+        reader
+            .headers()
+            .map_err(|e| PluginError::InvalidInput(format!("{NAME}: invalid CSV header: {e}")))?
+            .iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut columns = Columns::new(&raw_headers);
+    let headers = columns.names.clone();
+
+    // Resolve configured columns up front so typos fail fast.
+    let id_idx = match &cfg.id_column {
+        Some(name) if cfg.has_headers => Some(column_index(&headers, name, "id_column")?),
+        Some(name) => Some(parse_positional(name, "id_column")?),
+        None => None,
+    };
+    let content_idx: Option<Vec<usize>> = match &cfg.content_columns {
+        Some(cols) if cfg.has_headers => Some(
+            cols.iter()
+                .map(|c| column_index(&headers, c, "content_columns"))
+                .collect::<Result<_, _>>()?,
+        ),
+        Some(cols) => Some(
+            cols.iter()
+                .map(|c| parse_positional(c, "content_columns"))
+                .collect::<Result<_, _>>()?,
+        ),
+        None => None,
+    };
+
+    let stem = id_stem(blob);
+    let meta = DocumentMeta {
+        source: blob.filename.clone(),
+        filename: blob.filename.clone(),
+        mime: Some(blob.mime.clone()),
+        ..Default::default()
+    };
+
+    let mut docs = Vec::new();
+    let mut record = StringRecord::new();
+    let mut row: usize = 0;
+    loop {
+        ctx.check_cancelled()?;
+        if cfg.max_rows.is_some_and(|max| row >= max) {
+            break;
+        }
+        let more = reader.read_record(&mut record).map_err(|e| {
+            PluginError::InvalidInput(format!("{NAME}: invalid CSV at row {}: {e}", row + 1))
+        })?;
+        if !more {
+            break;
+        }
+        row += 1;
+        if row.is_multiple_of(HEARTBEAT_EVERY) {
+            ctx.heartbeat(format!("{NAME}: {row} rows"));
+        }
+
+        let mut fields = Map::new();
+        let mut content_parts: Vec<&str> = Vec::new();
+        for (i, cell) in record.iter().enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            fields.insert(columns.name(i).to_owned(), typed_cell(cell));
+            let include = match &content_idx {
+                Some(idx) => idx.contains(&i),
+                None => true,
+            };
+            if include {
+                content_parts.push(cell);
+            }
+        }
+        if fields.is_empty() {
+            // Blank line: nothing to index.
+            continue;
+        }
+
+        let id = id_idx
+            .and_then(|i| record.get(i))
+            .filter(|v| !v.is_empty())
+            .map(sanitize_id)
+            .unwrap_or_else(|| format!("{stem}_r{row}"));
+        fields.insert(columns.row_key.clone(), Value::from(row));
+
+        docs.push(Document {
+            id,
+            title: None,
+            content: content_parts.join(" "),
+            fields,
+            meta: meta.clone(),
+        });
+    }
+
+    Ok(docs)
 }
 
 /// Without headers, columns are addressed as `col_<n>` (1-based) in the config.
@@ -386,6 +629,7 @@ mod tests {
             "content_columns",
             "max_rows",
             "trim",
+            "encoding",
         ] {
             assert!(props.contains_key(key), "schema missing {key}");
         }
@@ -421,6 +665,82 @@ mod tests {
 
         let docs = run("a\tb\nx\ty\n", None, json!({})).await;
         assert_eq!(docs[0].fields["b"], json!("y"));
+    }
+
+    #[tokio::test]
+    async fn sniffing_ignores_delimiters_inside_quoted_fields() {
+        let docs = run("\"Last, First\";age\n\"Doe, John\";42\n", None, json!({})).await;
+        assert_eq!(docs[0].fields["Last, First"], json!("Doe, John"));
+        assert_eq!(docs[0].fields["age"], json!(42));
+    }
+
+    #[tokio::test]
+    async fn sniffing_prefers_the_delimiter_not_used_as_prose_punctuation() {
+        let docs = run(
+            "Name;Address, City\nBob;12 Main St, Paris\n",
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(docs[0].fields["Name"], json!("Bob"));
+        assert_eq!(docs[0].fields["Address, City"], json!("12 Main St, Paris"));
+    }
+
+    #[tokio::test]
+    async fn sniffing_prefers_the_delimiter_with_a_consistent_field_count() {
+        // The header has as many commas as tabs, but only tabs split every row
+        // into the same number of fields.
+        let tsv = "title\tsummary,short,long\tyear\nDune\tSand,worms,spice\t1965\nEmma\tMatchmaking\t1815\n";
+        let docs = run(tsv, None, json!({})).await;
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs[0].fields["summary,short,long"],
+            json!("Sand,worms,spice")
+        );
+        assert_eq!(docs[1].fields["year"], json!(1815));
+
+        // A comma file whose free-text column sometimes holds a semicolon.
+        let docs = run("id,tags\n1,a;b\n2,c\n3,d\n", None, json!({})).await;
+        assert_eq!(docs[0].fields["tags"], json!("a;b"));
+    }
+
+    #[test]
+    fn sniffing_falls_back_to_comma_for_single_column_and_empty_input() {
+        assert_eq!(sniff_delimiter(b""), b',');
+        assert_eq!(sniff_delimiter(b"single\ncolumn\n"), b',');
+        assert_eq!(sniff_delimiter(b"a,b\n"), b',');
+        assert_eq!(sniff_delimiter(b"a;b\n"), b';');
+        assert_eq!(sniff_delimiter(b"a|b|c\n1|2|3"), b'|');
+    }
+
+    /// Parsing a large payload must not hold the runtime thread: on a
+    /// single-threaded runtime, a ticker task keeps running while it parses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsing_runs_off_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let mut csv = String::from("id,name,score\n");
+        for i in 0..20_000 {
+            csv.push_str(&format!("{i},row {i},{i}.5\n"));
+        }
+        let docs = run(&csv, None, json!({})).await;
+        ticker.abort();
+        assert_eq!(docs.len(), 20_000);
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the runtime was blocked for the whole parse"
+        );
     }
 
     #[tokio::test]
@@ -465,6 +785,194 @@ mod tests {
         assert_eq!(docs[0].fields["v"], json!(7));
         let docs = run("zip, v\n 01234 , 7 \n", None, json!({"trim": false})).await;
         assert_eq!(docs[0].fields[" v"], json!(" 7 "));
+    }
+
+    #[tokio::test]
+    async fn identifier_like_cells_keep_their_text() {
+        let docs = run(
+            "phone,order_ref,sku,neg_ref,small_e\n+33612345678,123456789012345678901234,1E5,-123456789012345678901234,2e3\n",
+            None,
+            json!({}),
+        )
+        .await;
+        let f = &docs[0].fields;
+        assert_eq!(f["phone"], json!("+33612345678"), "a leading + is kept");
+        assert_eq!(
+            f["order_ref"],
+            json!("123456789012345678901234"),
+            "an integer too wide for 64 bits is not rounded through a float"
+        );
+        assert_eq!(f["neg_ref"], json!("-123456789012345678901234"));
+        assert_eq!(f["sku"], json!("1E5"), "exponent notation is not expanded");
+        assert_eq!(f["small_e"], json!("2e3"));
+    }
+
+    #[test]
+    fn typed_cells_otherwise_parse_as_before() {
+        assert_eq!(typed_cell("42"), json!(42));
+        assert_eq!(typed_cell("-42"), json!(-42));
+        assert_eq!(typed_cell("18446744073709551615"), json!(u64::MAX));
+        assert_eq!(typed_cell("9.5"), json!(9.5));
+        assert_eq!(typed_cell("-0.25"), json!(-0.25));
+        assert_eq!(typed_cell("1.50"), json!(1.5));
+        assert_eq!(typed_cell(".5"), json!(0.5));
+        assert_eq!(typed_cell("0"), json!(0));
+        assert_eq!(typed_cell("0.5"), json!(0.5));
+        assert_eq!(typed_cell("007"), json!("007"));
+        assert_eq!(typed_cell("TRUE"), json!(true));
+        assert_eq!(typed_cell("false"), json!(false));
+        assert_eq!(typed_cell("inf"), json!("inf"));
+        assert_eq!(typed_cell("NaN"), json!("NaN"));
+        assert_eq!(typed_cell("+"), json!("+"));
+        assert_eq!(typed_cell("-"), json!("-"));
+    }
+
+    #[tokio::test]
+    async fn colliding_field_names_never_drop_a_value() {
+        // Duplicate headers, and a generated suffix that a real header already uses.
+        let docs = run("name,name,name_2,name\nAda,Lovelace,x,y\n", None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["name"], json!("Ada"));
+        assert_eq!(f["name_2"], json!("x"), "a real header keeps its name");
+        assert_eq!(f["name_3"], json!("Lovelace"));
+        assert_eq!(f["name_4"], json!("y"));
+        // `id_column` binds to the first of the duplicates, a suffixed name to its own.
+        let docs = run(
+            "name,name\nAda,Lovelace\n",
+            None,
+            json!({"id_column": "name", "content_columns": ["name_2"]}),
+        )
+        .await;
+        assert_eq!(docs[0].id, "Ada");
+        assert_eq!(docs[0].content, "Lovelace");
+
+        // A `_row` column keeps its value; the row number gives way.
+        let docs = run("_row,v\n99,x\n", None, json!({})).await;
+        assert_eq!(docs[0].fields["_row"], json!(99));
+        assert_eq!(docs[0].fields["_row_2"], json!(1));
+
+        // Extra cells past the header row do not overwrite a real `col_<n>` header.
+        let docs = run("a,b,col_4\n1,2,3,4\n", None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["col_4"], json!(3));
+        assert_eq!(f["col_4_2"], json!(4));
+        // Neither does an empty header's fallback name.
+        let docs = run(",col_1\nx,y\n", None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["col_1"], json!("y"));
+        assert_eq!(f["col_1_2"], json!("x"));
+    }
+
+    #[tokio::test]
+    async fn a_header_row_of_one_repeated_name_is_named_in_linear_time() {
+        // Each repeat used to search the suffixes from `_2` again: n^2/2 lookups.
+        let n = 30_000;
+        let header = vec!["n"; n].join(",");
+        let row = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let started = std::time::Instant::now();
+        let docs = run(&format!("{header}\n{row}\n"), None, json!({})).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+        let f = &docs[0].fields;
+        assert_eq!(f["n"], json!(0));
+        for i in 2..=n {
+            assert_eq!(f[&format!("n_{i}")], json!(i - 1), "n_{i}");
+        }
+    }
+
+    async fn run_raw(blob: Blob, cfg: Value) -> Result<Vec<Document>, PluginError> {
+        match CsvParserPlugin::new()
+            .execute(&ActivityContext::noop(), PluginInput::Bytes(blob), cfg)
+            .await?
+        {
+            PluginOutput::Documents(d) => Ok(d),
+            other => panic!("expected documents, got {other:?}"),
+        }
+    }
+
+    fn raw(data: &[u8]) -> Blob {
+        Blob::new(data.to_vec(), "text/csv", None)
+    }
+
+    #[tokio::test]
+    async fn a_legacy_encoded_file_is_transcoded_instead_of_failing() {
+        // Excel on Windows: windows-1252, `é` is the single byte 0xE9.
+        let docs = run_raw(raw(b"name,city\nSoci\xE9t\xE9,Paris\n"), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Société"));
+        // In a header too: configured columns still resolve.
+        let docs = run_raw(
+            raw(b"soci\xE9t\xE9,v\nx,1\n"),
+            json!({"id_column": "société", "content_columns": ["société"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(docs[0].fields["société"], json!("x"));
+        assert_eq!(docs[0].id, "x");
+    }
+
+    #[tokio::test]
+    async fn the_declared_charset_and_byte_order_marks_are_honoured() {
+        // Shift_JIS for `名前` (name) / `東京` (Tokyo), declared by the server.
+        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode("名前,市\n東京,1\n");
+        let docs = run_raw(raw(&sjis).with_charset(Some("Shift_JIS".into())), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["名前"], json!("東京"));
+
+        // Excel's "Unicode Text": UTF-16LE with a byte order mark, tab-separated.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "name\tcity\nZoë\tKöln\n".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        let docs = run_raw(raw(&utf16), json!({})).await.unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Zoë"));
+        assert_eq!(docs[0].fields["city"], json!("Köln"));
+
+        // A UTF-8 byte order mark is not part of the first header.
+        let docs = run_raw(raw("\u{FEFF}name\nAda\n".as_bytes()), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Ada"));
+
+        // Valid UTF-8 wins over a declaration it contradicts.
+        let docs = run_raw(
+            raw("name\nSociété\n".as_bytes()).with_charset(Some("windows-1252".into())),
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(docs[0].fields["name"], json!("Société"));
+    }
+
+    #[tokio::test]
+    async fn the_encoding_option_forces_one() {
+        // 0xA4 is `€` in ISO-8859-15 and `¤` in windows-1252.
+        let data = b"price\n10\xA4\n";
+        let docs = run_raw(raw(data), json!({"encoding": "iso-8859-15"}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["price"], json!("10€"));
+        let docs = run_raw(raw(data), json!({})).await.unwrap();
+        assert_eq!(
+            docs[0].fields["price"],
+            json!("10¤"),
+            "windows-1252 fallback"
+        );
+        // Forcing UTF-8 on a stray byte replaces it rather than failing the file.
+        let docs = run_raw(raw(data), json!({"encoding": "utf-8"}))
+            .await
+            .unwrap();
+        assert_eq!(docs[0].fields["price"], json!("10\u{FFFD}"));
+
+        let err = run_raw(raw(data), json!({"encoding": "klingon"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidConfig(_)), "{err}");
     }
 
     #[tokio::test]

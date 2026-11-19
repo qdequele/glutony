@@ -25,14 +25,23 @@
 //!   which is reported as [`Event::Skipped`].
 //!
 //! `max_total_bytes` counts what decompression produces (zip entries and gzip
-//! streams). Tar entries are slices of data already counted, so they do not add to it.
+//! streams), including what was inflated for an entry that ends up skipped. Tar
+//! entries are slices of data already counted, so they do not add to it.
+//!
+//! A `.tar.gz` is read as a stream: each entry is checked against `max_file_bytes` on
+//! its own, and only the total bounds the tarball. A gzip stream that holds one file
+//! is that file, so `max_file_bytes` applies to it: over the limit, the walk fails
+//! with [`ArchiveError::FileTooLarge`] when the gzip is the archive itself, and the
+//! gzip is skipped when it sits inside another archive.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
 use std::path::{Component, Path};
+use std::rc::Rc;
 
 /// Canonical MIME type of a zip archive.
 pub const MIME_ZIP: &str = "application/zip";
@@ -199,19 +208,58 @@ pub fn walk(
     limits: &Limits,
     sink: &mut dyn FnMut(Event) -> Result<(), String>,
 ) -> Result<Summary, ArchiveError> {
+    walk_reserving(data, format, name, limits, &mut |_| Ok(()), sink)
+}
+
+/// [`walk`], calling `reserve(n)` before each file is decompressed into memory, `n`
+/// being the most bytes that file can take there (never more than
+/// [`Limits::max_file_bytes`]).
+///
+/// It lets the caller bound how much decompressed data is held at once: `reserve` may
+/// block until earlier files are let go. What follows a reservation is the file's own
+/// [`Event::File`], an [`Event::Skipped`] for it, or, when the file is a nested
+/// archive that gets opened, the reservations and events of its own entries. Either
+/// way, a reservation ends at the next reservation or event. Returning `Err` stops the
+/// walk, as from the sink.
+///
+/// A nested archive, and a gzip around a lone file or a tar, keep their own
+/// decompressed layer in memory while their content is walked: only the files handed
+/// to the sink are reserved.
+pub fn walk_reserving(
+    data: &[u8],
+    format: Format,
+    name: Option<&str>,
+    limits: &Limits,
+    reserve: &mut dyn FnMut(u64) -> Result<(), String>,
+    sink: &mut dyn FnMut(Event) -> Result<(), String>,
+) -> Result<Summary, ArchiveError> {
     let mut walker = Walker {
         limits,
+        reserve,
         sink,
-        summary: Summary::default(),
+        files: 0,
+        skipped: 0,
+        decompressed: Rc::new(Cell::new(0)),
     };
     walker.archive(data, format, "", name, 1)?;
-    Ok(walker.summary)
+    Ok(Summary {
+        files: walker.files,
+        skipped: walker.skipped,
+        decompressed_bytes: walker.decompressed.get(),
+    })
 }
 
 struct Walker<'a> {
     limits: &'a Limits,
+    reserve: &'a mut dyn FnMut(u64) -> Result<(), String>,
     sink: &'a mut dyn FnMut(Event) -> Result<(), String>,
-    summary: Summary,
+    /// Files yielded so far.
+    files: usize,
+    /// Entries skipped so far.
+    skipped: usize,
+    /// Bytes decompression produced so far. Shared with the [`Metered`] reader of
+    /// every `.tar.gz` being streamed, which counts while the walker handles entries.
+    decompressed: Rc<Cell<u64>>,
 }
 
 impl Walker<'_> {
@@ -270,6 +318,9 @@ impl Walker<'_> {
                 self.skip(path, &self.too_large())?;
                 continue;
             }
+            // The declared size bounds what is read: a larger entry is refused one
+            // byte past it (`read_counted`).
+            self.reserve(declared)?;
             let mut file = match archive.by_index(i) {
                 Ok(f) => f,
                 Err(e) => {
@@ -277,7 +328,7 @@ impl Walker<'_> {
                     continue;
                 }
             };
-            let data = match self.read_counted(&mut file) {
+            let data = match self.read_counted(&mut file, Some(declared)) {
                 Ok(Some(d)) => d,
                 Ok(None) => {
                     self.skip(path, &self.too_large())?;
@@ -296,11 +347,26 @@ impl Walker<'_> {
     }
 
     fn tar(&mut self, data: &[u8], prefix: &str, depth: usize) -> Result<(), ArchiveError> {
-        let corrupt = |e: std::io::Error| ArchiveError::Corrupt {
-            format: Format::Tar,
-            message: e.to_string(),
+        self.tar_entries(Cursor::new(data), &RefCell::new(None), prefix, depth)
+    }
+
+    /// Walk the entries of the tar that `reader` yields. `fault` is where a reader
+    /// that decompresses leaves the reason it stopped: `tar` only reports an I/O
+    /// error, which would otherwise read as a corrupt tar.
+    fn tar_entries<R: Read>(
+        &mut self,
+        reader: R,
+        fault: &RefCell<Option<ArchiveError>>,
+        prefix: &str,
+        depth: usize,
+    ) -> Result<(), ArchiveError> {
+        let corrupt = |e: io::Error| {
+            fault.borrow_mut().take().unwrap_or(ArchiveError::Corrupt {
+                format: Format::Tar,
+                message: e.to_string(),
+            })
         };
-        let mut archive = tar::Archive::new(Cursor::new(data));
+        let mut archive = tar::Archive::new(reader);
         for entry in archive.entries().map_err(corrupt)? {
             let mut entry = entry.map_err(corrupt)?;
             let kind = entry.header().entry_type();
@@ -334,6 +400,7 @@ impl Walker<'_> {
                 self.skip(path, &self.too_large())?;
                 continue;
             }
+            self.reserve(entry.size())?;
             let mut content = Vec::new();
             match (&mut entry)
                 .take(self.limits.max_file_bytes.saturating_add(1))
@@ -358,8 +425,37 @@ impl Walker<'_> {
         name: Option<&str>,
         depth: usize,
     ) -> Result<(), ArchiveError> {
+        let corrupt = |e: io::Error| ArchiveError::Corrupt {
+            format: Format::Gzip,
+            message: e.to_string(),
+        };
         let mut decoder = flate2::read::MultiGzDecoder::new(data);
-        let inner = match self.read_counted(&mut decoder) {
+        // One tar block is enough to tell a tarball from a lone file.
+        let mut head = Vec::with_capacity(TAR_BLOCK as usize);
+        (&mut decoder)
+            .take(TAR_BLOCK)
+            .read_to_end(&mut head)
+            .map_err(corrupt)?;
+        let is_tarball = is_tar(&head);
+        let mut stream = Cursor::new(head).chain(decoder);
+
+        // A .tar.gz is one archive, not two: its entries sit where the .tar.gz was.
+        // It is read as it inflates, so the tarball is bounded by the total alone and
+        // each entry by the per-file limit, as in a zip.
+        if is_tarball {
+            let fault = RefCell::new(None);
+            let metered = Metered {
+                inner: stream,
+                produced: Rc::clone(&self.decompressed),
+                max: self.limits.max_total_bytes,
+                fault: &fault,
+            };
+            return self.tar_entries(metered, &fault, prefix, depth);
+        }
+
+        // A gzip stream announces no size: it may take up to the per-file limit.
+        self.reserve(self.limits.max_file_bytes)?;
+        let inner = match self.read_counted(&mut stream, None) {
             Ok(Some(d)) => d,
             Ok(None) => return Err(ArchiveError::FileTooLarge(self.limits.max_file_bytes)),
             Err(Read2::Io(message)) => {
@@ -370,10 +466,6 @@ impl Walker<'_> {
             }
             Err(Read2::Fatal(e)) => return Err(e),
         };
-        // A .tar.gz is one archive, not two: its entries sit where the .tar.gz was.
-        if is_tar(&inner) {
-            return self.tar(&inner, prefix, depth);
-        }
         let file_name = name.map(gunzipped_name).unwrap_or_else(|| "file".into());
         self.file(format!("{prefix}{file_name}"), inner, depth)
     }
@@ -404,15 +496,15 @@ impl Walker<'_> {
                 other => other,
             };
         }
-        if self.summary.files >= self.limits.max_files {
+        if self.files >= self.limits.max_files {
             return Err(ArchiveError::TooManyFiles(self.limits.max_files));
         }
-        self.summary.files += 1;
+        self.files += 1;
         (self.sink)(Event::File { path, data }).map_err(ArchiveError::Stopped)
     }
 
     fn skip(&mut self, path: String, reason: &str) -> Result<(), ArchiveError> {
-        self.summary.skipped += 1;
+        self.skipped += 1;
         (self.sink)(Event::Skipped {
             path,
             reason: reason.to_string(),
@@ -420,33 +512,49 @@ impl Walker<'_> {
         .map_err(ArchiveError::Stopped)
     }
 
+    /// Announce that a file of at most `bytes` is about to be decompressed.
+    fn reserve(&mut self, bytes: u64) -> Result<(), ArchiveError> {
+        (self.reserve)(bytes.min(self.limits.max_file_bytes)).map_err(ArchiveError::Stopped)
+    }
+
     fn too_large(&self) -> String {
         format!("larger than {} bytes", self.limits.max_file_bytes)
     }
 
     /// Read a decompressing reader to the end, counting what it produces against the
-    /// total. `Ok(None)` when the file alone is over [`Limits::max_file_bytes`].
-    fn read_counted(&mut self, reader: &mut dyn Read) -> Result<Option<Vec<u8>>, Read2> {
-        let left = self
-            .limits
-            .max_total_bytes
-            .saturating_sub(self.summary.decompressed_bytes);
+    /// total, whether the file is kept or not. `Ok(None)` when the file alone is over
+    /// [`Limits::max_file_bytes`].
+    ///
+    /// `declared` is the size the container announces for the file, when it does. A
+    /// file that turns out larger is unreadable, and found so one byte past that size:
+    /// a forged entry cannot have the walk inflate up to the limit for nothing.
+    fn read_counted(
+        &mut self,
+        reader: &mut dyn Read,
+        declared: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, Read2> {
+        let produced = self.decompressed.get();
+        let left = self.limits.max_total_bytes.saturating_sub(produced);
         let cap = self.limits.max_file_bytes.min(left);
+        let bound = declared.map_or(cap, |d| d.min(cap));
         let mut out = Vec::new();
-        reader
-            .take(cap.saturating_add(1))
-            .read_to_end(&mut out)
-            .map_err(|e| Read2::Io(e.to_string()))?;
+        let read = reader.take(bound.saturating_add(1)).read_to_end(&mut out);
         let len = out.len() as u64;
+        // Counted before anything else: bytes inflated for a file that ends up
+        // skipped were produced all the same.
+        self.decompressed.set(produced.saturating_add(len));
+        read.map_err(|e| Read2::Io(e.to_string()))?;
+        if len > left {
+            return Err(Read2::Fatal(ArchiveError::TooLarge(
+                self.limits.max_total_bytes,
+            )));
+        }
         if len > cap {
-            if len > left {
-                return Err(Read2::Fatal(ArchiveError::TooLarge(
-                    self.limits.max_total_bytes,
-                )));
-            }
             return Ok(None);
         }
-        self.summary.decompressed_bytes += len;
+        if len > bound {
+            return Err(Read2::Io("larger than its declared size".into()));
+        }
         Ok(Some(out))
     }
 }
@@ -456,6 +564,50 @@ impl Walker<'_> {
 enum Read2 {
     Io(String),
     Fatal(ArchiveError),
+}
+
+/// Size of a tar block: the header of the first entry fills the first one.
+const TAR_BLOCK: u64 = 512;
+
+/// A decompressing reader whose output counts against [`Limits::max_total_bytes`]
+/// as it is read, for a stream too large to buffer whole.
+///
+/// It stops with an I/O error, and leaves the actual reason in `fault`: the total
+/// was exceeded, or the compressed stream is corrupt.
+struct Metered<'a, R> {
+    inner: R,
+    produced: Rc<Cell<u64>>,
+    max: u64,
+    fault: &'a RefCell<Option<ArchiveError>>,
+}
+
+impl<R: Read> Read for Metered<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let produced = self.produced.get();
+        // One byte past the limit is enough to know it is exceeded.
+        let allowed = self.max.saturating_sub(produced).saturating_add(1);
+        let want = buf
+            .len()
+            .min(usize::try_from(allowed).unwrap_or(usize::MAX));
+        let n = match self.inner.read(&mut buf[..want]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+            Err(e) => {
+                *self.fault.borrow_mut() = Some(ArchiveError::Corrupt {
+                    format: Format::Gzip,
+                    message: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+        let produced = produced.saturating_add(n as u64);
+        self.produced.set(produced);
+        if produced > self.max {
+            *self.fault.borrow_mut() = Some(ArchiveError::TooLarge(self.max));
+            return Err(io::Error::other("the archive expands past its limit"));
+        }
+        Ok(n)
+    }
 }
 
 fn unreadable(e: &str) -> String {
@@ -834,6 +986,159 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    /// Rewrite every central-directory record of `zip` to declare `size` uncompressed
+    /// bytes, as a forged archive would.
+    fn declare_size(mut zip: Vec<u8>, size: u32) -> Vec<u8> {
+        let mut patched = 0;
+        let mut i = 0;
+        while i + 28 <= zip.len() {
+            if zip[i..].starts_with(b"PK\x01\x02") {
+                zip[i + 24..i + 28].copy_from_slice(&size.to_le_bytes());
+                patched += 1;
+                i += 28;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(patched > 0, "no central-directory record found");
+        zip
+    }
+
+    #[test]
+    fn skipped_oversized_gzip_members_count_toward_the_total() {
+        // Each member is tiny on the wire and inflates past the per-file limit: the
+        // bytes inflated before giving up on it are still decompression output.
+        let member = gz(&[0u8; 4096]);
+        let data = zip_of(&[("a.gz", &member), ("b.gz", &member), ("c.gz", &member)]);
+        let limits = Limits {
+            max_file_bytes: 1024,
+            max_total_bytes: 2500,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Zip, None, &limits);
+        assert_eq!(r, Err(ArchiveError::TooLarge(2500)), "{events:?}");
+        assert!(files(&events).is_empty());
+    }
+
+    #[test]
+    fn a_zip_entry_larger_than_it_declares_is_not_inflated() {
+        let big = [0u8; 4096];
+        let data = declare_size(zip_of(&[("a", &big), ("b", &big), ("c", &big)]), 1);
+        let limits = Limits {
+            max_file_bytes: 1024,
+            max_total_bytes: 2500,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Zip, None, &limits);
+        let summary = r.unwrap();
+        let reason = "unreadable: larger than its declared size";
+        assert_eq!(
+            skipped(&events),
+            vec![("a", reason), ("b", reason), ("c", reason)]
+        );
+        // One byte past the declared size is enough to know.
+        assert_eq!(summary.decompressed_bytes, 6);
+    }
+
+    #[test]
+    fn a_tar_gz_larger_than_the_file_limit_is_read_entry_by_entry() {
+        let (a, b, c) = ([b'a'; 700], [b'b'; 700], [b'c'; 700]);
+        let data = gz(&tar_of(&[("a.txt", &a), ("b.txt", &b), ("c.txt", &c)]));
+        let limits = Limits {
+            max_file_bytes: 1024,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Gzip, Some("logs.tar.gz"), &limits);
+        let summary = r.unwrap();
+        assert_eq!(
+            files(&events),
+            vec![
+                ("a.txt", a.as_slice()),
+                ("b.txt", b.as_slice()),
+                ("c.txt", c.as_slice())
+            ]
+        );
+        assert!(skipped(&events).is_empty(), "{events:?}");
+        assert_eq!(summary.files, 3);
+        // Three 512-byte headers and three 700-byte files padded to 1024.
+        assert!(
+            summary.decompressed_bytes >= 3 * (512 + 1024),
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_entry_of_a_tar_gz_is_skipped_alone() {
+        let big = [b'x'; 4096];
+        let data = gz(&tar_of(&[
+            ("a.txt", b"alpha"),
+            ("big.bin", &big),
+            ("c.txt", b"gamma"),
+        ]));
+        let limits = Limits {
+            max_file_bytes: 1024,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Gzip, Some("logs.tgz"), &limits);
+        r.unwrap();
+        assert_eq!(
+            files(&events),
+            vec![
+                ("a.txt", b"alpha".as_slice()),
+                ("c.txt", b"gamma".as_slice())
+            ]
+        );
+        assert_eq!(
+            skipped(&events),
+            vec![("big.bin", "larger than 1024 bytes")]
+        );
+    }
+
+    #[test]
+    fn a_tar_gz_bomb_stops_at_the_total_limit() {
+        let mib = vec![0u8; 1024 * 1024];
+        let data = gz(&tar_of(&[("a", &mib), ("b", &mib), ("c", &mib)]));
+        assert!(data.len() < 64 * 1024);
+        let limits = Limits {
+            max_total_bytes: 2 * 1024 * 1024,
+            ..Limits::default()
+        };
+        let (r, events) = run(&data, Format::Gzip, Some("bomb.tar.gz"), &limits);
+        assert_eq!(r, Err(ArchiveError::TooLarge(2 * 1024 * 1024)));
+        assert_eq!(files(&events).len(), 1, "only the first fits");
+
+        // Nested, it still ends the walk: skipping it would let the next one start
+        // from a fresh budget. The entries it skips are inflated to be passed over,
+        // so they count too.
+        let limits = Limits {
+            max_file_bytes: 64 * 1024,
+            max_total_bytes: 2 * 1024 * 1024,
+            ..Limits::default()
+        };
+        let outer = zip_of(&[("inner.tar.gz", &data), ("after.txt", b"after")]);
+        let (r, events) = run(&outer, Format::Zip, None, &limits);
+        assert_eq!(r, Err(ArchiveError::TooLarge(2 * 1024 * 1024)));
+        assert!(files(&events).is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_truncated_tar_gz_is_a_corrupt_gzip() {
+        let body: Vec<u8> = (0..20_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut data = gz(&tar_of(&[("a.txt", b"alpha"), ("b.bin", &body)]));
+        data.truncate(data.len() / 2);
+        let (r, _) = run(&data, Format::Gzip, Some("cut.tar.gz"), &Limits::default());
+        assert!(
+            matches!(
+                r,
+                Err(ArchiveError::Corrupt {
+                    format: Format::Gzip,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+    }
+
     #[test]
     fn too_many_files_is_an_error() {
         let data = zip_of(&[("a", b"1"), ("b", b"2"), ("c", b"3")]);
@@ -856,5 +1161,69 @@ mod tests {
         });
         assert_eq!(r, Err(ArchiveError::Stopped("receiver gone".into())));
         assert_eq!(seen, 1);
+    }
+
+    /// Every file handed to the sink was reserved, for at least its size, right
+    /// before it was decompressed: zip, tar, a lone gzip, a `.tar.gz` and a nested
+    /// zip alike.
+    #[test]
+    fn every_file_is_reserved_before_it_is_decompressed() {
+        let inner = zip_of(&[("deep.txt", b"deep deep")]);
+        let tar = tar_of(&[("t1.txt", b"tar one"), ("t2.txt", b"tar two!")]);
+        let data = zip_of(&[
+            ("a.txt", b"alpha"),
+            ("logs.tar", &tar),
+            ("logs.tar.gz", &gz(&tar)),
+            ("note.txt.gz", &gz(b"gzipped note")),
+            ("inner.zip", &inner),
+            ("empty.txt", b""),
+        ]);
+        let limits = Limits::default();
+        // What the sink and the reservation hook saw, in order.
+        let seen = RefCell::new(Vec::<Result<u64, Event>>::new());
+        let r = walk_reserving(
+            &data,
+            Format::Zip,
+            None,
+            &limits,
+            &mut |n| {
+                seen.borrow_mut().push(Ok(n));
+                Ok(())
+            },
+            &mut |e| {
+                seen.borrow_mut().push(Err(e));
+                Ok(())
+            },
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let seen = seen.into_inner();
+        let mut files = 0;
+        for (i, step) in seen.iter().enumerate() {
+            if let Err(Event::File { path, data }) = step {
+                files += 1;
+                let Some(Ok(reserved)) = i.checked_sub(1).map(|p| &seen[p]) else {
+                    panic!("{path} was not reserved right before it: {seen:?}");
+                };
+                assert!(*reserved >= data.len() as u64, "{path}: {reserved}");
+                assert!(*reserved <= limits.max_file_bytes);
+            }
+        }
+        assert_eq!(files, 7, "{seen:?}");
+
+        // A reservation that fails stops the walk before anything is decompressed.
+        let mut events = 0;
+        let r = walk_reserving(
+            &data,
+            Format::Zip,
+            None,
+            &limits,
+            &mut |_| Err("abandoned".into()),
+            &mut |_| {
+                events += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(r, Err(ArchiveError::Stopped("abandoned".into())));
+        assert_eq!(events, 0);
     }
 }

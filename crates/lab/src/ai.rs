@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::credits::FailureBackoff;
 use crate::{LabCredentials, LabError, STALE_FOR, is_lab_account};
 
 /// The longest a target is reused without asking the Lab, whatever `cache_ttl` says.
@@ -86,6 +87,7 @@ pub struct AiTargetCache {
     creds: LabCredentials,
     http: reqwest::Client,
     targets: Mutex<HashMap<String, Cached>>,
+    failures: FailureBackoff,
     /// Test-only offset added to the clock, so tests move the cache windows forward
     /// without waiting.
     #[cfg(test)]
@@ -114,6 +116,7 @@ impl AiTargetCache {
             creds,
             http,
             targets: Mutex::new(HashMap::new()),
+            failures: FailureBackoff::default(),
             #[cfg(test)]
             skew: Mutex::new(Duration::ZERO),
         }
@@ -159,6 +162,14 @@ impl AiTargetCache {
     /// mint a new key; the cached entry is dropped first only when it holds that very
     /// key. When the Lab cannot answer, a cached target up to [`STALE_FOR`] old is
     /// returned instead (with `refresh` too), but never the rejected key.
+    ///
+    /// After a failed fetch the Lab is not asked again for
+    /// [`FAILURE_BACKOFF`](crate::FAILURE_BACKOFF), with `refresh` too, so a hung Lab
+    /// costs one timeout, not one per step: lookups in that window get the stale target
+    /// or `Unavailable` at once. The pause covers every account when the failure is the
+    /// Lab's, and one account when it is that account's, as for the credit check. A
+    /// lookup with `rejected_key_id` is sent regardless: the worker reports a refused
+    /// key once, and the Lab has to hear it to replace the key.
     pub async fn get(
         &self,
         account_id: &str,
@@ -187,7 +198,21 @@ impl AiTargetCache {
                 }
             }
         }
-        match self.fetch(account_id, rejected_key_id).await {
+        let blocked = match rejected_key_id {
+            None => self.failures.blocked(account_id, now),
+            Some(_) => None,
+        };
+        let fetched = match blocked {
+            Some(e) => Err(e),
+            None => {
+                let fetched = self.fetch(account_id, rejected_key_id).await;
+                // Timed from when the failure was seen, so a 5 s timeout still leaves
+                // the full backoff before the next attempt.
+                self.failures.record(account_id, &fetched, self.now());
+                fetched
+            }
+        };
+        match fetched {
             Ok(Fetched::Target(target)) => {
                 self.targets
                     .lock()
@@ -207,7 +232,7 @@ impl AiTargetCache {
             }
             Err(e) => match self.cached(account_id) {
                 Some(c) if now.duration_since(c.fetched_at) < STALE_FOR => {
-                    tracing::warn!(error = %e, account_id, "Lab unreachable; using a stale AI target");
+                    tracing::warn!(error = %e, account_id, "the Lab could not answer; using a stale AI target");
                     AiLookup::Target(c.target)
                 }
                 _ => {
@@ -702,5 +727,93 @@ mod tests {
         let t: LabAiTarget = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(t.decision_model.as_deref(), Some("typesafe/jev"));
         assert_eq!(serde_json::to_value(&t).unwrap(), v);
+    }
+
+    const OTHER: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62";
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_remembered_for_10s() {
+        // A hung or failing Lab must not cost every AI step a timeout: after one failure
+        // the cache stops asking for FAILURE_BACKOFF, with `refresh` too.
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ai_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body("k1", 60)))
+            .mount(&lab)
+            .await;
+        let c = cache(&lab);
+        c.get(ACCOUNT, None, false).await;
+        lab.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&lab)
+            .await;
+        c.advance(Duration::from_secs(61));
+        for refresh in [false, false, true] {
+            assert_eq!(
+                c.get(ACCOUNT, None, refresh).await,
+                AiLookup::Target(target("k1"))
+            );
+        }
+        assert_eq!(requests(&lab).await, 1, "only the first lookup asked");
+        // An account with nothing cached is refused without asking.
+        assert!(is_unavailable(&c.get(OTHER, None, false).await));
+        assert_eq!(requests(&lab).await, 1);
+        // A rejected key is still reported: the Lab has to hear about it to replace it.
+        assert_eq!(
+            c.get(ACCOUNT, Some("k0"), false).await,
+            AiLookup::Target(target("k1"))
+        );
+        assert_eq!(requests(&lab).await, 2);
+        // And the cached key that was rejected is not served, backoff or not.
+        assert!(is_unavailable(&c.get(ACCOUNT, Some("k1"), false).await));
+        assert_eq!(requests(&lab).await, 3);
+        assert!(is_unavailable(&c.get(ACCOUNT, None, false).await));
+        assert_eq!(requests(&lab).await, 3);
+
+        // Past the backoff the Lab is asked again, and a success ends it.
+        lab.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body("k2", 60)))
+            .mount(&lab)
+            .await;
+        c.advance(Duration::from_secs(11));
+        assert_eq!(
+            c.get(ACCOUNT, None, false).await,
+            AiLookup::Target(target("k2"))
+        );
+        assert_eq!(
+            c.get(OTHER, None, false).await,
+            AiLookup::Target(target("k2"))
+        );
+        assert_eq!(requests(&lab).await, 2);
+    }
+
+    #[tokio::test]
+    async fn one_account_s_bad_answer_is_remembered_for_that_account_only() {
+        let lab = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ai_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&lab)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/internal/accounts/{OTHER}/ai")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body("k1", 60)))
+            .mount(&lab)
+            .await;
+        let c = cache(&lab);
+        assert!(is_unavailable(&c.get(ACCOUNT, None, false).await));
+        assert!(is_unavailable(&c.get(ACCOUNT, None, true).await));
+        assert_eq!(requests(&lab).await, 1);
+        assert_eq!(
+            c.get(OTHER, None, false).await,
+            AiLookup::Target(target("k1"))
+        );
+        assert!(is_unavailable(&c.get(ACCOUNT, None, false).await));
+        assert_eq!(requests(&lab).await, 2);
+        c.advance(Duration::from_secs(11));
+        assert!(is_unavailable(&c.get(ACCOUNT, None, false).await));
+        assert_eq!(requests(&lab).await, 3);
     }
 }

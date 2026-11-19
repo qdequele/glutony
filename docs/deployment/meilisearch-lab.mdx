@@ -148,12 +148,14 @@ plane sends batches of up to 500 to `POST {LAB_URL}/internal/events` with
 marks the ids the Lab lists in `accepted`, and retries the rest with backoff (max
 5 min). A Lab `401` is logged and retried like any other failure.
 
-An event the Lab has not accepted **24 h** after it was written to the outbox (its
-`created_at`) was skipped on purpose (for example `product mismatch`): it is dropped
-with an error log and counted in `glutony_lab_events_dropped_total`. The check runs
-hourly. Set `LAB_URL` before enabling `LAB_EVENTS_ENABLED`: events already older than
-24 h when the sender first starts get at most one delivery attempt before they are
-dropped.
+An event the Lab answered `200` for without listing it in `accepted` was skipped on
+purpose (for example `product mismatch`): it is dropped **24 h** after that first
+skip. An event that never got such an answer (Lab unreachable, `401`, any other
+status, an unreadable answer) is not taken as rejected: it is retried for **7 days**
+after it was written to the outbox, then dropped. Both drops log an error and count
+in `glutony_lab_events_dropped_total`. The check runs hourly, so a Lab outage or a
+credential problem fixed within 7 days loses no event, and events that waited while
+`LAB_URL` was unset are delivered once it is set, if they are under 7 days old.
 
 ### Credit pre-check
 
@@ -164,9 +166,13 @@ a Lab account, the gateway calls `GET {LAB_URL}/internal/accounts/{account}` (ca
 inactive. When the Lab cannot answer and no cached answer is that recent, or before
 the Lab has confirmed the credentials at boot, it answers
 `503 {"code": "lab_unavailable"}` and starts nothing. After a failed call the gateway
-does not ask the Lab again for 10 s (for any account): requests in that window use a
-cached answer or get the `503` straight away, so a hung Lab costs one timeout, not one
-per request. Tenants that are not Lab account ids (Cloud projects) are never checked.
+does not ask the Lab again for 10 s: requests in that window use a cached answer or
+get the `503` straight away, so a hung Lab costs one timeout, not one per request.
+That pause covers every account when the failure is the Lab's (unreachable or timed
+out, `401`, `403`, `429`, any `5xx`), and only the account that was asked about when
+the failure is its own (an answer the gateway cannot read, any other `4xx`): the other
+accounts are still checked. Tenants that are not Lab account ids (Cloud projects) are
+never checked.
 
 Scheduled source runs start from Temporal, not through the gateway, so they are
 checked at the start of each run instead: when the source's tenant is a Lab account
@@ -191,9 +197,10 @@ The control plane serves `GET /metrics`:
 
 - `glutony_lab_events_pending`
 - `glutony_lab_events_oldest_pending_seconds`
-- `glutony_lab_events_delivered_total`
+- `glutony_lab_events_delivered_total`: events the Lab accepted and the outbox marked delivered
 - `glutony_lab_events_dropped_total`
-- `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`)
+- `glutony_lab_events_failed_total{reason}` (`connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted`):
+  events, not batches. A refused batch of 500 adds 500, and an event adds one each time it is tried again
 
 The pending gauges are refreshed on every scrape, so they are correct even when
 `LAB_URL` is unset and events are waiting in the outbox. The sender reads at most
@@ -211,7 +218,7 @@ threshold as Lumen), and on any increase of `glutony_lab_events_dropped_total`:
 - alert: GlutonyLabEventsDropped
   expr: increase(glutony_lab_events_dropped_total[1h]) > 0
   annotations:
-    summary: glutony dropped usage events the Lab never accepted within 24 h
+    summary: glutony dropped usage events the Lab skipped, or never accepted within 7 days
 ```
 
 ## AI steps on the team's Gateway
@@ -228,7 +235,13 @@ with a per-team key instead of the worker's own `LLM_API_KEY` / `TYPESAFE_API_KE
    plane replica keeps its own cache, so a retried step (attempt 2 and later) asks
    with `?refresh=true`: the replica then asks the Lab even when its cached answer is
    fresh, so a retry never reuses a key another replica saw rotated. When the Lab
-   cannot answer that refresh, the cached answer is still used, as above.
+   cannot answer that refresh, the cached answer is still used, as above. After a
+   failed call the control plane does not ask the Lab again for 10 s, with
+   `?refresh=true` too: lookups in that window get the cached answer or the `503`
+   straight away, so a hung Lab costs one timeout, not one per AI step. As for the
+   credit pre-check, the pause covers every account when the failure is the Lab's and
+   one account when it is that account's. A refused key (step 3) is reported to the
+   Lab regardless.
 2. The plugin calls the Gateway's URL with the team's key and models. The key stays
    in the worker's memory for that step: it is not part of the activity input, so it
    never reaches Temporal history, and no log line or error carries it.
@@ -242,9 +255,10 @@ answer (`503 lab_unavailable`), or a control plane answering any other error (a 
 without `no_gateway`, for example a replica not yet running this route during a
 rolling deploy), is retried with the activity's retry policy. The route serves team
 keys, so it needs `CONTROL_PLANE_TOKEN`: with `CONTROL_PLANE_TOKEN_DISABLED=true` it
-answers `403 token_required` and the step fails for good. A control plane without
-`LAB_INSTANCE_*` serves no target, and the step uses the worker's own key (the
-worker logs a warning for a Lab account). Tenants that are not Lab account ids are
+answers `403 token_required` and the step fails for good. A Lab account's AI step
+never falls back to the worker's own key: a control plane without `LAB_INSTANCE_*`
+serves no target, so it could not ask the Lab, and the step fails retryably (then for
+good once the activity's retries run out). Tenants that are not Lab account ids are
 never looked up. On such a worker the AI plugins register even without their env
 key, so another tenant's AI step fails with `InvalidConfig` naming it
 (`LLM_API_KEY`, `TYPESAFE_API_KEY`).
@@ -272,11 +286,15 @@ reason and retried on the next tick.
   are templates: a tenant pipeline that names one fails validation on save and, if
   it was saved before this rule, fails the indexer step with "a tenant job may only
   use its own connections".
+- A global pipeline may pin no connection: with `LAB_URL` / `LAB_INSTANCE_*` set on
+  the control plane, saving or validating one answers `422`. Pin connections in
+  tenant pipelines. A global pinned pipeline saved before this rule is still served
+  and its tenant jobs still need their own connection of that name.
 - A request that carries a tenant never falls back to `MEILI_URL` / `MEILI_API_KEY`:
   it brings its own `X-Meili-Host` / key, or its pipeline is pinned to a connection.
-- The control plane's `/internal/*` routes require `CONTROL_PLANE_TOKEN`. That token
-  guards `/internal/*` only: `/pipelines`, `/jobs` and `/plugins` on port 9000 stay
-  open, so port 9000 must never be reachable from outside the cluster network.
+- Every control plane route except `/health` and `/metrics` requires
+  `CONTROL_PLANE_TOKEN`. Port 9000 must still never be reachable from outside the
+  cluster network.
 
 Before upgrading, copy any global connection a tenant pipeline relies on into that
 tenant, and deploy the control plane before the workers (a new worker against an old
@@ -315,7 +333,8 @@ gives the commands.
 
 Lab events still waiting in the outbox from a pre-v2 release (written by the old
 workers, in a shape a v2 Lab rejects) are converted to the v2 `usage.recorded` shape
-when the new control plane first boots, and get a fresh 24 h delivery window. Workers
+when the new control plane first boots, and get a fresh delivery window (their
+earlier skips are forgotten). Workers
 not upgraded yet keep posting that old shape while the rollout runs (the control plane
 goes first), and an old control-plane replica still running stores it as is, so the
 new control plane also converts such events when it stores them and, at the latest,

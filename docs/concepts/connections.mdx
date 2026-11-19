@@ -44,7 +44,7 @@ pipelines whose indexer step names it.
 | `GET /connections` | List. |
 | `POST /connections` | Create (validated as above). |
 | `GET /connections/{uid}` | One connection, with `used_by`. |
-| `PATCH /connections/{uid}` | Change `name`, `host` or `api_key`. Omit `api_key` to keep it. |
+| `PATCH /connections/{uid}` | Change `name`, `host` or `api_key`. Omit `api_key` to keep it while `host` stays on the same origin; moving `host` to another origin (scheme, host or port) needs a new `api_key`, or it answers `422`. |
 | `DELETE /connections/{uid}` | Delete. Never blocked. |
 
 ## Pinning a pipeline
@@ -87,6 +87,11 @@ the document, rather than looping on `413`.
 - The key is decrypted only inside the indexer activity, just before the
   plugin runs. The workflow carries the connection's **name**, so the key is
   never written to Temporal history.
+- A Meilisearch key sent with a request to a pinned pipeline (`X-Meili-Api-Key`,
+  `Authorization: Bearer`, or the `MEILI_API_KEY` fallback) is never used, and
+  is dropped before the job starts, so it is not written to Temporal history
+  either. Inside an archive whose files are routed by their own type, it is
+  dropped for each file whose pipeline is pinned.
 - The host is re-checked against `MEILI_CONNECTION_HOSTS` at every run, so
   tightening the policy takes effect immediately.
 - Connections are tenant-scoped like pipelines: a tenant sees its own
@@ -94,6 +99,11 @@ the document, rather than looping on `413`.
 - A tenant pipeline may only name its **own** connections. Global connections are
   templates: a tenant can **see** one but never **use** it. See
   [Tenants and global connections](#tenants-and-global-connections).
+- A **global** pipeline that names a connection is for standalone deployments only:
+  its jobs there have no tenant and use the global row. On a deployment that serves
+  tenants (the control plane runs with `LAB_URL` / `LAB_INSTANCE_*`), saving one is
+  refused (`422`), because a tenant job would look the name up among its own
+  connections only. Create the pinned pipeline in each tenant instead.
 
 `MEILI_CONNECTION_HOSTS` controls where connections may point:
 

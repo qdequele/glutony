@@ -19,7 +19,10 @@ pub mod schedules;
 pub mod sources;
 pub mod state;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::header::CONTENT_LENGTH;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
@@ -97,13 +100,46 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
     )
 }
 
+/// Refuse a request whose declared `Content-Length` is over the upload limit, with the
+/// gateway's JSON `413 payload_too_large`.
+///
+/// [`RequestBodyLimitLayer`] makes the same check, but answers in plain text before any
+/// handler runs. This sits outside it so a client always reads the documented error
+/// shape; the layer stays as the guard for bodies that announce no length.
+async fn refuse_declared_oversize(limit: usize, req: Request, next: Next) -> Response {
+    let declared = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit as u64) {
+        return GatewayError::TooLarge("request body exceeds the configured size limit".into())
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// Hold a share of the in-flight upload budget (`MAX_INFLIGHT_UPLOAD_MB`) from before
+/// an ingest route reads its body until its response is built, or answer 503.
+async fn admit_upload(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let declared = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    match state.upload_budget.admit(declared).await {
+        Ok(_reservation) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Build the axum router with every route of SPEC §4 plus `GET /health`, the body
-/// limits (`MAX_UPLOAD_MB`) and request tracing.
+/// limits (`MAX_UPLOAD_MB`, `MAX_INFLIGHT_UPLOAD_MB`) and request tracing.
 pub fn router(state: AppState) -> Router {
     let limit = state.config.max_upload_bytes();
     let cors = cors_layer(&state.config.cors_allow_origins);
-    let router = Router::new()
-        .route("/health", get(health))
+    // The routes that buffer a whole upload, behind the in-flight body budget.
+    let ingest = Router::new()
         .route("/ingest", post(handlers::ingest::ingest))
         .route("/ingest/batch", post(handlers::ingest::ingest_batch))
         .route(
@@ -124,6 +160,13 @@ pub fn router(state: AppState) -> Router {
             "/indexes/{index_uid}/ingest/pipeline/{name}",
             post(handlers::pipeline::ingest_into_index_with_pipeline),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admit_upload,
+        ));
+    let router = Router::new()
+        .route("/health", get(health))
+        .merge(ingest)
         .route("/jobs", get(handlers::jobs::list_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))
@@ -170,12 +213,19 @@ pub fn router(state: AppState) -> Router {
             post(handlers::sources::unpause_source),
         )
         .route("/sources/{uid}/run", post(handlers::sources::run_source))
+        .route(
+            "/sources/{uid}/reset-state",
+            post(handlers::sources::reset_source_state),
+        )
         .route("/sources/{uid}/runs", get(handlers::sources::list_runs))
         .route("/plugins", get(handlers::plugins::list_plugins))
         .route("/catalog", get(handlers::catalog::get_catalog))
         .route("/usage", get(handlers::usage::get_usage))
         .layer(DefaultBodyLimit::max(limit))
         .layer(RequestBodyLimitLayer::new(limit))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| refuse_declared_oversize(limit, req, next),
+        ))
         .layer(TraceLayer::new_for_http());
     // Applied with a `match` rather than an `Option` layer so the gateway does not
     // need tower's `util` feature just for `option_layer`.
@@ -202,7 +252,7 @@ pub mod test_support {
     use meili_ingest_blob::BlobStore;
     use meili_ingest_plugin_sdk::{
         ArchiveWorkflowInput, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput,
-        StepDefinition,
+        PluginInput, StepDefinition,
     };
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
@@ -225,6 +275,7 @@ pub mod test_support {
         snapshots: Mutex<HashMap<Uuid, JobSnapshot>>,
         forgotten: Mutex<Vec<Uuid>>,
         fail_start: Mutex<bool>,
+        refused: Mutex<Vec<PluginInput>>,
     }
 
     impl FakeStarter {
@@ -253,6 +304,10 @@ pub mod test_support {
         pub fn fail_start(&self) {
             *self.fail_start.lock().unwrap() = true;
         }
+        /// The input of every start refused after [`FakeStarter::fail_start`].
+        pub fn refused_inputs(&self) -> Vec<PluginInput> {
+            self.refused.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -262,6 +317,7 @@ pub mod test_support {
             input: &PipelineWorkflowInput,
         ) -> Result<StartedWorkflow, GatewayError> {
             if *self.fail_start.lock().unwrap() {
+                self.refused.lock().unwrap().push(input.input.clone());
                 return Err(GatewayError::Upstream("temporal unavailable".into()));
             }
             self.inputs.lock().unwrap().push(input.clone());
@@ -275,6 +331,7 @@ pub mod test_support {
             input: &ArchiveWorkflowInput,
         ) -> Result<StartedWorkflow, GatewayError> {
             if *self.fail_start.lock().unwrap() {
+                self.refused.lock().unwrap().push(input.input.clone());
                 return Err(GatewayError::Upstream("temporal unavailable".into()));
             }
             self.archive_inputs.lock().unwrap().push(input.clone());
@@ -447,6 +504,57 @@ pub mod test_support {
             .unwrap()
     }
 
+    /// `docs/openapi.yaml` as JSON.
+    pub fn openapi_spec() -> serde_json::Value {
+        serde_yaml::from_str(include_str!("../../../docs/openapi.yaml")).unwrap()
+    }
+
+    /// Whether `docs/openapi.yaml` declares a `status` response for `method path`.
+    pub fn openapi_declares(method: &str, path: &str, status: u16) -> bool {
+        let spec = openapi_spec();
+        let operation = &spec["paths"][path][method.to_lowercase()];
+        assert!(
+            operation.is_object(),
+            "docs/openapi.yaml has no {method} {path}"
+        );
+        operation["responses"][status.to_string()].is_object()
+    }
+
+    /// Assert that `docs/openapi.yaml` declares `status` for `method path` (`path` as
+    /// written in the spec, e.g. `/jobs/{job_id}`) and that `body` validates against
+    /// that response's `application/json` schema.
+    pub fn assert_matches_openapi(method: &str, path: &str, status: u16, body: &serde_json::Value) {
+        let spec = openapi_spec();
+        assert!(
+            openapi_declares(method, path, status),
+            "docs/openapi.yaml: {method} {path} does not declare a {status} response"
+        );
+        let mut response =
+            &spec["paths"][path][method.to_lowercase()]["responses"][status.to_string()];
+        if let Some(reference) = response["$ref"].as_str() {
+            let name = reference.trim_start_matches("#/components/responses/");
+            response = &spec["components"]["responses"][name];
+        }
+        let schema = &response["content"]["application/json"]["schema"];
+        assert!(
+            schema.is_object(),
+            "docs/openapi.yaml: {method} {path} {status} has no application/json schema"
+        );
+        // The schema's `#/components/...` references resolve against this root.
+        let mut root = schema.clone();
+        root["components"] = spec["components"].clone();
+        let validator = jsonschema::validator_for(&root)
+            .unwrap_or_else(|e| panic!("{method} {path} {status}: invalid schema: {e}"));
+        let errors: Vec<String> = validator
+            .iter_errors(body)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{method} {path} {status}: the body does not match docs/openapi.yaml: {errors:#?}\nbody: {body:#}"
+        );
+    }
+
     /// Read a JSON response body.
     pub async fn json_body(resp: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
@@ -487,6 +595,129 @@ mod tests {
         // The UI reads these to render the tenant and to hide features that are off.
         assert_eq!(body["features"]["usage_analytics"], false);
         assert!(body["tenant_id"].is_null());
+        assert_matches_openapi("GET", "/health", 200, &body);
+        let documented = &openapi_spec()["paths"]["/health"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["properties"];
+        for field in ["version", "tenant_id", "features"] {
+            assert!(
+                documented[field].is_object(),
+                "/health returns `{field}`; docs/openapi.yaml must declare it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_oversized_body_is_a_json_413() {
+        let server = MockServer::start().await;
+        let cfg = GatewayConfig {
+            max_upload_mb: 1,
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, cfg).await;
+        let big = vec![b'a'; 1024 * 1024 + 10];
+        let mut req = standalone_request("/ingest", "text/plain", big);
+        // A client that announces the size is refused before the handler runs.
+        req.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(1024 * 1024 + 10),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "payload_too_large", "{body}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+
+    /// A raw upload of `len` bytes that says how big it is.
+    fn sized_upload(len: usize) -> Request<Body> {
+        let mut req = standalone_request("/ingest", "text/plain", vec![b'a'; len]);
+        req.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(len),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn uploads_past_the_in_flight_budget_get_a_json_503() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        // `MAX_UPLOAD_MB=1` and the default budget of twice that: two maximum-size
+        // uploads in flight fill it, and a third request, however small, has to wait.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/resolve"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(
+                        serde_json::json!({"pipeline": sample_pipeline("builtin.text", None)}),
+                    )
+                    // Holds the first two requests (and their buffered bodies) in flight.
+                    .set_delay(std::time::Duration::from_secs(4)),
+            )
+            .mount(&server)
+            .await;
+        mount_jobs_ok(&server).await;
+        let cfg = GatewayConfig {
+            max_upload_mb: 1,
+            ..GatewayConfig::default()
+        };
+        let (app, _) = test_app(&server, cfg).await;
+        let full = 1024 * 1024;
+        let held: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(app.clone().oneshot(sized_upload(full))))
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let resp = app.clone().oneshot(sized_upload(10)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "{:?}",
+            resp.headers()
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "overloaded", "{body}");
+        assert_matches_openapi("POST", "/ingest", 503, &body);
+
+        for h in held {
+            let resp = h.await.unwrap().unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "admitted while idle");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_query_string_is_a_json_400() {
+        let server = MockServer::start().await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        for uri in [
+            "/usage",
+            "/usage?date_from=2026-01-01",
+            "/sources?include_archived=yes",
+            "/sources/x/runs?limit=abc",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                resp.headers()[axum::http::header::CONTENT_TYPE],
+                "application/json",
+                "{uri}"
+            );
+            let body = json_body(resp).await;
+            assert_eq!(body["code"], "bad_request", "{uri}: {body}");
+            assert!(
+                body["error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{uri}: {body}"
+            );
+        }
     }
 
     #[tokio::test]

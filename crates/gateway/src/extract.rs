@@ -172,6 +172,8 @@ pub async fn extract_payload(
             return Err(GatewayError::BadRequest("empty JSON body".into()));
         }
         let value: Value = serde_json::from_slice(&body)?;
+        // The raw bytes are no longer needed: free them before the tree is converted.
+        drop(body);
         return payload_from_json(value);
     }
     if body.is_empty() {
@@ -181,10 +183,31 @@ pub async fn extract_payload(
         ));
     }
     Ok(Extracted {
-        payload: file_payload(body.to_vec(), filename_hint, content_type),
+        // `Vec::from` takes over the buffer of a uniquely owned `Bytes` instead of
+        // copying it, so an upload is held once, not twice.
+        payload: detect_file_payload(Vec::from(body), filename_hint, content_type).await?,
         index: None,
         pipeline: None,
     })
+}
+
+/// [`file_payload`] for a request handler: above
+/// [`DETECT_BLOCKING_THRESHOLD_BYTES`](meili_ingest_router::DETECT_BLOCKING_THRESHOLD_BYTES)
+/// the detection runs on the blocking pool, since sniffing JSON parses the whole
+/// payload and would otherwise hold an async worker thread.
+async fn detect_file_payload(
+    data: Vec<u8>,
+    filename: Option<&str>,
+    content_type_hint: Option<&str>,
+) -> Result<IngestPayload, GatewayError> {
+    if data.len() <= meili_ingest_router::DETECT_BLOCKING_THRESHOLD_BYTES {
+        return Ok(file_payload(data, filename, content_type_hint));
+    }
+    let filename = filename.map(str::to_owned);
+    let hint = content_type_hint.map(str::to_owned);
+    tokio::task::spawn_blocking(move || file_payload(data, filename.as_deref(), hint.as_deref()))
+        .await
+        .map_err(|e| GatewayError::Internal(format!("MIME detection failed: {e}")))
 }
 
 /// Build a [`IngestPayload::File`] running MIME detection.
@@ -221,7 +244,7 @@ async fn extract_multipart(mut mp: Multipart) -> Result<Extracted, GatewayError>
                 let filename = field.file_name().map(str::to_string);
                 let ct = field.content_type().map(str::to_string);
                 let data = field.bytes().await?;
-                file = Some((data.to_vec(), filename, ct));
+                file = Some((Vec::from(data), filename, ct));
             }
             "url" => url = non_empty(field.text().await?),
             "s3" => s3 = non_empty(field.text().await?),
@@ -240,7 +263,7 @@ async fn extract_multipart(mut mp: Multipart) -> Result<Extracted, GatewayError>
 
     let payload = if let Some((data, filename, ct)) = file {
         let filename = filename_override.or(filename);
-        file_payload(data, filename.as_deref(), ct.as_deref())
+        detect_file_payload(data, filename.as_deref(), ct.as_deref()).await?
     } else if let Some(url) = url {
         IngestPayload::Url {
             url,
@@ -304,31 +327,35 @@ pub fn payload_from_json(value: Value) -> Result<Extracted, GatewayError> {
             index: None,
             pipeline: None,
         }),
-        Value::Object(obj) => {
+        Value::Object(mut obj) => {
             let index = str_field(&obj, "index");
             let pipeline = str_field(&obj, "pipeline");
-            let payload = if let Some(items) = obj.get("items") {
+            // Items and documents are taken out of the parsed tree, never cloned: a
+            // body near the upload limit is held once.
+            let payload = if let Some(items) = obj.remove("items") {
                 let Value::Array(items) = items else {
                     return Err(GatewayError::BadRequest("`items` must be an array".into()));
                 };
                 let mut out = Vec::with_capacity(items.len());
-                for (i, item) in items.iter().enumerate() {
+                for (i, item) in items.into_iter().enumerate() {
                     let Value::Object(fields) = item else {
                         return Err(GatewayError::BadRequest(format!(
                             "items[{i}] must be an object"
                         )));
                     };
-                    let payload = single_from_object(item.clone())
+                    let index = str_field(&fields, "index");
+                    let pipeline = str_field(&fields, "pipeline");
+                    let payload = single_from_object(fields)
                         .map_err(|e| GatewayError::BadRequest(format!("items[{i}]: {e}")))?;
                     out.push(BatchItem {
                         payload,
-                        index: str_field(fields, "index"),
-                        pipeline: str_field(fields, "pipeline"),
+                        index,
+                        pipeline,
                     });
                 }
                 IngestPayload::Batch(out)
             } else {
-                single_from_object(Value::Object(obj))?
+                single_from_object(obj)?
             };
             Ok(Extracted {
                 payload,
@@ -343,10 +370,9 @@ pub fn payload_from_json(value: Value) -> Result<Extracted, GatewayError> {
 }
 
 /// `{url}` / `{s3}` / `{documents}` object → a single (non-batch) payload.
-fn single_from_object(value: Value) -> Result<IngestPayload, GatewayError> {
-    let Value::Object(obj) = value else {
-        return Err(GatewayError::BadRequest("expected a JSON object".into()));
-    };
+fn single_from_object(
+    mut obj: serde_json::Map<String, Value>,
+) -> Result<IngestPayload, GatewayError> {
     let filename = str_field(&obj, "filename");
     let content_type = str_field(&obj, "content_type");
     if let Some(url) = str_field(&obj, "url") {
@@ -363,8 +389,8 @@ fn single_from_object(value: Value) -> Result<IngestPayload, GatewayError> {
             content_type,
         });
     }
-    if let Some(docs) = obj.get("documents") {
-        return Ok(IngestPayload::Documents(documents_from_json(docs.clone())?));
+    if let Some(docs) = obj.remove("documents") {
+        return Ok(IngestPayload::Documents(documents_from_json(docs)?));
     }
     Err(GatewayError::BadRequest(
         "JSON body must contain `url`, `s3`, `documents` or `items`".into(),
@@ -397,7 +423,8 @@ pub fn documents_from_json(value: Value) -> Result<Vec<Document>, GatewayError> 
         .collect()
 }
 
-/// One JSON object → [`Document`]: `id` from `id` (string or number) or generated;
+/// One JSON object → [`Document`]: `id` from `id` (string or number, sanitised to
+/// `[A-Za-z0-9_-]`) or generated when missing, `null` or blank;
 /// `title` from `title`; `content` from `content`/`text`/`body` (string) or all string
 /// values joined by a space; every other key goes into `fields`.
 pub fn document_from_json(value: Value) -> Result<Document, GatewayError> {
@@ -410,8 +437,10 @@ pub fn document_from_json(value: Value) -> Result<Document, GatewayError> {
         Some(Value::String(s)) if !s.trim().is_empty() => {
             meili_ingest_plugin_sdk::sanitize_id(s.trim())
         }
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Null) | None => Uuid::new_v4().to_string(),
+        // `1.5` or `1e3` print with characters Meilisearch refuses in a document id.
+        Some(Value::Number(n)) => meili_ingest_plugin_sdk::sanitize_id(&n.to_string()),
+        // A blank id is no id, as for an uploaded JSON file.
+        Some(Value::Null | Value::String(_)) | None => Uuid::new_v4().to_string(),
         Some(other) => {
             return Err(GatewayError::BadRequest(format!(
                 "`id` must be a string or number, got {other}"
@@ -574,6 +603,32 @@ mod tests {
     }
 
     #[test]
+    fn document_from_json_sanitizes_a_non_integer_numeric_id() {
+        let d = document_from_json(json!({"id": 1.5})).unwrap();
+        assert_eq!(d.id, "1_5");
+        let v: Value = serde_json::from_str(r#"{"id":1e3}"#).unwrap();
+        let d = document_from_json(v).unwrap();
+        assert!(
+            !d.id.is_empty()
+                && d.id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "{:?}",
+            d.id
+        );
+        // Integers, negative ones included, are already valid ids.
+        assert_eq!(document_from_json(json!({"id": -7})).unwrap().id, "-7");
+    }
+
+    #[test]
+    fn document_from_json_generates_an_id_for_an_empty_one() {
+        for id in ["", "   "] {
+            let d = document_from_json(json!({"id": id, "title": "t"})).unwrap();
+            assert!(Uuid::parse_str(&d.id).is_ok(), "{id:?} -> {:?}", d.id);
+        }
+    }
+
+    #[test]
     fn document_from_json_rejects_bad_shapes() {
         assert!(document_from_json(json!("str")).is_err());
         assert!(document_from_json(json!({"id": ["x"]})).is_err());
@@ -581,6 +636,74 @@ mod tests {
         assert!(documents_from_json(json!("nope")).is_err());
         let err = documents_from_json(json!([{"id": "ok"}, 3])).unwrap_err();
         assert!(matches!(err, GatewayError::BadRequest(m) if m.starts_with("documents[1]")));
+    }
+
+    // --- no copy of the upload ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_raw_upload_is_moved_into_the_blob_not_copied() {
+        let data = vec![7u8; 64 * 1024];
+        let ptr = data.as_ptr();
+        let e = extract_payload(
+            Some("application/octet-stream"),
+            Bytes::from(data),
+            None,
+            Some("a.bin"),
+        )
+        .await
+        .unwrap();
+        let IngestPayload::File(blob) = e.payload else {
+            panic!("expected a file payload");
+        };
+        assert_eq!(blob.data.len(), 64 * 1024);
+        assert_eq!(blob.data.as_ptr(), ptr, "the upload buffer was copied");
+    }
+
+    #[test]
+    fn json_documents_are_moved_not_deep_cloned() {
+        // The heap buffer of a string value must still be the one the parser allocated.
+        // (`json!` serialises its arguments, so the tree is assembled by hand.)
+        fn object(entries: Vec<(&str, Value)>) -> Value {
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            )
+        }
+        fn documents() -> (Value, *const u8) {
+            let s = "x".repeat(4096);
+            let ptr = s.as_ptr();
+            let doc = object(vec![("id", json!("1")), ("blob", Value::String(s))]);
+            (Value::Array(vec![doc]), ptr)
+        }
+        fn blob_ptr(d: &Document) -> *const u8 {
+            d.fields["blob"].as_str().unwrap().as_ptr()
+        }
+
+        let (docs, ptr) = documents();
+        let e = payload_from_json(object(vec![("documents", docs)])).unwrap();
+        let IngestPayload::Documents(docs) = e.payload else {
+            panic!("expected documents");
+        };
+        assert_eq!(blob_ptr(&docs[0]), ptr, "`documents` was cloned");
+
+        let (docs, ptr) = documents();
+        let item = object(vec![
+            ("documents", docs),
+            ("index", json!(" own ")),
+            ("pipeline", json!("p")),
+        ]);
+        let e = payload_from_json(object(vec![("items", Value::Array(vec![item]))])).unwrap();
+        let IngestPayload::Batch(items) = e.payload else {
+            panic!("expected a batch");
+        };
+        assert_eq!(items[0].index.as_deref(), Some("own"));
+        assert_eq!(items[0].pipeline.as_deref(), Some("p"));
+        let IngestPayload::Documents(docs) = &items[0].payload else {
+            panic!("expected documents");
+        };
+        assert_eq!(blob_ptr(&docs[0]), ptr, "the item was cloned");
     }
 
     // --- JSON bodies --------------------------------------------------------------------
@@ -795,6 +918,118 @@ mod tests {
             panic!()
         };
         assert_eq!(blob.mime, "text/csv");
+    }
+
+    #[tokio::test]
+    async fn raw_ndjson_body_is_a_file_detected_as_ndjson() {
+        // Not a JSON ingest request: one record per line is content to ingest.
+        let body = "{\"id\":1}\n{\"id\":2}\n";
+        for (content_type, filename) in [
+            (Some("application/x-ndjson"), None),
+            (None, Some("events.ndjson")),
+            (Some("application/octet-stream"), Some("dump.jsonl")),
+            (None, None),
+        ] {
+            let e = extract_payload(content_type, Bytes::from(body), None, filename)
+                .await
+                .unwrap();
+            let IngestPayload::File(blob) = e.payload else {
+                panic!()
+            };
+            assert_eq!(
+                blob.mime, "application/x-ndjson",
+                "{content_type:?} {filename:?}"
+            );
+            assert_eq!(blob.data, body.as_bytes());
+        }
+    }
+
+    /// A runtime with one blocking thread, held busy until the returned sender fires.
+    /// Anything that needs the blocking pool cannot finish while it is held.
+    fn runtime_with_busy_blocking_pool() -> (tokio::runtime::Runtime, std::sync::mpsc::Sender<()>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        rt.spawn_blocking(move || {
+            let _ = held.recv();
+        });
+        (rt, release)
+    }
+
+    /// A JSON array just over the size where detection leaves the async thread.
+    fn large_json_body() -> Bytes {
+        let mut body = String::from("[");
+        while body.len() <= meili_ingest_router::DETECT_BLOCKING_THRESHOLD_BYTES {
+            body.push_str("{\"id\":1,\"title\":\"a reasonably long title\"},");
+        }
+        body.push_str("{\"id\":2}]");
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn mime_detection_of_a_large_raw_body_leaves_the_async_thread() {
+        let (rt, release) = runtime_with_busy_blocking_pool();
+        rt.block_on(async {
+            // Sniffing JSON parses the whole body: with the pool busy the extraction
+            // must wait for it instead of parsing on this thread.
+            let mut pending = Box::pin(extract_payload(
+                Some("application/octet-stream"),
+                large_json_body(),
+                None,
+                None,
+            ));
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+            assert!(
+                waited.is_err(),
+                "a large body was detected on the async thread"
+            );
+
+            // A small body is detected in place and does not need the pool.
+            let small = extract_payload(None, Bytes::from("[1,2,3]"), None, None)
+                .await
+                .unwrap();
+            let IngestPayload::File(blob) = small.payload else {
+                panic!()
+            };
+            assert_eq!(blob.mime, "application/json");
+
+            release.send(()).unwrap();
+            let IngestPayload::File(blob) = pending.await.unwrap().payload else {
+                panic!()
+            };
+            assert_eq!(blob.mime, "application/json");
+            assert_eq!(blob.data, large_json_body());
+        });
+    }
+
+    #[test]
+    fn mime_detection_of_a_large_multipart_file_leaves_the_async_thread() {
+        let (rt, release) = runtime_with_busy_blocking_pool();
+        rt.block_on(async {
+            let b = "XBOUNDARYX";
+            let body = form(
+                b,
+                vec![part(b, "file", Some("rows"), None, &large_json_body())],
+            );
+            let mp = multipart_from(b, body).await;
+            let mut pending = Box::pin(extract_payload(None, Bytes::new(), Some(mp), None));
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+            assert!(
+                waited.is_err(),
+                "a large multipart file was detected on the async thread"
+            );
+            release.send(()).unwrap();
+            let IngestPayload::File(blob) = pending.await.unwrap().payload else {
+                panic!()
+            };
+            assert_eq!(blob.mime, "application/json");
+            assert_eq!(blob.filename.as_deref(), Some("rows"));
+        });
     }
 
     #[tokio::test]

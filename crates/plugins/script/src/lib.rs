@@ -40,7 +40,9 @@
 //! Pipeline configs are tenant-authored, so the engine is locked down. `no_module`
 //! removes `import`/`export`, `no_custom_syntax` removes syntax extension and
 //! `no_time` removes the clock; rhai has no file, network or process API to begin
-//! with, so a script can only reach `doc`. On top of that every run is bounded by an
+//! with, so a script can only reach `doc`. `print` and `debug` are accepted but
+//! their output is discarded, so a script cannot write to the worker's logs. On top
+//! of that every run is bounded by an
 //! operation budget (`max_ops`), a wall-clock budget (`timeout_ms`) and fixed caps on
 //! expression depth, call depth, string, array and map sizes.
 //!
@@ -50,12 +52,17 @@
 //! |---|---|---|
 //! | `script` | required | the rhai script, run once per document |
 //! | `on_error` | `fail` | what a per-document error does: `fail`, `skip` or `keep` |
-//! | `max_ops` | `100000` | rhai operations one document may use |
-//! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
+//! | `max_ops` | `100000` | rhai operations one document may use, at most 100,000,000 |
+//! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use, at most 30,000 |
+//!
+//! Larger budgets are clamped, not rejected. The whole step also has a one-hour
+//! budget; running past it, or being cancelled, stops the script that is running
+//! and fails the step whatever `on_error` says. Scripts run on a blocking thread,
+//! never on the async runtime.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use meili_ingest_plugin_sdk::prelude::*;
 use rhai::{AST, Dynamic, Engine, Map, Scope};
@@ -72,14 +79,21 @@ const HEARTBEAT_EVERY: usize = 10;
 const MAX_EXPR_DEPTH: usize = 64;
 /// Deepest function call chain a script may build (bounds recursion).
 const MAX_CALL_LEVELS: usize = 16;
-/// Longest string a script may build, in characters.
+/// String bytes a script may build on top of the document it was given.
 const MAX_STRING_SIZE: usize = 512 * 1024;
-/// Largest array a script may build.
+/// Array elements a script may build on top of the document it was given.
 const MAX_ARRAY_SIZE: usize = 10_000;
-/// Largest map a script may build.
+/// Map entries a script may build on top of the document it was given.
 const MAX_MAP_SIZE: usize = 10_000;
 /// Operations between two wall-clock checks in `on_progress`.
 const PROGRESS_EVERY: u64 = 1_000;
+/// Highest `max_ops` honoured; larger values are clamped to it.
+const MAX_OPS_CEILING: u64 = 100_000_000;
+/// Highest `timeout_ms` honoured; larger values are clamped to it.
+const MAX_TIMEOUT_MS: u64 = 30_000;
+/// Wall-clock budget of the whole step, across all its documents. A backstop: the
+/// per-document budgets alone still allow documents x `timeout_ms`.
+const STEP_BUDGET: Duration = Duration::from_secs(60 * 60);
 
 /// The document script plugin. Stateless; construct with [`DocumentScriptPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -161,6 +175,11 @@ impl Config {
 /// abort hook is `on_progress`, and an `Engine` cannot be cloned, so the per-document
 /// wall-clock budget is carried in a shared deadline the closure reads and
 /// [`Runner::run`] rewrites before each document.
+///
+/// Three things stop a running script from the same closure: the document's own
+/// deadline, the whole step's budget, and the activity's cancellation flag. The
+/// closure is the only place that can, because the script runs on a blocking thread
+/// that cannot be aborted from outside.
 struct Runner {
     engine: Engine,
     ast: AST,
@@ -168,17 +187,51 @@ struct Runner {
     base: Instant,
     /// Nanoseconds after `base` at which the current document must stop.
     deadline: Arc<AtomicU64>,
+    /// Per-document wall-clock budget, after clamping to [`MAX_TIMEOUT_MS`].
     timeout_ms: u64,
+    /// The whole step's wall-clock budget, measured from `base`.
+    step_budget: Duration,
+    /// The activity's cancellation flag.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Runner {
+    /// Build the sandboxed engine and compile the script, with the default step
+    /// budget and a cancellation flag nothing sets.
+    #[cfg(test)]
+    fn new(cfg: &Config) -> Result<Self, PluginError> {
+        Self::build(cfg, STEP_BUDGET, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// [`Runner::new`] with another step budget.
+    #[cfg(test)]
+    fn with_step_budget(cfg: &Config, step_budget: Duration) -> Result<Self, PluginError> {
+        Self::build(cfg, step_budget, Arc::new(AtomicBool::new(false)))
+    }
+
     /// Build the sandboxed engine and compile the script.
+    ///
+    /// `max_ops` and `timeout_ms` are tenant-authored, so they are clamped to
+    /// [`MAX_OPS_CEILING`] and [`MAX_TIMEOUT_MS`] rather than rejected: a pipeline
+    /// saved with a larger value keeps working, within the server's bounds.
     ///
     /// A syntax error surfaces here — before any document is touched — so it fails
     /// the step as `InvalidConfig` whatever `on_error` says.
-    fn new(cfg: &Config) -> Result<Self, PluginError> {
+    fn build(
+        cfg: &Config,
+        step_budget: Duration,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, PluginError> {
+        let max_ops = cfg.max_ops.min(MAX_OPS_CEILING);
+        let timeout_ms = cfg.timeout_ms.min(MAX_TIMEOUT_MS);
+
         let mut engine = Engine::new();
-        engine.set_max_operations(cfg.max_ops);
+        // Rhai's default handlers `println!` the script's text onto the worker's
+        // stdout, next to its logs. Discard it rather than disable the symbols, so
+        // scripts that call them keep compiling.
+        engine.on_print(|_| {});
+        engine.on_debug(|_, _, _| {});
+        engine.set_max_operations(max_ops);
         engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_EXPR_DEPTH);
         engine.set_max_call_levels(MAX_CALL_LEVELS);
         engine.set_max_string_size(MAX_STRING_SIZE);
@@ -188,12 +241,16 @@ impl Runner {
         let base = Instant::now();
         let deadline = Arc::new(AtomicU64::new(u64::MAX));
         let watch = Arc::clone(&deadline);
+        let stop = Arc::clone(&cancelled);
+        let step_deadline = nanos(step_budget);
         engine.on_progress(move |ops| {
             if ops % PROGRESS_EVERY != 0 {
                 return None;
             }
-            let elapsed = base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            if elapsed >= watch.load(Ordering::Relaxed) {
+            let elapsed = nanos(base.elapsed());
+            if elapsed >= watch.load(Ordering::Relaxed).min(step_deadline)
+                || stop.load(Ordering::Relaxed)
+            {
                 // Any `Some` aborts the script; the value is discarded by rhai.
                 Some(Dynamic::UNIT)
             } else {
@@ -210,21 +267,61 @@ impl Runner {
             ast,
             base,
             deadline,
-            timeout_ms: cfg.timeout_ms,
+            timeout_ms,
+            step_budget,
+            cancelled,
         })
+    }
+
+    /// Fail the step once it is cancelled or past its whole-step budget.
+    ///
+    /// Checked between documents and after every per-document error, so that a
+    /// script aborted for one of these reasons fails the step instead of going
+    /// through `on_error` (which would skip or keep every remaining document).
+    fn check_step(&self) -> Result<(), PluginError> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(PluginError::Cancelled);
+        }
+        if self.base.elapsed() >= self.step_budget {
+            return Err(PluginError::NonRetryable(format!(
+                "{NAME}: the step ran past its step budget of {}s",
+                self.step_budget.as_secs()
+            )));
+        }
+        Ok(())
     }
 
     /// Give the next document a fresh wall-clock budget.
     fn arm_deadline(&self) {
-        let now = self.base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let now = nanos(self.base.elapsed());
         let budget = self.timeout_ms.saturating_mul(1_000_000);
         self.deadline
             .store(now.saturating_add(budget), Ordering::Relaxed);
     }
 
+    /// Size the string, array and map caps for one document.
+    ///
+    /// Rhai checks the whole container a value lives in, not what the script added:
+    /// after `doc.title = …` it sums every string, array element and map entry in
+    /// `doc`, and after `doc.content.trim()` it measures all of `content`. Fixed caps
+    /// would fail scripts on large documents they only received, so each cap is the
+    /// document's own size plus the fixed headroom. The headroom is added, not
+    /// multiplied, so a script on a large document can build no more than one on a
+    /// small document.
+    fn size_limits_for(&mut self, map: &Map) {
+        let (arrays, maps, strings) = map_sizes(map);
+        self.engine
+            .set_max_string_size(strings.saturating_add(MAX_STRING_SIZE));
+        self.engine
+            .set_max_array_size(arrays.saturating_add(MAX_ARRAY_SIZE));
+        self.engine
+            .set_max_map_size(maps.saturating_add(MAX_MAP_SIZE));
+    }
+
     /// Run the script over one document, mutating it in place.
-    fn run(&self, doc: &mut Document) -> Result<Verdict, PluginError> {
+    fn run(&mut self, doc: &mut Document) -> Result<Verdict, PluginError> {
         let map = to_scope_map(doc)?;
+        self.size_limits_for(&map);
         let mut scope = Scope::new();
         scope.push("doc", map);
 
@@ -245,6 +342,87 @@ impl Runner {
             return Ok(Verdict::Drop);
         }
         Ok(Verdict::Keep)
+    }
+}
+
+/// A duration in nanoseconds, saturating at `u64::MAX` (about 584 years).
+fn nanos(d: Duration) -> u64 {
+    d.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// Run the script over every document, applying `on_error`.
+///
+/// Synchronous: [`DocumentScriptPlugin::execute`] runs it on a blocking thread so
+/// the script never holds an async runtime thread, and heartbeats and cancellation
+/// are handled here, between and inside documents.
+fn run_all(
+    mut runner: Runner,
+    docs: Vec<Document>,
+    on_error: OnError,
+    ctx: &ActivityContext,
+) -> Result<Vec<Document>, PluginError> {
+    let mut out = Vec::with_capacity(docs.len());
+    for (i, mut doc) in docs.into_iter().enumerate() {
+        runner.check_step()?;
+        if i % HEARTBEAT_EVERY == 0 {
+            ctx.heartbeat(format!("document {i}"));
+        }
+        match runner.run(&mut doc) {
+            Ok(Verdict::Keep) => out.push(doc),
+            Ok(Verdict::Drop) => {}
+            Err(e) => {
+                // A script stopped by a cancel or the step budget is not this
+                // document's fault.
+                runner.check_step()?;
+                match on_error {
+                    OnError::Fail => {
+                        return Err(PluginError::NonRetryable(format!(
+                            "{NAME}: document `{}`: {e}",
+                            doc.id
+                        )));
+                    }
+                    OnError::Skip => {
+                        tracing::warn!(document = %doc.id, error = %e, "{NAME}: dropping document");
+                    }
+                    OnError::Keep => {
+                        tracing::warn!(document = %doc.id, error = %e, "{NAME}: keeping document untouched");
+                        out.push(doc);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Sizes of a map as rhai's data-size check counts them: `(array elements, map
+/// entries, string bytes)`, summed over every nested container.
+fn map_sizes(map: &Map) -> (usize, usize, usize) {
+    let mut total = (0, 0, 0);
+    for value in map.values() {
+        total.1 += 1;
+        add_sizes(&mut total, value);
+    }
+    total
+}
+
+/// Add the sizes of the containers and strings inside `value` to `total`, the way
+/// rhai's `calc_data_sizes` does for an element of a map or an array.
+fn add_sizes(total: &mut (usize, usize, usize), value: &Dynamic) {
+    if let Ok(s) = value.as_immutable_string_ref() {
+        total.2 += s.len();
+    } else if let Ok(m) = value.as_map_ref() {
+        let (a, m, s) = map_sizes(&m);
+        total.0 += a;
+        total.1 += m;
+        total.2 += s;
+    } else if let Ok(array) = value.as_array_ref() {
+        for v in array.iter() {
+            total.0 += 1;
+            add_sizes(total, v);
+        }
+    } else if let Ok(blob) = value.as_blob_ref() {
+        total.0 += 1 + blob.len();
     }
 }
 
@@ -326,20 +504,23 @@ fn dynamic_to_json(value: &Dynamic) -> Result<Value, PluginError> {
 ///
 /// `meta` is deliberately not read back: it is provenance the pipeline owns, so the
 /// script sees it but cannot rewrite it.
+///
+/// Every value is converted before any is written, so a failure leaves `doc` exactly
+/// as it was: `on_error: keep` promises the document untouched.
 fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
     for key in ["id", "title", "content", "fields"] {
         if let Some(v) = map.get(key) {
             reject_non_finite(v, &format!("doc.{key}"))?;
         }
     }
-    if let Some(id) = map.get("id") {
-        let id = match dynamic_to_json(id)? {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        doc.id = sanitize_id(&id);
-    }
-    doc.title = match map.get("title") {
+    let id = match map.get("id") {
+        Some(id) => Some(match dynamic_to_json(id)? {
+            Value::String(s) => sanitize_id(&s),
+            other => sanitize_id(&other.to_string()),
+        }),
+        None => None,
+    };
+    let title = match map.get("title") {
         None => None,
         Some(t) if t.is_unit() => None,
         Some(t) => Some(match dynamic_to_json(t)? {
@@ -347,14 +528,15 @@ fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
             other => other.to_string(),
         }),
     };
-    if let Some(content) = map.get("content") {
-        doc.content = match dynamic_to_json(content)? {
+    let content = match map.get("content") {
+        Some(content) => Some(match dynamic_to_json(content)? {
             Value::String(s) => s,
             Value::Null => String::new(),
             other => other.to_string(),
-        };
-    }
-    doc.fields = match map.get("fields") {
+        }),
+        None => None,
+    };
+    let fields = match map.get("fields") {
         Some(f) => match dynamic_to_json(f)? {
             Value::Object(o) => o,
             other => {
@@ -365,7 +547,58 @@ fn from_scope_map(map: &Map, doc: &mut Document) -> Result<(), PluginError> {
         },
         None => Default::default(),
     };
+
+    let mut fields = fields;
+    for (key, value) in fields.iter_mut() {
+        if let Some(original) = doc.fields.get(key) {
+            restore_large_integers(value, original);
+        }
+    }
+
+    if let Some(id) = id {
+        doc.id = id;
+    }
+    doc.title = title;
+    if let Some(content) = content {
+        doc.content = content;
+    }
+    doc.fields = fields;
     Ok(())
+}
+
+/// Put back the integers above `i64::MAX` the script left alone.
+///
+/// Rhai integers are i64, so such a u64 reaches the script as a float and would be
+/// written back as one (`18446744073709551615` becoming `1.8446744073709552e19`)
+/// even when the script never touched it. Wherever the original held such an
+/// integer at the same path and the result is the float it was converted to, the
+/// original number is restored. A value the script moved to another key, or
+/// computed with, stays the float rhai produced.
+fn restore_large_integers(new: &mut Value, original: &Value) {
+    match (new, original) {
+        (Value::Number(n), Value::Number(o)) => {
+            if let Some(big) = o.as_u64()
+                && big > i64::MAX as u64
+                && n.is_f64()
+                && n.as_f64() == Some(big as f64)
+            {
+                *n = o.clone();
+            }
+        }
+        (Value::Object(n), Value::Object(o)) => {
+            for (key, value) in n.iter_mut() {
+                if let Some(orig) = o.get(key) {
+                    restore_large_integers(value, orig);
+                }
+            }
+        }
+        (Value::Array(n), Value::Array(o)) => {
+            for (value, orig) in n.iter_mut().zip(o) {
+                restore_large_integers(value, orig);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// What the script decided about one document.
@@ -408,13 +641,13 @@ impl Plugin for DocumentScriptPlugin {
                         "type": "integer",
                         "minimum": 1,
                         "default": 100000,
-                        "description": "Rhai operations one document may use before the script is aborted."
+                        "description": "Rhai operations one document may use before the script is aborted. Values above 100000000 are clamped to it."
                     },
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
                         "default": 1000,
-                        "description": "Wall-clock milliseconds one document may use before the script is aborted."
+                        "description": "Wall-clock milliseconds one document may use before the script is aborted. Values above 30000 are clamped to it."
                     }
                 }
             }))
@@ -428,34 +661,12 @@ impl Plugin for DocumentScriptPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let docs = input.into_documents()?;
-        let runner = Runner::new(&cfg)?;
+        let runner = Runner::build(&cfg, STEP_BUDGET, ctx.cancellation_flag())?;
+        ctx.check_cancelled()?;
 
-        let mut out = Vec::with_capacity(docs.len());
-        for (i, mut doc) in docs.into_iter().enumerate() {
-            if i % HEARTBEAT_EVERY == 0 {
-                ctx.check_cancelled()?;
-                ctx.heartbeat(format!("document {i}"));
-            }
-            match runner.run(&mut doc) {
-                Ok(Verdict::Keep) => out.push(doc),
-                Ok(Verdict::Drop) => {}
-                Err(e) => match cfg.on_error {
-                    OnError::Fail => {
-                        return Err(PluginError::NonRetryable(format!(
-                            "{NAME}: document `{}`: {e}",
-                            doc.id
-                        )));
-                    }
-                    OnError::Skip => {
-                        tracing::warn!(document = %doc.id, error = %e, "{NAME}: dropping document");
-                    }
-                    OnError::Keep => {
-                        tracing::warn!(document = %doc.id, error = %e, "{NAME}: keeping document untouched");
-                        out.push(doc);
-                    }
-                },
-            }
-        }
+        let on_error = cfg.on_error;
+        let ctx = ctx.clone();
+        let out = run_blocking(move || run_all(runner, docs, on_error, &ctx)).await??;
         Ok(PluginOutput::Documents(out))
     }
 }
@@ -717,6 +928,30 @@ mod tests {
         assert!(!out[0].fields.contains_key("boom"));
     }
 
+    /// The script ran, but reading `doc` back failed after `id`, `title` and
+    /// `content` would already have been converted: none of them may stick.
+    #[tokio::test]
+    async fn on_error_keep_is_untouched_when_the_read_back_fails() {
+        let mut bad = doc("a", "hello");
+        bad.fields.insert("original".into(), json!(true));
+
+        let out = try_run(
+            vec![bad],
+            json!({
+                "script": r#"doc.id = "other"; doc.title = "New"; doc.content = "changed"; doc.fields = 5;"#,
+                "on_error": "keep"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a");
+        assert_eq!(out[0].title, None);
+        assert_eq!(out[0].content, "hello");
+        assert_eq!(out[0].fields.get("original"), Some(&json!(true)));
+    }
+
     #[tokio::test]
     async fn an_endless_loop_is_stopped_by_the_operation_budget() {
         let started = std::time::Instant::now();
@@ -796,6 +1031,136 @@ mod tests {
         assert_eq!(out[1].fields.get("n"), Some(&json!(200000)));
     }
 
+    /// Budgets are tenant-authored: without a ceiling `u64::MAX` for both made a
+    /// `loop {}` run for centuries.
+    #[test]
+    fn budgets_are_clamped_to_server_ceilings() {
+        let runner = Runner::new(
+            &Config::parse(json!({
+                "script": "1",
+                "max_ops": u64::MAX,
+                "timeout_ms": u64::MAX
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(runner.engine.max_operations(), MAX_OPS_CEILING);
+        assert_eq!(runner.timeout_ms, MAX_TIMEOUT_MS);
+
+        // Values under the ceiling are kept as configured.
+        let runner = Runner::new(
+            &Config::parse(json!({"script": "1", "max_ops": 5000, "timeout_ms": 50})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(runner.engine.max_operations(), 5000);
+        assert_eq!(runner.timeout_ms, 50);
+    }
+
+    fn cancellable_context() -> (ActivityContext, Arc<std::sync::atomic::AtomicBool>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Keep the receiver alive for the whole test so heartbeats have somewhere to go.
+        std::mem::forget(rx);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_id = ActivityContext::noop().job_id();
+        let ctx = ActivityContext::new(job_id, "script", 1, tx, Arc::clone(&flag));
+        (ctx, flag)
+    }
+
+    /// A cancel must stop a script that is still running, not wait for it to use
+    /// up its own budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_stops_a_running_script() {
+        let (ctx, flag) = cancellable_context();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+
+        let started = std::time::Instant::now();
+        let err = DocumentScriptPlugin::new()
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![doc("a", "x")]),
+                json!({
+                    "script": "let i = 0; loop { i += 1; }",
+                    "max_ops": 4000000000u64,
+                    "timeout_ms": 5000,
+                    "on_error": "keep"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PluginError::Cancelled), "got {err:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A running script must not hold the async runtime: other tasks on the same
+    /// (here single-threaded) runtime keep making progress meanwhile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_running_script_does_not_block_the_runtime() {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let out = try_run(
+            vec![doc("a", "x")],
+            json!({
+                "script": "let i = 0; loop { i += 1; }",
+                "max_ops": 4000000000u64,
+                "timeout_ms": 300,
+                "on_error": "keep"
+            }),
+        )
+        .await
+        .unwrap();
+        ticker.abort();
+
+        assert_eq!(out.len(), 1);
+        let ticks = ticks.load(Ordering::Relaxed);
+        assert!(ticks >= 5, "the runtime only ticked {ticks} times");
+    }
+
+    /// A per-document budget alone still lets documents x timeout run; the whole
+    /// step has its own, and running out of it fails the step whatever `on_error`
+    /// says instead of skipping every remaining document.
+    #[test]
+    fn the_step_budget_fails_the_step() {
+        let cfg = Config::parse(json!({
+            "script": "let i = 0; loop { i += 1; }",
+            "max_ops": 4000000000u64,
+            "timeout_ms": 10000,
+            "on_error": "skip"
+        }))
+        .unwrap();
+        let runner = Runner::with_step_budget(&cfg, std::time::Duration::from_millis(200)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_all(
+            runner,
+            vec![doc("a", "x"), doc("b", "x"), doc("c", "x")],
+            cfg.on_error,
+            &ActivityContext::noop(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("step budget")),
+            "got {err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn scripts_cannot_import_modules() {
         let err = try_run(vec![doc("a", "hello")], script(r#"import "std" as s;"#))
@@ -871,6 +1236,142 @@ mod tests {
         let out = run(vec![doc("a", "x")], script("doc.fields.v = 10.0 / 4.0;")).await;
 
         assert_eq!(out[0].fields.get("v"), Some(&json!(2.5)));
+    }
+
+    /// Set in the child process [`print_and_debug_do_not_reach_stdout`] spawns.
+    const PRINT_CHILD_ENV: &str = "DOCUMENT_SCRIPT_PRINT_CHILD";
+    const PRINT_MARKER: &str = "forged-log-line-7f3a";
+
+    /// Runs only inside the child process: a script that prints and debugs.
+    #[tokio::test]
+    async fn print_and_debug_child() {
+        if std::env::var_os(PRINT_CHILD_ENV).is_none() {
+            return;
+        }
+        let out = run(
+            vec![doc("a", "x")],
+            script(&format!(
+                r#"print("{PRINT_MARKER}"); debug("{PRINT_MARKER}"); true"#
+            )),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Tenant scripts must not write to the worker's stdout, where they would
+    /// interleave forged lines with the structured logs. Rhai's default `print` and
+    /// `debug` handlers `println!`, so this runs the script in a child test process
+    /// without output capture and checks what reached its stdout.
+    #[test]
+    fn print_and_debug_do_not_reach_stdout() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::print_and_debug_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PRINT_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "child failed: {stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child test did not run: {stdout}"
+        );
+        assert!(
+            !stdout.contains(PRINT_MARKER),
+            "script output reached stdout: {stdout}"
+        );
+    }
+
+    /// Rhai integers are i64, so a u64 above `i64::MAX` reaches the script as a
+    /// float. One the script never touched must still come back as the same integer.
+    #[tokio::test]
+    async fn untouched_integers_above_i64_max_round_trip() {
+        let big = json!(18446744073709551615u64);
+        let mut d = doc("a", "x");
+        d.fields.insert("snowflake".into(), big.clone());
+        d.fields.insert(
+            "nested".into(),
+            json!({"b": big.clone(), "list": [1, big.clone()]}),
+        );
+
+        let out = run(
+            vec![d],
+            script("doc.fields.seen = true; doc.fields.nested.c = 1;"),
+        )
+        .await;
+
+        assert_eq!(out[0].fields.get("snowflake"), Some(&big));
+        assert_eq!(out[0].fields["nested"]["b"], big);
+        assert_eq!(out[0].fields["nested"]["list"], json!([1, big.clone()]));
+        assert_eq!(out[0].fields["nested"]["c"], json!(1));
+        assert_eq!(out[0].fields["seen"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_large_integer_the_script_rewrites_is_not_restored() {
+        let mut d = doc("a", "x");
+        d.fields.insert("n".into(), json!(18446744073709551615u64));
+
+        let out = run(vec![d], script("doc.fields.n = 2.5;")).await;
+
+        assert_eq!(out[0].fields["n"], json!(2.5));
+    }
+
+    /// The size caps bound what a script builds, not the document it was handed:
+    /// rhai checks the whole `doc` map after every assignment into it and the whole
+    /// string after every method call on it.
+    #[tokio::test]
+    async fn a_large_document_is_not_rejected_by_the_size_caps() {
+        let big = "x".repeat(600 * 1024);
+        let mut d = doc("a", &big);
+        d.fields.insert("name".into(), json!("Widget"));
+
+        let out = try_run(vec![d.clone()], script("doc.title = doc.fields.name;"))
+            .await
+            .unwrap();
+        assert_eq!(out[0].title.as_deref(), Some("Widget"));
+        assert_eq!(out[0].content, big);
+
+        let out = try_run(vec![d], script("doc.content.trim();"))
+            .await
+            .unwrap();
+        assert_eq!(out[0].content, big);
+
+        let mut d = doc("b", "x");
+        d.fields
+            .insert("links".into(), json!(vec!["l"; MAX_ARRAY_SIZE + 1]));
+        let out = try_run(vec![d], script("doc.fields.x = 1;")).await.unwrap();
+        assert_eq!(out[0].fields["x"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn a_script_still_cannot_build_an_oversized_string() {
+        let err = try_run(
+            vec![doc("a", "x")],
+            script("let s = \"xxxxxxxx\"; loop { s += s; }"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("too large")),
+            "got {err:?}"
+        );
+
+        // On a large document the headroom is the same fixed cap, not a multiple.
+        let err = try_run(
+            vec![doc("a", &"x".repeat(600 * 1024))],
+            script("doc.content += doc.content;"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("too large")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

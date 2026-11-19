@@ -87,6 +87,10 @@ development, never for an exposed deployment.
 Nothing found → `400 {"error": "...", "code": "missing_context"}`, unless the
 pipeline is pinned.
 
+Step 6 never takes a management token: a bearer equal to `LAB_SERVICE_TOKEN` or
+`ADMIN_API_KEY` is ignored as a Meilisearch key, so it is neither sent to
+Meilisearch nor stored with the job, and resolution continues with step 7.
+
 A **pinned** pipeline names a [Meilisearch connection](/concepts/connections)
 on every `meili_indexer` step. The connection's host and key always win over
 steps 1, 2, 6 and 7, so such a pipeline accepts requests with no context at

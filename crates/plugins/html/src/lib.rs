@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use ego_tree::NodeRef;
+use ego_tree::iter::Edge;
 use meili_ingest_plugin_sdk::prelude::*;
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::Deserialize;
@@ -124,6 +125,83 @@ fn base_meta(blob: &Blob) -> DocumentMeta {
     }
 }
 
+/// How far into the page the `<meta charset>` prescan looks, as in the HTML spec.
+const PRESCAN_BYTES: usize = 1024;
+
+/// Decode the page's bytes into text.
+///
+/// In order: a byte order mark; then UTF-8 when the bytes are valid UTF-8 (servers
+/// and templates often declare a legacy charset for pages that are really UTF-8,
+/// and honouring it would garble them); then `transport_charset`, the `charset` of
+/// the HTTP `Content-Type` the page was served with ([`Blob::charset`]), which the
+/// HTML standard ranks above `<meta>`; then the charset a `<meta>` in the first
+/// [`PRESCAN_BYTES`] declares; and lossy UTF-8 when nothing usable is declared.
+/// Unknown labels are skipped. A UTF-16 `Content-Type` is honoured, while a `<meta>`
+/// declaring UTF-16 is read as UTF-8, as the spec says.
+fn decode_html(bytes: &[u8], transport_charset: Option<&str>) -> String {
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding
+            .decode_without_bom_handling(&bytes[bom_len..])
+            .0
+            .into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let transport =
+        transport_charset.and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()));
+    match transport.or_else(|| declared_charset(&bytes[..bytes.len().min(PRESCAN_BYTES)])) {
+        Some(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The encoding a `<meta charset=…>` or `<meta http-equiv="Content-Type"
+/// content="…; charset=…">` in `head` names, when it is a known WHATWG label.
+///
+/// A declared UTF-16 is read as UTF-8, as the spec says: a page whose bytes reached
+/// this point is not UTF-16, or it would have carried a byte order mark.
+fn declared_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let lower = head.to_ascii_lowercase();
+    let mut rest = lower.as_slice();
+    while let Some(start) = find(rest, b"<meta") {
+        let tag = &rest[start + 5..];
+        let end = tag.iter().position(|&b| b == b'>').unwrap_or(tag.len());
+        let tag = &tag[..end];
+        rest = &rest[start + 5 + end..];
+
+        let Some(at) = find(tag, b"charset") else {
+            continue;
+        };
+        let value = tag[at + 7..].trim_ascii_start();
+        let Some(value) = value.strip_prefix(b"=") else {
+            continue;
+        };
+        let value = value.trim_ascii_start();
+        let value = value
+            .strip_prefix(b"\"")
+            .or_else(|| value.strip_prefix(b"'"))
+            .unwrap_or(value);
+        let len = value
+            .iter()
+            .position(|b| matches!(b, b'"' | b'\'' | b';' | b'/' | b'>') || b.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        let Some(encoding) = encoding_rs::Encoding::for_label(&value[..len]) else {
+            continue;
+        };
+        if encoding == encoding_rs::UTF_16BE || encoding == encoding_rs::UTF_16LE {
+            return Some(encoding_rs::UTF_8);
+        }
+        return Some(encoding);
+    }
+    None
+}
+
+/// Index of the first occurrence of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Parse a CSS selector; the selectors used here are constants, so failure is a bug.
 fn selector(css: &str) -> Result<Selector, PluginError> {
     Selector::parse(css)
@@ -142,6 +220,23 @@ fn first_text(doc: &Html, css: &str) -> Result<Option<String>, PluginError> {
         .select(&sel)
         .map(|e| collapse(&e.text().collect::<String>()))
         .find(|t| !t.is_empty()))
+}
+
+/// Elements matching `sel` that are still attached to the document, in document order.
+///
+/// [`Html::select`] walks every node of the arena, including the descendants of the
+/// subtrees [`remove_noise`] detached, so after removal it would still find an
+/// `<h1>` inside a dropped `<header>`. Selecting from the root element walks the
+/// live tree only.
+fn live_select<'a, 'b>(
+    doc: &'a Html,
+    sel: &'b Selector,
+) -> impl Iterator<Item = ElementRef<'a>> + use<'a, 'b> {
+    doc.tree
+        .root()
+        .children()
+        .filter_map(ElementRef::wrap)
+        .flat_map(move |root| root.select(sel))
 }
 
 /// `attr` of the first element matching `css`, trimmed; `None` when missing or blank.
@@ -167,31 +262,34 @@ fn remove_noise(doc: &mut Html) -> Result<(), PluginError> {
 }
 
 /// Walk `node` in document order, appending text and line/cell separators to `out`.
+///
+/// Iterative on purpose: the parser puts no limit on nesting depth, and a walk that
+/// recursed once per level would overflow the thread stack (aborting the worker
+/// process) on a page of a few hundred thousand nested tags.
 fn append_text(node: NodeRef<'_, Node>, out: &mut String) {
-    match node.value() {
-        // Newlines inside a text node are plain whitespace in HTML; only block
-        // elements start new lines.
-        Node::Text(t) => out.push_str(&t.replace(['\n', '\r'], " ")),
-        Node::Element(el) => {
-            let name = el.name();
-            let block = BLOCK_TAGS.contains(&name);
-            let cell = CELL_TAGS.contains(&name);
-            if block {
-                out.push('\n');
-            } else if cell {
-                out.push('\t');
-            }
-            for child in node.children() {
-                append_text(child, out);
-            }
-            if block {
-                out.push('\n');
-            }
-        }
-        // Comments, doctype, processing instructions and the document root itself.
-        _ => {
-            for child in node.children() {
-                append_text(child, out);
+    for edge in node.traverse() {
+        match edge {
+            Edge::Open(n) => match n.value() {
+                // Newlines inside a text node are plain whitespace in HTML; only
+                // block elements start new lines.
+                Node::Text(t) => out.push_str(&t.replace(['\n', '\r'], " ")),
+                Node::Element(el) => {
+                    let name = el.name();
+                    if BLOCK_TAGS.contains(&name) {
+                        out.push('\n');
+                    } else if CELL_TAGS.contains(&name) {
+                        out.push('\t');
+                    }
+                }
+                // Comments, doctype, processing instructions and the document root.
+                _ => {}
+            },
+            Edge::Close(n) => {
+                if let Node::Element(el) = n.value()
+                    && BLOCK_TAGS.contains(&el.name())
+                {
+                    out.push('\n');
+                }
             }
         }
     }
@@ -238,7 +336,7 @@ fn links_of(root: ElementRef<'_>) -> Result<Vec<String>, PluginError> {
 fn content_root(doc: &Html) -> Result<Option<ElementRef<'_>>, PluginError> {
     for css in ["main", "article", "body"] {
         let sel = selector(css)?;
-        if let Some(el) = doc.select(&sel).next() {
+        if let Some(el) = live_select(doc, &sel).next() {
             return Ok(Some(el));
         }
     }
@@ -285,7 +383,7 @@ impl Plugin for HtmlExtractorPlugin {
         let blob = input.into_bytes()?;
         let base = base_id(&blob);
         let mut meta = base_meta(&blob);
-        let source = blob.text_lossy();
+        let source = decode_html(&blob.data, blob.charset.as_deref());
 
         let mut doc = Html::parse_document(&source);
         ctx.check_cancelled()?;
@@ -310,7 +408,12 @@ impl Plugin for HtmlExtractorPlugin {
 
         let title = match title_tag {
             Some(t) => Some(t),
-            None => first_text(&doc, "h1")?,
+            None => {
+                let h1 = selector("h1")?;
+                live_select(&doc, &h1)
+                    .map(|e| collapse(&e.text().collect::<String>()))
+                    .find(|t| !t.is_empty())
+            }
         };
 
         let (content, links) = match content_root(&doc)? {
@@ -505,6 +608,215 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidConfig(_)), "got {err:?}");
+    }
+
+    /// A page nested deeper than the thread stack can recurse through. The walk used
+    /// to recurse once per level, so this overflowed the stack and aborted the whole
+    /// worker process instead of producing a document. A small stack keeps the
+    /// depth (and so the parse time) of the test low while still proving the walk
+    /// does not grow with nesting.
+    #[test]
+    fn a_deeply_nested_page_does_not_overflow_the_stack() {
+        let depth = 30_000;
+        let html = format!(
+            "<html><body>{}deep text{}</body></html>",
+            "<span>".repeat(depth),
+            "</span>".repeat(depth)
+        );
+        let docs = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(HtmlExtractorPlugin::new().execute(
+                        &ActivityContext::noop(),
+                        input(&html),
+                        serde_json::json!({}),
+                    ))
+                    .unwrap()
+                    .into_documents()
+                    .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].content, "deep text");
+    }
+
+    async fn extract(html: &str) -> Document {
+        let out = HtmlExtractorPlugin::new()
+            .execute(&ActivityContext::noop(), input(html), serde_json::json!({}))
+            .await
+            .unwrap();
+        out.into_documents().unwrap().remove(0)
+    }
+
+    async fn extract_bytes(bytes: &[u8]) -> Document {
+        let out = HtmlExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(Blob::new(bytes.to_vec(), "text/html", None)),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        out.into_documents().unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_page_declared_in_a_legacy_charset_is_decoded_with_it() {
+        let doc = extract_bytes(
+            b"<html><head><meta charset=\"windows-1252\"><title>Caf\xE9 r\xE9sum\xE9</title>\
+              </head><body><p>Caf\xE9 r\xE9sum\xE9</p></body></html>",
+        )
+        .await;
+        assert_eq!(doc.title.as_deref(), Some("Café résumé"));
+        assert_eq!(doc.content, "Café résumé");
+
+        // `iso-8859-1` is a WHATWG label for windows-1252, declared the http-equiv way.
+        let doc = extract_bytes(
+            b"<html><head><META HTTP-EQUIV='Content-Type' CONTENT='text/html; charset=ISO-8859-1'>\
+              </head><body><p>na\xEFve</p></body></html>",
+        )
+        .await;
+        assert_eq!(doc.content, "naïve");
+    }
+
+    async fn extract_served_as(bytes: &[u8], charset: &str) -> Document {
+        let blob =
+            Blob::new(bytes.to_vec(), "text/html", None).with_charset(Some(charset.to_owned()));
+        let out = HtmlExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                PluginInput::Bytes(blob),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        out.into_documents().unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn the_http_content_type_charset_decodes_an_undeclared_page() {
+        let doc = extract_served_as(
+            b"<html><head><title>Caf\xE9</title></head><body><p>r\xE9sum\xE9</p></body></html>",
+            "windows-1252",
+        )
+        .await;
+        assert_eq!(doc.title.as_deref(), Some("Café"));
+        assert_eq!(doc.content, "résumé");
+    }
+
+    #[tokio::test]
+    async fn the_http_content_type_charset_wins_over_a_meta_declaration() {
+        // Shift_JIS bytes for 日本語, served as Shift_JIS by a page whose template
+        // wrongly says windows-1252.
+        let doc = extract_served_as(
+            b"<html><head><meta charset=\"windows-1252\"></head>\
+              <body><p>\x93\xfa\x96{\x8c\xea</p></body></html>",
+            "shift_jis",
+        )
+        .await;
+        assert_eq!(doc.content, "日本語");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_http_charset_falls_back_to_the_meta_declaration() {
+        let page =
+            b"<html><head><meta charset=\"windows-1252\"></head><body><p>Caf\xE9</p></body></html>";
+        assert_eq!(extract_served_as(page, "x-made-up").await.content, "Café");
+    }
+
+    #[tokio::test]
+    async fn a_utf16_page_without_bom_is_decoded_with_the_http_charset() {
+        let page: Vec<u8> = "<html><body><p>日本語</p></body></html>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(extract_served_as(&page, "utf-16le").await.content, "日本語");
+    }
+
+    #[tokio::test]
+    async fn valid_utf8_and_a_bom_win_over_the_http_charset() {
+        let page = "<html><body><p>Café</p></body></html>".as_bytes();
+        assert_eq!(extract_served_as(page, "shift_jis").await.content, "Café");
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(page);
+        assert_eq!(
+            extract_served_as(&bytes, "windows-1252").await.content,
+            "Café"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shift_jis_page_is_decoded() {
+        let doc = extract_bytes(
+            b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=Shift_JIS\">\
+              </head><body><p>\x93\xfa\x96{\x8c\xea</p></body></html>",
+        )
+        .await;
+        assert_eq!(doc.content, "日本語");
+    }
+
+    #[tokio::test]
+    async fn a_byte_order_mark_wins_and_is_stripped() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            "<html><head><meta charset=\"windows-1252\"></head><body><p>Café</p></body></html>"
+                .as_bytes(),
+        );
+        let doc = extract_bytes(&bytes).await;
+        assert_eq!(doc.content, "Café");
+    }
+
+    #[tokio::test]
+    async fn valid_utf8_is_kept_despite_a_wrong_legacy_declaration() {
+        let doc = extract_bytes(
+            "<html><head><meta charset=\"iso-8859-1\"></head><body><p>Café</p></body></html>"
+                .as_bytes(),
+        )
+        .await;
+        assert_eq!(doc.content, "Café");
+    }
+
+    #[tokio::test]
+    async fn the_h1_title_fallback_ignores_removed_boilerplate() {
+        let doc = extract(
+            "<html><body><header><h1>Acme Corp</h1></header>\
+             <main><h1>Pricing</h1><p>Plans</p></main></body></html>",
+        )
+        .await;
+        assert_eq!(doc.title.as_deref(), Some("Pricing"));
+    }
+
+    #[tokio::test]
+    async fn the_content_root_ignores_removed_boilerplate() {
+        let doc = extract(
+            "<html><body><aside><article>Related teaser</article></aside>\
+             <article>Real post</article></body></html>",
+        )
+        .await;
+        assert_eq!(doc.content, "Real post");
+
+        let doc =
+            extract("<html><body><header><main>x</main></header><p>Body</p></body></html>").await;
+        assert_eq!(doc.content, "Body");
+    }
+
+    #[tokio::test]
+    async fn blocks_and_cells_nested_in_inline_elements_keep_their_separators() {
+        let html = "<html><body><span><div>one<p>two</p>three</div></span>\
+                    <table><tr><td><span>a</span></td><td><b>b</b></td></tr></table>\
+                    <div><div><br>four</div></div></body></html>";
+        let out = HtmlExtractorPlugin::new()
+            .execute(&ActivityContext::noop(), input(html), serde_json::json!({}))
+            .await
+            .unwrap();
+        let docs = out.into_documents().unwrap();
+        assert_eq!(docs[0].content, "one\ntwo\nthree\na\tb\nfour");
     }
 
     #[tokio::test]

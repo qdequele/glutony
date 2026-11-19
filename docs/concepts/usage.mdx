@@ -25,7 +25,14 @@ One row per pipeline step, plus one row per job.
 Volume is observed by the worker. Cost units come from the plugins themselves, because
 only the plugin knows what it spent on an external service: the enricher reports the
 token counts the provider returned, the transcriber reports the audio seconds it was
-billed for, the extractors report pages. Plugins report through
+billed for, the extractors report pages. Local work reports no cost units:
+`video_audio_extractor` decodes on the worker, so it records no `audio_seconds`, and
+the transcriber after it is the only step that reports the audio, once. When the transcription response carries no
+duration, an uncompressed WAV upload is measured from its header: the rate comes from
+its sample rate, channels and bits per sample (never the informational bytes-per-second
+field) and the audio is every byte after the `data` header, so a forged header cannot
+shrink the billed seconds. Compressed audio without a duration counts the request only.
+Plugins report through
 `ActivityContext::record_usage`, and the accumulator is shared across clones so a
 plugin fanning out concurrently is not undercounted.
 
@@ -67,8 +74,9 @@ sorting key.
 `documents_out` on a step row counts a document once per stage, so a pipeline that
 extracts then chunks then indexes reports it three times. That measures work done,
 not corpus size. The rollups expose `documents_indexed` for the number that actually
-reached Meilisearch, taken from the job row's final-step count — that is the figure
-to report.
+reached Meilisearch, taken from the job row: the documents its `meili_indexer` steps
+wrote (0 for a job cancelled before indexing), or the final step's count for a
+succeeded pipeline with no indexer. That is the figure to report.
 </Note>
 
 | Table | Freshness | Deduplicated | Retention | Use for |
@@ -154,7 +162,7 @@ Tinybird tokens; setting both is refused at boot.
 | `USAGE_CLICKHOUSE_URL` | — | ClickHouse HTTP interface, e.g. `http://127.0.0.1:8123`. Absent: not this store. |
 | `USAGE_CLICKHOUSE_DATABASE` | `default` | Must exist. |
 | `USAGE_CLICKHOUSE_TABLE` | `meili_ingest_usage` | Created by the workers if missing. |
-| `USAGE_CLICKHOUSE_USER` | `default` | Workers need `INSERT`, `SELECT` and `CREATE TABLE` on the database; the gateway `SELECT`. |
+| `USAGE_CLICKHOUSE_USER` | `default` | Workers need `INSERT`, `SELECT` and `CREATE TABLE` on the database, plus `ALTER ADD COLUMN` on the table to upgrade it themselves; the gateway `SELECT`. |
 | `USAGE_CLICKHOUSE_PASSWORD` | empty | Sent in `X-ClickHouse-Key`, never logged. |
 | `USAGE_CLICKHOUSE_TIMEOUT_SECS` | `20` | Worker HTTP timeout. |
 
@@ -164,10 +172,19 @@ sorting key, monthly partitions and 180-day TTL. Rows go in with `INSERT … FOR
 JSONEachRow`, which rejects an unknown field, so schema drift fails loudly as it does
 in Tinybird.
 
+Two changes to the table are repaired on the spot, then the insert is tried once more:
+
+- **A table from an older release** that lacks a column added since: the workers run
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for every column. Without the `ALTER` grant
+  the insert fails as before; add the column by hand. A changed type or a renamed
+  column is never repaired.
+- **A table dropped while the workers run**: they create it again.
+
 `GET /usage` returns the same columns as `tenant_usage`, from one query over the raw
 table with `FINAL`: redelivered rows are collapsed before they are counted, and there is
-no hourly lag. The tenant and dates are bound as typed query parameters. Before the
-first row is written (no table yet) it answers an empty list.
+no hourly lag. The tenant and dates are bound as typed query parameters. Days are UTC,
+as on Tinybird, whatever the ClickHouse server's time zone. Before the first row is
+written (no table yet) it answers an empty list.
 
 With either store, usage is recorded when a job finishes, so only jobs that finish after
 the store is configured are counted. Nothing is backfilled: older jobs, succeeded or

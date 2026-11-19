@@ -49,7 +49,8 @@ async fn main() -> anyhow::Result<()> {
     // Plugins
     // With LAB_AI_GATEWAY, AI plugins without their env key still register: a Lab
     // tenant's step runs on the team's Gateway; any other fails naming the key.
-    let mut registry = PluginRegistry::builtin_with(config.lab_ai_gateway);
+    tracing::info!(limits = ?config.parser_limits, "record parser limits");
+    let mut registry = PluginRegistry::builtin_with(config.lab_ai_gateway, config.parser_limits);
     if let Some(spec) = &config.external_plugins {
         registry.load_external(spec).await;
     }
@@ -85,7 +86,9 @@ async fn main() -> anyhow::Result<()> {
     .with_object_ref_policy(
         meili_ingest_blob::ObjectRefPolicy::from_env()
             .context("invalid OBJECT_REF_AMBIENT_CREDENTIALS or OBJECT_REF_BUCKETS")?,
-    );
+    )
+    // A URL or object ref is read into memory: larger ones fail the step.
+    .with_ref_max_bytes(meili_ingest_blob::ref_max_bytes_from_env()?);
     tracing::info!(policy = ?blob.object_ref_policy(), "object ref policy (s3://, gs://, az:// refs)");
 
     // Publish manifests to the control plane (best effort).
@@ -153,12 +156,19 @@ async fn main() -> anyhow::Result<()> {
         .with_default_index(default_index.clone());
     // Archives route their files through the control plane like the gateway does, and
     // stage them in the same blob store; they need no fetch credential.
-    tracing::info!(limits = ?config.archive_limits, "archive limits");
+    // One archive expands at a time on this worker, holding at most
+    // ARCHIVE_INFLIGHT_MB of its decompressed files in memory at once.
     let archive_activities = ArchiveActivities::new(
         SourceActivities::new(config.control_plane_url.clone(), blob.clone())
             .with_control_plane_token(config.control_plane_token.clone())
             .with_default_index(default_index),
         config.archive_limits.clone(),
+    )
+    .with_inflight_bytes(config.archive_inflight_bytes);
+    tracing::info!(
+        limits = ?config.archive_limits,
+        inflight_bytes = archive_activities.budget().bytes(),
+        "archive limits"
     );
 
     if config.lab_events_enabled && config.control_plane_url.is_none() {
@@ -175,6 +185,22 @@ async fn main() -> anyhow::Result<()> {
     }
     if config.lab_ai_gateway {
         tracing::info!("AI steps of Lab accounts run on the team's Gateway");
+    }
+
+    // Finished jobs' blobs are deleted BLOB_TTL_DAYS (control plane) after they
+    // ended; the control plane's job table says which. Without one, they stay.
+    match &config.control_plane_url {
+        Some(cp) => {
+            let sweeper = meili_ingest_worker::blob_sweep::BlobSweeper::new(
+                cp,
+                config.control_plane_token.clone(),
+                blob.clone(),
+            );
+            tokio::spawn(sweeper.run(meili_ingest_worker::blob_sweep::SWEEP_INTERVAL));
+        }
+        None => {
+            tracing::warn!("CONTROL_PLANE_URL is not set: finished jobs' blobs are never deleted")
+        }
     }
 
     let activities = StepActivities::new(registry, blob, config.payload_spill_bytes)

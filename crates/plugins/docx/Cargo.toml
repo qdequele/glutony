@@ -14,6 +14,8 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 docx-rs.workspace = true
+# Zip-bomb guard: inflate the package once, capped, before docx-rs reads it.
+zip.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

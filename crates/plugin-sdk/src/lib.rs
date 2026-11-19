@@ -45,6 +45,7 @@
 pub mod ai;
 pub mod context;
 pub mod cost;
+pub mod env;
 pub mod error;
 pub mod tenant;
 pub mod types;

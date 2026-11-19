@@ -13,6 +13,8 @@
 //! The offset form is what makes the TMDB export work: its daily file is published
 //! around 08:00 UTC, so a schedule firing at 00:30 must ask for `{{ date-1d:… }}`.
 
+use std::fmt::Write as _;
+
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 
@@ -65,8 +67,20 @@ fn expand(token: &str, at: DateTime<Utc>, tz: Tz) -> Result<String, SourceError>
             )));
         }
     };
-    let shifted = at + offset;
-    Ok(shifted.with_timezone(&tz).format(fmt).to_string())
+    let shifted = at.checked_add_signed(offset).ok_or_else(|| {
+        SourceError::Template(format!(
+            "{{{{ {token} }}}}: the offset is outside the supported date range"
+        ))
+    })?;
+    // `to_string()` would panic here: chrono reports an unknown specifier (`%Q`, a
+    // trailing `%`) only while formatting, as a `fmt::Error`.
+    let mut out = String::new();
+    write!(out, "{}", shifted.with_timezone(&tz).format(fmt)).map_err(|_| {
+        SourceError::Template(format!(
+            "{{{{ {token} }}}}: {fmt:?} is not a valid strftime format"
+        ))
+    })?;
+    Ok(out)
 }
 
 /// Parse an offset such as `-1d`, `+2d`, `-3h`, `+30m`.
@@ -181,6 +195,60 @@ mod tests {
         assert!(render("{{ date-1x:%Y }}", at(2026, 9, 13, 0), "UTC").is_err());
         assert!(render("{{ date-:%Y }}", at(2026, 9, 13, 0), "UTC").is_err());
         assert!(render("{{ dateX:%Y }}", at(2026, 9, 13, 0), "UTC").is_err());
+    }
+
+    #[test]
+    fn an_invalid_date_format_is_an_error_not_a_panic() {
+        for bad in ["{{ date:%Q }}", "{{ date:%Y% }}", "{{ date-1d:%Y-%! }}"] {
+            let err = render(bad, at(2026, 9, 13, 0), "UTC").expect_err(bad);
+            assert!(matches!(err, SourceError::Template(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn an_offset_past_the_representable_dates_is_an_error_not_a_panic() {
+        for bad in [
+            "{{ date+99999999999d:%Y }}",
+            "{{ date-99999999999d:%Y }}",
+            "{{ date+9999999999999h:%Y }}",
+        ] {
+            let err = render(bad, at(2026, 9, 13, 0), "UTC").expect_err(bad);
+            assert!(matches!(err, SourceError::Template(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn an_offset_landing_on_the_edge_of_the_date_range_never_panics() {
+        // The shifted instant can be representable in UTC and still overflow once the
+        // zone's offset is applied; either a rendered date or an error is fine.
+        let edge = DateTime::<Utc>::MAX_UTC - at(2026, 9, 13, 0);
+        let low = at(2026, 9, 13, 0) - DateTime::<Utc>::MIN_UTC;
+        for tz in ["UTC", "Pacific/Kiritimati", "Pacific/Pago_Pago"] {
+            for minutes in [
+                edge.num_minutes(),
+                edge.num_minutes() - 1,
+                edge.num_minutes() - 600,
+                edge.num_minutes() - 24 * 60,
+            ] {
+                let _ = render(
+                    &format!("{{{{ date+{minutes}m:%Y-%m-%d %H:%M %Z }}}}"),
+                    at(2026, 9, 13, 0),
+                    tz,
+                );
+            }
+            for minutes in [
+                low.num_minutes(),
+                low.num_minutes() - 1,
+                low.num_minutes() - 600,
+                low.num_minutes() - 24 * 60,
+            ] {
+                let _ = render(
+                    &format!("{{{{ date-{minutes}m:%Y-%m-%d %H:%M %Z }}}}"),
+                    at(2026, 9, 13, 0),
+                    tz,
+                );
+            }
+        }
     }
 
     #[test]

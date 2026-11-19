@@ -24,13 +24,11 @@ description: Gateway, control plane, Temporal and worker pools
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                  workers-general               workers-io
-                  (pdf,docx,xlsx,               (s3_downloader)
-                   chunker,indexer,
-                   AI steps, ocr)
-                         └─────────────┬─────────────┘
+                                       ▼
+                                workers-general
+                         (pdf,docx,xlsx,chunker,indexer,
+                          AI steps, ocr, every plugin)
+                                       │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
                         └──────────────────────────────────────────────┘
@@ -46,11 +44,18 @@ Public HTTP API (port 8080). For each ingest request it:
 2. Parses the payload (multipart, JSON `url` / `s3` / `documents`, or raw body).
 3. Detects the MIME type: magic bytes (`infer`) → file extension → UTF-8 sniff →
    `application/octet-stream`. The `Content-Type` header is only a last-resort hint.
+   Magic bytes that only name a container or guess from the first characters are
+   refined by the extension: a zip or OLE file with an Office extension is that
+   Office format, and text that merely opens like HTML, XML or a script takes the
+   type of a text extension (a `README.md` starting with `<div align="center">` is
+   Markdown).
 4. Asks the control plane to resolve a pipeline (`POST /internal/resolve`) or
    loads the named one.
 5. Resolves the target index and writes it into the context.
-6. Stages the payload: bytes ≤ `INLINE_MAX_BYTES` travel inside the workflow
-   input; larger ones go to the blob store as a `Staged` reference.
+6. Stages the payload: bytes and inline `documents` ≤ `INLINE_MAX_BYTES` travel
+   inside the workflow input; larger ones go to the blob store as a `Staged`
+   reference. If the workflow then cannot be started, the staged object is
+   removed again.
 7. Starts the `PipelineWorkflow` (id `ingest-<job_id>`) and records the job in
    the control plane.
 
@@ -74,12 +79,8 @@ Internal JSON API (port 9000) backed by Postgres:
 Each job is one `PipelineWorkflow` execution. The workflow is deterministic:
 it walks the DAG in topological order, resolves each step's input from its
 dependencies, fans out when asked, and schedules one `execute_step` activity
-per branch on the task queue for that plugin:
-
-| Plugin | Task queue |
-|---|---|
-| `s3_downloader` | `workers-io` |
-| everything else | `workers-general` |
+per branch on the task queue for that plugin. Today every plugin, `s3_downloader`
+included, runs on `workers-general` (a `workers-io` pool for downloads is planned).
 
 No model runs inside a worker: AI steps (`llm_enricher`, `jev_enricher`,
 `image_captioner`, `whisper_transcriber`) call hosted APIs, so they share
@@ -97,13 +98,16 @@ A worker polls one task queue (`TASK_QUEUE`). The `execute_step` activity:
 2. Builds an `ActivityContext` forwarding heartbeats and cancellation.
 3. Dispatches to the plugin from the `PluginRegistry` (built-in, WASM or gRPC).
 4. Spills outputs larger than `PAYLOAD_SPILL_BYTES` back to the blob store so
-   they stay under Temporal's 2 MB payload limit.
+   they stay under Temporal's 2 MB payload limit. The branches of a fanned-out
+   step share that budget, so their merged output stays under it too.
 
 ### Blob store
 
 `object_store`-backed (`file://`, `s3://`, `gs://`, `az://`, `memory://`).
 Holds staged uploads and spilled step outputs under `jobs/<job_id>/…`.
-Gateway and all workers must point at the same store.
+Gateway and all workers must point at the same store. The workers delete a job's
+prefix `BLOB_TTL_DAYS` (default 7) after the job ended, as the control plane's job
+table tells them ([Blob store retention](/deployment/environment-variables#blob-store-retention)).
 
 ## Repository layout
 

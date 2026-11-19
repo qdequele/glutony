@@ -1,6 +1,7 @@
 //! Worker configuration from environment variables (SPEC §13 "Worker").
 
 use anyhow::Context;
+use meili_ingest_plugin_sdk::env::flag;
 
 /// Runtime configuration of a worker process.
 #[derive(Clone)]
@@ -9,7 +10,7 @@ pub struct WorkerConfig {
     pub temporal_url: String,
     /// Temporal namespace.
     pub temporal_namespace: String,
-    /// Task queue this worker polls (`workers-general` or `workers-io`).
+    /// Task queue this worker polls (`workers-general`, where every plugin runs).
     pub task_queue: String,
     /// Control plane base URL, used to publish plugin manifests at boot.
     pub control_plane_url: Option<String>,
@@ -34,6 +35,12 @@ pub struct WorkerConfig {
     /// Bounds on one archive upload (`ARCHIVE_MAX_FILES`, `ARCHIVE_MAX_FILE_MB`,
     /// `ARCHIVE_MAX_UNPACKED_MB`, `ARCHIVE_MAX_DEPTH`).
     pub archive_limits: meili_ingest_archive::Limits,
+    /// Decompressed archive content held in memory at once, in bytes
+    /// (`ARCHIVE_INFLIGHT_MB`).
+    pub archive_inflight_bytes: u64,
+    /// Bounds on one Parquet / Avro / MessagePack step (`PARSER_MAX_ROWS`,
+    /// `PARSER_MAX_DECODED_MB`).
+    pub parser_limits: meili_ingest_plugin_json::DecodeLimits,
 }
 
 /// Default of `SHUTDOWN_GRACE_SECS`: with [`SHUTDOWN_HARD_MARGIN`] the worker is gone
@@ -62,6 +69,8 @@ impl WorkerConfig {
         };
         let shutdown_grace = shutdown_grace(std::env::var("SHUTDOWN_GRACE_SECS").ok().as_deref())?;
         let archive_limits = archive_limits(|name| std::env::var(name).ok())?;
+        let archive_inflight_bytes = archive_inflight_bytes(|name| std::env::var(name).ok())?;
+        let parser_limits = parser_limits(|name| std::env::var(name).ok())?;
         Ok(Self {
             temporal_url: std::env::var("TEMPORAL_URL")
                 .unwrap_or_else(|_| "http://temporal-frontend:7233".to_string()),
@@ -81,10 +90,14 @@ impl WorkerConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_concurrent_activities,
-            lab_events_enabled: parse_flag(std::env::var("LAB_EVENTS_ENABLED").ok().as_deref()),
+            lab_events_enabled: lab_events_enabled(
+                std::env::var("LAB_EVENTS_ENABLED").ok().as_deref(),
+            ),
             lab_ai_gateway: lab_ai_gateway(std::env::var("LAB_AI_GATEWAY").ok().as_deref()),
             shutdown_grace,
             archive_limits,
+            archive_inflight_bytes,
+            parser_limits,
         })
     }
 }
@@ -94,20 +107,7 @@ impl WorkerConfig {
 pub fn archive_limits(
     env: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<meili_ingest_archive::Limits> {
-    const MIB: u64 = 1024 * 1024;
-    let read = |name: &str| -> anyhow::Result<Option<u64>> {
-        match env(name)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            None => Ok(None),
-            Some(v) => match v.parse::<u64>() {
-                Ok(0) => anyhow::bail!("{name} must be greater than 0"),
-                Ok(n) => Ok(Some(n)),
-                Err(_) => anyhow::bail!("{name} must be a positive integer, got {v:?}"),
-            },
-        }
-    };
+    let read = |name: &str| positive_var(&env, name);
     let defaults = meili_ingest_archive::Limits::default();
     let as_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
     Ok(meili_ingest_archive::Limits {
@@ -117,6 +117,47 @@ pub fn archive_limits(
         max_total_bytes: read("ARCHIVE_MAX_UNPACKED_MB")?
             .map_or(defaults.max_total_bytes, |n| n.saturating_mul(MIB)),
         max_depth: read("ARCHIVE_MAX_DEPTH")?.map_or(defaults.max_depth, as_usize),
+    })
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// A positive integer variable; blank is unset, zero and anything else refused.
+fn positive_var(env: &impl Fn(&str) -> Option<String>, name: &str) -> anyhow::Result<Option<u64>> {
+    match env(name)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => Ok(None),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => anyhow::bail!("{name} must be greater than 0"),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => anyhow::bail!("{name} must be a positive integer, got {v:?}"),
+        },
+    }
+}
+
+/// `ARCHIVE_INFLIGHT_MB`, in bytes: how much decompressed archive content the worker
+/// holds in memory at once (default [`crate::archive_activity::DEFAULT_INFLIGHT_BYTES`]).
+/// The archive activities raise it to `ARCHIVE_MAX_FILE_MB` when it is lower.
+pub fn archive_inflight_bytes(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<u64> {
+    Ok(positive_var(&env, "ARCHIVE_INFLIGHT_MB")?
+        .map_or(crate::archive_activity::DEFAULT_INFLIGHT_BYTES, |n| {
+            n.saturating_mul(MIB)
+        }))
+}
+
+/// What one `parquet_parser` / `avro_parser` / `msgpack_parser` step may decode
+/// (`PARSER_MAX_ROWS`, `PARSER_MAX_DECODED_MB`), each from its variable when set
+/// (blank is unset), with the same rules as [`archive_limits`].
+pub fn parser_limits(
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<meili_ingest_plugin_json::DecodeLimits> {
+    let defaults = meili_ingest_plugin_json::DecodeLimits::default();
+    Ok(meili_ingest_plugin_json::DecodeLimits {
+        max_rows: positive_var(&env, "PARSER_MAX_ROWS")?.unwrap_or(defaults.max_rows),
+        max_decoded_bytes: positive_var(&env, "PARSER_MAX_DECODED_MB")?
+            .map_or(defaults.max_decoded_bytes, |n| n.saturating_mul(MIB)),
     })
 }
 
@@ -140,6 +181,8 @@ impl std::fmt::Debug for WorkerConfig {
             .field("lab_ai_gateway", &self.lab_ai_gateway)
             .field("shutdown_grace", &self.shutdown_grace)
             .field("archive_limits", &self.archive_limits)
+            .field("archive_inflight_bytes", &self.archive_inflight_bytes)
+            .field("parser_limits", &self.parser_limits)
             .finish()
     }
 }
@@ -168,15 +211,14 @@ fn shutdown_grace(raw: Option<&str>) -> anyhow::Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
-/// `true`/`1` (any case) -> on; anything else or unset -> off.
-fn parse_flag(raw: Option<&str>) -> bool {
-    raw.map(str::trim)
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+/// `LAB_EVENTS_ENABLED`: a [`flag`], off unless set.
+fn lab_events_enabled(raw: Option<&str>) -> bool {
+    flag("LAB_EVENTS_ENABLED", raw)
 }
 
-/// `LAB_AI_GATEWAY`: a [`parse_flag`], off unless set.
+/// `LAB_AI_GATEWAY`: a [`flag`], off unless set.
 fn lab_ai_gateway(raw: Option<&str>) -> bool {
-    parse_flag(raw)
+    flag("LAB_AI_GATEWAY", raw)
 }
 
 /// Whether Lab events would be priced with the bundled placeholder list prices: they
@@ -232,20 +274,27 @@ mod tests {
             ("true", true),
             ("1", true),
             ("TRUE", true),
+            ("yes", true),
+            ("On", true),
             ("false", false),
             ("0", false),
+            ("off", false),
             ("", false),
+            ("enabled", false),
         ] {
-            assert_eq!(super::parse_flag(Some(raw)), expected, "{raw:?}");
+            assert_eq!(super::lab_events_enabled(Some(raw)), expected, "{raw:?}");
         }
-        assert!(!super::parse_flag(None));
+        assert!(!super::lab_events_enabled(None));
     }
 
     #[test]
     fn lab_ai_gateway_flag_parsing() {
         assert!(super::lab_ai_gateway(Some(" true\n")));
         assert!(super::lab_ai_gateway(Some("1")));
-        assert!(!super::lab_ai_gateway(Some("yes")));
+        assert!(super::lab_ai_gateway(Some("yes")));
+        assert!(super::lab_ai_gateway(Some("ON")));
+        assert!(!super::lab_ai_gateway(Some("no")));
+        assert!(!super::lab_ai_gateway(Some("y")), "unrecognised is off");
         assert!(!super::lab_ai_gateway(None), "off unless asked for");
     }
 
@@ -286,6 +335,8 @@ mod tests {
             lab_ai_gateway: true,
             shutdown_grace: std::time::Duration::from_secs(1),
             archive_limits: meili_ingest_archive::Limits::default(),
+            archive_inflight_bytes: crate::archive_activity::DEFAULT_INFLIGHT_BYTES,
+            parser_limits: meili_ingest_plugin_json::DecodeLimits::default(),
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("cp-token-value"), "{shown}");
@@ -319,6 +370,53 @@ mod tests {
             let env = |name: &str| (name == "ARCHIVE_MAX_FILES").then(|| bad.to_string());
             let err = super::archive_limits(env).unwrap_err().to_string();
             assert!(err.contains("ARCHIVE_MAX_FILES"), "{err}");
+        }
+    }
+
+    #[test]
+    fn archive_inflight_budget_default_and_parse() {
+        assert_eq!(
+            super::archive_inflight_bytes(|_| None).unwrap(),
+            crate::archive_activity::DEFAULT_INFLIGHT_BYTES
+        );
+        let env = |name: &str| (name == "ARCHIVE_INFLIGHT_MB").then(|| " 64 ".to_string());
+        assert_eq!(
+            super::archive_inflight_bytes(env).unwrap(),
+            64 * 1024 * 1024
+        );
+        for bad in ["0", "-1", "lots"] {
+            let env = |name: &str| (name == "ARCHIVE_INFLIGHT_MB").then(|| bad.to_string());
+            let err = super::archive_inflight_bytes(env).unwrap_err().to_string();
+            assert!(err.contains("ARCHIVE_INFLIGHT_MB"), "{err}");
+        }
+    }
+
+    #[test]
+    fn parser_limits_default_and_parse() {
+        use meili_ingest_plugin_json::DecodeLimits;
+        assert_eq!(
+            super::parser_limits(|_| None).unwrap(),
+            DecodeLimits::default()
+        );
+        let env = |name: &str| match name {
+            "PARSER_MAX_ROWS" => Some(" 5000 ".to_string()),
+            "PARSER_MAX_DECODED_MB" => Some("64".to_string()),
+            _ => None,
+        };
+        let l = super::parser_limits(env).unwrap();
+        assert_eq!(l.max_rows, 5000);
+        assert_eq!(l.max_decoded_bytes, 64 * 1024 * 1024);
+        let blank = |name: &str| (name == "PARSER_MAX_ROWS").then(String::new);
+        assert_eq!(
+            super::parser_limits(blank).unwrap().max_rows,
+            DecodeLimits::default().max_rows
+        );
+        for var in ["PARSER_MAX_ROWS", "PARSER_MAX_DECODED_MB"] {
+            for bad in ["0", "-1", "lots"] {
+                let env = |name: &str| (name == var).then(|| bad.to_string());
+                let err = super::parser_limits(env).unwrap_err().to_string();
+                assert!(err.contains(var), "{err}");
+            }
         }
     }
 }

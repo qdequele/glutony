@@ -123,7 +123,24 @@ impl TryFrom<JobRow> for JobRecord {
     }
 }
 
-/// Insert a job row (idempotent: a repeated insert of the same `job_id` overwrites).
+/// How far along a status is: `queued`, then `running`, then the terminal ones.
+///
+/// The row has several writers with no ordering between them (the gateway's insert at
+/// submit time, its write-through of a Temporal snapshot, the worker's patches), so
+/// the SQL below refuses a status that ranks below the stored one. The terminal
+/// statuses share a rank: one may replace another (a cancel landing after a failure).
+fn status_rank(status: JobStatus) -> i32 {
+    match status {
+        JobStatus::Queued => 0,
+        JobStatus::Running => 1,
+        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled => 2,
+    }
+}
+
+/// Insert a job row. Idempotent: a repeated insert of the same `job_id` overwrites,
+/// except that it never moves the status backwards. When the stored status is further
+/// along than the inserted one (see [`status_rank`]), the stored status, step, error
+/// and start time are kept.
 pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpError> {
     let row: JobRow = sqlx::query_as(
         "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
@@ -133,8 +150,19 @@ pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpE
          ON CONFLICT (job_id) DO UPDATE SET \
             workflow_id = EXCLUDED.workflow_id, pipeline_uid = EXCLUDED.pipeline_uid, \
             tenant_id = EXCLUDED.tenant_id, index_name = EXCLUDED.index_name, \
-            status = EXCLUDED.status, current_step = EXCLUDED.current_step, \
-            error = EXCLUDED.error, started_at = EXCLUDED.started_at, updated_at = now(), \
+            status = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                       WHEN 'running' THEN 1 ELSE 2 END) \
+                          THEN jobs.status ELSE EXCLUDED.status END, \
+            current_step = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                             WHEN 'running' THEN 1 ELSE 2 END) \
+                                THEN jobs.current_step ELSE EXCLUDED.current_step END, \
+            error = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                      WHEN 'running' THEN 1 ELSE 2 END) \
+                         THEN jobs.error ELSE EXCLUDED.error END, \
+            started_at = CASE WHEN $13 < (CASE jobs.status WHEN 'queued' THEN 0 \
+                                                           WHEN 'running' THEN 1 ELSE 2 END) \
+                              THEN jobs.started_at ELSE EXCLUDED.started_at END, \
+            updated_at = now(), \
             source_id = COALESCE(EXCLUDED.source_id, jobs.source_id), \
             parent_job_id = COALESCE(EXCLUDED.parent_job_id, jobs.parent_job_id) \
          RETURNING job_id, workflow_id, pipeline_uid, tenant_id, index_name, status, \
@@ -152,12 +180,18 @@ pub async fn insert_job(pool: &PgPool, job: &JobRecord) -> Result<JobRecord, CpE
     .bind(job.updated_at)
     .bind(job.source_id)
     .bind(job.parent_job_id)
+    .bind(status_rank(job.status))
     .fetch_one(pool)
     .await?;
     JobRecord::try_from(row)
 }
 
 /// Apply a partial update; `None` when the job does not exist.
+///
+/// A status that ranks below the stored one (see [`status_rank`]) is a stale write:
+/// the stored status, step and error are kept, and the stored row is returned like
+/// any other, since the gateway uses the answer as its cached record. `index_name` is
+/// not about the status and is written either way.
 pub async fn update_job_row(
     pool: &PgPool,
     job_id: Uuid,
@@ -170,9 +204,17 @@ pub async fn update_job_row(
     let clear_step = upd.status == Some(JobStatus::Succeeded);
     let row: Option<JobRow> = sqlx::query_as(
         "UPDATE jobs SET \
-            status = COALESCE($2, status), \
-            current_step = CASE WHEN $6 THEN NULL ELSE COALESCE($3, current_step) END, \
-            error = COALESCE($4, error), \
+            status = CASE WHEN $7 < (CASE status WHEN 'queued' THEN 0 \
+                                                 WHEN 'running' THEN 1 ELSE 2 END) \
+                          THEN status ELSE COALESCE($2, status) END, \
+            current_step = CASE WHEN $7 < (CASE status WHEN 'queued' THEN 0 \
+                                                       WHEN 'running' THEN 1 ELSE 2 END) \
+                                THEN current_step \
+                                WHEN $6 THEN NULL \
+                                ELSE COALESCE($3, current_step) END, \
+            error = CASE WHEN $7 < (CASE status WHEN 'queued' THEN 0 \
+                                                WHEN 'running' THEN 1 ELSE 2 END) \
+                         THEN error ELSE COALESCE($4, error) END, \
             index_name = COALESCE($5, index_name), \
             updated_at = now() \
          WHERE job_id = $1 \
@@ -185,6 +227,8 @@ pub async fn update_job_row(
     .bind(upd.error.as_deref())
     .bind(upd.index_name.as_deref())
     .bind(clear_step)
+    // NULL without a status: the comparison is then NULL and nothing is refused.
+    .bind(upd.status.map(status_rank))
     .fetch_optional(pool)
     .await?;
     row.map(JobRecord::try_from).transpose()
@@ -252,11 +296,14 @@ pub struct JobList {
     pub limit: i64,
     /// Offset that was applied.
     pub offset: i64,
-    /// Total rows matching the filters, ignoring paging. Lets a client show a page
-    /// count and disable "next" on the real last page instead of guessing from
-    /// whether the page came back full.
+    /// Total rows matching the filters, ignoring paging, capped at [`TOTAL_CAP`]. Lets a
+    /// client show a page count and disable "next" on the real last page instead of
+    /// guessing from whether the page came back full; at the cap there may be more.
     pub total: i64,
 }
+
+/// `JobList::total` stops counting here.
+pub const TOTAL_CAP: i64 = 10_000;
 
 /// `GET /jobs?tenant_id=&status=&pipeline_uid=&parent_job_id=&limit=&offset=` → newest
 /// first.
@@ -300,17 +347,22 @@ pub async fn list_jobs(
         .map(JobRecord::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Counting stops at TOTAL_CAP rows, so a page request costs at most that many
+    // index entries however long the history is.
     let (total,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM jobs \
-         WHERE ($1::text IS NULL OR tenant_id = $1) \
-           AND ($2::text IS NULL OR status = $2) \
-           AND ($3::text IS NULL OR pipeline_uid = $3) \
-           AND ($4::uuid IS NULL OR parent_job_id = $4)",
+        "SELECT count(*) FROM ( \
+             SELECT 1 FROM jobs \
+             WHERE ($1::text IS NULL OR tenant_id = $1) \
+               AND ($2::text IS NULL OR status = $2) \
+               AND ($3::text IS NULL OR pipeline_uid = $3) \
+               AND ($4::uuid IS NULL OR parent_job_id = $4) \
+             LIMIT $5) AS capped",
     )
     .bind(tenant_id.as_deref())
     .bind(q.status.as_deref())
     .bind(q.pipeline_uid.as_deref())
     .bind(q.parent_job_id)
+    .bind(TOTAL_CAP)
     .fetch_one(&state.pool)
     .await?;
 
@@ -331,6 +383,126 @@ pub async fn get_job(
         .await?
         .map(Json)
         .ok_or_else(|| CpError::NotFound(format!("job {job_id} not found")))
+}
+
+/// Default of `BLOB_TTL_DAYS`: how long after a job ended its blobs are deleted.
+pub const DEFAULT_BLOB_TTL_DAYS: u32 = 7;
+
+/// How long a claimed job stays with the worker that claimed it. A worker that dies
+/// mid-sweep leaves its jobs to the next claim after this.
+pub const BLOB_SWEEP_LEASE_SECS: i64 = 60 * 60;
+
+/// Body of `POST /internal/blob-sweep/claim`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlobSweepClaimRequest {
+    /// Most jobs to claim, 1..=500, default 100.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Answer of `POST /internal/blob-sweep/claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSweepClaim {
+    /// `false` when `BLOB_TTL_DAYS=0`: blobs are never deleted.
+    pub enabled: bool,
+    /// The jobs whose blobs the caller now deletes.
+    pub jobs: Vec<BlobSweepJob>,
+}
+
+/// One job to sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSweepJob {
+    /// Its blobs are under `jobs/<job_id>/`.
+    pub job_id: Uuid,
+    /// `archive` for an archive job, whose files were staged under their own ids.
+    pub pipeline_uid: String,
+}
+
+/// Body of `POST /internal/blob-sweep/done`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlobSweepDone {
+    /// Jobs whose blobs are gone.
+    pub job_ids: Vec<Uuid>,
+}
+
+/// Claim up to `limit` jobs whose blobs are due for deletion: over (succeeded, failed
+/// or cancelled) for more than `ttl_days`, not swept yet, not claimed by another
+/// worker in the last [`BLOB_SWEEP_LEASE_SECS`], and, for an archive, with no file
+/// job still running. Oldest first.
+pub async fn claim_blob_sweep(
+    pool: &PgPool,
+    ttl_days: u32,
+    limit: i64,
+) -> Result<Vec<BlobSweepJob>, CpError> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "UPDATE jobs SET blobs_claimed_at = now() \
+         WHERE job_id IN ( \
+             SELECT j.job_id FROM jobs j \
+             WHERE j.status IN ('succeeded', 'failed', 'cancelled') \
+               AND j.blobs_deleted_at IS NULL \
+               AND j.updated_at < now() - make_interval(days => $1) \
+               AND (j.blobs_claimed_at IS NULL \
+                    OR j.blobs_claimed_at < now() - make_interval(secs => $3)) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM jobs c \
+                   WHERE c.parent_job_id = j.job_id \
+                     AND c.status NOT IN ('succeeded', 'failed', 'cancelled')) \
+             ORDER BY j.updated_at \
+             LIMIT $2 \
+             FOR UPDATE SKIP LOCKED) \
+         RETURNING job_id, pipeline_uid",
+    )
+    .bind(i32::try_from(ttl_days).unwrap_or(i32::MAX))
+    .bind(limit)
+    .bind(BLOB_SWEEP_LEASE_SECS as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(job_id, pipeline_uid)| BlobSweepJob {
+            job_id,
+            pipeline_uid,
+        })
+        .collect())
+}
+
+/// Record that the blobs of `job_ids` are gone; they are never claimed again.
+pub async fn mark_blobs_deleted(pool: &PgPool, job_ids: &[Uuid]) -> Result<u64, CpError> {
+    let done = sqlx::query("UPDATE jobs SET blobs_deleted_at = now() WHERE job_id = ANY($1)")
+        .bind(job_ids)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
+
+/// `POST /internal/blob-sweep/claim` body [`BlobSweepClaimRequest`] → 200
+/// [`BlobSweepClaim`]. Workers call it on a timer and delete each job's blobs.
+pub async fn claim_blob_sweep_route(
+    State(state): State<AppState>,
+    JsonBody(req): JsonBody<BlobSweepClaimRequest>,
+) -> Result<Json<BlobSweepClaim>, CpError> {
+    if state.blob_ttl_days == 0 {
+        return Ok(Json(BlobSweepClaim {
+            enabled: false,
+            jobs: Vec::new(),
+        }));
+    }
+    let limit = req.limit.unwrap_or(100).clamp(1, 500);
+    let jobs = claim_blob_sweep(&state.pool, state.blob_ttl_days, limit).await?;
+    Ok(Json(BlobSweepClaim {
+        enabled: true,
+        jobs,
+    }))
+}
+
+/// `POST /internal/blob-sweep/done` body [`BlobSweepDone`] → 204.
+pub async fn blob_sweep_done_route(
+    State(state): State<AppState>,
+    JsonBody(done): JsonBody<BlobSweepDone>,
+) -> Result<StatusCode, CpError> {
+    let marked = mark_blobs_deleted(&state.pool, &done.job_ids).await?;
+    tracing::info!(jobs = marked, "job blobs deleted");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

@@ -73,7 +73,14 @@ pub enum PluginOutput { Bytes(Blob), Ref(ContentRef), Documents(Vec<Document>), 
 ```
 
 When indexed it is flattened to `{ id, title?, content, ...fields, _meta: {...} }`; `_meta` is left out when the document has no metadata.
-Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes).
+Ids are sanitised to `[a-zA-Z0-9_-]` (≤ 511 bytes). The stem of a generated id
+(`Blob::id_stem`, the file path without its extension) is kept to 400 bytes: a
+longer one is cut and ends with a short hash of the whole path, so the
+`_<index>` or `_p<page>` suffix always fits and long paths stay distinct.
+Sanitising turns every non-ASCII character into `_`, so a file path or sheet name
+with any (`報告.pdf`, a sheet `売上`) also gets `_` and a 12-character hash of the
+original appended (`name_id_part` in the SDK): `報告.pdf` and `計画.pdf` get
+different ids. A pure-ASCII name is only sanitised, as before.
 
 ## ActivityContext
 
@@ -83,6 +90,19 @@ Long-running plugins must cooperate with Temporal:
 ctx.heartbeat("page 12/300");   // every ~10 items; resets the 60 s heartbeat timeout
 ctx.check_cancelled()?;         // returns PluginError::Cancelled after POST /jobs/:id/cancel
 ```
+
+A built-in plugin can checkpoint its progress so that a retry of the step resumes
+instead of starting over:
+
+```rust
+if let Some(done) = ctx.previous_progress() { /* skip what the last attempt finished */ }
+ctx.record_progress(serde_json::json!({ "sent": 3 })); // small and opaque: ids, counters
+```
+
+The checkpoint travels in the Temporal heartbeat details, which every later heartbeat
+repeats. Heartbeats are best effort, so a retry can see an older checkpoint or none,
+and only work that is safe to repeat should be skipped. `previous_progress()` is
+always `None` on the first attempt and for WASM and gRPC plugins.
 
 ## Errors
 
@@ -117,14 +137,9 @@ it to the control plane like any built-in.
 
 ## Task queues
 
-A plugin's name decides which worker pool runs it:
-
-```rust
-match plugin {
-    "s3_downloader" => "workers-io",
-    _               => "workers-general",
-}
-```
+A plugin's name decides which worker pool runs it. Today every plugin runs on
+`workers-general`, `s3_downloader` included (a `workers-io` pool for downloads is
+planned; nothing routes there until it ships).
 
 No model runs inside a worker: AI steps call hosted APIs, so they share
 `workers-general` with every other plugin. External plugins run there too:
@@ -134,6 +149,7 @@ declare them in `EXTERNAL_PLUGINS` on the `workers-general` pool.
 
 `meili_indexer` is the **only** plugin that talks to Meilisearch. It reads the
 `MeiliContext` (host, api_key, index) that the workflow flattened into its
-config, creates the index if needed (`auto_create_index`, `primary_key`; an
+config, creates the index if needed (`auto_create_index`, `primary_key`; with
+`auto_create_index: false` a missing index fails the step instead; an
 existing index keeps its own primary key), batches `addDocuments` calls
 (`batch_size`) and waits for the tasks (`wait_for_completion`). It never reads environment variables.

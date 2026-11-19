@@ -5,7 +5,8 @@
 //!
 //! * `mode: "row"` (default) → one [`Document`] per data row. The first row of each
 //!   sheet is used as headers (`has_headers: true`), each cell becomes
-//!   `fields[header]` with its natural JSON type, `content` is the non-empty cell
+//!   `fields[header]` with its natural JSON type (`col_<n>` without a header; a
+//!   repeated header gets a `_2`, `_3`, … suffix), `content` is the non-empty cell
 //!   texts joined by a space, `fields._row` is the 1-based row number,
 //!   `_meta.section` is the sheet name and `_meta.page` the 1-based sheet index.
 //!   Id: `<filename_stem>_<sheet>_r<row>`.
@@ -14,17 +15,46 @@
 //! `sheets` restricts extraction to the named sheets; `max_rows` caps the rows read
 //! per sheet.
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 
-use calamine::{Data, Range, Reader};
+use calamine::{Data, DataRef, Reader, Sheets};
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
+
+mod zip_budget;
 
 /// Plugin name, as referenced by `steps[].plugin`.
 pub const NAME: &str = "xlsx_extractor";
 
 /// Number of rows between two heartbeats.
 const HEARTBEAT_EVERY: usize = 100;
+
+/// Largest decompressed size accepted for one part of a zipped workbook.
+///
+/// Uploads arrive from untrusted tenants and deflate reaches ratios of ~1000:1, so a
+/// small workbook can expand to gigabytes ("zip bomb") and exhaust a worker. Sheet
+/// and shared-strings XML of a real million-row workbook reaches a few hundred MB,
+/// hence a larger limit than for `.docx` or `.pptx`.
+pub const MAX_PART_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Largest total decompressed size accepted for one zipped workbook.
+pub const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Images (`xl/media/`, `.ods` `Pictures/`) are not parsed: only the total bounds them.
+fn classify_part(name: &str) -> zip_budget::Part {
+    if name.starts_with("xl/media/") || name.starts_with("Pictures/") {
+        zip_budget::Part::Copied
+    } else {
+        zip_budget::Part::Parsed
+    }
+}
+
+const LIMITS: zip_budget::Limits = zip_budget::Limits {
+    part: MAX_PART_BYTES,
+    total: MAX_TOTAL_BYTES,
+    classify: classify_part,
+};
 
 /// The spreadsheet extractor plugin. Stateless; construct with [`XlsxExtractorPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -131,17 +161,161 @@ fn cell_text(cell: &Data) -> String {
     }
 }
 
-/// Header name for a column: the trimmed header cell text, or `col_<n>` (1-based).
-fn header_name(headers: &[String], col: usize) -> String {
-    headers
-        .get(col)
-        .filter(|h| !h.is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("col_{}", col + 1))
+/// Field name of every column of a sheet `width` columns wide.
+///
+/// A column is named after its trimmed header cell text, or `col_<n>` (1-based) when
+/// the header is empty or missing. Names are unique so that no column overwrites
+/// another: the first column with a given header keeps it, and a later column whose
+/// name is already taken, by a repeated header or by a real header that looks like a
+/// fallback (`col_3`), gets the first free `<name>_<k>` (`k` from 2). Real headers
+/// are reserved before any suffix is picked, so `Notes | Notes | Notes_2` names the
+/// second column `Notes_3`.
+fn column_names(headers: &[String], width: usize) -> Vec<String> {
+    let header = |col: usize| headers.get(col).filter(|h| !h.is_empty());
+    let mut taken: HashSet<String> = (0..headers.len()).filter_map(header).cloned().collect();
+    let mut first_use: HashSet<&str> = HashSet::new();
+    let mut next_suffix: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    (0..width.max(headers.len()))
+        .map(|col| {
+            if let Some(h) = header(col)
+                && first_use.insert(h.as_str())
+            {
+                return h.clone();
+            }
+            let base = header(col)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{}", col + 1));
+            let mut name = base.clone();
+            // Resume from the last suffix tried for this base: names are never freed,
+            // so every smaller one is still taken, and a row of identical headers is
+            // named in linear time.
+            let k = next_suffix.entry(base.clone()).or_insert(2usize);
+            while taken.contains(&name) {
+                name = format!("{base}_{k}");
+                *k += 1;
+            }
+            taken.insert(name.clone());
+            name
+        })
+        .collect()
 }
 
-fn sheet_error(name: &str, e: calamine::Error) -> PluginError {
+fn sheet_error(name: &str, e: impl std::fmt::Display) -> PluginError {
     PluginError::NonRetryable(format!("failed to read sheet {name:?}: {e}"))
+}
+
+/// The non-empty cells of one sheet, keyed by absolute (0-based) row, then column.
+///
+/// calamine's `worksheet_range` builds a dense grid spanning the outermost cells, so
+/// a few-KB file with a value in `A1` and another in `XFD1048576` asks for ~1.7e10
+/// cells (hundreds of GB), and a single stray value on the last row of a 30-column
+/// sheet for ~1 GB. Keeping only the cells that exist makes memory proportional to
+/// the sheet's content. Rows and column indices keep the dense range's conventions:
+/// the first row is the first row holding a cell, and columns are counted from the
+/// leftmost column holding a cell.
+#[derive(Debug, Default)]
+struct SheetCells {
+    rows: BTreeMap<u32, BTreeMap<u32, Data>>,
+    /// Leftmost column holding a cell.
+    first_col: u32,
+    /// Rightmost column holding a cell.
+    last_col: u32,
+}
+
+impl SheetCells {
+    fn insert(&mut self, (row, col): (u32, u32), value: Data) {
+        if self.rows.is_empty() || col < self.first_col {
+            self.first_col = col;
+        }
+        if self.rows.is_empty() || col > self.last_col {
+            self.last_col = col;
+        }
+        self.rows.entry(row).or_default().insert(col, value);
+    }
+
+    /// Number of columns between the leftmost and rightmost cells, both included.
+    fn width(&self) -> usize {
+        if self.rows.is_empty() {
+            0
+        } else {
+            (self.last_col - self.first_col) as usize + 1
+        }
+    }
+
+    /// Absolute index of the first row holding a cell.
+    fn first_row(&self) -> u32 {
+        self.rows.keys().next().copied().unwrap_or(0)
+    }
+
+    /// The cells of one row as text, indexed from [`Self::first_col`], with gaps as
+    /// empty strings and no trailing empty cells.
+    fn row_texts(&self, row: &BTreeMap<u32, Data>) -> Vec<String> {
+        let width = row
+            .keys()
+            .next_back()
+            .map_or(0, |last| (last - self.first_col) as usize + 1);
+        let mut texts = vec![String::new(); width];
+        for (col, cell) in row {
+            texts[(col - self.first_col) as usize] = cell_text(cell);
+        }
+        while texts.last().is_some_and(String::is_empty) {
+            texts.pop();
+        }
+        texts
+    }
+}
+
+/// Read the non-empty cells of `sheet`.
+///
+/// `.xlsx`/`.xlsm` and `.xlsb` sheets are streamed cell by cell, so no dense grid is
+/// ever built for them. calamine has no such reader for `.xls` and `.ods`: it builds
+/// their grids while opening the workbook, so they are read from that range.
+fn read_sheet<RS: std::io::Read + std::io::Seek>(
+    workbook: &mut Sheets<RS>,
+    sheet: &str,
+) -> Result<SheetCells, PluginError> {
+    let mut cells = SheetCells::default();
+    match workbook {
+        Sheets::Xlsx(xlsx) => {
+            let mut reader = match xlsx.worksheet_cells_reader(sheet) {
+                Ok(reader) => reader,
+                // Chart sheets and other non-worksheet parts hold no cells, as with
+                // `worksheet_range`.
+                Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(cells),
+                Err(e) => return Err(sheet_error(sheet, e)),
+            };
+            while let Some(cell) = reader.next_cell().map_err(|e| sheet_error(sheet, e))? {
+                push_cell(&mut cells, cell.get_position(), cell.get_value());
+            }
+        }
+        Sheets::Xlsb(xlsb) => {
+            let mut reader = xlsb
+                .worksheet_cells_reader(sheet)
+                .map_err(|e| sheet_error(sheet, e))?;
+            while let Some(cell) = reader.next_cell().map_err(|e| sheet_error(sheet, e))? {
+                push_cell(&mut cells, cell.get_position(), cell.get_value());
+            }
+        }
+        Sheets::Xls(_) | Sheets::Ods(_) => {
+            let range = workbook
+                .worksheet_range(sheet)
+                .map_err(|e| sheet_error(sheet, e))?;
+            let (row0, col0) = range.start().unwrap_or((0, 0));
+            for (row, col, cell) in range.used_cells() {
+                cells.insert((row0 + row as u32, col0 + col as u32), cell.clone());
+            }
+        }
+    }
+    Ok(cells)
+}
+
+/// Keep a streamed cell unless it is empty (a styled cell with no value): the same
+/// cells `worksheet_range` keeps.
+fn push_cell(cells: &mut SheetCells, pos: (u32, u32), value: &DataRef<'_>) {
+    if !matches!(value, DataRef::Empty) {
+        cells.insert(pos, Data::from(value.clone()));
+    }
 }
 
 /// Build the documents for one sheet in row mode.
@@ -152,34 +326,37 @@ fn extract_rows(
     meta: &DocumentMeta,
     sheet_index: usize,
     sheet: &str,
-    range: &Range<Data>,
+    cells: &SheetCells,
 ) -> Result<Vec<Document>, PluginError> {
-    let first_row = range.start().map(|(r, _)| r as usize).unwrap_or(0);
-    let mut rows = range.rows();
+    let first_row = cells.first_row() as usize;
+    let mut rows = cells.rows.iter();
     let headers: Vec<String> = if cfg.has_headers {
         rows.next()
-            .map(|r| r.iter().map(cell_text).collect())
+            .map(|(_, row)| cells.row_texts(row))
             .unwrap_or_default()
     } else {
         Vec::new()
     };
+    let names = column_names(&headers, cells.width());
     let header_offset = usize::from(cfg.has_headers);
-    let sheet_id = sanitize_id(sheet);
+    let sheet_id = name_id_part(sheet);
     let page = u32::try_from(sheet_index + 1).ok();
 
     let mut docs = Vec::new();
-    for (i, row) in rows.enumerate() {
+    for (read, (&row, row_cells)) in rows.enumerate() {
         ctx.check_cancelled()?;
+        // Blank rows hold no cells but still count towards `max_rows`.
+        let i = row as usize - first_row - header_offset;
         if cfg.max_rows.is_some_and(|max| i >= max) {
             break;
         }
-        let row_number = first_row + header_offset + i + 1;
-        if row_number.is_multiple_of(HEARTBEAT_EVERY) {
+        let row_number = row as usize + 1;
+        if read > 0 && read.is_multiple_of(HEARTBEAT_EVERY) {
             ctx.heartbeat(format!("{sheet} row {row_number}"));
         }
         let mut fields = serde_json::Map::new();
         let mut parts = Vec::new();
-        for (col, cell) in row.iter().enumerate() {
+        for (&col, cell) in row_cells {
             let Some(value) = cell_value(cell) else {
                 continue;
             };
@@ -188,7 +365,8 @@ fn extract_rows(
                 other => other.to_string(),
             };
             parts.push(text);
-            fields.insert(header_name(&headers, col), value);
+            let col = (col - cells.first_col) as usize;
+            fields.insert(names[col].clone(), value);
         }
         if parts.is_empty() {
             continue;
@@ -213,30 +391,30 @@ fn extract_sheet(
     meta: &DocumentMeta,
     sheet_index: usize,
     sheet: &str,
-    range: &Range<Data>,
+    cells: &SheetCells,
 ) -> Result<Option<Document>, PluginError> {
+    let first_row = cells.first_row() as usize;
     let mut lines = Vec::new();
-    for (i, row) in range.rows().enumerate() {
+    for (read, (&row, row_cells)) in cells.rows.iter().enumerate() {
         ctx.check_cancelled()?;
+        // Blank rows hold no cells but still count towards `max_rows`.
+        let i = row as usize - first_row;
         if cfg.max_rows.is_some_and(|max| i >= max) {
             break;
         }
-        if i > 0 && i.is_multiple_of(HEARTBEAT_EVERY) {
+        if read > 0 && read.is_multiple_of(HEARTBEAT_EVERY) {
             ctx.heartbeat(format!("{sheet} row {i}"));
         }
-        let mut cells: Vec<String> = row.iter().map(cell_text).collect();
-        // Drop trailing empty cells so rows shorter than the sheet width have no dangling tabs.
-        while cells.last().is_some_and(String::is_empty) {
-            cells.pop();
-        }
-        if !cells.is_empty() {
-            lines.push(cells.join("\t"));
+        // Gaps become empty cells; rows shorter than the sheet have no dangling tabs.
+        let texts = cells.row_texts(row_cells);
+        if !texts.is_empty() {
+            lines.push(texts.join("\t"));
         }
     }
     if lines.is_empty() {
         return Ok(None);
     }
-    let mut doc = Document::with_id(format!("{base}_{}", sanitize_id(sheet)), lines.join("\n"));
+    let mut doc = Document::with_id(format!("{base}_{}", name_id_part(sheet)), lines.join("\n"));
     doc.title = Some(sheet.to_owned());
     doc.fields
         .insert("_rows".into(), serde_json::Value::from(lines.len()));
@@ -244,6 +422,54 @@ fn extract_sheet(
     doc.meta.section = Some(sheet.to_owned());
     doc.meta.page = u32::try_from(sheet_index + 1).ok();
     Ok(Some(doc))
+}
+
+/// Whole synchronous extraction: open the workbook, read the selected sheets, build
+/// the documents. Runs inside [`run_blocking`] because zip inflation and sheet XML
+/// parsing are CPU-bound and calamine has no cancellation point inside a sheet.
+fn extract(ctx: &ActivityContext, blob: Blob, cfg: &Config) -> Result<Vec<Document>, PluginError> {
+    let base = base_id(&blob);
+    let meta = base_meta(&blob);
+
+    // `.xls` is not a zip and passes through; calamine bounds it by the BIFF format.
+    zip_budget::check(&blob.data, "spreadsheet", &LIMITS)?;
+    let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(blob.data))
+        .map_err(|e| PluginError::NonRetryable(format!("failed to open spreadsheet: {e}")))?;
+
+    let mut docs = Vec::new();
+    for (sheet_index, sheet) in workbook.sheet_names().iter().enumerate() {
+        ctx.check_cancelled()?;
+        if cfg
+            .sheets
+            .as_ref()
+            .is_some_and(|wanted| !wanted.iter().any(|w| w == sheet))
+        {
+            continue;
+        }
+        let cells = read_sheet(&mut workbook, sheet)?;
+        match cfg.mode {
+            Mode::Row => docs.extend(extract_rows(
+                ctx,
+                cfg,
+                &base,
+                &meta,
+                sheet_index,
+                sheet,
+                &cells,
+            )?),
+            Mode::Sheet => docs.extend(extract_sheet(
+                ctx,
+                cfg,
+                &base,
+                &meta,
+                sheet_index,
+                sheet,
+                &cells,
+            )?),
+        }
+        ctx.heartbeat(format!("sheet {sheet} done"));
+    }
+    Ok(docs)
 }
 
 #[async_trait]
@@ -302,52 +528,10 @@ impl Plugin for XlsxExtractorPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = parse_config(config)?;
         let blob = input.into_bytes()?;
-        let base = base_id(&blob);
-        let meta = base_meta(&blob);
 
-        let data = blob.data.clone();
-        let mut workbook =
-            run_blocking(move || calamine::open_workbook_auto_from_rs(Cursor::new(data)))
-                .await?
-                .map_err(|e| {
-                    PluginError::NonRetryable(format!("failed to open spreadsheet: {e}"))
-                })?;
+        let ctx = ctx.clone();
+        let docs = run_blocking(move || extract(&ctx, blob, &cfg)).await??;
 
-        let mut docs = Vec::new();
-        for (sheet_index, sheet) in workbook.sheet_names().iter().enumerate() {
-            ctx.check_cancelled()?;
-            if cfg
-                .sheets
-                .as_ref()
-                .is_some_and(|wanted| !wanted.iter().any(|w| w == sheet))
-            {
-                continue;
-            }
-            let range = workbook
-                .worksheet_range(sheet)
-                .map_err(|e| sheet_error(sheet, e))?;
-            match cfg.mode {
-                Mode::Row => docs.extend(extract_rows(
-                    ctx,
-                    &cfg,
-                    &base,
-                    &meta,
-                    sheet_index,
-                    sheet,
-                    &range,
-                )?),
-                Mode::Sheet => docs.extend(extract_sheet(
-                    ctx,
-                    &cfg,
-                    &base,
-                    &meta,
-                    sheet_index,
-                    sheet,
-                    &range,
-                )?),
-            }
-            ctx.heartbeat(format!("sheet {sheet} done"));
-        }
         tracing::debug!(
             plugin = NAME,
             documents = docs.len(),
@@ -396,6 +580,19 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn a_row_of_one_repeated_header_is_named_in_linear_time() {
+        // The widest sheet a spreadsheet format allows, every header the same.
+        let headers = vec!["n".to_string(); 16_384];
+        let started = std::time::Instant::now();
+        let names = column_names(&headers, headers.len());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(names[0], "n");
+        assert_eq!(names[1], "n_2");
+        assert_eq!(names[16_383], "n_16384");
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+    }
     #[test]
     fn manifest_is_well_formed() {
         let m = XlsxExtractorPlugin::new().manifest();
@@ -449,6 +646,34 @@ mod tests {
         assert_eq!(note.id, "data_Team_Roster_Notes_r2");
         assert_eq!(note.fields["note"], "hello world");
         assert_eq!(note.meta.page, Some(2));
+    }
+
+    #[tokio::test]
+    async fn sheets_with_non_ascii_names_get_distinct_ids() {
+        let mut wb = Workbook::new();
+        for name in ["売上", "在庫"] {
+            let ws = wb.add_worksheet();
+            ws.set_name(name).unwrap();
+            ws.write_string(0, 0, "item").unwrap();
+            ws.write_string(1, 0, name).unwrap();
+        }
+        let bytes = wb.save_to_buffer().unwrap();
+        for mode in ["row", "sheet"] {
+            let docs = XlsxExtractorPlugin::new()
+                .execute(
+                    &ActivityContext::noop(),
+                    input(bytes.clone()),
+                    serde_json::json!({ "mode": mode }),
+                )
+                .await
+                .unwrap()
+                .into_documents()
+                .unwrap();
+            assert_eq!(docs.len(), 2, "{mode}");
+            assert_ne!(docs[0].id, docs[1].id, "{mode}");
+            let tag = origin_tag("売上");
+            assert!(docs[0].id.contains(&tag), "{mode}: {}", docs[0].id);
+        }
     }
 
     #[tokio::test]
@@ -509,6 +734,159 @@ mod tests {
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].fields["col_1"], "note");
         assert_eq!(docs[0].fields["_row"], 1);
+    }
+
+    /// The sheet parse runs off the async runtime: on a single-threaded runtime a
+    /// sibling task keeps getting polled while a large sheet is being read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sheet_parsing_does_not_block_the_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Instant;
+
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        for col in 0..4u16 {
+            ws.write_string(0, col, format!("h{col}")).unwrap();
+        }
+        for row in 1..4_000u32 {
+            for col in 0..4u16 {
+                ws.write_number(row, col, f64::from(row) + f64::from(col))
+                    .unwrap();
+            }
+        }
+        let bytes = wb.save_to_buffer().unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let max_gap_us = Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let done = done.clone();
+            let max_gap_us = max_gap_us.clone();
+            async move {
+                let mut last = Instant::now();
+                while !done.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                    let now = Instant::now();
+                    let gap = now.duration_since(last).as_micros() as u64;
+                    max_gap_us.fetch_max(gap, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let started = Instant::now();
+        let out = XlsxExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                input(bytes),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let total_us = started.elapsed().as_micros() as u64;
+        done.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+
+        assert_eq!(out.into_documents().unwrap().len(), 3_999);
+        let max_gap_us = max_gap_us.load(Ordering::Relaxed);
+        assert!(
+            max_gap_us * 4 < total_us,
+            "the runtime was blocked for {max_gap_us} us of a {total_us} us extraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_headers_get_distinct_field_names() {
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        // Name | Notes | Notes | Notes_2 | (empty) | col_5
+        for (col, header) in [(0, "Name"), (1, "Notes"), (2, "Notes"), (3, "Notes_2")] {
+            ws.write_string(0, col, header).unwrap();
+        }
+        ws.write_string(0, 5, "col_5").unwrap();
+        for (col, value) in [
+            "Ada", "first", "second", "third", "fourth", "fifth", "sixth",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ws.write_string(1, col as u16, value).unwrap();
+        }
+        let bytes = wb.save_to_buffer().unwrap();
+
+        let out = XlsxExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                input(bytes),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let docs = out.into_documents().unwrap();
+        assert_eq!(docs.len(), 1, "{docs:#?}");
+        let fields = &docs[0].fields;
+        assert_eq!(fields["Name"], "Ada");
+        assert_eq!(fields["Notes"], "first");
+        assert_eq!(fields["Notes_3"], "second");
+        assert_eq!(fields["Notes_2"], "third");
+        assert_eq!(fields["col_5_2"], "fourth");
+        assert_eq!(fields["col_5"], "fifth");
+        // Wider than the header row: the fallback name is free here.
+        assert_eq!(fields["col_7"], "sixth");
+        assert_eq!(fields.len(), 8, "{fields:#?}");
+    }
+
+    /// A zipped workbook whose extra part declares more than [`MAX_PART_BYTES`] is
+    /// refused before calamine opens it. (The declared size is forged on a small part
+    /// so the fixture stays cheap; `zip_budget` tests cover parts that really inflate
+    /// past the limit, with or without an honest header.)
+    #[tokio::test]
+    async fn rejects_a_zip_bomb_instead_of_decompressing_it() {
+        use std::io::Write;
+        let mut source = zip::ZipArchive::new(Cursor::new(make_xlsx())).unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..source.len() {
+            writer.raw_copy_file(source.by_index(i).unwrap()).unwrap();
+        }
+        writer
+            .start_file("xl/bomb.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"<bomb/>").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+
+        // Rewrite the uncompressed size of `xl/bomb.xml` in its local header and its
+        // central directory entry.
+        let declared = u32::try_from(MAX_PART_BYTES + 1).unwrap().to_le_bytes();
+        let mut patched = 0;
+        for at in 0..bytes.len() - 4 {
+            let (offset, name_at) = match &bytes[at..at + 4] {
+                [0x50, 0x4b, 0x03, 0x04] => (22, 30),
+                [0x50, 0x4b, 0x01, 0x02] => (24, 46),
+                _ => continue,
+            };
+            if bytes[at + name_at..].starts_with(b"xl/bomb.xml") {
+                bytes[at + offset..at + offset + 4].copy_from_slice(&declared);
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 2);
+
+        let err = XlsxExtractorPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                input(bytes),
+                serde_json::json!({}),
+            )
+            .await
+            .expect_err("a zip bomb must be rejected");
+        match err {
+            PluginError::NonRetryable(m) => assert!(
+                m.contains("xl/bomb.xml") && m.contains("zip bomb"),
+                "unexpected message: {m}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]

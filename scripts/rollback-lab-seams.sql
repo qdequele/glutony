@@ -1,7 +1,9 @@
 -- Roll back migrations 0003 (tenant_id), 0004 (lab_events) and 0005 (its v2 rewrite,
 -- dropped with the table) so the previous glutony binary starts: sqlx refuses a
 -- database with a migration it does not know. Every later migration goes too: 0006
--- (jobs.parent_job_id, archive file jobs).
+-- (jobs.parent_job_id, archive file jobs), 0007 (lab_events.first_skipped_at,
+-- dropped with the table), 0008 (the started_at indexes of jobs and source_runs) and
+-- 0009 (jobs.blobs_*, the job blob sweep).
 --
 --   psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -f scripts/rollback-lab-seams.sql
 --
@@ -29,7 +31,13 @@ END $$;
 
 DROP TABLE IF EXISTS lab_events;
 
+DROP INDEX IF EXISTS jobs_blobs_due;
+ALTER TABLE jobs DROP COLUMN IF EXISTS blobs_claimed_at;
+ALTER TABLE jobs DROP COLUMN IF EXISTS blobs_deleted_at;
+
 DROP INDEX IF EXISTS jobs_parent;
+DROP INDEX IF EXISTS jobs_started;
+DROP INDEX IF EXISTS source_runs_started;
 ALTER TABLE jobs DROP COLUMN IF EXISTS parent_job_id;
 
 ALTER TABLE pipelines         RENAME COLUMN tenant_id TO project_id;
@@ -43,4 +51,4 @@ ALTER INDEX sources_uid_tenant           RENAME TO sources_uid_project;
 ALTER INDEX sources_pipeline_tenant      RENAME TO sources_pipeline;
 ALTER INDEX meili_connections_uid_tenant RENAME TO meili_connections_uid_project;
 
-DELETE FROM _sqlx_migrations WHERE version IN (3, 4, 5, 6);
+DELETE FROM _sqlx_migrations WHERE version IN (3, 4, 5, 6, 7, 8, 9);

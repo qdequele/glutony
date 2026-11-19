@@ -11,7 +11,9 @@
 //! the archive, so a retried activity overwrites what an earlier attempt staged and
 //! recorded instead of leaving orphans behind.
 
+use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -25,6 +27,7 @@ use meili_ingest_router::{canonical_mime, detect_mime, mime_to_default_index};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::activity::to_activity_error;
@@ -33,6 +36,82 @@ use crate::source_activity::SourceActivities;
 /// How often the expansion heartbeats while it works.
 const KEEPALIVE: Duration = Duration::from_secs(20);
 
+/// Default of `ARCHIVE_INFLIGHT_MB`: the decompressed files one worker holds in memory
+/// at once, between the walk and the blob store.
+pub const DEFAULT_INFLIGHT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The budget is counted in KiB, so a `u32` permit request covers any file.
+const BUDGET_UNIT: u64 = 1024;
+
+/// Bytes of decompressed files held in memory at once, across every expansion of this
+/// worker. A file is reserved before it is decompressed and let go once staged.
+#[derive(Debug)]
+pub struct InflightBudget {
+    permits: Arc<Semaphore>,
+    /// Total, in [`BUDGET_UNIT`]s.
+    units: u32,
+    /// Bytes reserved now, and the most ever reserved at once.
+    in_use: Arc<AtomicU64>,
+    high_water: Arc<AtomicU64>,
+}
+
+/// Part of the [`InflightBudget`], held while one file is in memory.
+#[derive(Debug)]
+pub struct Reservation {
+    _permit: OwnedSemaphorePermit,
+    bytes: u64,
+    in_use: Arc<AtomicU64>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.in_use.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+impl InflightBudget {
+    /// A budget of `bytes`.
+    pub fn new(bytes: u64) -> Self {
+        let units = u32::try_from(bytes.div_ceil(BUDGET_UNIT).max(1)).unwrap_or(u32::MAX);
+        Self {
+            permits: Arc::new(Semaphore::new(units as usize)),
+            units,
+            in_use: Arc::new(AtomicU64::new(0)),
+            high_water: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The whole budget, in bytes.
+    pub fn bytes(&self) -> u64 {
+        u64::from(self.units) * BUDGET_UNIT
+    }
+
+    /// The most bytes ever reserved at once.
+    pub fn high_water(&self) -> u64 {
+        self.high_water.load(Ordering::SeqCst)
+    }
+
+    /// Wait until `bytes` fit, then hold them. A file larger than the whole budget
+    /// takes all of it, so it is always admitted once it is alone.
+    pub async fn reserve(&self, bytes: u64) -> Reservation {
+        let units = u32::try_from(bytes.div_ceil(BUDGET_UNIT))
+            .unwrap_or(u32::MAX)
+            .min(self.units);
+        let permit = Arc::clone(&self.permits)
+            .acquire_many_owned(units)
+            .await
+            .expect("the budget's semaphore is never closed");
+        let bytes = u64::from(units) * BUDGET_UNIT;
+        let now = self.in_use.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        self.high_water.fetch_max(now, Ordering::SeqCst);
+        Reservation {
+            _permit: permit,
+            bytes,
+            in_use: Arc::clone(&self.in_use),
+        }
+    }
+}
+
 /// Shared state of the archive activities.
 pub struct ArchiveActivities {
     /// Control plane access, blob store and default index (shared with the source
@@ -40,17 +119,56 @@ pub struct ArchiveActivities {
     pub base: SourceActivities,
     /// Bounds on one archive.
     pub limits: Limits,
+    /// One expansion at a time on this worker: each holds its whole archive in memory
+    /// while it walks it.
+    expansions: Arc<Semaphore>,
+    /// Decompressed files held in memory at once.
+    budget: Arc<InflightBudget>,
+    /// Tests: counts the bytes of each file the walk hands over, measured apart from
+    /// the budget.
+    #[cfg(test)]
+    live_files: Option<Arc<tests::LiveFiles>>,
 }
 
 impl ArchiveActivities {
-    /// Activities using `base` for the control plane and the blob store.
+    /// Activities using `base` for the control plane and the blob store, with the
+    /// default in-flight budget ([`DEFAULT_INFLIGHT_BYTES`]).
     pub fn new(base: SourceActivities, limits: Limits) -> Self {
-        Self { base, limits }
+        let budget = Arc::new(InflightBudget::new(inflight_budget(
+            DEFAULT_INFLIGHT_BYTES,
+            &limits,
+        )));
+        Self {
+            base,
+            limits,
+            expansions: Arc::new(Semaphore::new(1)),
+            budget,
+            #[cfg(test)]
+            live_files: None,
+        }
+    }
+
+    /// Hold at most `bytes` of decompressed files in memory at once
+    /// (`ARCHIVE_INFLIGHT_MB`), never less than one file of the largest size allowed.
+    pub fn with_inflight_bytes(mut self, bytes: u64) -> Self {
+        self.budget = Arc::new(InflightBudget::new(inflight_budget(bytes, &self.limits)));
+        self
+    }
+
+    /// The in-flight budget.
+    pub fn budget(&self) -> &InflightBudget {
+        &self.budget
     }
 
     fn blob(&self) -> &BlobStore {
         &self.base.blob
     }
+}
+
+/// The in-flight budget for `bytes` asked: at least one file of
+/// [`Limits::max_file_bytes`], or that file could never be admitted.
+pub fn inflight_budget(bytes: u64, limits: &Limits) -> u64 {
+    bytes.max(limits.max_file_bytes)
 }
 
 /// Input of [`ArchiveActivities::expand_archive`].
@@ -60,6 +178,10 @@ pub struct ExpandArchiveInput {
     pub job_id: Uuid,
     /// The archive itself (a reference).
     pub input: PluginInput,
+    /// The job's tenant: a tenant is not told the fetch allowlist when its URL is
+    /// refused. Absent from histories recorded before it existed (then standalone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Output of [`ArchiveActivities::expand_archive`].
@@ -159,6 +281,33 @@ struct ResolveResponse {
     index_pattern: Option<String>,
 }
 
+/// An archive [`Event`] as it crosses from the blocking walker to the async activity:
+/// a file already carries its detected MIME.
+#[derive(Debug, PartialEq)]
+enum Walked {
+    /// A file to ingest, with its MIME.
+    File {
+        path: String,
+        data: Vec<u8>,
+        mime: String,
+    },
+    /// An entry that will not be ingested, and why.
+    Skipped { path: String, reason: String },
+}
+
+impl Walked {
+    /// Detect the MIME of a walked file. Call it on the walker's thread.
+    fn detect(event: Event) -> Self {
+        match event {
+            Event::File { path, data } => {
+                let mime = detect_mime(&data, Some(&path), None);
+                Self::File { path, data, mime }
+            }
+            Event::Skipped { path, reason } => Self::Skipped { path, reason },
+        }
+    }
+}
+
 /// The job id of the `ordinal`-th file of archive `job_id`: stable across retries.
 pub fn file_job_id(job_id: Uuid, ordinal: usize) -> Uuid {
     Uuid::new_v5(&job_id, format!("archive-file-{ordinal}").as_bytes())
@@ -231,9 +380,17 @@ impl ArchiveActivities {
         &self,
         input: &ExpandArchiveInput,
     ) -> Result<ExpandArchiveOutput, PluginError> {
+        // Taken before the archive is read into memory: expansions waiting their turn
+        // hold nothing.
+        let expansion = Arc::clone(&self.expansions)
+            .acquire_owned()
+            .await
+            .expect("the expansion semaphore is never closed");
         let blob = match &input.input {
+            // A tenant's archive is not told the fetch allowlist; a standalone one is.
             PluginInput::Ref(r) => self
                 .blob()
+                .with_guard_disclosure(input.tenant_id.is_none())
                 .fetch_ref(r, &self.base.http)
                 .await
                 .map_err(|e| from_blob_error("fetching the archive", e))?,
@@ -262,24 +419,69 @@ impl ArchiveActivities {
             ..
         } = blob;
         let limits = self.limits.clone();
-        // Small buffer: at most a few files are held in memory between the walk and
-        // the blob store.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(4);
+        // What bounds memory is the budget, not the channel: each file is reserved
+        // before it is decompressed and let go once staged.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Walked, Option<Reservation>)>(4);
+        let budget = Arc::clone(&self.budget);
+        let handle = tokio::runtime::Handle::current();
+        #[cfg(test)]
+        let live_files = self.live_files.clone();
         let walker = tokio::task::spawn_blocking(move || {
-            meili_ingest_archive::walk(&data, format, filename.as_deref(), &limits, &mut |e| {
-                tx.blocking_send(e)
-                    .map_err(|_| "the archive expansion was abandoned".to_string())
-            })
+            // The walk holds the archive: the next expansion starts once it is done.
+            let _expansion = expansion;
+            let abandoned = || "the archive expansion was abandoned".to_string();
+            // The reservation of the file being decompressed, until its event.
+            let pending: Cell<Option<Reservation>> = Cell::new(None);
+            meili_ingest_archive::walk_reserving(
+                &data,
+                format,
+                filename.as_deref(),
+                &limits,
+                &mut |bytes| {
+                    // An earlier reservation not used by a file (a nested archive
+                    // being opened) is let go first: it could block this one.
+                    pending.set(None);
+                    // Waiting for room must not outlive the expansion: once it gives
+                    // up (an error, a cancellation), the receiver is dropped.
+                    let reserved = handle.block_on(async {
+                        tokio::select! {
+                            r = budget.reserve(bytes) => Some(r),
+                            () = tx.closed() => None,
+                        }
+                    });
+                    pending.set(Some(reserved.ok_or_else(abandoned)?));
+                    Ok(())
+                },
+                &mut |e| {
+                    #[cfg(test)]
+                    if let (Some(live), Event::File { data, .. }) = (&live_files, &e) {
+                        live.produced(data.len());
+                    }
+                    // A skipped entry frees its reservation right here.
+                    let reserved = match &e {
+                        Event::File { .. } => pending.take(),
+                        Event::Skipped { .. } => {
+                            pending.set(None);
+                            None
+                        }
+                    };
+                    // Detection can read a whole file (a JSON sniff parses it), so it
+                    // runs here, on the blocking thread that walks the archive, and
+                    // never on the async threads that receive the files.
+                    tx.blocking_send((Walked::detect(e), reserved))
+                        .map_err(|_| abandoned())
+                },
+            )
         });
 
         let mut entries: Vec<ManifestEntry> = Vec::new();
         let mut skipped = 0usize;
         let mut skipped_samples = Vec::new();
-        while let Some(event) = rx.recv().await {
+        // The reservation lives to the end of the iteration: the file is staged.
+        while let Some((event, _reservation)) = rx.recv().await {
             match event {
-                Event::File { path, data } => {
+                Walked::File { path, data, mime } => {
                     let job_id = file_job_id(input.job_id, entries.len());
-                    let mime = detect_mime(&data, Some(&path), None);
                     // Always staged: bytes never enter workflow history. The full path
                     // is the filename, so documents keep their folder and two `a.pdf`
                     // in different folders get different ids.
@@ -302,7 +504,7 @@ impl ArchiveActivities {
                         input: staged,
                     });
                 }
-                Event::Skipped { path, reason } => {
+                Walked::Skipped { path, reason } => {
                     skipped += 1;
                     if skipped_samples.len() < ARCHIVE_ISSUES_KEPT {
                         skipped_samples.push(issue(&path, reason, None));
@@ -335,6 +537,24 @@ impl ArchiveActivities {
             skipped,
             skipped_samples,
         })
+    }
+
+    /// [`Self::expand`], given up as soon as `cancelled` resolves.
+    ///
+    /// Giving up drops the expansion, which closes the channel its walk feeds: the walk
+    /// stops at its next entry instead of staging the rest of an archive nobody wants
+    /// any more. What was staged until then stays under the job's keys, as after any
+    /// failed expansion, until the job's blobs are swept ([`crate::blob_sweep`]).
+    pub async fn expand_unless(
+        &self,
+        input: &ExpandArchiveInput,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<ExpandArchiveOutput, PluginError> {
+        tokio::select! {
+            biased;
+            () = cancelled => Err(PluginError::Cancelled),
+            expanded = self.expand(input) => expanded,
+        }
     }
 
     /// Route one page of the manifest into child jobs.
@@ -411,6 +631,12 @@ impl ArchiveActivities {
                 continue;
             }
             let mut context = input.context.clone();
+            // A file whose pipeline writes through connections never reads the
+            // request's destination: keep the caller's key out of its history.
+            if pipeline.pins_destination() {
+                context.host = None;
+                context.api_key = None;
+            }
             context.index = Some(file_index(
                 locked,
                 &pipeline,
@@ -543,7 +769,8 @@ impl ArchiveActivities {
                 }
             }
         });
-        let result = self.expand(&input).await;
+        // Cancellation reaches an activity through its heartbeats.
+        let result = self.expand_unless(&input, ctx.cancelled()).await;
         keepalive.abort();
         result.map_err(to_activity_error)
     }
@@ -636,6 +863,45 @@ mod tests {
     }
 
     #[test]
+    fn walked_files_carry_their_mime_from_the_walker() {
+        // The MIME is settled where the event is built (the blocking walker), so the
+        // async loop never parses a file to find its type.
+        let walked = Walked::detect(Event::File {
+            path: "data/rows".into(),
+            data: b"[{\"id\":1},{\"id\":2}]".to_vec(),
+        });
+        assert_eq!(
+            walked,
+            Walked::File {
+                path: "data/rows".into(),
+                data: b"[{\"id\":1},{\"id\":2}]".to_vec(),
+                mime: "application/json".into(),
+            }
+        );
+        assert_eq!(
+            Walked::detect(Event::File {
+                path: "docs/README.md".into(),
+                data: b"<div align=\"center\">\n# T\n".to_vec(),
+            }),
+            Walked::File {
+                path: "docs/README.md".into(),
+                data: b"<div align=\"center\">\n# T\n".to_vec(),
+                mime: "text/markdown".into(),
+            }
+        );
+        assert_eq!(
+            Walked::detect(Event::Skipped {
+                path: "a".into(),
+                reason: "empty".into(),
+            }),
+            Walked::Skipped {
+                path: "a".into(),
+                reason: "empty".into(),
+            }
+        );
+    }
+
+    #[test]
     fn file_job_ids_are_stable_and_distinct() {
         let job = Uuid::new_v4();
         assert_eq!(file_job_id(job, 3), file_job_id(job, 3));
@@ -676,7 +942,11 @@ mod tests {
         ]);
         let input = staged_archive(&a, job_id, data).await;
         let out = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         assert_eq!(out.files, 2);
@@ -717,7 +987,11 @@ mod tests {
         .with_origin(Some("https://a.example/q3.zip".into()));
         let input = a.blob().stage_upload(job_id, archive, 0).await.unwrap();
         let out = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         let entries: Vec<ManifestEntry> =
@@ -740,7 +1014,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = PluginInput::Bytes(Blob::new(b"hello".to_vec(), "text/plain", None));
         let err = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap_err();
         assert!(!err.is_retryable(), "{err}");
@@ -757,11 +1035,70 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"a"), ("b.txt", b"b")])).await;
         let err = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap_err();
         assert!(!err.is_retryable(), "{err}");
         assert!(err.to_string().contains("more than 1 files"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_expansion_stops_and_writes_no_manifest() {
+        // The archive comes from a host that takes its time: the expansion is still
+        // fetching it when the job is cancelled.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/q3.zip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(zip_of(&[("a.txt", b"a")]))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let a = activities("http://unused");
+        let job_id = Uuid::new_v4();
+        let input = ExpandArchiveInput {
+            job_id,
+            input: PluginInput::Ref(ContentRef::Url {
+                url: format!("{}/q3.zip", server.uri()),
+                mime: Some("application/zip".into()),
+                filename: Some("q3.zip".into()),
+            }),
+            tenant_id: None,
+        };
+        let cancelled = async {
+            while server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let out = tokio::time::timeout(Duration::from_secs(10), a.expand_unless(&input, cancelled))
+            .await
+            .expect("a cancelled expansion returns at once");
+        assert!(matches!(out, Err(PluginError::Cancelled)), "{out:?}");
+        assert!(a.blob().get(&manifest_key(job_id)).await.is_err());
+
+        // Not cancelled, it runs to the end.
+        let job_id = Uuid::new_v4();
+        let input = ExpandArchiveInput {
+            job_id,
+            input: staged_archive(&a, job_id, zip_of(&[("a.txt", b"a")])).await,
+            tenant_id: None,
+        };
+        let out = a
+            .expand_unless(&input, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(out.files, 1);
     }
 
     #[tokio::test]
@@ -803,7 +1140,11 @@ mod tests {
         ]);
         let input = staged_archive(&a, job_id, data).await;
         let expanded = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
 
@@ -867,7 +1208,11 @@ mod tests {
         let job_id = Uuid::new_v4();
         let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"hello")])).await;
         let expanded = a
-            .expand(&ExpandArchiveInput { job_id, input })
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
             .await
             .unwrap();
         let forced = ForcedPipeline {
@@ -936,6 +1281,331 @@ mod tests {
             "{:?}",
             wrong_index.failed
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_whose_pipeline_pins_a_connection_gets_no_request_key() {
+        // The archive's own input keeps the request's destination for the files that
+        // need it; a file job that writes through a connection must not carry the
+        // caller's key into its workflow history.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/jobs"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let a = activities(&server.uri());
+        let job_id = Uuid::new_v4();
+        let input = staged_archive(&a, job_id, zip_of(&[("a.txt", b"hello")])).await;
+        let expanded = a
+            .expand(&ExpandArchiveInput {
+                job_id,
+                input,
+                tenant_id: None,
+            })
+            .await
+            .unwrap();
+        let mut pinned = pipeline("pinned", None);
+        pinned.steps[1].config = serde_json::json!({ "connection": "prod-movies" });
+
+        for (pipeline, key, host) in [
+            (pinned, None, None),
+            (
+                pipeline("plain", None),
+                Some("key"),
+                Some("http://meili:7700"),
+            ),
+        ] {
+            let out = a
+                .prepare(&PrepareArchiveInput {
+                    job_id,
+                    manifest: expanded.manifest.clone(),
+                    offset: 0,
+                    limit: 10,
+                    context: destination(),
+                    forced_pipeline: Some(ForcedPipeline {
+                        pipeline,
+                        index_pattern: None,
+                    }),
+                    locked_index: Some("locked".into()),
+                })
+                .await
+                .unwrap();
+            let job = &out.jobs[0].workflow_input;
+            assert_eq!(job.context.api_key.as_deref(), key, "{}", job.pipeline.uid);
+            assert_eq!(job.context.host.as_deref(), host, "{}", job.pipeline.uid);
+            assert_eq!(job.context.tenant_id.as_deref(), Some("t1"));
+            assert_eq!(job.context.index.as_deref(), Some("locked"));
+        }
+    }
+
+    /// Bytes of decompressed files alive between the walk and the store, counted
+    /// apart from the budget: up when the walk hands a file over, down when the store
+    /// is done writing it (and the file is dropped).
+    #[derive(Debug, Default)]
+    pub(super) struct LiveFiles {
+        now: AtomicU64,
+        high_water: AtomicU64,
+    }
+
+    impl LiveFiles {
+        pub(super) fn produced(&self, bytes: usize) {
+            let bytes = bytes as u64;
+            let now = self.now.fetch_add(bytes, Ordering::SeqCst) + bytes;
+            self.high_water.fetch_max(now, Ordering::SeqCst);
+        }
+
+        fn written(&self, bytes: usize) {
+            self.now.fetch_sub(bytes as u64, Ordering::SeqCst);
+        }
+
+        fn high_water(&self) -> u64 {
+            self.high_water.load(Ordering::SeqCst)
+        }
+    }
+
+    /// An in-memory store whose writes each take `delay`, like a remote store that is
+    /// slower than decompression.
+    #[derive(Debug)]
+    struct SlowStore {
+        inner: object_store::memory::InMemory,
+        delay: Duration,
+        /// Writes still to fail.
+        failing: std::sync::atomic::AtomicUsize,
+        /// Told when a staged file is written (or refused).
+        live: Arc<LiveFiles>,
+    }
+
+    impl std::fmt::Display for SlowStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("SlowStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for SlowStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            tokio::time::sleep(self.delay).await;
+            let fail = self
+                .failing
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            // An archive's files are staged under `jobs/<file job>/input/`.
+            let file = location.as_ref().contains("/input/");
+            let len = payload.content_length();
+            let result = if fail {
+                Err(object_store::Error::Generic {
+                    store: "SlowStore",
+                    source: "write refused".into(),
+                })
+            } else {
+                self.inner.put_opts(location, payload, opts).await
+            };
+            if file {
+                self.live.written(len);
+            }
+            result
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn slow_activities(delay: Duration, limits: Limits, inflight: u64) -> ArchiveActivities {
+        failing_activities(delay, limits, inflight, 0)
+    }
+
+    fn failing_activities(
+        delay: Duration,
+        limits: Limits,
+        inflight: u64,
+        failing: usize,
+    ) -> ArchiveActivities {
+        let live = Arc::new(LiveFiles::default());
+        let store = BlobStore::from_object_store(Arc::new(SlowStore {
+            inner: object_store::memory::InMemory::new(),
+            delay,
+            failing: failing.into(),
+            live: Arc::clone(&live),
+        }));
+        let mut a = ArchiveActivities::new(SourceActivities::new(None, store), limits)
+            .with_inflight_bytes(inflight);
+        a.live_files = Some(live);
+        a
+    }
+
+    fn live_files(a: &ArchiveActivities) -> &LiveFiles {
+        a.live_files
+            .as_deref()
+            .expect("a slow store counts live files")
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A zip of `n` files of 1 MiB each, deflated to almost nothing.
+    fn mib_files_zip(n: usize) -> Vec<u8> {
+        let content = vec![b'a'; MIB];
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..n {
+            w.start_file(format!("f{i}.txt"), opts).unwrap();
+            w.write_all(&content).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn mib_files_input(data: Vec<u8>) -> ExpandArchiveInput {
+        ExpandArchiveInput {
+            job_id: Uuid::new_v4(),
+            input: PluginInput::Bytes(Blob::new(data, "application/zip", None)),
+            tenant_id: None,
+        }
+    }
+
+    fn mib_limits() -> Limits {
+        Limits {
+            max_file_bytes: MIB as u64,
+            ..Limits::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn one_archive_expands_at_a_time_per_worker() {
+        let a = Arc::new(slow_activities(
+            Duration::ZERO,
+            mib_limits(),
+            2 * MIB as u64,
+        ));
+        // Another expansion is running.
+        let running = Arc::clone(&a.expansions).acquire_owned().await.unwrap();
+        let waiting = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move { a.expand(&mib_files_input(mib_files_zip(1))).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "it waits for its turn");
+        drop(running);
+        let out = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("it runs once the other is done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.files, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_expansion_frees_the_walk_waiting_for_room() {
+        // The first file cannot be staged; the walk is by then waiting for room for
+        // the second. The expansion fails, and its walk stops instead of waiting
+        // forever with the worker's expansion slot.
+        let a = failing_activities(Duration::from_millis(50), mib_limits(), MIB as u64, 1);
+        let err = a
+            .expand(&mib_files_input(mib_files_zip(4)))
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err}");
+        assert!(err.to_string().contains("staging a file"), "{err}");
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            a.expand(&mib_files_input(mib_files_zip(2))),
+        )
+        .await
+        .expect("the next expansion gets the slot")
+        .unwrap();
+        assert_eq!(out.files, 2);
+        assert_eq!(a.budget().high_water(), MIB as u64);
+    }
+
+    #[test]
+    fn the_budget_always_admits_the_largest_file() {
+        let limits = mib_limits();
+        assert_eq!(inflight_budget(10, &limits), MIB as u64);
+        assert_eq!(inflight_budget(3 * MIB as u64, &limits), 3 * MIB as u64);
+        let a = ArchiveActivities::new(SourceActivities::new(None, BlobStore::memory()), limits)
+            .with_inflight_bytes(1);
+        assert_eq!(a.budget().bytes(), MIB as u64);
+        assert_eq!(
+            ArchiveActivities::new(
+                SourceActivities::new(None, BlobStore::memory()),
+                Limits::default()
+            )
+            .budget()
+            .bytes(),
+            DEFAULT_INFLIGHT_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn decompressed_files_held_in_memory_stay_within_the_budget() {
+        // Eight 1 MiB files that compress to almost nothing, a store that takes a
+        // while to write each: decompression outruns staging. A 2 MiB budget holds two
+        // files at a time, however many the channel could queue. What is measured is
+        // the files themselves, from the walk handing one over to the store being done
+        // with it, not what the budget believes it lent.
+        let limits = Limits {
+            max_file_bytes: MIB as u64,
+            ..Limits::default()
+        };
+        let a = slow_activities(Duration::from_millis(100), limits, 2 * MIB as u64);
+        let data = mib_files_zip(8);
+        assert!(data.len() < MIB / 10, "the zip is small: {}", data.len());
+        let out = a.expand(&mib_files_input(data)).await.unwrap();
+        assert_eq!(out.files, 8);
+        let held = live_files(&a).high_water();
+        assert!(
+            held <= 2 * MIB as u64,
+            "{held} bytes of files were held at once"
+        );
+        // The store was slow enough for the walk to get ahead: the budget was full.
+        assert_eq!(held, 2 * MIB as u64, "two files were held at once");
     }
 
     #[tokio::test]

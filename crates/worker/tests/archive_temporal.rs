@@ -1,14 +1,16 @@
 //! `ArchiveWorkflow` against a real Temporal server, with the control plane played by
 //! wiremock and each file's pipeline running for real.
 //!
-//! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`).
+//! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`),
+//! and fails instead when `CI` is set (the CI `test` job runs a Temporal dev server).
 //! The worker polls `workers-general`, the queue step activities are routed to, so run
 //! these against a Temporal server no other worker polls.
 //!
 //! What these check that the activity unit tests cannot: that the workflow is
 //! registered under the name the gateway starts, that every file runs as a child job
 //! linked to its archive, that continue-as-new carries the position and the counts,
-//! and that one failed file fails the archive and is named.
+//! that one failed file fails the archive and is named, and that a cancelled archive
+//! ends cancelled, in Temporal and in its job row, whatever it was doing.
 
 use std::io::Write;
 use std::str::FromStr;
@@ -19,15 +21,17 @@ use meili_ingest_archive::Limits;
 use meili_ingest_blob::BlobStore;
 use meili_ingest_plugin_sdk::{
     ARCHIVE_WORKFLOW_TYPE, ArchiveBatching, ArchiveWorkflowInput, ArchiveWorkflowOutput, Blob,
-    MeiliContext, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput, StepDefinition,
+    ContentRef, MeiliContext, PipelineDefinition, PipelineTrigger, PipelineWorkflowInput,
+    PluginInput, StepDefinition,
 };
+use meili_ingest_worker::archive_activity::file_job_id;
 use meili_ingest_worker::{
     ArchiveActivities, ArchiveWorkflow, PipelineWorkflow, PluginRegistry, SourceActivities,
     StepActivities,
 };
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowDescribeOptions,
-    WorkflowGetResultOptions, WorkflowStartOptions,
+    Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowCancelOptions,
+    WorkflowDescribeOptions, WorkflowGetResultOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_sdk::runtime::worker_tuner::{FixedSizeSlotSupplier, TunerHolder};
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
@@ -43,7 +47,15 @@ const QUEUE: &str = "workers-general";
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn client() -> Option<Client> {
-    let raw = std::env::var("TEMPORAL_TEST_URL").ok()?;
+    let Ok(raw) = std::env::var("TEMPORAL_TEST_URL") else {
+        // CI starts a Temporal dev server for these: a lost TEMPORAL_TEST_URL there
+        // must fail the run, not turn every test into a silent pass.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but TEMPORAL_TEST_URL is not: the Temporal tests would skip"
+        );
+        return None;
+    };
     let url = Url::from_str(&raw).expect("TEMPORAL_TEST_URL is a url");
     let connection = Connection::connect(ConnectionOptions::new(url).build())
         .await
@@ -124,6 +136,29 @@ async fn bodies(cp: &MockServer, verb: &str, p: &str) -> Vec<serde_json::Value> 
         .collect()
 }
 
+/// How a test cancels the archive job once `cp` has received `verb` on `path`.
+struct CancelOn {
+    verb: &'static str,
+    path: String,
+    /// Send the `cancel` signal before the Temporal cancellation, as the gateway's
+    /// `POST /jobs/{id}/cancel` does. The Temporal UI and CLI send the latter alone.
+    signal: bool,
+}
+
+/// How long a slowed-down request is held: long enough for the cancellation to land
+/// while the activity making it is still running.
+const HELD: Duration = Duration::from_secs(4);
+
+/// How many requests `cp` received for `verb` on `p`.
+async fn bodies_len(cp: &MockServer, verb: &str, p: &str) -> usize {
+    cp.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == verb && r.url.path() == p)
+        .count()
+}
+
 /// Stage `zip`, run the archive job on a worker, and return its result and the run id
 /// of its last run.
 async fn run_archive(
@@ -142,6 +177,19 @@ async fn run_archive(
         )
         .await
         .expect("stage the archive");
+    run_job(client, cp, job_id, blob, input, batching, None).await
+}
+
+/// Run the archive job reading `input` on a worker, cancelling it as `cancel` says.
+async fn run_job(
+    client: Client,
+    cp: &MockServer,
+    job_id: Uuid,
+    blob: BlobStore,
+    input: PluginInput,
+    batching: ArchiveBatching,
+    cancel: Option<CancelOn>,
+) -> (Result<ArchiveWorkflowOutput, String>, String, String) {
     let archive_activities = ArchiveActivities::new(
         SourceActivities::new(Some(cp.uri()), blob.clone()),
         Limits::default(),
@@ -197,6 +245,29 @@ async fn run_archive(
             .await
             .expect("start");
         let first_run = handle.info().run_id.clone().unwrap_or_default();
+        if let Some(on) = cancel {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while bodies_len(cp, on.verb, &on.path).await == 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the job reaches the point where it is cancelled");
+            if on.signal {
+                handle
+                    .signal(
+                        ArchiveWorkflow::cancel,
+                        (),
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await
+                    .expect("signal cancel");
+            }
+            handle
+                .cancel(WorkflowCancelOptions::default())
+                .await
+                .expect("request cancellation");
+        }
         let result = tokio::time::timeout(
             Duration::from_secs(120),
             handle.get_result(WorkflowGetResultOptions::builder().build()),
@@ -307,4 +378,156 @@ async fn a_failed_file_fails_the_archive_and_is_named() {
             .contains("bad.json"),
         "{last}"
     );
+}
+
+/// The job ended cancelled, for Temporal and in its cached row.
+async fn assert_cancelled(
+    result: Result<ArchiveWorkflowOutput, String>,
+    cp: &MockServer,
+    job: Uuid,
+) {
+    let err = result.expect_err("a cancelled archive does not succeed");
+    assert!(err.starts_with("Cancelled"), "{err}");
+    let row = bodies(cp, "PATCH", &format!("/internal/jobs/{job}")).await;
+    assert_eq!(
+        row.last().map(|b| b["status"].clone()),
+        Some(serde_json::json!("cancelled")),
+        "{row:?}"
+    );
+}
+
+const ONE_WAVE: ArchiveBatching = ArchiveBatching {
+    wave: 10,
+    waves_per_run: 10,
+};
+
+/// Cancel the archive job while its one file runs, with or without the `cancel`
+/// signal that the gateway sends first.
+async fn cancel_while_its_files_run(signal: bool) {
+    let Some(client) = client().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let cp = control_plane().await;
+    let job_id = Uuid::new_v4();
+    // The file's own job is held on its first control-plane write.
+    let file_row = format!("/internal/jobs/{}", file_job_id(job_id, 0));
+    Mock::given(method("PATCH"))
+        .and(path(file_row.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({}))
+                .set_delay(HELD),
+        )
+        .with_priority(1)
+        .mount(&cp)
+        .await;
+    let blob = BlobStore::memory();
+    let zip = zip_of(&[("a.json", br#"{"id": 1}"#)]);
+    let input = blob
+        .stage_upload(
+            job_id,
+            Blob::new(zip, "application/zip", Some("bundle.zip".into())),
+            0,
+        )
+        .await
+        .expect("stage the archive");
+    let cancel = CancelOn {
+        verb: "PATCH",
+        path: file_row,
+        signal,
+    };
+    let (result, _, _) = run_job(client, &cp, job_id, blob, input, ONE_WAVE, Some(cancel)).await;
+    assert_cancelled(result, &cp, job_id).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_while_its_files_run_ends_cancelled() {
+    // As `POST /jobs/{id}/cancel` does it: the signal, then the Temporal cancellation.
+    cancel_while_its_files_run(true).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_from_temporal_while_its_files_run_ends_cancelled() {
+    // No `cancel` signal: this is what the Temporal UI and CLI do.
+    cancel_while_its_files_run(false).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_while_unpacking_ends_cancelled() {
+    let Some(client) = client().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let cp = control_plane().await;
+    let job_id = Uuid::new_v4();
+    // The archive is fetched from a slow host, so the expansion is still running when
+    // the cancellation lands.
+    Mock::given(method("GET"))
+        .and(path("/bundle.zip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(zip_of(&[("a.json", br#"{"id": 1}"#)]))
+                .set_delay(HELD),
+        )
+        .mount(&cp)
+        .await;
+    let input = PluginInput::Ref(ContentRef::Url {
+        url: format!("{}/bundle.zip", cp.uri()),
+        mime: Some("application/zip".into()),
+        filename: Some("bundle.zip".into()),
+    });
+    let cancel = CancelOn {
+        verb: "GET",
+        path: "/bundle.zip".into(),
+        signal: true,
+    };
+    let (result, _, _) = run_job(
+        client,
+        &cp,
+        job_id,
+        BlobStore::memory(),
+        input,
+        ONE_WAVE,
+        Some(cancel),
+    )
+    .await;
+    assert_cancelled(result, &cp, job_id).await;
+}
+
+#[tokio::test]
+async fn an_archive_cancelled_while_routing_its_files_ends_cancelled() {
+    let Some(client) = client().await else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let cp = control_plane().await;
+    Mock::given(method("POST"))
+        .and(path("/internal/resolve"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "pipeline": json_pipeline() }))
+                .set_delay(HELD),
+        )
+        .with_priority(1)
+        .mount(&cp)
+        .await;
+    let job_id = Uuid::new_v4();
+    let blob = BlobStore::memory();
+    let zip = zip_of(&[("a.json", br#"{"id": 1}"#)]);
+    let input = blob
+        .stage_upload(
+            job_id,
+            Blob::new(zip, "application/zip", Some("bundle.zip".into())),
+            0,
+        )
+        .await
+        .expect("stage the archive");
+    let cancel = CancelOn {
+        verb: "POST",
+        path: "/internal/resolve".into(),
+        signal: true,
+    };
+    let (result, _, _) = run_job(client, &cp, job_id, blob, input, ONE_WAVE, Some(cancel)).await;
+    assert_cancelled(result, &cp, job_id).await;
 }

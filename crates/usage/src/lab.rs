@@ -12,7 +12,7 @@ use meili_ingest_plugin_sdk::{JobStatus, UsageUnits};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::JobUsageInput;
+use crate::{JobUsageInput, documents_indexed};
 
 /// Namespace of glutony's deterministic Lab event ids. Never change it: a new value
 /// would give redelivered events new ids and bill them twice.
@@ -82,7 +82,7 @@ pub struct JobCompletedData {
     pub index_uid: String,
     /// Always 0 for glutony.
     pub pages_crawled: u64,
-    /// The final step's documents.
+    /// The documents that reached Meilisearch ([`documents_indexed`]).
     pub documents_indexed: u64,
     /// Wall time of the job, whole seconds.
     pub duration_secs: u64,
@@ -153,14 +153,6 @@ pub fn unpriced_provider_calls(input: &JobUsageInput) -> u64 {
     totals(input).unpriced_calls
 }
 
-fn documents_out(input: &JobUsageInput) -> u64 {
-    input
-        .steps
-        .last()
-        .map(|s| s.document_count as u64)
-        .unwrap_or(0)
-}
-
 /// Pages OCR'd by the job: for each [`OCR_PLUGIN`] step, the `pages` it reported, or
 /// else its output documents. The gRPC plugin contract carries no usage, so today the
 /// plugin reports nothing and emits one document per page it read.
@@ -194,7 +186,7 @@ pub fn lab_units(input: &JobUsageInput, totals: &UsageUnits) -> BTreeMap<String,
         0
     };
     BTreeMap::from([
-        ("documents".to_string(), documents_out(input)),
+        ("documents".to_string(), documents_indexed(input)),
         ("bytes_in".to_string(), input.input_bytes),
         ("step_seconds".to_string(), step_ms.div_ceil(1000)),
         ("llm_tokens_in".to_string(), totals.llm_input_tokens),
@@ -246,7 +238,7 @@ pub fn lab_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReason> 
         input.job_id,
         input.pipeline_uid,
         input.status.as_str(),
-        documents_out(input),
+        documents_indexed(input),
         if complete {
             ""
         } else {
@@ -288,7 +280,7 @@ pub fn lab_job_event_for_job(input: &JobUsageInput) -> Result<LabEvent, SkipReas
                 job_id,
                 index_uid: input.pipeline_uid.clone(),
                 pages_crawled: 0,
-                documents_indexed: documents_out(input),
+                documents_indexed: documents_indexed(input),
                 duration_secs,
             }),
         ),
@@ -408,7 +400,10 @@ mod tests {
                 .contains("provider cost incomplete")
         );
         let units = &v["data"]["units"];
-        assert_eq!(units["documents"], 12, "the final step's documents");
+        assert_eq!(
+            units["documents"], 12,
+            "a succeeded job without an indexer: the final step's documents"
+        );
         assert_eq!(units["bytes_in"], 5_000, "the job's payload size");
         assert_eq!(units["step_seconds"], 4, "3.3 s of steps, rounded up");
         assert_eq!(units["llm_tokens_in"], 1_000);
@@ -686,6 +681,35 @@ mod tests {
         assert_eq!(v["data"]["pages_crawled"], 0);
         assert_eq!(v["data"]["duration_secs"], 9);
         assert_eq!(v["data"]["job_id"], "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn a_job_cancelled_before_indexing_bills_no_documents() {
+        let mut cancelled = input();
+        cancelled.status = JobStatus::Cancelled;
+        let usage = lab_event_for_job(&cancelled).unwrap();
+        let LabEventData::Usage(data) = &usage.data else {
+            panic!("usage.recorded carries usage data");
+        };
+        assert_eq!(data.units["documents"], 0);
+        assert!(
+            data.description.contains(", 0 documents"),
+            "{}",
+            data.description
+        );
+    }
+
+    #[test]
+    fn documents_come_from_the_indexer_step() {
+        let mut job = input();
+        let mut index = step("index", 5, 300, UsageUnits::none());
+        index.plugin = meili_ingest_plugin_sdk::INDEXER_PLUGIN.into();
+        job.steps.push(index);
+        job.steps.push(step("notify", 9, 10, UsageUnits::none()));
+        let units = lab_units(&job, &totals(&job));
+        assert_eq!(units["documents"], 5);
+        let v = serde_json::to_value(lab_job_event_for_job(&job).unwrap()).unwrap();
+        assert_eq!(v["data"]["documents_indexed"], 5);
     }
 
     #[test]

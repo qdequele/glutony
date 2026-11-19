@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::auth::Scope;
 use crate::error::GatewayError;
+use crate::handlers::check_pipeline_name;
 use crate::state::AppState;
 
 /// A pipeline as the API returns it: the definition plus whose it is.
@@ -104,7 +105,7 @@ pub async fn create_pipeline(
 ) -> Result<(StatusCode, Json<PipelineView>), GatewayError> {
     let content_type = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok());
     let mut def = parse_pipeline(&body, content_type)?;
-    def.validate()
+    def.validate_for_save()
         .map_err(|e| GatewayError::Invalid(e.to_string()))?;
     if def.builtin {
         return Err(GatewayError::Forbidden(
@@ -233,6 +234,7 @@ pub async fn get_pipeline(
     scope: Scope,
     Path(name): Path<String>,
 ) -> Result<Json<PipelineView>, GatewayError> {
+    check_pipeline_name(&name)?;
     let tenant_id = scope.tenant_id.clone();
     let row = state
         .control_plane
@@ -247,6 +249,7 @@ pub async fn delete_pipeline(
     scope: Scope,
     Path(name): Path<String>,
 ) -> Result<StatusCode, GatewayError> {
+    check_pipeline_name(&name)?;
     let tenant_id = scope.tenant_id.clone();
     let archived = state
         .control_plane
@@ -730,6 +733,39 @@ steps:
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_name_cannot_reach_another_control_plane_route() {
+        let server = MockServer::start().await;
+        // A control plane that would happily delete a source or serve another tenant.
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        for (verb, uri) in [
+            ("DELETE", "/pipelines/..%2Finternal%2Fsources%2Fmy-source"),
+            ("DELETE", "/pipelines/.."),
+            ("DELETE", "/pipelines/mine%3Ftenant_id%3Dvictim"),
+            ("GET", "/pipelines/secret%3Ftenant_id%3Dvictim"),
+            ("GET", "/pipelines/..%2Fmetrics"),
+            ("GET", "/pipelines/a%23b"),
+            ("GET", "/pipelines/has%20space"),
+        ] {
+            let req = Request::builder()
+                .method(verb)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{verb} {uri}");
+            assert_eq!(json_body(resp).await["code"], "bad_request", "{verb} {uri}");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the control plane was called"
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,8 @@
 //!   the router crate;
 //! * MIME/filename → pipeline resolution (`POST /internal/resolve`);
 //! * plugin manifest registry (`/plugins`, `POST /internal/plugins`);
-//! * denormalized job cache (`/internal/jobs`);
+//! * denormalized job cache (`/internal/jobs`), and which jobs' blobs are due for
+//!   deletion (`/internal/blob-sweep/*`, `BLOB_TTL_DAYS`);
 //! * Meilisearch connections (`/internal/connections`), keys held sealed;
 //! * scheduled sources (`/internal/sources`, `/internal/sources-by-id`,
 //!   `/internal/source-runs`);
@@ -32,6 +33,7 @@ pub mod metrics;
 pub mod pipelines;
 pub mod plugins;
 pub mod resolver;
+pub mod retention;
 pub mod sources;
 
 use axum::extract::{FromRequest, Request, State};
@@ -60,7 +62,8 @@ pub struct AppState {
     pub lab_notify: std::sync::Arc<tokio::sync::Notify>,
     /// Prometheus metrics served at `GET /metrics`.
     pub metrics: metrics::LabMetrics,
-    /// Bearer token internal callers (gateway, workers) present on `/internal/*`; `None` leaves them open (dev only).
+    /// Bearer token internal callers (gateway, workers) present on every route but
+    /// `/health` and `/metrics`; `None` leaves them all open (dev only).
     pub internal_token: Option<String>,
     /// Lab account lookups behind `GET /internal/lab/credits/{account_id}`; `None`
     /// when the control plane has no Lab instance credentials (nothing is checked).
@@ -68,6 +71,13 @@ pub struct AppState {
     /// Lab Gateway targets behind `GET /internal/lab/ai/{account_id}`; `None` when the
     /// control plane has no Lab instance credentials (no target is served).
     pub lab_ai: Option<std::sync::Arc<meili_ingest_lab::AiTargetCache>>,
+    /// The deployment serves tenants: the control plane runs with the Lab seams
+    /// (`LAB_URL` + `LAB_INSTANCE_*`). A global pipeline may then pin no connection,
+    /// since tenant jobs resolve a pinned name in their own scope only.
+    pub tenants: bool,
+    /// Days after a job ended before its blobs are deleted (`BLOB_TTL_DAYS`); `0`
+    /// keeps them.
+    pub blob_ttl_days: u32,
 }
 
 impl AppState {
@@ -81,7 +91,21 @@ impl AppState {
             internal_token: None,
             lab_credits: None,
             lab_ai: None,
+            tenants: false,
+            blob_ttl_days: jobs::DEFAULT_BLOB_TTL_DAYS,
         }
+    }
+
+    /// Mark the deployment as serving tenants (see [`AppState::tenants`]).
+    pub fn with_tenants(mut self, tenants: bool) -> Self {
+        self.tenants = tenants;
+        self
+    }
+
+    /// Delete a job's blobs `days` after it ended (`0`: never).
+    pub fn with_blob_ttl_days(mut self, days: u32) -> Self {
+        self.blob_ttl_days = days;
+        self
     }
 
     /// Answer the workers' credit checks from this cache (spec v2 §8.1).
@@ -99,7 +123,7 @@ impl AppState {
         self
     }
 
-    /// Require `Authorization: Bearer <token>` on every `/internal/*` route.
+    /// Require `Authorization: Bearer <token>` on every route but `/health` and `/metrics`.
     pub fn with_internal_token(mut self, token: Option<String>) -> Self {
         self.internal_token = token
             .map(|t| t.trim().to_string())
@@ -136,18 +160,23 @@ pub fn control_plane_token_policy(
         Some(t) => Ok(Some(t)),
         None if disabled => {
             tracing::warn!(
-                "CONTROL_PLANE_TOKEN_DISABLED=true: /internal/* routes are open; never expose this port"
+                "CONTROL_PLANE_TOKEN_DISABLED=true: every control plane route is open; never expose this port"
             );
             Ok(None)
         }
         None => anyhow::bail!(
-            "CONTROL_PLANE_TOKEN is not set: the gateway and workers authenticate to /internal/* with it. \
+            "CONTROL_PLANE_TOKEN is not set: the gateway and workers authenticate to the control plane with it. \
              Set it (openssl rand -hex 32) on all three services, or set CONTROL_PLANE_TOKEN_DISABLED=true in dev"
         ),
     }
 }
 
-/// Middleware: `/internal/*` needs the configured bearer token; everything else passes.
+/// The only routes that answer without the token: the liveness/readiness probe and the
+/// Prometheus scrape. Matched exactly, so no prefix of them is open.
+pub const OPEN_PATHS: [&str; 2] = ["/health", "/metrics"];
+
+/// Middleware: with a configured token, every route but [`OPEN_PATHS`] needs it as a
+/// bearer; with none (`CONTROL_PLANE_TOKEN_DISABLED=true`), everything passes.
 pub async fn require_internal_token(
     State(state): State<AppState>,
     req: Request,
@@ -156,7 +185,7 @@ pub async fn require_internal_token(
     let Some(expected) = &state.internal_token else {
         return next.run(req).await;
     };
-    if !req.uri().path().starts_with("/internal/") {
+    if OPEN_PATHS.contains(&req.uri().path()) {
         return next.run(req).await;
     }
     let presented = req
@@ -246,8 +275,9 @@ pub fn app(state: AppState) -> Router {
             "/pipelines",
             get(pipelines::list_pipelines).post(pipelines::create_pipeline),
         )
-        // Registered before `/pipelines/{uid}` so the literal path wins over the
-        // wildcard and a pipeline can never be named "validate".
+        // The literal path wins over `/pipelines/{uid}`, so a pipeline named "validate"
+        // could not be fetched or deleted: `pipelines::prepare_definition` refuses
+        // that uid (`pipelines::RESERVED_UID`).
         .route("/pipelines/validate", post(pipelines::validate_pipeline))
         .route(
             "/pipelines/{uid}",
@@ -261,6 +291,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/internal/jobs/{job_id}",
             get(jobs::get_job).patch(jobs::update_job),
+        )
+        .route(
+            "/internal/blob-sweep/claim",
+            post(jobs::claim_blob_sweep_route),
+        )
+        .route(
+            "/internal/blob-sweep/done",
+            post(jobs::blob_sweep_done_route),
         )
         .route(
             "/internal/connections",
@@ -285,6 +323,10 @@ pub fn app(state: AppState) -> Router {
             get(sources::get_source)
                 .patch(sources::patch_source)
                 .delete(sources::delete_source),
+        )
+        .route(
+            "/internal/sources/{uid}/reset-state",
+            post(sources::reset_source_state),
         )
         .route(
             "/internal/sources-by-id/{id}",

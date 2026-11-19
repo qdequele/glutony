@@ -19,6 +19,8 @@ use docx_rs::{
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 
+mod zip_budget;
+
 /// Plugin name, as referenced by `steps[].plugin`.
 pub const NAME: &str = "docx_extractor";
 
@@ -27,6 +29,34 @@ const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordproce
 
 /// Number of blocks between two heartbeats.
 const HEARTBEAT_EVERY: usize = 50;
+
+/// Largest decompressed size accepted for one XML part of a `.docx`.
+///
+/// Uploads arrive from untrusted tenants and deflate reaches ratios of ~1000:1, so a
+/// small `.docx` can expand to gigabytes ("zip bomb") and exhaust a worker; `docx-rs`
+/// also builds a document tree several times the size of the XML. Real
+/// `word/document.xml` parts are a few megabytes; 64 MiB is far past any legitimate
+/// document.
+pub const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Largest total decompressed size accepted for one `.docx`, media included
+/// (`docx-rs` loads images into memory too).
+pub const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Media and embedded files are copied as-is: only the total bounds them.
+fn classify_part(name: &str) -> zip_budget::Part {
+    if name.starts_with("word/media/") || name.starts_with("word/embeddings/") {
+        zip_budget::Part::Copied
+    } else {
+        zip_budget::Part::Parsed
+    }
+}
+
+const LIMITS: zip_budget::Limits = zip_budget::Limits {
+    part: MAX_PART_BYTES,
+    total: MAX_TOTAL_BYTES,
+    classify: classify_part,
+};
 
 /// The DOCX extractor plugin. Stateless; construct with [`DocxExtractorPlugin::new`].
 #[derive(Debug, Clone, Default)]
@@ -281,10 +311,13 @@ impl Plugin for DocxExtractorPlugin {
         let base = base_id(&blob);
         let meta = base_meta(&blob);
 
-        let data = blob.data.clone();
-        let docx = run_blocking(move || docx_rs::read_docx(&data))
-            .await?
-            .map_err(|e| PluginError::NonRetryable(format!("failed to parse DOCX: {e}")))?;
+        let data = blob.data;
+        let docx = run_blocking(move || {
+            zip_budget::check(&data, "docx", &LIMITS)?;
+            docx_rs::read_docx(&data)
+                .map_err(|e| PluginError::NonRetryable(format!("failed to parse DOCX: {e}")))
+        })
+        .await??;
         let blocks = collect_blocks(&docx);
         let mut title = core_title(&docx);
 
@@ -500,6 +533,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput(_)), "got {err:?}");
+    }
+
+    /// [`make_docx`] with its `name` part replaced by `size` bytes of XML filler.
+    fn docx_with_part(name: &str, size: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut source = zip::ZipArchive::new(Cursor::new(make_docx())).unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..source.len() {
+            let entry = source.by_index(i).unwrap();
+            if entry.name() != name {
+                writer.raw_copy_file(entry).unwrap();
+            }
+        }
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(b"<w:document><w:body><w:p><w:r><w:t>")
+            .unwrap();
+        let chunk = vec![b' '; 1024 * 1024];
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            writer.write_all(&chunk[..n]).unwrap();
+            left -= n;
+        }
+        writer
+            .write_all(b"</w:t></w:r></w:p></w:body></w:document>")
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn rejects_a_zip_bomb_instead_of_decompressing_it() {
+        let bomb = docx_with_part("word/document.xml", (MAX_PART_BYTES + 1024) as usize);
+        assert!(
+            (bomb.len() as u64) < MAX_PART_BYTES / 10,
+            "fixture should compress well, got {} bytes",
+            bomb.len()
+        );
+        let err = DocxExtractorPlugin::new()
+            .execute(&ActivityContext::noop(), input(bomb), serde_json::json!({}))
+            .await
+            .expect_err("a zip bomb must be rejected");
+        match err {
+            PluginError::NonRetryable(m) => {
+                assert!(
+                    m.contains("word/document.xml") && m.contains("zip bomb"),
+                    "unexpected message: {m}"
+                )
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]

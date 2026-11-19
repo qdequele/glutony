@@ -39,7 +39,8 @@ serde_json = "1"
 ```
 
 Implement `Plugin` exactly as you would for a built-in, then export the two entry points
-the runtime looks for (`manifest` is optional, `execute` is required):
+the runtime looks for. Both are required for a module the worker loads from
+`EXTERNAL_PLUGINS`, which cannot supply a manifest for it:
 
 ```rust
 // src/lib.rs
@@ -84,7 +85,8 @@ pub fn execute(input: Vec<u8>) -> FnResult<Vec<u8>> {
 }
 ```
 
-`run_plugin` decodes the `{"input": PluginInput, "config": {...}}` envelope, runs
+`run_plugin` decodes the `{"input": PluginInput, "config": {...}, "job_id": "...",
+"step_id": "...", "attempt": 1}` envelope, runs
 `execute` on a single-threaded executor (there is no tokio inside WASM) and encodes the
 result as `{"ok": PluginOutput}` or `{"error": {"message": "...", "retryable": bool}}`.
 It never panics on bad input: decoding failures become a non-retryable error reply.
@@ -107,7 +109,10 @@ EXTERNAL_PLUGINS="wasm:/plugins/upper_plugin.wasm"
 
 Limits worth knowing: the guest runs with WASI enabled but has no network access unless
 the host manifest allows hosts; heartbeats inside the guest are discarded (the host
-heartbeats once per call); one call runs at a time per loaded module.
+heartbeats once per call); one call runs at a time per loaded module. The context's
+`job_id()`, `step_id()` and `attempt()` are the real ones, but `record_usage` is
+discarded (external plugins do not report billable usage), `previous_progress()` is
+always `None`, cancellation is never observed and `ai_target()` is never set.
 
 ## A gRPC plugin in another language
 

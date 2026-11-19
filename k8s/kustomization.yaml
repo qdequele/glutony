@@ -5,11 +5,15 @@
 # is), so re-applying never resets it.
 #
 # Everything is deployed into the `meili-ingest` namespace from the single
-# image ghcr.io/qdequele/glutony. Override the tag with:
-#   kustomize edit set image ghcr.io/qdequele/glutony=ghcr.io/qdequele/glutony:0.1.0
+# image ghcr.io/qdequele/glutony, at the release `newTag` below pins.
+# scripts/prepare-release.sh writes it with every release and CI's `version
+# sync` job fails when it is not the crate version, so do not edit it by hand:
+# apply the tree of the release you deploy. A moving tag such as `latest` would
+# leave nodes on the image they cached (the Deployments use IfNotPresent).
 #
 # temporal.yaml is a non-production reference (single-pod auto-setup). Remove
-# it and point TEMPORAL_URL at Temporal Cloud / your own cluster in production.
+# it and point TEMPORAL_URL at your own cluster in production (no TLS or
+# authentication on the connection: Temporal Cloud is not supported yet).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -33,7 +37,7 @@ configMapGenerator:
 
 images:
   - name: ghcr.io/qdequele/glutony
-    newTag: latest
+    newTag: 0.1.0
 
 commonLabels:
   app.kubernetes.io/part-of: meili-ingest

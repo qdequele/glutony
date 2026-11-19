@@ -8,6 +8,7 @@ pub mod activity;
 pub mod ai_target;
 pub mod archive_activity;
 pub mod archive_workflow;
+pub mod blob_sweep;
 pub mod config;
 pub mod connection;
 pub mod dag;

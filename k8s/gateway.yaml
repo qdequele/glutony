@@ -14,7 +14,8 @@ metadata:
     app.kubernetes.io/name: meili-gateway
     app.kubernetes.io/component: gateway
 spec:
-  replicas: 2
+  # No `replicas`: the HorizontalPodAutoscaler below owns the count (2-10), and a
+  # value here would reset it on every `kubectl apply -k`.
   strategy:
     type: RollingUpdate
     rollingUpdate:

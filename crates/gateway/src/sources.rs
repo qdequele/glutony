@@ -306,18 +306,62 @@ impl SourceView {
 /// Check a location can be fetched: its template renders (known tokens, known
 /// timezone), the result is a URL, and the host passes `SOURCE_FETCH_HOSTS`. The fetch
 /// re-checks the host at every run and every redirect; this is the early, friendly
-/// failure.
+/// failure. A refusal names the allowlist only when `list_allowed` (see
+/// [`HostPolicy::check_disclosing`] and [`crate::context::lists_fetch_allowlist`]).
 pub async fn validate_location(
     location: &Location,
     timezone: &str,
     policy: &HostPolicy,
+    list_allowed: bool,
 ) -> Result<(), GatewayError> {
     let Location::Url { url, .. } = location;
     let rendered = render(url, Utc::now(), timezone).map_err(unprocessable)?;
     let parsed = Url::parse(&rendered).map_err(|e| {
         GatewayError::Unprocessable(format!("location {rendered:?} is not a URL: {e}"))
     })?;
-    policy.check(&parsed).await.map_err(unprocessable)
+    policy
+        .check_disclosing(&parsed, list_allowed)
+        .await
+        .map_err(unprocessable)
+}
+
+/// Whether a stored fetch credential may follow a source from `old` to `new`: only when
+/// every request still goes to the same origin (scheme, host and effective port). A path
+/// change keeps it; anything else, or a location that cannot be read, does not.
+///
+/// A templated origin (`https://{{ date:%Y }}.example/…`) depends on the render time
+/// and timezone, so it only stays put when the template and the timezone are unchanged.
+pub fn same_fetch_origin(old: &Location, old_tz: &str, new: &Location, new_tz: &str) -> bool {
+    let (Location::Url { url: old, .. }, Location::Url { url: new, .. }) = (old, new);
+    match (origin_template(old), origin_template(new)) {
+        (Some(OriginTemplate::Fixed(a)), Some(OriginTemplate::Fixed(b))) => a.is_tuple() && a == b,
+        (Some(OriginTemplate::Templated), Some(OriginTemplate::Templated)) => {
+            old == new && old_tz == new_tz
+        }
+        _ => false,
+    }
+}
+
+enum OriginTemplate {
+    /// The scheme and authority hold no template token.
+    Fixed(url::Origin),
+    /// They do, so the origin is only known once rendered.
+    Templated,
+}
+
+/// The origin of a URL template, read from its `scheme://authority` prefix.
+fn origin_template(template: &str) -> Option<OriginTemplate> {
+    let scheme_end = template.find("://")? + 3;
+    let authority_len = template[scheme_end..]
+        .find(['/', '?', '#'])
+        .unwrap_or(template.len() - scheme_end);
+    let prefix = &template[..scheme_end + authority_len];
+    if prefix.contains("{{") {
+        return Some(OriginTemplate::Templated);
+    }
+    Url::parse(prefix)
+        .ok()
+        .map(|u| OriginTemplate::Fixed(u.origin()))
 }
 
 fn unprocessable(e: SourceError) -> GatewayError {
@@ -434,6 +478,20 @@ impl ControlPlaneClient {
         self.send_empty(req, "delete source").await
     }
 
+    /// `POST /internal/sources/{uid}/reset-state`: forget the incremental state of the
+    /// source in exactly this scope.
+    pub async fn reset_source_state(
+        &self,
+        uid: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let req = self
+            .http
+            .post(self.source_url("sources", uid, "reset-state")?)
+            .query(&Self::tenant_query(tenant_id));
+        self.send_empty(req, "reset source state").await
+    }
+
     /// `PUT /internal/sources-by-id/{id}/paused`.
     pub async fn set_source_paused(&self, id: Uuid, paused: bool) -> Result<(), GatewayError> {
         let req = self
@@ -476,6 +534,7 @@ mod tests {
             &url("https://x.example/{{ nope }}"),
             "UTC",
             &HostPolicy::Any,
+            true,
         )
         .await
         .expect_err("unknown token");
@@ -488,6 +547,7 @@ mod tests {
             &url("https://x.example/a"),
             "Mars/Olympus",
             &HostPolicy::Any,
+            true,
         )
         .await
         .expect_err("unknown tz");
@@ -500,6 +560,7 @@ mod tests {
             &url("http://files.internal/export.json"),
             "UTC",
             &HostPolicy::Public,
+            true,
         )
         .await
         .expect_err("public-only rejects http");
@@ -508,9 +569,64 @@ mod tests {
             &url("http://files.internal/export_{{ date:%Y }}.json"),
             "UTC",
             &HostPolicy::parse("files.internal").expect("policy"),
+            true,
         )
         .await
         .expect("an allowlisted host is accepted");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_source_refused_by_the_allowlist_does_not_see_it() {
+        let policy = HostPolicy::parse("files.internal:8080,exports.corp.lan").expect("policy");
+        let location = url("http://anything.test/x.json");
+        let err = validate_location(&location, "UTC", &policy, false)
+            .await
+            .expect_err("not allowed")
+            .to_string();
+        assert!(err.contains("not an allowed host"), "{err}");
+        assert!(!err.contains("files.internal"), "{err}");
+        assert!(!err.contains("exports.corp.lan"), "{err}");
+        let err = validate_location(&location, "UTC", &policy, true)
+            .await
+            .expect_err("not allowed")
+            .to_string();
+        assert!(err.contains("files.internal:8080"), "{err}");
+    }
+
+    #[test]
+    fn a_credential_follows_a_path_change_but_not_an_origin_change() {
+        let same = |a: &str, b: &str| same_fetch_origin(&url(a), "UTC", &url(b), "UTC");
+        assert!(same(
+            "https://x.example/a",
+            "https://X.example:443/b_{{ date:%Y }}"
+        ));
+        assert!(same("https://x.example", "https://x.example?q=1"));
+        assert!(!same("https://x.example/a", "http://x.example/a"), "scheme");
+        assert!(
+            !same("https://x.example/a", "https://x.example:8443/a"),
+            "port"
+        );
+        assert!(!same("https://x.example/a", "https://y.example/a"), "host");
+        assert!(!same(
+            "https://x.example/a",
+            "https://x.example.y.example/a"
+        ));
+        assert!(!same("https://x.example/a", "https://u@y.example/a"));
+        assert!(!same("https://x.example/a", "not a url"));
+
+        // A templated origin stays put only when nothing that renders it changes.
+        let t = "https://{{ date:%Y }}.x.example/a";
+        assert!(same(t, t));
+        assert!(!same(t, "https://{{ date:%Y }}.x.example/b"));
+        assert!(!same(t, "https://2026.x.example/a"));
+        assert!(!same("https://2026.x.example/a", t));
+        assert!(!same_fetch_origin(&url(t), "UTC", &url(t), "Europe/Paris"));
+        assert!(same_fetch_origin(
+            &url("https://x.example/{{ date:%Y }}"),
+            "UTC",
+            &url("https://x.example/{{ date:%Y }}"),
+            "Europe/Paris"
+        ));
     }
 
     #[test]

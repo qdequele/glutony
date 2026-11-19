@@ -12,7 +12,7 @@ use meili_ingest_plugin_sdk::{AiTarget, PluginError};
 use serde::Deserialize;
 use url::Url;
 
-use crate::connection::{ControlPlane, authed};
+use crate::connection::{ControlPlane, authed_within};
 
 /// Plugins that call the team's Gateway when the worker attaches a target.
 pub const LAB_AI_PLUGINS: [&str; 3] = ["llm_enricher", "image_captioner", "jev_enricher"];
@@ -74,7 +74,7 @@ pub async fn fetch_ai_target(
         url.query_pairs_mut().append_pair("refresh", "true");
     }
 
-    let resp = authed(cp.http.get(url), cp.token)
+    let resp = authed_within(cp.http.get(url), cp.token, cp.timeout)
         .send()
         .await
         .map_err(|e| {
@@ -148,6 +148,7 @@ mod tests {
             http,
             base_url: Some(base),
             token: Some("cp-token"),
+            timeout: crate::connection::CONTROL_PLANE_TIMEOUT,
         }
     }
 
@@ -352,6 +353,7 @@ mod tests {
             http: &http,
             base_url: None,
             token: None,
+            timeout: crate::connection::CONTROL_PLANE_TIMEOUT,
         };
         let err = fetch_ai_target(&none, ACCOUNT, None, false)
             .await

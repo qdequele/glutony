@@ -1,7 +1,8 @@
 //! `SourceRunWorkflow` against a real Temporal server, with the control plane, the
 //! upstream file server and Meilisearch played by wiremock.
 //!
-//! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`).
+//! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`),
+//! and fails instead when `CI` is set (the CI `test` job runs a Temporal dev server).
 //! What these check that the activity unit tests cannot: that the workflow is
 //! registered under the name schedules start, that its activities round-trip through
 //! history, that child `PipelineWorkflow`s start under the job's workflow id, and
@@ -32,7 +33,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const SOURCE_ID: &str = "22222222-2222-2222-2222-222222222222";
 
 async fn client() -> Option<Client> {
-    let raw = std::env::var("TEMPORAL_TEST_URL").ok()?;
+    let Ok(raw) = std::env::var("TEMPORAL_TEST_URL") else {
+        // CI starts a Temporal dev server for these: a lost TEMPORAL_TEST_URL there
+        // must fail the run, not turn every test into a silent pass.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but TEMPORAL_TEST_URL is not: the Temporal tests would skip"
+        );
+        return None;
+    };
     let url = Url::from_str(&raw).expect("TEMPORAL_TEST_URL is a url");
     let connection = Connection::connect(ConnectionOptions::new(url).build())
         .await

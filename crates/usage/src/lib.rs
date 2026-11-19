@@ -88,10 +88,11 @@ pub mod lab;
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::{JobStatus, StepResult, UsageUnits};
+use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, JobStatus, StepResult, UsageUnits};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -279,7 +280,8 @@ pub struct UsageEvent {
     pub step_id: String,
     /// Plugin name, `""` on job rows.
     pub plugin: String,
-    /// Temporal task queue the work ran on (`workers-general`, `workers-io`).
+    /// Temporal task queue the work ran on (`workers-general`; older rows may say
+    /// `workers-io`).
     pub task_queue: String,
     /// [`JobStatus::as_str`] of the step (or of the job on job rows).
     pub status: String,
@@ -294,7 +296,8 @@ pub struct UsageEvent {
     pub input_bytes: u64,
     /// MIME type of the job's original payload, `""` when unknown.
     pub input_mime: String,
-    /// Documents the step produced; on job rows, the documents the final step produced.
+    /// Documents the step produced; on job rows, the documents that reached Meilisearch
+    /// ([`documents_indexed`]).
     pub documents_out: u64,
     /// [`UsageUnits::llm_input_tokens`].
     pub llm_input_tokens: u64,
@@ -391,8 +394,9 @@ pub struct JobUsageInput {
 ///
 /// The job row summarises the pipeline: its `duration_ms` is the wall-clock
 /// `finished_at - started_at` (≥ the sum of the steps, because it includes queueing),
-/// its `input_bytes` is the original payload, its `documents_out` is what the **final**
-/// step produced (summing steps would count a document once per stage), and its usage
+/// its `input_bytes` is the original payload, its `documents_out` is what reached
+/// Meilisearch ([`documents_indexed`]; summing every step would count a document once
+/// per stage), and its usage
 /// units are the sum over all steps. Because the units appear both on the step rows and
 /// on the job row, any aggregation must pick one: the rollup in
 /// `tinybird/pipes/usage_daily_mv.pipe` sums units from `kind = 'step'` rows only.
@@ -425,17 +429,44 @@ pub fn events_for_job(input: &JobUsageInput) -> Vec<UsageEvent> {
     job.status = input.status.as_str().to_string();
     job.duration_ms = wall_clock_ms(input.started_at, input.finished_at);
     job.input_bytes = input.input_bytes;
-    job.documents_out = input
-        .steps
-        .last()
-        .map(|s| s.document_count as u64)
-        .unwrap_or(0);
+    job.documents_out = documents_indexed(input);
     apply_units(&mut job, totals);
     job.error_kind = error_kind_for(input.status, input.error.as_deref()).to_string();
     job.error = truncate_chars(input.error.as_deref().unwrap_or_default(), MAX_ERROR_CHARS);
     events.push(job);
 
     events
+}
+
+/// The documents of a job that reached Meilisearch: the job row's `documents_out`
+/// (rolled up as `documents_indexed`) and the Lab's `documents` unit.
+///
+/// It is the sum over the succeeded [`INDEXER_PLUGIN`] steps, whatever the job status:
+/// a job cancelled before its indexer ran wrote nothing, and one cancelled (or failed)
+/// after it did write those documents. Only when no indexer step ran at all and the
+/// job succeeded is it the final step's output, for a pipeline that does not index.
+/// `steps` holds only the steps that ran, so a cancelled or failed job without an
+/// indexer step reports 0 rather than an intermediate step's count.
+pub fn documents_indexed(input: &JobUsageInput) -> u64 {
+    let mut indexers = input
+        .steps
+        .iter()
+        .filter(|s| s.plugin == INDEXER_PLUGIN)
+        .peekable();
+    if indexers.peek().is_some() {
+        return indexers
+            .filter(|s| s.status == JobStatus::Succeeded)
+            .map(|s| s.document_count as u64)
+            .fold(0, u64::saturating_add);
+    }
+    if input.status != JobStatus::Succeeded {
+        return 0;
+    }
+    input
+        .steps
+        .last()
+        .map(|s| s.document_count as u64)
+        .unwrap_or(0)
 }
 
 /// A row with everything that is common to all rows of a job filled in, and the
@@ -633,7 +664,9 @@ enum Sink {
     ClickHouse {
         config: clickhouse::ClickHouseConfig,
         /// Set once `CREATE TABLE IF NOT EXISTS` succeeded; shared by every clone.
-        table_ready: Arc<tokio::sync::OnceCell<()>>,
+        /// Cleared when an insert finds the table gone, so the next try recreates it.
+        /// Two first sends racing may both issue the `CREATE`, which is idempotent.
+        table_ready: Arc<AtomicBool>,
     },
 }
 
@@ -744,7 +777,7 @@ impl UsageClient {
         Self {
             sink: Sink::ClickHouse {
                 config,
-                table_ready: Arc::new(tokio::sync::OnceCell::new()),
+                table_ready: Arc::new(AtomicBool::new(false)),
             },
             http,
         }
@@ -783,16 +816,60 @@ impl UsageClient {
             Sink::ClickHouse {
                 config,
                 table_ready,
-            } => table_ready
-                .get_or_try_init(|| async {
-                    config
-                        .ensure_table(&self.http)
-                        .await
-                        .map_err(UsageError::from)
-                })
-                .await
-                .map(|_| ()),
+            } => {
+                if table_ready.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                config.ensure_table(&self.http).await?;
+                table_ready.store(true, Ordering::Release);
+                Ok(())
+            }
         }
+    }
+
+    /// Insert into ClickHouse, recovering once from a table that changed under us: one
+    /// dropped since it was created is recreated, and one an older release created
+    /// gets the columns added since. Anything else, or a second failure, is returned
+    /// as is.
+    async fn insert_clickhouse(
+        &self,
+        config: &clickhouse::ClickHouseConfig,
+        table_ready: &AtomicBool,
+        body: &str,
+    ) -> Result<(), UsageError> {
+        self.prepare().await?;
+        let failure = match config.insert(&self.http, body).await {
+            Ok(()) => return Ok(()),
+            Err(f) => f,
+        };
+        if failure.is_unknown_table() {
+            tracing::warn!(
+                table = %config.table(),
+                "usage table is gone: creating it again"
+            );
+            table_ready.store(false, Ordering::Release);
+            self.prepare().await?;
+        } else if failure.is_column_drift() {
+            if let Err(alter) = config.add_missing_columns(&self.http).await {
+                // Most likely no `ALTER` grant: report the drift itself, loudly.
+                tracing::warn!(
+                    table = %config.table(),
+                    error = %alter,
+                    "could not add missing columns to the usage table"
+                );
+                return Err(failure.into());
+            }
+            tracing::info!(
+                table = %config.table(),
+                "added missing columns to the usage table"
+            );
+        } else {
+            return Err(failure.into());
+        }
+        config
+            .insert(&self.http, body)
+            .await
+            .map_err(UsageError::from)
     }
 
     /// Append `events` to the data source through
@@ -837,8 +914,10 @@ impl UsageClient {
                 token,
                 datasource,
             } => (base_url, token, datasource),
-            Sink::ClickHouse { config, .. } => {
-                self.prepare().await?;
+            Sink::ClickHouse {
+                config,
+                table_ready,
+            } => {
                 tracing::debug!(
                     table = %config.table(),
                     events = events.len(),
@@ -846,10 +925,7 @@ impl UsageClient {
                     "sending usage events to ClickHouse"
                 );
                 // `INSERT` is synchronous: a 200 means the rows are written.
-                return config
-                    .insert(&self.http, body)
-                    .await
-                    .map_err(UsageError::from);
+                return self.insert_clickhouse(config, table_ready, &body).await;
             }
         };
         let url = format!("{base_url}/v0/events?name={datasource}&wait=true");
@@ -1389,7 +1465,10 @@ mod tests {
         assert_eq!(job.duration_ms, 9_000, "wall clock, not the sum of steps");
         assert_eq!(job.input_bytes, 1_000_000);
         assert_eq!(job.input_mime, "application/pdf");
-        assert_eq!(job.documents_out, 0, "documents out of the final step");
+        assert_eq!(
+            job.documents_out, 0,
+            "a failed job without an indexer indexed nothing"
+        );
         // Units are summed across every step.
         assert_eq!(job.pages, 9);
         assert_eq!(job.llm_input_tokens, 400);
@@ -1478,6 +1557,74 @@ mod tests {
         let events = events_for_job(&input);
         assert_eq!(events[0].error_kind, ERROR_KIND_CANCELLED);
         assert_eq!(events[2].error_kind, ERROR_KIND_CANCELLED);
+    }
+
+    /// extract -> chunk -> index, cancelled while (or before) `index` ran: only the
+    /// steps that succeeded were recorded, and nothing reached Meilisearch.
+    #[test]
+    fn a_cancelled_job_before_the_indexer_reports_no_documents() {
+        let mut input = job_input();
+        input.status = JobStatus::Cancelled;
+        input.steps = vec![
+            step(
+                "extract",
+                "pdf_extractor",
+                JobStatus::Succeeded,
+                UsageUnits::none(),
+            ),
+            step("chunk", "chunker", JobStatus::Succeeded, UsageUnits::none()),
+        ];
+        let events = events_for_job(&input);
+        let job = events.last().expect("job row");
+        assert_eq!(job.kind, UsageEventKind::Job);
+        assert_eq!(job.documents_out, 0, "nothing was indexed");
+        assert_eq!(documents_indexed(&input), 0);
+    }
+
+    /// A cancel that lands after the indexer finished: its documents really reached
+    /// Meilisearch, whatever the job status.
+    #[test]
+    fn a_job_counts_what_its_indexer_steps_wrote_not_the_last_step() {
+        let mut input = job_input();
+        let mut index = step(
+            "index",
+            INDEXER_PLUGIN,
+            JobStatus::Succeeded,
+            UsageUnits::none(),
+        );
+        index.document_count = 5;
+        let mut notify = step("notify", "script", JobStatus::Succeeded, UsageUnits::none());
+        notify.document_count = 9;
+        input.steps = vec![
+            step(
+                "extract",
+                "pdf_extractor",
+                JobStatus::Succeeded,
+                UsageUnits::none(),
+            ),
+            index.clone(),
+            notify,
+        ];
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 5);
+
+        input.status = JobStatus::Cancelled;
+        input.steps.pop();
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 5);
+
+        // Several indexer steps (one per index) are summed.
+        input.status = JobStatus::Succeeded;
+        let mut second = index;
+        second.step_id = "index_archive".into();
+        second.document_count = 7;
+        input.steps.push(second);
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 12);
+    }
+
+    #[test]
+    fn a_succeeded_job_without_an_indexer_reports_its_final_step() {
+        let input = job_input();
+        assert!(input.steps.iter().all(|s| s.plugin != INDEXER_PLUGIN));
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 12);
     }
 
     #[test]

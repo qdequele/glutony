@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 
 use crate::auth::Scope;
 use crate::connections::{
-    ConnectionView, CreateConnection, UpdateConnection, normalize_host, valid_uid,
+    ConnectionView, CreateConnection, UpdateConnection, normalize_host, same_origin, valid_uid,
     validate_destination,
 };
 use crate::error::GatewayError;
@@ -115,7 +115,9 @@ pub async fn get_connection(
 }
 
 /// `PATCH /connections/{uid}` — rename, repoint or rekey. A change to `host` or
-/// `api_key` is re-validated against Meilisearch; omitting `api_key` keeps it.
+/// `api_key` is re-validated against Meilisearch. Omitting `api_key` keeps it, unless
+/// `host` moves to another origin (scheme, host or port): that is a 422, so the stored
+/// key never reaches a host it was not saved for.
 pub async fn patch_connection(
     State(state): State<AppState>,
     scope: Scope,
@@ -138,6 +140,17 @@ pub async fn patch_connection(
 
     let new_host = req.host.as_deref().map(normalize_host).transpose()?;
     let new_key = non_blank(req.api_key);
+    // The stored key was saved for its host: it is never opened to be sent anywhere else.
+    // Repointing to another origin needs the caller to prove they hold a key for it.
+    if let Some((host, url)) = &new_host
+        && new_key.is_none()
+        && !same_origin(url, &normalize_host(&stored.host)?.1)
+    {
+        return Err(GatewayError::Unprocessable(format!(
+            "connection {uid:?}: moving it to {host:?}, another host, needs its api_key \
+             too; the stored key is only ever sent to the host it was saved for"
+        )));
+    }
     let mut sealed = None;
     if new_host.is_some() || new_key.is_some() {
         // Validate the destination as it will be after this patch.
@@ -504,6 +517,134 @@ mod tests {
             serde_json::json!({"name": "Movies"}),
             "no key, no host"
         );
+    }
+
+    /// A control plane holding `prod` on `host` with the real sealed key, answering any
+    /// PATCH with the same record.
+    async fn stored_prod(host: &str) -> MockServer {
+        let cp = MockServer::start().await;
+        let sealed = secret().seal(PLAINTEXT.as_bytes()).expect("seal");
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record("prod", host, &sealed)))
+            .mount(&cp)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/internal/connections/prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(record("prod", host, &sealed)))
+            .mount(&cp)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod/used_by"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    async fn sent_patches(cp: &MockServer) -> Vec<serde_json::Value> {
+        cp.received_requests()
+            .await
+            .expect("recorded")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| serde_json::from_slice(&r.body).expect("json"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_new_host_without_a_new_key_is_422_and_the_stored_key_goes_nowhere() {
+        let meili = meili().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let cp = stored_prod(&meili.uri()).await;
+
+        let (status, body) = call(
+            &app(&cp, Some(secret())),
+            json_req(
+                "PATCH",
+                "/connections/prod",
+                serde_json::json!({"host": elsewhere.uri()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "validation");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("api_key"),
+            "{body}"
+        );
+        assert!(sent_patches(&cp).await.is_empty(), "nothing was stored");
+        // `expect(0)` on `elsewhere` is verified when it drops: no probe reached it.
+    }
+
+    #[tokio::test]
+    async fn a_new_host_with_a_new_key_is_validated_and_stored() {
+        let old = MockServer::start().await;
+        let new = meili().await;
+        let cp = stored_prod(&old.uri()).await;
+        let (status, body) = call(
+            &app(&cp, Some(secret())),
+            json_req(
+                "PATCH",
+                "/connections/prod",
+                serde_json::json!({"host": new.uri(), "api_key": PLAINTEXT}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let patches = sent_patches(&cp).await;
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0]["host"], new.uri());
+        assert!(patches[0]["api_key"].is_array(), "a new sealed key is sent");
+    }
+
+    #[tokio::test]
+    async fn the_same_host_written_differently_keeps_the_stored_key() {
+        // A full-object PATCH re-sends the host it read; a trailing slash, an upper-case
+        // host or an explicit default port is still the host the key was saved for.
+        // A path-only change (a Meilisearch behind a path prefix) stays on that host too.
+        let meili = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header(
+                "authorization",
+                format!("Bearer {PLAINTEXT}").as_str(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&meili)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex("/health$"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&meili)
+            .await;
+        let cp = stored_prod(&meili.uri()).await;
+        let app = app(&cp, Some(secret()));
+        for host in [
+            format!("{}/", meili.uri()),
+            meili.uri().to_uppercase(),
+            format!("{}/meili", meili.uri()),
+        ] {
+            let (status, body) = call(
+                &app,
+                json_req(
+                    "PATCH",
+                    "/connections/prod",
+                    serde_json::json!({"host": host, "name": "Movies"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{host}: {body}");
+        }
+        for patch in sent_patches(&cp).await {
+            assert!(patch.get("api_key").is_none(), "the key is kept: {patch}");
+        }
     }
 
     #[tokio::test]

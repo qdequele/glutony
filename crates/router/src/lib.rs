@@ -12,12 +12,21 @@
 //! * [`plugin_task_queue`] — the Temporal task queue per plugin (SPEC §8.3).
 
 use meili_ingest_plugin_sdk::{
-    INDEXER_PLUGIN, PipelineDefinition, PipelineTrigger, RetryConfig, StepDefinition,
+    INDEXER_PLUGIN, PipelineDefinition, PipelineTrigger, RetryConfig, StepDefinition, glob_match,
+    mime_matches,
 };
 use serde::{Deserialize, Serialize};
 
 /// Fallback MIME type when nothing is recognised.
 pub const OCTET_STREAM: &str = "application/octet-stream";
+
+/// Payload size above which [`detect_mime`] should not run on an async thread.
+///
+/// Detection is cheap for most content, but text that opens like JSON is parsed in
+/// full to tell JSON from prose: linear in the payload, hundreds of milliseconds for
+/// a few hundred megabytes. Callers on an async runtime move the call to a blocking
+/// thread above this size.
+pub const DETECT_BLOCKING_THRESHOLD_BYTES: usize = 1024 * 1024;
 
 /// Number of leading bytes inspected by the UTF-8 sniff.
 const SNIFF_LEN: usize = 512;
@@ -56,6 +65,8 @@ pub mod mime {
     pub const CSV: &str = "text/csv";
     /// JSON.
     pub const JSON: &str = "application/json";
+    /// Newline-delimited JSON (NDJSON / JSON Lines), canonical spelling.
+    pub const NDJSON: &str = "application/x-ndjson";
     /// Apache Parquet.
     pub const PARQUET: &str = "application/vnd.apache.parquet";
     /// Apache Avro object container file.
@@ -92,7 +103,11 @@ pub mod catalog;
 /// file as `audio/x-wav`, `mime_guess` maps `.m4a` to `audio/m4a`, and callers send
 /// `audio/mp3`. Pipelines declare one spelling in `trigger.content_types`, so without
 /// canonicalisation an ordinary `.wav` upload matches nothing and the gateway answers
-/// 415. Everything downstream sees the canonical name.
+/// 415. Everything downstream sees the canonical name, and a trigger may use any of
+/// the spellings: [`trigger_matches`] canonicalises it too.
+///
+/// Takes a bare, lower-case `type/subtype`; [`canonical_content_type`] accepts the
+/// rest.
 pub fn canonical_mime(mime: &str) -> &str {
     match mime {
         "audio/x-wav" | "audio/wave" | "audio/vnd.wave" | "audio/x-pn-wav" | "audio/wav-x" => {
@@ -106,6 +121,10 @@ pub fn canonical_mime(mime: &str) -> &str {
         "video/matroska" | "video/x-mkv" => mime::MKV,
         "image/jpg" => "image/jpeg",
         "text/x-csv" | "application/csv" => mime::CSV,
+        "application/jsonl"
+        | "application/x-jsonlines"
+        | "application/jsonlines"
+        | "application/ndjson" => mime::NDJSON,
         "application/x-parquet" | "application/parquet" | "application/vnd.apache.parquet1" => {
             mime::PARQUET
         }
@@ -124,6 +143,54 @@ pub fn canonical_mime(mime: &str) -> &str {
         "application/tar" => mime::TAR,
         other => other,
     }
+}
+
+/// A content type as it is compared everywhere: parameters dropped, trimmed,
+/// lower-cased, aliases collapsed by [`canonical_mime`]. Wildcards (`audio/*`, `*/*`)
+/// pass through unchanged.
+///
+/// Both sides of a trigger match go through this, so `audio/mp3` in a trigger and a
+/// detected `audio/mpeg` are the same type.
+pub fn canonical_content_type(content_type: &str) -> String {
+    canonical_mime(&mime_essence(content_type)).to_owned()
+}
+
+/// Whether `pipeline`'s trigger matches a MIME type / filename, alias spellings
+/// included on both sides.
+///
+/// Same rules as [`PipelineDefinition::trigger_matches`]: `type/*` and `*/*`
+/// wildcards, a `filename_pattern` that must match when set, and a trigger with
+/// neither content types nor a pattern matching nothing. The difference is that every
+/// `content_types` entry and `mime` are first passed through
+/// [`canonical_content_type`].
+pub fn trigger_matches(pipeline: &PipelineDefinition, mime: &str, filename: Option<&str>) -> bool {
+    let Some(trigger) = &pipeline.trigger else {
+        return false;
+    };
+    let mime = canonical_content_type(mime);
+    let mime_ok = trigger
+        .content_types
+        .iter()
+        .any(|ct| mime_matches(&canonical_content_type(ct), &mime));
+    if !mime_ok && !trigger.content_types.is_empty() {
+        return false;
+    }
+    match (&trigger.filename_pattern, filename) {
+        (Some(pattern), Some(name)) => glob_match(pattern, name),
+        (Some(_), None) => false,
+        (None, _) => mime_ok,
+    }
+}
+
+/// Whether `pipeline`'s trigger names `mime` itself, alias spellings included. A
+/// wildcard (`*/*`, `application/*`) does not count.
+pub fn trigger_names_type(pipeline: &PipelineDefinition, mime: &str) -> bool {
+    let mime = canonical_content_type(mime);
+    pipeline.trigger.as_ref().is_some_and(|t| {
+        t.content_types
+            .iter()
+            .any(|ct| canonical_content_type(ct) == mime)
+    })
 }
 
 /// Whether `mime` is an archive the gateway expands into one job per file (zip, tar,
@@ -201,12 +268,15 @@ impl PipelineRouter {
     /// Priority: tenant-scoped user pipeline > global user pipeline > builtin.
     /// Within a tier, a trigger with a matching `filename_pattern` beats a MIME-only
     /// trigger. Remaining ties go to the first pipeline in the list.
+    ///
+    /// Alias spellings are the same type on both sides ([`trigger_matches`]): a
+    /// trigger on `audio/mp3` matches a detected `audio/mpeg`.
     pub fn resolve(&self, req: RouteRequest<'_>) -> Option<RouteMatch<'_>> {
         self.pipelines
             .iter()
             .enumerate()
             .filter(|(_, p)| visible_to(p, req.tenant_id))
-            .filter(|(_, p)| p.trigger_matches(req.mime, req.filename))
+            .filter(|(_, p)| trigger_matches(p, req.mime, req.filename))
             .min_by_key(|(i, p)| {
                 let has_pattern = p
                     .trigger
@@ -273,13 +343,13 @@ pub fn mime_to_default_index(mime: &str) -> &'static str {
 
 /// Temporal task queue that runs a plugin (SPEC §8.3).
 ///
-/// No model runs inside a worker: AI steps call a hosted API, so they share
-/// `workers-general` with every other plugin instead of needing their own pool.
-pub fn plugin_task_queue(plugin: &str) -> &'static str {
-    match plugin {
-        "s3_downloader" => "workers-io",
-        _ => "workers-general",
-    }
+/// Every plugin runs on `workers-general`, the queue every shipped worker layout
+/// polls. No model runs inside a worker: AI steps call a hosted API, so they need no
+/// pool of their own. `s3_downloader` stays there too until a `workers-io` pool ships:
+/// the Kubernetes manifests poll no other queue, and a step on an unpolled queue waits
+/// forever.
+pub fn plugin_task_queue(_plugin: &str) -> &'static str {
+    "workers-general"
 }
 
 // ---------------------------------------------------------------------------
@@ -288,19 +358,30 @@ pub fn plugin_task_queue(plugin: &str) -> &'static str {
 
 /// Detect the MIME type of `data` (SPEC §10).
 ///
-/// 1. Magic bytes (`infer`). A bare `application/zip` is refined with the
-///    extension when it names an Office document.
+/// 1. Magic bytes (`infer`). A signature that only names a container or guesses from
+///    the opening characters is refined with the extension: a bare `application/zip`
+///    or OLE compound file when the extension names an Office document, and text
+///    that merely opens like HTML, XML or a script when the extension names a text
+///    format (a `README.md` starting with `<div align="center">` is Markdown).
 /// 2. File extension of `filename` (`.md`/`.markdown` → `text/markdown`,
-///    `.yaml`/`.yml` → `application/yaml`, the rest via `mime_guess`).
+///    `.yaml`/`.yml` → `application/yaml`, `.ndjson`/`.jsonl` →
+///    `application/x-ndjson`, the rest via `mime_guess`).
 /// 3. UTF-8 sniff of the first 512 bytes → `text/plain`, upgraded to
-///    `application/json` when the text starts with `{`/`[` and parses as JSON, or to
-///    `text/html` when it starts with `<!doctype html` / `<html`.
+///    `application/json` when the text starts with `{`/`[` and parses as JSON, to
+///    `application/x-ndjson` when it is one JSON object or array per line instead,
+///    or to `text/html` when it starts with `<!doctype html` / `<html`.
 /// 4. `content_type_hint`, only when it is a real type (not
 ///    `application/octet-stream`, not `multipart/*`).
 /// 5. `application/octet-stream`.
 ///
 /// The result is passed through [`canonical_mime`], so `audio/x-wav` becomes
 /// `audio/wav` and `.m4a` becomes `audio/mp4` before any pipeline trigger is matched.
+///
+/// Step 3 parses the whole payload when it opens with `{`/`[`, so this is a blocking
+/// call for large content: see [`DETECT_BLOCKING_THRESHOLD_BYTES`]. JSON nested
+/// deeper than `serde_json`'s recursion limit (128 levels) does not parse there and
+/// is reported as `text/plain`; name the file `.json` or pick the pipeline to route
+/// it as JSON.
 pub fn detect_mime(data: &[u8], filename: Option<&str>, content_type_hint: Option<&str>) -> String {
     canonical_mime(&detect_mime_raw(data, filename, content_type_hint)).to_owned()
 }
@@ -316,8 +397,9 @@ fn detect_mime_raw(data: &[u8], filename: Option<&str>, content_type_hint: Optio
 
     if let Some(kind) = infer::get(data) {
         let magic = kind.mime_type();
-        if magic == mime::ZIP
-            && let Some(ext) = from_ext.as_deref().filter(|m| is_zip_based_office(m))
+        if let Some(ext) = from_ext
+            .as_deref()
+            .filter(|ext| extension_refines(magic, ext))
         {
             return ext.to_owned();
         }
@@ -360,6 +442,7 @@ fn mime_from_extension(filename: &str) -> Option<String> {
         "md" | "markdown" => Some(mime::MARKDOWN),
         "yaml" | "yml" => Some(mime::YAML),
         "json" => Some(mime::JSON),
+        "ndjson" | "jsonl" => Some(mime::NDJSON),
         "csv" => Some(mime::CSV),
         "parquet" => Some(mime::PARQUET),
         "avro" => Some(mime::AVRO),
@@ -387,6 +470,39 @@ fn magic_record_format(data: &[u8]) -> Option<&'static str> {
         return Some(mime::AVRO);
     }
     None
+}
+
+/// What `infer` reports for an OLE compound file it cannot attribute to Word, Excel
+/// or PowerPoint (an installer, an Outlook message, or an Office file whose root
+/// CLSID is not one it knows).
+const OLE_STORAGE: &str = "application/x-ole-storage";
+
+/// Whether the extension's type `ext` should replace the signature's type `magic`.
+///
+/// Most signatures identify the format and beat a wrong extension. A few only name a
+/// container or guess from the opening characters, and the extension then knows
+/// better, as long as it agrees with what the signature did establish:
+///
+/// * a zip container, when the extension names a zip-based Office format;
+/// * an OLE compound file, when the extension names a legacy Office format;
+/// * text that opens like HTML (`<p …>`, `<div …>`, `<!-- …`), XML (`<?xml`) or a
+///   script (`#!`), when the extension names a text format. A Markdown README often
+///   opens with an HTML tag, and an XHTML or SVG file with an XML declaration.
+fn extension_refines(magic: &str, ext: &str) -> bool {
+    match magic {
+        mime::ZIP => is_zip_based_office(ext),
+        OLE_STORAGE => matches!(ext, mime::DOC | mime::XLS | mime::PPT),
+        mime::HTML | "text/xml" | "text/x-shellscript" => is_text_format(ext),
+        _ => false,
+    }
+}
+
+/// Formats that are text underneath, whatever their top-level type says.
+fn is_text_format(m: &str) -> bool {
+    m.starts_with("text/")
+        || m.ends_with("+xml")
+        || m.ends_with("+json")
+        || matches!(m, mime::JSON | mime::YAML | "application/xml")
 }
 
 /// Office formats that are zip containers underneath.
@@ -419,10 +535,13 @@ fn sniff_utf8(data: &[u8]) -> Option<&str> {
 /// Refine sniffed text into JSON / HTML / plain text.
 fn classify_text(head: &str, full: &[u8]) -> &'static str {
     let trimmed = head.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\r']);
-    if (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && serde_json::from_slice::<serde::de::IgnoredAny>(full).is_ok()
-    {
-        return mime::JSON;
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if serde_json::from_slice::<serde::de::IgnoredAny>(full).is_ok() {
+            return mime::JSON;
+        }
+        if sniff_ndjson(full) {
+            return mime::NDJSON;
+        }
     }
     let lower: String = trimmed
         .chars()
@@ -433,6 +552,33 @@ fn classify_text(head: &str, full: &[u8]) -> &'static str {
         return mime::HTML;
     }
     mime::TEXT
+}
+
+/// Number of leading non-empty lines the NDJSON sniff parses.
+const NDJSON_SNIFF_LINES: usize = 5;
+
+/// Whether `full` looks like newline-delimited JSON: at least two non-empty lines,
+/// and each of the first few is a JSON object or array on its own.
+///
+/// Lines are read from the whole payload, not the 512-byte sniff window, so a long
+/// first record is not cut short; only the first [`NDJSON_SNIFF_LINES`] are parsed.
+/// Lines of bare scalars do not count: a column of numbers is text.
+fn sniff_ndjson(full: &[u8]) -> bool {
+    let mut seen = 0usize;
+    let lines = full
+        .split(|b| *b == b'\n')
+        .map(<[u8]>::trim_ascii)
+        .filter(|line| !line.is_empty())
+        .take(NDJSON_SNIFF_LINES);
+    for line in lines {
+        if !matches!(line[0], b'{' | b'[')
+            || serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err()
+        {
+            return false;
+        }
+        seen += 1;
+    }
+    seen >= 2
 }
 
 /// A content-type hint we are willing to trust as a last resort.
@@ -592,7 +738,7 @@ pub fn builtin_pipelines() -> Vec<PipelineDefinition> {
             "json",
             "JSON",
             "Flatten JSON into documents, index.",
-            &[mime::JSON],
+            &[mime::JSON, mime::NDJSON],
             vec![step("extract", "json_flattener"), index_step()],
         ),
         builtin(
@@ -879,6 +1025,7 @@ mod tests {
             ("text/x-markdown", "builtin.markdown"),
             ("text/csv", "builtin.csv"),
             ("application/json", "builtin.json"),
+            ("application/x-ndjson", "builtin.json"),
             ("image/jpeg", "builtin.image"),
             ("image/png", "builtin.image"),
             ("image/webp", "builtin.image"),
@@ -1198,7 +1345,7 @@ mod tests {
         assert_eq!(plugin_task_queue("llm_enricher"), "workers-general");
         assert_eq!(plugin_task_queue("jev_enricher"), "workers-general");
         assert_eq!(plugin_task_queue("image_captioner"), "workers-general");
-        assert_eq!(plugin_task_queue("s3_downloader"), "workers-io");
+        assert_eq!(plugin_task_queue("s3_downloader"), "workers-general");
         assert_eq!(plugin_task_queue("pdf_extractor"), "workers-general");
         assert_eq!(plugin_task_queue("chunker"), "workers-general");
         assert_eq!(plugin_task_queue("meili_indexer"), "workers-general");
@@ -1362,6 +1509,81 @@ mod tests {
     }
 
     #[test]
+    fn ndjson_is_detected_and_routed_to_the_json_pipeline() {
+        let ndjson = b"{\"id\":1}\n{\"id\":2}\n";
+        assert_eq!(detect_mime(ndjson, None, None), mime::NDJSON);
+        assert_eq!(
+            detect_mime(ndjson, Some("events.ndjson"), None),
+            mime::NDJSON
+        );
+        assert_eq!(detect_mime(ndjson, Some("dump.JSONL"), None), mime::NDJSON);
+        assert_eq!(
+            detect_mime(ndjson, None, Some("application/x-ndjson")),
+            mime::NDJSON
+        );
+        // Blank lines, CRLF and array records are still one value per line.
+        assert_eq!(
+            detect_mime(b"\n[1,2]\r\n\r\n[3,4]\r\n{\"a\":null}", None, None),
+            mime::NDJSON
+        );
+        // A first record longer than the 512-byte sniff window.
+        let long = format!(
+            "{{\"id\":1,\"text\":\"{}\"}}\n{{\"id\":2}}\n",
+            "x".repeat(2 * SNIFF_LEN)
+        );
+        assert_eq!(detect_mime(long.as_bytes(), None, None), mime::NDJSON);
+
+        // The extension names the type before the content is sniffed, and a URL or
+        // object ref is routed from its name alone.
+        assert_eq!(detect_mime(b"", Some("events.ndjson"), None), mime::NDJSON);
+        assert_eq!(
+            mime_from_filename("events.ndjson").as_deref(),
+            Some(mime::NDJSON)
+        );
+        assert_eq!(
+            mime_from_filename("exports/dump.jsonl").as_deref(),
+            Some(mime::NDJSON)
+        );
+        for alias in [
+            "application/jsonl",
+            "application/x-jsonlines",
+            "application/jsonlines",
+            "application/ndjson",
+        ] {
+            assert_eq!(canonical_mime(alias), mime::NDJSON, "{alias}");
+        }
+
+        // Not NDJSON: one value, pretty-printed JSON that does not parse, a second
+        // line that is not JSON, and lines of bare scalars.
+        assert_eq!(detect_mime(b"{\"id\":1}\n", None, None), mime::JSON);
+        assert_eq!(
+            detect_mime(b"{\n  \"id\": 1,\n  \"oops\"\n}\n", None, None),
+            mime::TEXT
+        );
+        assert_eq!(
+            detect_mime(b"{\"id\":1}\nand then prose\n", None, None),
+            mime::TEXT
+        );
+        assert_eq!(detect_mime(b"1\n2\n3\n", None, None), mime::TEXT);
+        assert_eq!(detect_mime(b"{\"id\":1}\n2\n", None, None), mime::TEXT);
+        // The extension still beats the sniff.
+        assert_eq!(detect_mime(ndjson, Some("app.log"), None), mime::TEXT);
+
+        let router = PipelineRouter::new(builtin_pipelines());
+        for filename in [None, Some("events.ndjson"), Some("dump.jsonl")] {
+            let mime = detect_mime(ndjson, filename, None);
+            let m = router
+                .resolve(RouteRequest {
+                    mime: &mime,
+                    filename,
+                    tenant_id: None,
+                })
+                .unwrap_or_else(|| panic!("no route for {mime}"));
+            assert_eq!(m.pipeline.uid, "builtin.json");
+        }
+    }
+
+    #[test]
     fn html_sniff() {
         assert_eq!(
             detect_mime(b"<!DOCTYPE html><html><body>x</body></html>", None, None),
@@ -1492,6 +1714,124 @@ mod tests {
         );
     }
 
+    /// A valid OLE compound file whose root CLSID is zero, as xlwt, POI and Word 95
+    /// write it: `infer` cannot tell Word from Excel and reports a generic container.
+    fn ole_without_clsid(stream: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut file = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        file.create_stream(stream)
+            .unwrap()
+            .write_all(&[0u8; 64])
+            .unwrap();
+        file.flush().unwrap();
+        file.into_inner().into_inner()
+    }
+
+    #[test]
+    fn extension_names_the_office_format_of_a_generic_ole_file() {
+        let workbook = ole_without_clsid("Workbook");
+        assert_eq!(
+            detect_mime_raw(&workbook, None, None),
+            OLE_STORAGE,
+            "the fixture must be the generic case"
+        );
+        assert_eq!(detect_mime(&workbook, Some("export.xls"), None), mime::XLS);
+        let document = ole_without_clsid("WordDocument");
+        assert_eq!(detect_mime(&document, Some("letter.doc"), None), mime::DOC);
+        assert_eq!(detect_mime(&document, Some("deck.ppt"), None), mime::PPT);
+
+        // A header `cfb` cannot open takes the same path.
+        let mut truncated = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        truncated.extend([0u8; 504]);
+        assert_eq!(detect_mime(&truncated, Some("export.xls"), None), mime::XLS);
+
+        // Only an Office extension refines it: an installer or an Outlook message is
+        // still a generic OLE file, and a text extension does not turn it into text.
+        for name in ["setup.msi", "mail.msg", "notes.txt", "report.pdf"] {
+            assert_eq!(
+                detect_mime(&workbook, Some(name), None),
+                OLE_STORAGE,
+                "{name}"
+            );
+        }
+
+        let router = PipelineRouter::new(builtin_pipelines());
+        for (data, filename, uid) in [
+            (&workbook, "export.xls", "builtin.excel"),
+            (&document, "letter.doc", "builtin.word"),
+        ] {
+            let mime = detect_mime(data, Some(filename), None);
+            let m = router
+                .resolve(RouteRequest {
+                    mime: &mime,
+                    filename: Some(filename),
+                    tenant_id: None,
+                })
+                .unwrap_or_else(|| panic!("no route for {filename} ({mime})"));
+            assert_eq!(m.pipeline.uid, uid);
+        }
+    }
+
+    #[test]
+    fn extension_beats_loose_text_signatures() {
+        // `infer` calls anything opening with a common tag HTML, anything opening with
+        // `<?xml` XML and anything opening with `#!` a shell script.
+        let cases: [(&[u8], &str, &str); 9] = [
+            (
+                b"<div align=\"center\">\n\n# Title\n",
+                "README.md",
+                mime::MARKDOWN,
+            ),
+            (
+                b"<p align=\"center\"><img src=\"logo.png\"></p>\n# T\n",
+                "README.md",
+                mime::MARKDOWN,
+            ),
+            (b"<!-- comment -->\n# T\n", "a.md", mime::MARKDOWN),
+            (b"<b>bold</b> opening\n", "notes.txt", mime::TEXT),
+            (b"<a href=\"x\">x</a>,1\n", "rows.csv", mime::CSV),
+            (b"#!/bin/sh\necho hi\n", "notes.txt", mime::TEXT),
+            (b"#!shebang-looking title\n", "post.md", mime::MARKDOWN),
+            (
+                b"<?xml version=\"1.0\"?>\n<html></html>",
+                "page.html",
+                mime::HTML,
+            ),
+            (
+                b"<?xml version=\"1.0\"?>\n<svg></svg>",
+                "logo.svg",
+                "image/svg+xml",
+            ),
+        ];
+        for (data, filename, want) in cases {
+            assert_eq!(
+                detect_mime(data, Some(filename), None),
+                want,
+                "{filename}: raw signature was {:?}",
+                detect_mime_raw(data, None, None)
+            );
+        }
+
+        // Without a name, or with one that says nothing about text, the signature stands.
+        let tagged = b"<div align=\"center\">\n\n# Title\n";
+        assert_eq!(detect_mime(tagged, None, None), mime::HTML);
+        assert_eq!(detect_mime(tagged, Some("noext"), None), mime::HTML);
+        assert_eq!(detect_mime(tagged, Some("photo.png"), None), mime::HTML);
+        // A signature that identifies the format still beats the extension.
+        assert_eq!(detect_mime(PDF_HEAD, Some("README.md"), None), mime::PDF);
+
+        let router = PipelineRouter::new(builtin_pipelines());
+        let mime = detect_mime(tagged, Some("README.md"), None);
+        let m = router
+            .resolve(RouteRequest {
+                mime: &mime,
+                filename: Some("README.md"),
+                tenant_id: None,
+            })
+            .unwrap();
+        assert_eq!(m.pipeline.uid, "builtin.markdown");
+    }
+
     #[test]
     fn binary_garbage_is_octet_stream() {
         assert_eq!(detect_mime(GARBAGE, None, None), "application/octet-stream");
@@ -1585,6 +1925,95 @@ mod tests {
                 .uid,
             "builtin.word"
         );
+    }
+
+    #[test]
+    fn alias_spelled_triggers_match_the_canonical_type() {
+        // Detection always yields the canonical spelling, so a trigger written with an
+        // alias has to be canonicalised too or the tenant's pipeline never fires.
+        let cases = [
+            ("audio/mp3", "a.mp3"),
+            ("audio/x-wav", "a.wav"),
+            ("image/jpg", "a.jpg"),
+            (" Audio/MP3 ", "a.mp3"),
+            ("application/x-parquet", "a.parquet"),
+            ("application/x-zip-compressed", "a.zip"),
+        ];
+        for (alias, filename) in cases {
+            let mut pipelines = builtin_pipelines();
+            pipelines.push(user_pipeline("mine", Some("t1"), &[alias], None));
+            let router = PipelineRouter::new(pipelines);
+            let mime = detect_mime(b"", Some(filename), None);
+            let m = router
+                .resolve(RouteRequest {
+                    mime: &mime,
+                    filename: Some(filename),
+                    tenant_id: Some("t1"),
+                })
+                .unwrap_or_else(|| panic!("no route for {mime} (trigger {alias})"));
+            assert_eq!(m.pipeline.uid, "mine", "trigger {alias}, detected {mime}");
+        }
+    }
+
+    #[test]
+    fn an_alias_spelled_request_mime_is_canonicalised() {
+        // `POST /internal/resolve` takes the MIME as given: a caller other than the
+        // gateway may send an alias, with parameters or in upper case.
+        let router = PipelineRouter::new(builtin_pipelines());
+        for mime in ["audio/mp3", "Audio/X-WAV; rate=44100", "image/jpg"] {
+            let m = router
+                .resolve(RouteRequest {
+                    mime,
+                    filename: None,
+                    tenant_id: None,
+                })
+                .unwrap_or_else(|| panic!("no route for {mime}"));
+            assert!(
+                ["builtin.audio", "builtin.image"].contains(&m.pipeline.uid.as_str()),
+                "{mime} routed to {}",
+                m.pipeline.uid
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_matching_keeps_wildcards_and_filename_rules() {
+        let wild = user_pipeline("wild", None, &["audio/*"], None);
+        assert!(trigger_matches(&wild, "audio/mp3", None));
+        assert!(!trigger_matches(&wild, "video/mp4", None));
+        let any = user_pipeline("any", None, &["*/*"], None);
+        assert!(trigger_matches(&any, "application/x-custom", None));
+        // A filename pattern alone, and a pattern with no filename to test.
+        let by_name = user_pipeline("by-name", None, &[], Some("*.log"));
+        assert!(trigger_matches(&by_name, "text/plain", Some("app.LOG")));
+        assert!(!trigger_matches(&by_name, "text/plain", Some("app.txt")));
+        assert!(!trigger_matches(&by_name, "text/plain", None));
+        let both = user_pipeline("both", None, &["audio/mp3"], Some("call_*"));
+        assert!(trigger_matches(&both, "audio/mpeg", Some("call_1.mp3")));
+        assert!(!trigger_matches(&both, "audio/mpeg", Some("song.mp3")));
+        assert!(!trigger_matches(&both, "audio/wav", Some("call_1.wav")));
+        // No trigger, or an empty one, never matches.
+        let mut none = user_pipeline("none", None, &[], None);
+        assert!(!trigger_matches(&none, "text/plain", Some("a.txt")));
+        none.trigger = None;
+        assert!(!trigger_matches(&none, "text/plain", Some("a.txt")));
+    }
+
+    #[test]
+    fn content_types_are_normalised_before_comparison() {
+        assert_eq!(
+            canonical_content_type(" Audio/MP3; rate=44100 "),
+            "audio/mpeg"
+        );
+        assert_eq!(canonical_content_type("application/pdf"), "application/pdf");
+        assert_eq!(canonical_content_type("audio/*"), "audio/*");
+
+        // Naming a type is stricter than matching it: a wildcard does not count.
+        let zip = user_pipeline("zip", None, &["Application/X-Zip-Compressed"], None);
+        assert!(trigger_names_type(&zip, mime::ZIP));
+        assert!(!trigger_names_type(&zip, mime::GZIP));
+        let wild = user_pipeline("wild", None, &["application/*", "*/*"], None);
+        assert!(!trigger_names_type(&wild, mime::ZIP));
     }
 
     #[test]

@@ -110,11 +110,12 @@ server.add_insecure_port("[::]:50051")
 server.start(); server.wait_for_termination()
 ```
 
-Raise the gRPC max message size on both sides for media: the worker resolves
-`s3://` and staged references into bytes before calling you, so a 200 MB video
-arrives as a 270 MB base64 string. For very large media, have your plugin
-accept a `ref` input instead (`"accepts": ["ref"]`) and fetch the object
-itself; the worker then passes the reference through untouched.
+Mind the message size for media. The worker resolves `s3://` and staged
+references into bytes before calling you and sends them as base64 in one
+message of at most 64 MiB, so about 48 MiB of raw bytes is the most a gRPC
+plugin can receive. A larger input fails the step without a retry, with an
+error naming the limit, before anything is sent. Raise your server's own
+receive limit to 64 MiB (gRPC servers default to 4 MiB).
 
 ## Deploy
 
@@ -138,7 +139,12 @@ Sidecar (as above) is simplest; a separate Deployment + Service works too
 (`grpc:http://whisper.meili-ingest.svc:50051`) and is the better fit when the
 plugin needs a GPU, since only the plugin pods then land on GPU nodes. The
 worker calls `Manifest` at boot, registers the plugin under `manifest.name`,
-and publishes it to the control plane. Every name except `s3_downloader` routes
+and publishes it to the control plane. A plugin that is not up yet is retried
+for about 30 seconds, so a sidecar starting with the worker is found; the
+manifest call itself must answer within 10 seconds per attempt. Bind the port
+only once the plugin can answer: a plugin still unreachable after that wait
+stays unavailable until the worker restarts, and each such entry delays the
+worker's start by that long. Every plugin name routes
 to `workers-general`, so declare external plugins on that pool. A plugin gets
 its own pool only if you add its name to `plugin_task_queue` in
 `crates/router/src/lib.rs` and deploy a worker polling that queue.

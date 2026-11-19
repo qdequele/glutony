@@ -53,6 +53,13 @@ A file's path inside the archive becomes its filename, so documents keep their
 folder in `meta.filename` (`reports/eu/q3.pdf`), and ids include it:
 `reports/eu/q3.pdf` becomes `reports_eu_q3`, so `reports/us/q3.pdf` does not
 overwrite it. Uploading the same archive again updates the same documents.
+The extension is not part of the id, so two files of one folder that differ
+only by it (`guide.md` and `guide.html`) share ids and the one indexed last wins;
+give them different names (see the note in
+[built-in plugins](/plugins/built-in)).
+A path longer than 400 characters is shortened in the id and ends with a short
+hash of the full path, so every page and chunk id still fits Meilisearch's
+511-byte limit.
 The files of an archive fetched by URL or by a source also carry that origin's
 hash, like any fetched file ([Built-in plugins](/plugins/built-in)).
 
@@ -103,7 +110,8 @@ one), when no file could be ingested at all, or when the archive cannot be read.
 Skipped entries are reported but do not fail it.
 
 `POST /jobs/{job_id}/cancel` stops the archive job: no further file starts and the
-running ones are cancelled.
+running ones are cancelled. The job ends `cancelled` whatever it was doing, unpacking
+included: the worker stops reading the archive at its next entry.
 
 ## What is skipped
 
@@ -114,9 +122,10 @@ running ones are cancelled.
 | Symbolic and hard links | `symbolic link` / `link` |
 | Empty files | `empty file` |
 | Files over `ARCHIVE_MAX_FILE_MB` | `larger than … bytes` |
+| A nested `.gz` whose single file is over `ARCHIVE_MAX_FILE_MB` | `the file expands to more than … bytes` |
 | Archives nested deeper than `ARCHIVE_MAX_DEPTH` | `archive nested more than … levels deep` |
 | A nested archive that cannot be read | `not a readable … archive` |
-| Encrypted entries, or zip compression other than deflate | `unreadable: …` |
+| Encrypted entries, zip compression other than deflate, or a zip entry larger than the size it declares | `unreadable: …` |
 | Types no pipeline handles | `no pipeline handles …` |
 
 Files that cannot run as asked count as **failed**, not skipped: a pipeline that
@@ -127,9 +136,38 @@ another index than the `/indexes/{index_uid}/…` route.
 
 An archive is refused as a whole (the job fails, nothing is ingested) when it holds
 more than `ARCHIVE_MAX_FILES` files or decompression produces more than
-`ARCHIVE_MAX_UNPACKED_MB`: a small zip can expand to terabytes. The upload itself is
-bounded by the gateway's `MAX_UPLOAD_MB`. The worker holds the archive in memory while
-it expands it, plus a few files at a time.
+`ARCHIVE_MAX_UNPACKED_MB`: a small zip can expand to terabytes. What was decompressed
+for an entry that ends up skipped counts toward `ARCHIVE_MAX_UNPACKED_MB` too, so an
+archive of entries that each expand past `ARCHIVE_MAX_FILE_MB` is refused instead of
+being decompressed in full.
+
+`ARCHIVE_MAX_FILE_MB` applies to each file, never to a container: a `.tar.gz` whose
+tarball is larger is read entry by entry, like a zip, and only its oversized entries
+are skipped. A `.gz` holding a single file is that file: uploaded on its own and over
+the limit, its job fails with `the file expands to more than … bytes`.
+
+The upload itself is bounded by the gateway's `MAX_UPLOAD_MB`, and an archive named
+by URL or object ref by the workers' `REF_MAX_MB`.
+
+### Memory
+
+A worker expands one archive at a time; other archive jobs wait for their turn (the
+wait counts toward the expansion's one-hour timeout). While it expands one, the worker
+holds in memory:
+
+- the archive itself, up to `MAX_UPLOAD_MB` or `REF_MAX_MB`;
+- the decompressed files between the archive and the blob store, at most
+  `ARCHIVE_INFLIGHT_MB` together. A file is counted before it is decompressed, at the
+  size its entry declares (`ARCHIVE_MAX_FILE_MB` for a lone `.gz`), and until it is
+  staged. The budget is never smaller than `ARCHIVE_MAX_FILE_MB`, so the largest file
+  allowed always fits;
+- each nested archive being opened (a `.zip` inside the zip, a `.zip.gz`), up to
+  `ARCHIVE_MAX_FILE_MB` per level of `ARCHIVE_MAX_DEPTH`. A `.tar.gz` is read as it
+  inflates and adds nothing.
+
+With the defaults, a flat archive peaks near 1 GiB above the worker's own needs:
+500 MiB of upload and 512 MiB of files. Size the worker's memory limit for that, plus
+one `ARCHIVE_MAX_FILE_MB` per nested level you expect.
 
 | Variable (worker) | Default |
 |---|---|
@@ -137,6 +175,7 @@ it expands it, plus a few files at a time.
 | `ARCHIVE_MAX_FILE_MB` | `512` |
 | `ARCHIVE_MAX_UNPACKED_MB` | `8192` |
 | `ARCHIVE_MAX_DEPTH` | `3` |
+| `ARCHIVE_INFLIGHT_MB` | `512` |
 
 ## Choosing the pipeline
 

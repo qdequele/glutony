@@ -29,6 +29,9 @@ pub struct ResolvedItem {
     pub mime: String,
     /// Filename hint, used for MIME detection and provenance.
     pub filename: Option<String>,
+    /// The `charset` the server declared in its `Content-Type`, lower-cased, if any.
+    /// Never part of `mime`.
+    pub charset: Option<String>,
 }
 
 /// Outcome of resolving a location.
@@ -59,6 +62,10 @@ pub struct ResolveRuntime {
     /// server, which the default policy would otherwise reject. Production always sets
     /// it.
     pub policy: Option<HostPolicy>,
+    /// Whether a `policy` allowlist rejection may name the allowed hosts (see
+    /// [`HostPolicy::check_disclosing`]): `true` only for a run without a tenant, whose
+    /// error the operator reads. Off by default.
+    pub list_allowed: bool,
     /// Redirect and body-size caps. Always enforced, independent of `policy`.
     pub limits: UrlGuard,
     /// The run's scheduled time, used for URL templating (Decision 9).
@@ -73,10 +80,18 @@ impl ResolveRuntime {
         Self {
             http: Self::http_client(),
             policy: Some(policy),
+            list_allowed: false,
             limits: UrlGuard::default(),
             scheduled_at,
             timezone,
         }
+    }
+
+    /// Sets [`ResolveRuntime::list_allowed`]: pass `tenant_id.is_none()`.
+    #[must_use]
+    pub fn listing_allowed_hosts(mut self, list_allowed: bool) -> Self {
+        self.list_allowed = list_allowed;
+        self
     }
 
     /// The client a runtime needs: redirects are **not** followed automatically. A

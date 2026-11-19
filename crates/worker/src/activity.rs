@@ -24,7 +24,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::ai_target::{LAB_AI_PLUGINS, fetch_ai_target};
-use crate::connection::{ConnectionSettings, ControlPlane, authed, resolve_connection};
+use crate::connection::{
+    CONTROL_PLANE_TIMEOUT, ConnectionSettings, ControlPlane, authed_within, resolve_connection,
+};
 use crate::registry::PluginRegistry;
 
 /// Interval at which the activity heartbeats on its own, independent of the plugin.
@@ -34,6 +36,17 @@ const KEEPALIVE_HEARTBEAT: Duration = Duration::from_secs(20);
 /// or the worker shutting down) before it is abandoned and the activity reports the
 /// cancellation. Plugins that poll the cancellation flag stop well within it.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// Waits before trying a job-row patch again after a 404. The gateway inserts the row
+/// right after starting the workflow, so a worker that picks the job up quickly (or
+/// finishes a small one) can patch before the row exists. Bounded, because the insert
+/// is best effort: when it failed the row never appears, and the terminal patch gates
+/// the usage report, so it must not wait for long.
+const JOB_ROW_MISSING_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
 
 /// Run `work`, but once `cancelled` resolves give it only `grace` more before giving up
 /// with [`PluginError::Cancelled`]. Without this a plugin that never polls the flag
@@ -90,7 +103,8 @@ pub struct JobStartedInput {
 /// Output of the `expand_fan_out` activity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FanOutActivityOutput {
-    /// One input per branch (large branches are spilled to the blob store).
+    /// One input per branch. Branches are spilled to the blob store as needed for the
+    /// whole list to fit the spill threshold.
     pub branches: Vec<PluginInput>,
 }
 
@@ -135,6 +149,8 @@ pub struct StepActivities {
     pub control_plane_url: Option<String>,
     /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
     pub control_plane_token: Option<String>,
+    /// Deadline of each control plane request ([`CONTROL_PLANE_TIMEOUT`]).
+    pub control_plane_timeout: Duration,
     /// Key and host policy for resolving an indexer step's Meilisearch connection.
     pub connections: ConnectionSettings,
     /// Post Lab billing events to the control plane (spec §5.3).
@@ -154,6 +170,7 @@ impl StepActivities {
             usage: None,
             control_plane_url: None,
             control_plane_token: None,
+            control_plane_timeout: CONTROL_PLANE_TIMEOUT,
             connections: ConnectionSettings::default(),
             lab_events: false,
             lab_ai_gateway: false,
@@ -203,6 +220,7 @@ impl StepActivities {
             http: &self.http,
             base_url: self.control_plane_url.as_deref(),
             token: self.control_plane_token.as_deref(),
+            timeout: self.control_plane_timeout,
         }
     }
 
@@ -231,16 +249,16 @@ impl StepActivities {
                 plugin_ctx.set_ai_target(target);
                 Ok(true)
             }
-            None => {
-                tracing::warn!(
-                    tenant,
-                    plugin,
-                    "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target \
-                     for this Lab account (it has no LAB_INSTANCE_* credentials?); the step \
-                     falls back to this worker's own provider key"
-                );
-                Ok(false)
-            }
+            // A Lab account's AI step always runs on the team's Gateway, never on this
+            // worker's own provider key. A control plane that served no target could not
+            // ask the Lab (a replica without `LAB_INSTANCE_*`, say mid-rollout): retryable,
+            // bounded by the step's retry policy. A team without a Gateway is the final
+            // `404 no_gateway` above.
+            None => Err(PluginError::Retryable(format!(
+                "LAB_AI_GATEWAY is on but the control plane served no Lab Gateway target for \
+                 this Lab account; {plugin} never runs on this worker's own provider key for \
+                 a Lab account (is LAB_INSTANCE_* set on every control plane replica?)"
+            ))),
         }
     }
 
@@ -327,9 +345,10 @@ impl StepActivities {
                 "LAB_EVENTS_ENABLED needs CONTROL_PLANE_URL".into(),
             ));
         };
-        let resp = authed(
+        let resp = authed_within(
             self.http.post(format!("{base}/internal/lab-events")),
             self.control_plane_token.as_deref(),
+            self.control_plane_timeout,
         )
         .json(&serde_json::json!({ "events": events }))
         .send()
@@ -355,7 +374,8 @@ impl StepActivities {
     }
 
     /// Patch the cached job row. Returns `Ok(false)` when no control plane is
-    /// configured, and an error only when the request itself failed.
+    /// configured or the row never appeared (see [`JOB_ROW_MISSING_BACKOFF`]), and an
+    /// error only when the request itself failed.
     async fn patch_job(
         &self,
         job_id: Uuid,
@@ -377,24 +397,38 @@ impl StepActivities {
             let truncated: String = err.chars().take(1000).collect();
             body.insert("error".into(), serde_json::json!(truncated));
         }
-        let resp = authed(self.http.patch(&url), self.control_plane_token.as_deref())
-            .json(&serde_json::Value::Object(body))
+        let body = serde_json::Value::Object(body);
+        let mut missing_retries = JOB_ROW_MISSING_BACKOFF.iter();
+        loop {
+            let resp = authed_within(
+                self.http.patch(&url),
+                self.control_plane_token.as_deref(),
+                self.control_plane_timeout,
+            )
+            .json(&body)
             .send()
             .await
             .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // The gateway failed to insert the row (best effort at submit time).
-            // Nothing to update and retrying will not create it.
-            tracing::warn!(job_id = %job_id, "no cached job row to update");
-            return Ok(false);
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                // The gateway inserts the row only after the workflow started, so a
+                // fast worker can get here first: wait a little for the row. When
+                // it never shows up the gateway's best-effort insert failed, and
+                // there is nothing to update.
+                if let Some(delay) = missing_retries.next() {
+                    tokio::time::sleep(*delay).await;
+                    continue;
+                }
+                tracing::warn!(job_id = %job_id, "no cached job row to update");
+                return Ok(false);
+            }
+            if !resp.status().is_success() {
+                return Err(PluginError::Retryable(format!(
+                    "control plane rejected the job status update: {}",
+                    resp.status()
+                )));
+            }
+            return Ok(true);
         }
-        if !resp.status().is_success() {
-            return Err(PluginError::Retryable(format!(
-                "control plane rejected the job status update: {}",
-                resp.status()
-            )));
-        }
-        Ok(true)
     }
 
     /// Run one plugin invocation without Temporal (used by tests and the CLI).
@@ -406,8 +440,10 @@ impl StepActivities {
         let started = Instant::now();
         let plugin = self.registry.resolve(&input.plugin)?;
         let manifest = plugin.manifest();
+        // A tenant's job is not told the fetch allowlist; a standalone one is.
         let resolved = self
             .blob
+            .with_guard_disclosure(input.tenant_id.is_none())
             .resolve_input(input.input, &self.http)
             .await
             .map_err(|e| match e {
@@ -478,7 +514,7 @@ impl StepActivities {
                 &input.step_id,
                 input.branch,
                 output,
-                self.spill_threshold,
+                branch_spill_threshold(self.spill_threshold, input.branch_total, input.merge_total),
             )
             .await
             .map_err(|e| PluginError::Retryable(format!("failed to spill step output: {e}")))?;
@@ -527,12 +563,26 @@ impl StepActivities {
         {
             crate::dag::FanOut::Branches(b) => b,
             crate::dag::FanOut::NeedsActivity(_) => {
-                return Err(PluginError::NonRetryable(
-                    "upstream output is still a reference after hydration".into(),
-                ));
+                return Err(PluginError::NonRetryable(format!(
+                    "fan_out {:?} of step {}: the upstream output is still a reference after \
+                     hydration",
+                    input.path, input.step_id
+                )));
+            }
+            crate::dag::FanOut::Invalid(why) => {
+                return Err(PluginError::InvalidInput(format!(
+                    "fan_out {:?} of step {} cannot split the upstream output: {why}",
+                    input.path, input.step_id
+                )));
             }
         };
-        let mut out = Vec::with_capacity(branches.len());
+        // The whole branch list is one activity result, so it is the list that has to
+        // fit the budget, not each branch. Branches stay inline while there is room
+        // for them and for a reference to every branch still to come; the rest are
+        // spilled.
+        let total = branches.len();
+        let mut used = 0usize;
+        let mut out = Vec::with_capacity(total);
         for (i, branch) in branches.into_iter().enumerate() {
             let as_output = match branch {
                 PluginInput::Documents(d) => PluginOutput::Documents(d),
@@ -541,23 +591,52 @@ impl StepActivities {
                 PluginInput::Ref(r) => PluginOutput::Ref(r),
                 PluginInput::Empty => PluginOutput::Empty,
             };
+            let reserved = (total - i - 1).saturating_mul(SPILLED_REF_SIZE);
+            let room = self
+                .spill_threshold
+                .saturating_sub(used.saturating_add(reserved))
+                // Nothing gets smaller than the reference that would replace it.
+                .max(SPILLED_REF_SIZE);
             let spilled = self
                 .blob
-                .spill_output(
-                    input.job_id,
-                    &format!("{}-fanout", input.step_id),
-                    Some(i),
-                    as_output,
-                    self.spill_threshold,
-                )
+                .spill_fan_out_input(input.job_id, &input.step_id, i, as_output, room)
                 .await
                 .map_err(|e| {
                     PluginError::Retryable(format!("failed to spill fan-out branch: {e}"))
                 })?;
+            used = used.saturating_add(spilled.approx_size());
             out.push(PluginInput::from(spilled));
         }
         Ok(FanOutActivityOutput { branches: out })
     }
+}
+
+/// What a spilled output weighs once it is a reference
+/// ([`PluginOutput::approx_size`] of a `Ref`).
+const SPILLED_REF_SIZE: usize = 256;
+
+/// Spill threshold of one output of a step running as `branch_total` branches, whose
+/// output a later step merges with `merge_total - 1` others.
+///
+/// The workflow merges the branch outputs into one `Many`, and a step with several
+/// dependencies merges their outputs into another, which is the single input of that
+/// step: it is the sum that has to stay under the threshold, and the outputs are
+/// produced without knowing each other's size. So each gets an equal share of the
+/// budget. A step that is neither fanned out nor merged keeps the whole of it.
+fn branch_spill_threshold(
+    threshold: usize,
+    branch_total: Option<usize>,
+    merge_total: Option<usize>,
+) -> usize {
+    let shares = branch_total
+        .unwrap_or(1)
+        .max(1)
+        .saturating_mul(merge_total.unwrap_or(1).max(1));
+    if shares <= 1 {
+        return threshold;
+    }
+    // Never below a reference: spilling something smaller would only grow it.
+    (threshold / shares).max(SPILLED_REF_SIZE)
 }
 
 /// Bytes a step actually consumed, for per-tenant metering.
@@ -582,9 +661,30 @@ pub fn to_activity_error(err: PluginError) -> ActivityError {
     }
 }
 
+/// The checkpoint the previous attempt of this activity recorded with
+/// [`PluginContext::record_progress`], read from the heartbeat details Temporal hands a
+/// retry. `None` on a first attempt, and for details that carry no checkpoint (a plain
+/// heartbeat message) or that cannot be decoded: the plugin then starts over.
+fn previous_progress(ctx: &ActivityContext) -> Option<serde_json::Value> {
+    match ctx.heartbeat_details().deserialize::<serde_json::Value>() {
+        Ok(details) => details
+            .as_ref()
+            .and_then(PluginContext::progress_from_heartbeat_details),
+        Err(e) => {
+            tracing::debug!(error = %e, "ignoring undecodable heartbeat details");
+            None
+        }
+    }
+}
+
 /// Wire the SDK [`ActivityContext`] to a plugin-facing context: heartbeats sent by the
 /// plugin are forwarded to Temporal, a keepalive heartbeat is sent periodically, and
 /// Temporal cancellation flips the shared flag the plugin polls.
+///
+/// Every heartbeat carries the plugin's latest checkpoint
+/// ([`PluginContext::heartbeat_details`]), because Temporal keeps only the last details,
+/// and the previous attempt's checkpoint is handed to the plugin
+/// ([`PluginContext::previous_progress`]).
 fn bridge_context(
     ctx: &ActivityContext,
     job_id: Uuid,
@@ -592,7 +692,11 @@ fn bridge_context(
 ) -> (PluginContext, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let plugin_ctx = PluginContext::new(job_id, step_id, ctx.info().attempt, tx, cancelled.clone());
+    let plugin_ctx = PluginContext::new(job_id, step_id, ctx.info().attempt, tx, cancelled.clone())
+        .with_previous_progress(previous_progress(ctx));
+    // Reads the checkpoint for each heartbeat. It holds a sender too, so the channel
+    // never closes on its own: `execute_step` aborts this task once the plugin returns.
+    let details = plugin_ctx.clone();
     let sdk_ctx = ctx.clone();
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(KEEPALIVE_HEARTBEAT);
@@ -600,15 +704,17 @@ fn bridge_context(
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(details) => {
-                        if let Err(e) = sdk_ctx.record_heartbeat(details).await {
+                    Some(message) => {
+                        let payload = details.heartbeat_details(message);
+                        if let Err(e) = sdk_ctx.record_heartbeat(payload).await {
                             tracing::debug!(error = %e, "heartbeat failed");
                         }
                     }
                     None => break,
                 },
                 _ = tick.tick() => {
-                    if let Err(e) = sdk_ctx.record_heartbeat("keepalive".to_string()).await {
+                    let payload = details.heartbeat_details("keepalive");
+                    if let Err(e) = sdk_ctx.record_heartbeat(payload).await {
                         tracing::debug!(error = %e, "keepalive heartbeat failed");
                     }
                 }
@@ -642,6 +748,19 @@ impl StepActivities {
         )
         .await;
         forwarder.abort();
+        // A plugin that checkpoints right before failing (an enricher whose last
+        // document spent its retry budget) may return before the forwarder sent that
+        // heartbeat. The failure carries the last heartbeat details to the retry, so
+        // send the final checkpoint now.
+        if let Err(e) = &result
+            && e.is_retryable()
+            && plugin_ctx.progress().is_some()
+            && let Err(hb) = ctx
+                .record_heartbeat(plugin_ctx.heartbeat_details("checkpoint before failing"))
+                .await
+        {
+            tracing::debug!(error = %hb, "final checkpoint heartbeat failed");
+        }
         result.map_err(to_activity_error)
     }
 
@@ -783,6 +902,7 @@ mod tests {
             input,
             branch: None,
             branch_total: None,
+            merge_total: None,
             tenant_id: None,
         }
     }
@@ -1168,6 +1288,27 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 0, "the plugin never runs");
     }
 
+    /// A control plane that serves no target (no `LAB_INSTANCE_*` on that replica)
+    /// could not ask the Lab: the step fails retryably and never falls back to the
+    /// worker's own provider key.
+    #[tokio::test]
+    async fn a_null_target_fails_the_lab_step_instead_of_using_the_worker_key() {
+        let cp = ai_control_plane(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "target": null })),
+        )
+        .await;
+        let probe = Probe::new("llm_enricher");
+        let runs = probe.runs.clone();
+        let a = ai_acts(&cp, probe, true);
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("no target means no AI step for a Lab account");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("no Lab Gateway target"), "{err}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the plugin never runs");
+    }
+
     #[tokio::test]
     async fn run_step_dispatches_to_plugin() {
         let a = acts(vec![Arc::new(Upper)]);
@@ -1284,6 +1425,216 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fan_out_branches_fit_the_payload_budget_together() {
+        // A spilled upstream well over Temporal's 2 MiB payload cap: the branch list
+        // is one activity result, so it must fit the budget as a whole.
+        let threshold = 1024 * 1024;
+        let a = StepActivities::new(
+            Arc::new(PluginRegistry::new()),
+            BlobStore::memory(),
+            threshold,
+        );
+        let job = Uuid::new_v4();
+        let docs: Vec<Document> = (0..3000)
+            .map(|i| Document::with_id(format!("d{i}"), "y".repeat(1024)))
+            .collect();
+        let upstream = PluginOutput::Documents(docs);
+        assert!(upstream.approx_size() > 2 * threshold);
+        let spilled = a
+            .blob
+            .spill_output(job, "chunk", None, upstream, threshold)
+            .await
+            .unwrap();
+        assert!(matches!(spilled, PluginOutput::Ref(_)));
+        let out = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: job,
+                step_id: "enrich".into(),
+                upstream: spilled,
+                path: "$.documents".into(),
+                max_branches: 500,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.branches.len(), 500);
+        let total: usize = out.branches.iter().map(PluginInput::approx_size).sum();
+        assert!(
+            total <= threshold,
+            "the branch list is {total} bytes, over the {threshold} byte budget"
+        );
+        // Small branches still travel inline: only the overflow is spilled.
+        assert!(matches!(out.branches[0], PluginInput::Documents(_)));
+        // Nothing is lost on the way.
+        let mut seen = 0;
+        for b in out.branches {
+            let resolved = a.blob.resolve_input(b, &a.http).await.unwrap();
+            seen += resolved.into_documents().unwrap().len();
+        }
+        assert_eq!(seen, 3000);
+    }
+
+    /// Run `total` branches of a fanned-out `upper` step, each over `content_len` bytes
+    /// of content, and return what the workflow merges: `Many` of the branch outputs.
+    async fn fan_in(a: &StepActivities, total: usize, content_len: usize) -> PluginOutput {
+        let job = Uuid::new_v4();
+        let mut outputs = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut input = step_input(
+                "upper",
+                PluginInput::Documents(vec![Document::with_id(
+                    format!("d{i}"),
+                    "y".repeat(content_len),
+                )]),
+            );
+            input.job_id = job;
+            input.branch = Some(i);
+            input.branch_total = Some(total);
+            let out = a.run_step(&PluginContext::noop(), input).await.unwrap();
+            outputs.push(out.output);
+        }
+        PluginOutput::Many(outputs)
+    }
+
+    fn upper_acts(threshold: usize) -> StepActivities {
+        let mut reg = PluginRegistry::new();
+        reg.register(Arc::new(Upper));
+        StepActivities::new(Arc::new(reg), BlobStore::memory(), threshold)
+    }
+
+    #[tokio::test]
+    async fn merged_branch_outputs_fit_the_payload_budget_together() {
+        let threshold = 64 * 1024;
+        let a = upper_acts(threshold);
+        // Each branch output is well under the threshold on its own, but the eight of
+        // them are merged into the single input of the next step.
+        let merged = fan_in(&a, 8, 16 * 1024).await;
+        assert!(
+            merged.approx_size() <= threshold,
+            "the merged output is {} bytes, over the {threshold} byte budget",
+            merged.approx_size()
+        );
+        let back = a.blob.hydrate_output(merged).await.unwrap();
+        assert_eq!(back.document_count(), 8);
+    }
+
+    #[tokio::test]
+    async fn small_branch_outputs_stay_inline() {
+        let a = upper_acts(64 * 1024);
+        let PluginOutput::Many(outputs) = fan_in(&a, 8, 100).await else {
+            panic!("fan_in returns Many");
+        };
+        assert!(
+            outputs
+                .iter()
+                .all(|o| matches!(o, PluginOutput::Documents(_))),
+            "{outputs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fan_out_hydrates_spilled_outputs_nested_in_a_fan_in() {
+        // The upstream is itself a fanned-out step: `Many` of branch outputs, one of
+        // them spilled.
+        let a = StepActivities::new(Arc::new(PluginRegistry::new()), BlobStore::memory(), 64);
+        let job = Uuid::new_v4();
+        let spilled = a
+            .blob
+            .spill_output(
+                job,
+                "prev",
+                Some(1),
+                PluginOutput::Documents(vec![
+                    Document::with_id("b", "y".repeat(100)),
+                    Document::with_id("c", "y".repeat(100)),
+                ]),
+                64,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(spilled, PluginOutput::Ref(_)));
+        let upstream = PluginOutput::Many(vec![
+            PluginOutput::Documents(vec![Document::with_id("a", "x")]),
+            spilled,
+        ]);
+        let out = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: job,
+                step_id: "enrich".into(),
+                upstream,
+                path: "$.documents".into(),
+                max_branches: 100,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.branches.len(), 3);
+        let mut ids = Vec::new();
+        for b in out.branches {
+            let resolved = a.blob.resolve_input(b, &a.http).await.unwrap();
+            ids.extend(resolved.into_documents().unwrap().into_iter().map(|d| d.id));
+        }
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn fan_out_inputs_never_share_a_key_with_another_steps_output() {
+        // The fan-out inputs of step `x` and branch 0 of a step named `x-fanout` are
+        // different objects.
+        let a = StepActivities::new(Arc::new(PluginRegistry::new()), BlobStore::memory(), 64);
+        let job = Uuid::new_v4();
+        let out = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: job,
+                step_id: "x".into(),
+                upstream: PluginOutput::Documents(vec![Document::with_id("a", "x".repeat(200))]),
+                path: "$.documents".into(),
+                max_branches: 100,
+            })
+            .await
+            .unwrap();
+        let PluginInput::Ref(ContentRef::Staged { uri: fan_out, .. }) = &out.branches[0] else {
+            panic!("expected a spilled branch, got {:?}", out.branches[0]);
+        };
+        let other = a
+            .blob
+            .spill_output(
+                job,
+                "x-fanout",
+                Some(0),
+                PluginOutput::Documents(vec![Document::with_id("b", "y".repeat(200))]),
+                0,
+            )
+            .await
+            .unwrap();
+        let PluginOutput::Ref(ContentRef::Staged { uri: step_out, .. }) = &other else {
+            panic!("expected a spilled output, got {other:?}");
+        };
+        assert_ne!(fan_out, step_out);
+        let branch = a
+            .blob
+            .resolve_input(out.branches[0].clone(), &a.http)
+            .await
+            .unwrap();
+        assert_eq!(branch.into_documents().unwrap()[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn fan_out_over_an_output_without_documents_fails() {
+        let a = StepActivities::new(Arc::new(PluginRegistry::new()), BlobStore::memory(), 64);
+        let err = a
+            .run_fan_out(FanOutActivityInput {
+                job_id: Uuid::new_v4(),
+                step_id: "enrich".into(),
+                upstream: PluginOutput::Bytes(Blob::new(vec![1], "application/pdf", None)),
+                path: "$.documents".into(),
+                max_branches: 100,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("enrich"), "{err}");
+    }
+
     /// Hands its input straight back, whatever it is: shows what the step received.
     struct Echo;
     #[async_trait]
@@ -1375,6 +1726,34 @@ mod tests {
         assert!(internal.received_requests().await.unwrap().is_empty());
     }
 
+    /// A tenant's step error says the host is not allowed, not which hosts are; a
+    /// standalone job's error still lists them for the operator.
+    #[tokio::test]
+    async fn a_tenant_step_refused_by_the_allowlist_does_not_see_it() {
+        let a = guarded_acts("files.internal:8080,exports.corp.lan");
+        let mut input = step_input("echo", url_input("http://anything.test/x".into()));
+        input.tenant_id = Some("tenant-1".into());
+        let err = a.run_step(&PluginContext::noop(), input).await.unwrap_err();
+        assert!(matches!(err, PluginError::NonRetryable(_)), "{err:?}");
+        let err = err.to_string();
+        assert!(err.contains("not an allowed host"), "{err}");
+        assert!(err.contains("SOURCE_FETCH_HOSTS"), "{err}");
+        for internal in ["files.internal", "exports.corp.lan", "HostPort"] {
+            assert!(!err.contains(internal), "{internal} leaked: {err}");
+        }
+
+        let err = a
+            .run_step(
+                &PluginContext::noop(),
+                step_input("echo", url_input("http://anything.test/x".into())),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("files.internal:8080"), "{err}");
+        assert!(!err.contains("HostPort"), "no Debug of the policy: {err}");
+    }
+
     #[tokio::test]
     async fn an_allowlisted_host_is_fetched() {
         use wiremock::matchers::{method, path};
@@ -1442,7 +1821,7 @@ mod tests {
         use meili_ingest_blob::UrlCheck as _;
         let check = crate::fetch_guard::PolicyCheck(meili_ingest_source::HostPolicy::Public);
         check
-            .check(&url::Url::parse("https://1.1.1.1/doc.pdf").unwrap())
+            .check(&url::Url::parse("https://1.1.1.1/doc.pdf").unwrap(), true)
             .await
             .unwrap();
         for blocked in [
@@ -1453,7 +1832,7 @@ mod tests {
         ] {
             assert!(
                 check
-                    .check(&url::Url::parse(blocked).unwrap())
+                    .check(&url::Url::parse(blocked).unwrap(), false)
                     .await
                     .is_err(),
                 "{blocked} must be refused under `public`"
@@ -1491,6 +1870,62 @@ mod tests {
             .mount(&cp)
             .await;
         cp
+    }
+
+    #[tokio::test]
+    async fn a_job_patch_that_beats_the_gateway_insert_is_tried_again() {
+        // The gateway starts the workflow, then inserts the cached row. A fast worker
+        // patches before that insert lands and gets a 404: the row is late, not
+        // missing, so the status must not be dropped.
+        let cp = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&cp)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&cp)
+            .await;
+        let patched = acts_with(&cp, false)
+            .patch_job(
+                Uuid::new_v4(),
+                JobStatus::Running,
+                Some("extract".into()),
+                None,
+            )
+            .await
+            .expect("patch");
+        assert!(patched, "the row that appeared was patched");
+        let requests = cp.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "running", "current_step": "extract"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_patch_gives_up_on_a_row_that_never_appears() {
+        // The gateway's insert is best effort: when it failed there is no row, and
+        // the patch must stay a no-op that neither fails nor holds the job for long.
+        let cp = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/internal/jobs/.+$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&cp)
+            .await;
+        let started = Instant::now();
+        let patched = acts_with(&cp, false)
+            .patch_job(Uuid::new_v4(), JobStatus::Succeeded, None, None)
+            .await
+            .expect("a missing row is not an error");
+        assert!(!patched);
+        assert_eq!(cp.received_requests().await.unwrap().len(), 4);
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     fn acts_with(cp: &MockServer, lab: bool) -> StepActivities {
@@ -1568,6 +2003,344 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
+    }
+
+    /// A control plane that accepts the request and then stays silent for `delay`.
+    async fn silent_control_plane(delay: Duration) -> MockServer {
+        let cp = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(delay),
+            )
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    const SILENCE: Duration = Duration::from_secs(5);
+
+    /// Activities whose control plane requests give up after 100 ms.
+    fn impatient(a: StepActivities) -> StepActivities {
+        StepActivities {
+            control_plane_timeout: Duration::from_millis(100),
+            ..a
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_the_job_status_write_as_retryable() {
+        let cp = silent_control_plane(SILENCE).await;
+        let a = impatient(acts_with(&cp, false));
+        let started = Instant::now();
+        let err = a
+            .patch_job(Uuid::new_v4(), JobStatus::Running, None, None)
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_the_usage_report_as_retryable() {
+        let cp = silent_control_plane(SILENCE).await;
+        let a = impatient(acts_with(&cp, true));
+        let started = Instant::now();
+        let err = a
+            .report_usage(&lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"))
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_the_lab_events_post_as_retryable() {
+        let cp = silent_control_plane(SILENCE).await;
+        let a = impatient(acts_with(&cp, true));
+        let started = Instant::now();
+        let err = a
+            .post_lab_events(&lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"))
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, UsageReportError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_silent_control_plane_fails_a_step_as_retryable() {
+        use meili_ingest_source::{HostPolicy, SecretKey};
+        let cp = silent_control_plane(SILENCE).await;
+
+        // Resolving the indexer's connection.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let a = impatient(
+            acts(vec![Arc::new(CapturingIndexer(seen))])
+                .with_control_plane(Some(cp.uri()))
+                .with_connections(ConnectionSettings {
+                    key: Some(Arc::new(SecretKey::from_bytes([5u8; 32]))),
+                    policy: HostPolicy::Any,
+                }),
+        );
+        let mut input = step_input(meili_ingest_plugin_sdk::INDEXER_PLUGIN, PluginInput::Empty);
+        input.config = serde_json::json!({ "connection": "prod-movies", "index": "movies" });
+        let started = Instant::now();
+        let err = a
+            .run_step(&PluginContext::noop(), input)
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+
+        // Fetching a Lab tenant's Gateway target.
+        let a = impatient(ai_acts(&cp, Probe::new("llm_enricher"), true));
+        let started = Instant::now();
+        let err = a
+            .run_step(&PluginContext::noop(), ai_step("llm_enricher", LAB_ACCOUNT))
+            .await
+            .expect_err("the control plane never answered");
+        assert!(matches!(err, PluginError::Retryable(_)), "{err:?}");
+        assert!(started.elapsed() < SILENCE, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_spilled_reference_weighs_what_the_budget_assumes() {
+        let spilled = PluginOutput::Ref(meili_ingest_plugin_sdk::ContentRef::Staged {
+            uri: "jobs/x/s-0.json".into(),
+            mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.to_owned()),
+            filename: None,
+            origin: None,
+            charset: None,
+        });
+        assert_eq!(spilled.approx_size(), SPILLED_REF_SIZE);
+    }
+
+    #[test]
+    fn a_fanned_out_step_shares_the_spill_budget_between_its_branches() {
+        assert_eq!(branch_spill_threshold(1 << 20, None, None), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, Some(1), None), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, Some(4), None), 1 << 18);
+        // Never below what a reference weighs.
+        assert_eq!(
+            branch_spill_threshold(64, Some(500), None),
+            SPILLED_REF_SIZE
+        );
+    }
+
+    #[test]
+    fn a_merged_step_shares_the_spill_budget_with_the_other_merged_outputs() {
+        assert_eq!(branch_spill_threshold(1 << 20, None, Some(1)), 1 << 20);
+        assert_eq!(branch_spill_threshold(1 << 20, None, Some(2)), 1 << 19);
+        // A fanned-out step merged with others: its branches share its share.
+        assert_eq!(branch_spill_threshold(1 << 20, Some(4), Some(2)), 1 << 17);
+        assert_eq!(
+            branch_spill_threshold(1 << 20, Some(usize::MAX), Some(2)),
+            SPILLED_REF_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn outputs_merged_by_a_step_with_several_dependencies_fit_the_threshold_together() {
+        let threshold = 1024 * 1024;
+        let a = acts(vec![Arc::new(Upper)]);
+        assert_eq!(a.spill_threshold, threshold);
+        let pipeline = PipelineDefinition {
+            uid: "p".into(),
+            name: "p".into(),
+            description: None,
+            version: 1,
+            trigger: None,
+            steps: vec![
+                StepDefinition::new("a", "upper"),
+                StepDefinition::new("b", "upper"),
+                StepDefinition::new("c", "upper"),
+                StepDefinition::new("index", "upper").depends_on(["a", "b", "c"]),
+            ],
+            builtin: false,
+            tenant_id: None,
+        };
+        // Each output alone is under the threshold, the three together are not.
+        let mut done = std::collections::HashMap::new();
+        for id in ["a", "b", "c"] {
+            let mut input = step_input(
+                "upper",
+                PluginInput::Documents(vec![Document::with_id(id, "x".repeat(400 * 1024))]),
+            );
+            input.step_id = id.into();
+            input.merge_total = crate::dag::merge_total(&pipeline, id);
+            let out = a
+                .run_step(&PluginContext::noop(), input)
+                .await
+                .expect("step runs");
+            done.insert(id.to_string(), out.output);
+        }
+        let merged = crate::dag::resolve_input(
+            pipeline.step("index").expect("step"),
+            &PluginInput::Empty,
+            &done,
+        );
+        assert!(
+            merged.approx_size() <= threshold,
+            "the merged input is {} bytes, over the {threshold} threshold",
+            merged.approx_size()
+        );
+        // Nothing is lost: the next step reads every document back.
+        let docs = a
+            .blob
+            .resolve_input(merged, &a.http)
+            .await
+            .expect("hydrate")
+            .into_documents()
+            .expect("documents");
+        assert_eq!(docs.len(), 3);
+    }
+
+    /// Answers with the checkpoint the previous attempt left (`null` without one), then
+    /// checkpoints `{"done": attempt}`.
+    struct Checkpointer;
+    #[async_trait]
+    impl Plugin for Checkpointer {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("checkpointer", "0")
+        }
+        async fn execute(
+            &self,
+            ctx: &PluginContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            let previous = ctx.previous_progress().cloned().unwrap_or_default();
+            ctx.record_progress(serde_json::json!({ "done": ctx.attempt() }));
+            ctx.heartbeat("after the checkpoint");
+            // Let the forwarder send the heartbeats before the activity returns.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(PluginOutput::Documents(vec![Document::with_id(
+                "previous",
+                previous.to_string(),
+            )]))
+        }
+    }
+
+    /// Run `execute_step` on [`Checkpointer`] as attempt `attempt`, with `details` as the
+    /// previous attempt's heartbeat details. Returns what the plugin saw and the
+    /// heartbeat details sent to Temporal.
+    async fn run_checkpointer(
+        attempt: u32,
+        details: Option<serde_json::Value>,
+    ) -> (String, Vec<serde_json::Value>) {
+        use temporalio_sdk::testing::{ActivityEnvironment, TestActivityInfoOptions};
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let mut env = ActivityEnvironment::builder_with_default();
+        if let Some(details) = details {
+            env = env.heartbeat_details(details).expect("encode details");
+        }
+        let env = env
+            .info(
+                TestActivityInfoOptions::builder()
+                    .attempt(attempt)
+                    .deadline(None)
+                    .build(),
+            )
+            .on_heartbeat(move |d| {
+                let d = d
+                    .downcast::<serde_json::Value>()
+                    .expect("heartbeat details are JSON");
+                sink.lock().expect("lock").push(*d);
+            })
+            .register_activities(acts(vec![Arc::new(Checkpointer)]))
+            .build();
+        let out = env
+            .run(
+                StepActivities::execute_step,
+                step_input("checkpointer", PluginInput::Empty),
+            )
+            .await
+            .expect("step runs");
+        let seen = match out.output {
+            PluginOutput::Documents(d) => d[0].content.clone(),
+            other => panic!("{other:?}"),
+        };
+        let sent = sent.lock().expect("lock").clone();
+        (seen, sent)
+    }
+
+    #[tokio::test]
+    async fn a_retry_reads_the_progress_the_previous_attempt_heartbeated() {
+        // Attempt 1 has nothing to resume and checkpoints in every heartbeat.
+        let (seen, sent) = run_checkpointer(1, None).await;
+        assert_eq!(seen, "null");
+        let last = sent.last().expect("heartbeats were sent").clone();
+        assert_eq!(last["message"], "after the checkpoint");
+
+        // Attempt 2 is handed exactly what attempt 1 sent last.
+        let (seen, sent) = run_checkpointer(2, Some(last)).await;
+        assert_eq!(seen, r#"{"done":1}"#);
+        assert_eq!(
+            PluginContext::progress_from_heartbeat_details(sent.last().expect("heartbeats")),
+            Some(serde_json::json!({ "done": 2 }))
+        );
+    }
+
+    /// Checkpoints, then fails at once: the shape of an enricher whose last document
+    /// spent its retry budget.
+    struct FailsAfterCheckpoint;
+    #[async_trait]
+    impl Plugin for FailsAfterCheckpoint {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("fails_after_checkpoint", "0")
+        }
+        async fn execute(
+            &self,
+            ctx: &PluginContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            ctx.record_progress(serde_json::json!({ "done": [0, 1] }));
+            Err(PluginError::retryable("upstream busy"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_attempt_hands_its_last_checkpoint_to_the_retry() {
+        use temporalio_sdk::testing::{ActivityEnvironment, TestActivityInfoOptions};
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let env = ActivityEnvironment::builder_with_default()
+            .info(TestActivityInfoOptions::builder().deadline(None).build())
+            .on_heartbeat(move |d| {
+                let d = d
+                    .downcast::<serde_json::Value>()
+                    .expect("heartbeat details are JSON");
+                sink.lock().expect("lock").push(*d);
+            })
+            .register_activities(acts(vec![Arc::new(FailsAfterCheckpoint)]))
+            .build();
+        env.run(
+            StepActivities::execute_step,
+            step_input("fails_after_checkpoint", PluginInput::Empty),
+        )
+        .await
+        .expect_err("the step fails");
+        // Temporal hands the retry the last heartbeat details of the failed attempt,
+        // so the checkpoint recorded just before the failure must be among them.
+        let sent = sent.lock().expect("lock").clone();
+        assert_eq!(
+            sent.last()
+                .and_then(PluginContext::progress_from_heartbeat_details),
+            Some(serde_json::json!({ "done": [0, 1] })),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_heartbeat_details_carry_no_progress() {
+        // What a worker without checkpoints (or a plugin recording none) leaves behind.
+        let (seen, _) = run_checkpointer(2, Some(serde_json::json!("keepalive"))).await;
+        assert_eq!(seen, "null");
     }
 
     #[test]

@@ -264,7 +264,8 @@ impl ConnectionRepo {
 // ---------------------------------------------------------------------------
 // `/internal/connections` handlers. Internal only: the gateway owns validation, sealing
 // and redaction, and the worker resolves an indexer step's connection through
-// `get_owned` (`scope=tenant`) for a tenant job, `get` for a global one.
+// `get_owned` (`scope=tenant`) for a job that has a tenant, whatever the scope of its
+// pipeline, and through `get` (the global row) for a tenantless job.
 // ---------------------------------------------------------------------------
 
 /// `GET /internal/connections?tenant_id=` → the tenant's plus global connections.

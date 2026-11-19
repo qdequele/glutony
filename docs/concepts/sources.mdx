@@ -79,6 +79,7 @@ A source starts **active**. Pause and resume it, or run it once off-schedule:
 curl -X POST $INGEST/sources/tmdb/pause
 curl -X POST $INGEST/sources/tmdb/unpause
 curl -X POST $INGEST/sources/tmdb/run      # 202; skipped if a run is in flight
+curl -X POST $INGEST/sources/tmdb/reset-state  # 204; the next run re-ingests in full
 ```
 
 ### Location
@@ -130,7 +131,10 @@ record of `https://httpbin.org/json`. The hash names the source (its project and
   `…/v2/data.json`) never overwrite each other in a shared index.
 
 A run that produces fewer documents than the previous one leaves the extra ones
-in place: delete them, or give the content an id of its own.
+in place: delete them, or give the content an id of its own. Chunks cannot have
+an id of their own; for them, set
+[`prune: true`](/plugins/built-in#pruning-stale-chunks) on the `meili_indexer`
+step, which deletes the stale chunks of every document the run indexed again.
 
 ## Runs and change detection
 
@@ -179,20 +183,35 @@ without credits is `failed` before anything is fetched, and the next tick tries 
 A source remembers the last `ETag`, `Last-Modified` and content hash, and sends
 `If-None-Match` / `If-Modified-Since` on the next fetch. That state is saved
 **only** when a run succeeds, so a failed run is retried in full on the next
-tick. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
+tick. A `PATCH` that changes the `location`, `timezone`, `pipeline_uid`,
+`index_name` or `auth` forgets that state, so the next run fetches in full and
+ingests into the new destination even when the upstream file has not changed.
+An edit to the steps of the pipeline itself keeps it: nothing is reset on its
+own, since re-ingesting every source of a pipeline can be costly. To re-ingest
+after such an edit, call `POST /sources/{uid}/reset-state` (`204`), which
+forgets the saved `ETag`, `Last-Modified` and hash without touching the
+schedule; the next run, scheduled or `POST /sources/{uid}/run`, then fetches in
+full and ingests. A run already in flight when you reset still saves the state
+it learns. Each job a run starts is an ordinary [job](/concepts/jobs) and shows up in
 `GET /jobs/{id}`.
 
 Runs never overlap: if a run is still going when the next tick fires, that
 tick is skipped.
 
-Sources upsert documents; they never delete. A document that disappears
-upstream stays in the index.
+Sources upsert documents; they never delete, except the stale chunks that an
+indexer step with [`prune: true`](/plugins/built-in#pruning-stale-chunks) removes.
+A document that disappears upstream stays in the index.
 
 ## Deleting
 
 `DELETE /sources/{uid}` removes the schedule and the source. Deleting the
 **pipeline** a source uses does not fail; the source is archived instead:
 its schedule is removed, it shows `archived_at`, and it can no longer be run.
+Archiving is one-way, and an archived source keeps its `uid`: `GET /sources`
+hides it (add `?include_archived=true`), and creating another source with that
+`uid` answers `409` naming the archived one. Delete it to reuse the name.
+Deleting a global pipeline also archives the sources of the tenants that used
+it, except those of a tenant with a pipeline of its own under the same `uid`.
 
 ## Security
 
@@ -210,6 +229,12 @@ forgery unless it is restricted. meili-ingest restricts it by default.
   | `any` | any `http`/`https` host |
   | `files.internal,feeds.example.com:8443` | exactly those hosts |
 
+  A public address is one routable on the internet: not loopback, private
+  (RFC 1918), link-local, carrier-grade NAT, unique-local, multicast, or a
+  reserved, benchmarking or documentation range (`0.0.0.0/8`, `198.18.0.0/15`,
+  `240.0.0.0/4`…). An IPv4 address carried inside an IPv6 one (IPv4-mapped,
+  NAT64 `64:ff9b::/96`, 6to4) is judged as that IPv4 address.
+
   The policy is checked when the source is saved, at every fetch, and at every
   redirect hop (at most 5). The same policy governs `{"url": …}` bodies sent to
   the ingest routes: refused at the gateway with a `422`, and re-checked by the
@@ -226,9 +251,15 @@ forgery unless it is restricted. meili-ingest restricts it by default.
   ```
 
   Reads show the kind and header names with values masked as `****`. In
-  `PATCH`, omit `auth` to keep it, send `null` to clear it.
+  `PATCH`, omit `auth` to keep it, send `null` to clear it. A credential stays
+  bound to the origin (scheme, host and port) it was saved with: a `PATCH` that
+  moves the `location` to another origin while one is stored answers `422`
+  unless it also sends `auth`, a new one or `null`. A path change keeps it.
 - **Size**: a response is capped at 512 MiB, both as downloaded and once
   decompressed. A file over the cap fails the run without being retried.
+- **Time**: a fetch has 10 minutes, redirects and body included, so a file at
+  the size cap needs about 1 MiB/s. A download that stops sending data for 60
+  seconds is abandoned earlier. Both count as a transport error and are retried.
 
 Without `SOURCE_SECRET_KEY` the gateway answers `501` on every `/sources`
 route.

@@ -17,28 +17,31 @@ kubectl -n meili-ingest get pods
 |---|---|
 | `namespace.yaml` | `meili-ingest` namespace |
 | `control-plane.yaml` | shared `ConfigMap`, control plane `Deployment` + `Service` (9000) |
-| `gateway.yaml` | gateway `Deployment` (2 replicas), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
+| `gateway.yaml` | gateway `Deployment` (2–10 replicas via the HPA), `Service` (8080), CPU `HorizontalPodAutoscaler`, `PodDisruptionBudget` |
 | `workers.yaml` | `workers-general` `Deployment` with a KEDA `ScaledObject` |
 | `temporal.yaml` | **reference only** single-pod Temporal (`auto-setup`) + Postgres + UI |
-| `kustomization.yaml` | ties it together; pin the image tag here |
+| `kustomization.yaml` | ties it together; pins the image to the release (`newTag`, written by the release script) |
 | `secrets.example.yaml` | **example only**, not in the kustomization: every key of the `meili-ingest-secrets` `Secret` |
 
 ## Prerequisites
 
 - Kubernetes 1.27+.
 - [KEDA](https://keda.sh) 2.12+ for worker autoscaling (`helm install keda kedacore/keda -n keda --create-namespace`).
-  Without KEDA, delete the `ScaledObject`s and set `replicas` by hand.
+  Without KEDA, delete the `ScaledObject` and add `replicas` to the
+  `workers-general` `Deployment` by hand (the manifest leaves it to the autoscaler).
 - Prometheus scraping the Temporal server (for the default trigger), or KEDA ≥ 2.15 for the native `temporal` scaler.
 - A Postgres database for the control plane.
 - An object store bucket for the blob store (pods do not share a disk).
-- Temporal: Temporal Cloud or your own cluster. `temporal.yaml` is for dev/staging.
+- Temporal: your own cluster, reachable without TLS or authentication (see
+  [Temporal connection](/deployment/environment-variables#temporal-connection);
+  Temporal Cloud is not supported yet). `temporal.yaml` is for dev/staging.
 
 ## 1. Configure
 
 Edit the `ConfigMap` in `k8s/control-plane.yaml`:
 
 ```yaml
-TEMPORAL_URL: "http://temporal-frontend:7233"    # or your Temporal Cloud endpoint
+TEMPORAL_URL: "http://temporal-frontend:7233"    # or your own cluster's frontend
 TEMPORAL_NAMESPACE: "default"
 BLOB_STORE_URL: "s3://meili-ingest-blobs"        # gs:// and az:// work too
 LLM_BASE_URL: "https://api.openai.com/v1"
@@ -79,13 +82,16 @@ kubectl -n meili-ingest rollout restart deployment/meili-control-plane \
   deployment/meili-gateway deployment/workers-general
 ```
 
-`CONTROL_PLANE_TOKEN` guards the control plane's `/internal/*` routes only:
-`/pipelines`, `/jobs` and `/plugins` on port 9000 stay open. Keep the
-`meili-control-plane` `Service` a `ClusterIP` and never expose port 9000 outside the
-cluster network.
+`CONTROL_PLANE_TOKEN` guards every control plane route except `/health` (the
+probes) and `/metrics` (the Prometheus scrape). Keep the `meili-control-plane`
+`Service` a `ClusterIP` and never expose port 9000 outside the cluster network.
 
 The control plane runs two replicas; its outbox sender leases rows with
-`SKIP LOCKED`, so both deliver without duplicates.
+`SKIP LOCKED`, so both deliver without duplicates. Each replica keeps its own
+copy of the pipeline list for 5 seconds to route uploads: the replica that
+handles a pipeline create, update or delete uses it at once, the other one up
+to 5 seconds later. An upload sent right after the change can still be routed
+by the previous list.
 
 ### Optional: report to a Meilisearch Lab
 
@@ -143,11 +149,18 @@ as env vars or a service account annotation, with `AWS_REGION` for S3. Tenants'
 `{"s3": …}` refs are not read with them unless `OBJECT_REF_AMBIENT_CREDENTIALS=true`
 (see [object refs](/deployment/environment-variables#object-refs)).
 
+The workers delete each finished job's blobs `BLOB_TTL_DAYS` (control plane, default
+7) after it ended, so their role also needs `s3:ListBucket` and `s3:DeleteObject` on
+`jobs/`. Add a lifecycle rule expiring `jobs/` after about 30 days on the bucket as a
+backstop ([Blob store retention](/deployment/environment-variables#blob-store-retention)).
+
 ## 2. Gateway
 
-- 2 replicas, `RollingUpdate` with `maxUnavailable: 0`, spread across nodes.
+- `RollingUpdate` with `maxUnavailable: 0`, spread across nodes.
 - Readiness and liveness on `GET /health`.
-- `HorizontalPodAutoscaler` 2–10 replicas at 70 % CPU.
+- `HorizontalPodAutoscaler` 2–10 replicas at 70 % CPU. The `Deployment` sets no
+  `replicas`, so re-applying the manifests never resets the count the HPA chose; a
+  fresh install starts one pod until the HPA raises it to 2 a few seconds later.
 - `PodDisruptionBudget` `minAvailable: 1`.
 - Envoy trust: `ENVOY_TRUSTED_HEADER` from the secret. For a standalone
   deployment uncomment `MEILI_URL` / `MEILI_API_KEY` instead.
@@ -231,33 +244,83 @@ see [Authoring a gRPC plugin](/plugins/authoring-grpc).
 
 `temporal.yaml` deploys `temporalio/auto-setup` with a single Postgres
 `StatefulSet` and the Temporal UI. It exists so `kubectl apply -k` produces a
-working cluster; **it is not HA and not for production**. For production:
+working cluster; **it is not HA and not for production**. For production, run
+the [official Helm chart](https://github.com/temporalio/helm-charts) with
+Cassandra/Postgres and Elasticsearch, set `TEMPORAL_URL` to its frontend, and
+remove `temporal.yaml` from `kustomization.yaml`.
 
-- [Temporal Cloud](https://temporal.io/cloud): set `TEMPORAL_URL` to your
-  namespace endpoint and mount the mTLS client certificate.
-- Self-managed: the [official Helm chart](https://github.com/temporalio/helm-charts)
-  with Cassandra/Postgres and Elasticsearch.
-
-Then remove `temporal.yaml` from `kustomization.yaml`.
+The gateway and workers connect without TLS or authentication, so keep the
+frontend on the cluster network. Temporal Cloud, which requires mTLS or an API
+key, is not supported yet (see
+[Temporal connection](/deployment/environment-variables#temporal-connection)).
 
 ## 5. Verify
 
+Forward the gateway in one terminal:
+
 ```bash
 kubectl -n meili-ingest port-forward svc/meili-gateway 8080:8080
+```
+
+and in another, send a file. With `ENVOY_TRUSTED_HEADER` set (step 1), the gateway
+honours `X-Meili-Host` only together with the matching `X-Meili-Envoy-Secret`:
+
+```bash
 curl -H "X-Meili-Host: http://meilisearch.default.svc:7700" \
+     -H "X-Meili-Envoy-Secret: $(kubectl -n meili-ingest get secret meili-ingest-secrets \
+          -o jsonpath='{.data.ENVOY_TRUSTED_HEADER}' | base64 -d)" \
      -H "Authorization: Bearer <key>" \
      -F file=@report.pdf http://localhost:8080/ingest
 kubectl -n meili-ingest get scaledobjects
 ```
 
+A standalone deployment (`MEILI_URL` / `MEILI_API_KEY` uncommented in
+`k8s/gateway.yaml`) needs neither header: `curl -F file=@report.pdf
+http://localhost:8080/ingest`.
+
 ## Upgrades
 
-Pin the image tag in `kustomization.yaml` (`newTag: 0.2.0`: release images are
-tagged without the `v`) and `kubectl apply -k k8s/`. The `Secret` is not in the
+`kustomization.yaml` pins the image to the release its tree belongs to
+(`newTag: 0.2.0`: release images are tagged without the `v`, never `latest`, which
+nodes would keep cached under `imagePullPolicy: IfNotPresent`). Check out the
+release's tag (`git checkout v0.2.0`) and `kubectl apply -k k8s/`: the new tag
+changes the pod template, so every `Deployment` rolls to it. The release script
+writes `newTag` with each release, so `main` right after a release names the new
+image a few minutes before the release workflow has pushed it; apply a tag, not
+`main`, to avoid an `ImagePullBackOff` in that window. The `Secret` is not in the
 kustomization, so this never resets it; add any new key with `kubectl patch secret`
 and restart the pods. Control-plane migrations run automatically at boot
 (`sqlx::migrate!`). Workflows in flight keep running: the workflow code is versioned
 by Temporal and activities are retried on the new workers.
+
+The gateway and `workers-general` `Deployment`s set no `replicas`: the HPA and the
+KEDA `ScaledObject` own the count, so `kubectl apply -k` keeps it. On a cluster first
+deployed from manifests that still set `replicas`, the first apply without it scales
+both back to one pod until the autoscalers catch up (a few seconds). To avoid that dip,
+remove the `replicas` line from the last applied configuration first:
+
+```bash
+kubectl -n meili-ingest apply edit-last-applied deployment/meili-gateway
+kubectl -n meili-ingest apply edit-last-applied deployment/workers-general
+```
+
+### Upgrading to a control plane that guards every route
+
+Earlier releases checked `CONTROL_PLANE_TOKEN` on `/internal/*` only; `/pipelines`,
+`/pipelines/validate`, `/pipelines/{uid}`, `/jobs` and `/plugins` answered anyone who
+reached port 9000. They now answer `401 unauthorized` without the bearer. `/health` and
+`/metrics` stay open, so the probes and the Prometheus scrape need no change.
+
+The gateway and the workers already send the token on every control plane request,
+so they need no change and no particular order. Roll out in this order:
+
+1. Find anything else that calls port 9000 directly on those routes (operator
+   scripts, cron jobs, dashboards) and give it `Authorization: Bearer
+   $CONTROL_PLANE_TOKEN`, or point it at the gateway's API instead.
+2. Upgrade as usual (`newTag`, then `kubectl apply -k k8s/`).
+
+A control plane running with `CONTROL_PLANE_TOKEN_DISABLED=true` and no token keeps
+every route open, as before.
 
 ### Upgrading to Lab contract v2
 
