@@ -1391,10 +1391,26 @@ mod tests {
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
             tokio::time::sleep(self.delay).await;
-            let fail = self
-                .failing
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
+            // Take one of the remaining failures, if any. A compare-exchange loop:
+            // `fetch_update` is deprecated on recent toolchains and its replacement
+            // is not stable on the one CI pins.
+            let fail = {
+                let mut left = self.failing.load(Ordering::SeqCst);
+                loop {
+                    if left == 0 {
+                        break false;
+                    }
+                    match self.failing.compare_exchange(
+                        left,
+                        left - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break true,
+                        Err(seen) => left = seen,
+                    }
+                }
+            };
             // An archive's files are staged under `jobs/<file job>/input/`.
             let file = location.as_ref().contains("/input/");
             let len = payload.content_length();

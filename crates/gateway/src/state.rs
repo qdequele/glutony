@@ -749,6 +749,10 @@ struct UpstreamErrorBody {
     error: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    diagnostics: Option<serde_json::Value>,
 }
 
 /// Thin HTTP client for the control plane's internal API.
@@ -830,6 +834,8 @@ impl ControlPlaneClient {
         let status = resp.status();
         let body = resp.bytes().await.unwrap_or_default();
         let parsed: UpstreamErrorBody = serde_json::from_slice(&body).unwrap_or_default();
+        let code = parsed.code;
+        let diagnostics = parsed.diagnostics;
         let msg = parsed
             .error
             .or(parsed.message)
@@ -845,6 +851,12 @@ impl ControlPlaneClient {
             StatusCode::FORBIDDEN => GatewayError::Forbidden(msg),
             StatusCode::CONFLICT => GatewayError::Conflict(msg),
             StatusCode::BAD_REQUEST => GatewayError::BadRequest(msg),
+            StatusCode::UNPROCESSABLE_ENTITY if code.as_deref() == Some("invalid_step_config") => {
+                GatewayError::InvalidStepConfig {
+                    message: msg,
+                    diagnostics: diagnostics.unwrap_or_else(|| serde_json::Value::Array(vec![])),
+                }
+            }
             StatusCode::UNPROCESSABLE_ENTITY => GatewayError::Invalid(msg),
             StatusCode::PAYLOAD_TOO_LARGE => GatewayError::TooLarge(msg),
             _ => GatewayError::Upstream(format!("control plane {what}: {status}: {msg}")),

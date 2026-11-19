@@ -59,6 +59,22 @@ Billing: a plugin named `ocr` is billed to the Lab as `ocr_pages` (5 credits eac
 one per output document (emit one document per page you OCR), or per `pages` if it
 ever reports usage. See [Meilisearch Lab](/deployment/meilisearch-lab).
 
+## Editor hints
+
+A client that renders a step's form from your `config_schema` (such as the Meilisearch
+Lab console) shows a `string` property as a one-line input unless you add `"x-widget"`:
+
+```json
+"prompt": { "type": "string", "x-widget": "textarea" }
+```
+
+| Value | Renders as |
+|---|---|
+| `"textarea"` | multi-line text |
+| `"code"` | multi-line monospace text |
+
+Unknown values are ignored.
+
 ## Python example (Whisper)
 
 ```python
