@@ -376,7 +376,7 @@ fn chunk_document(parent: &Document, cfg: &Config) -> Vec<Document> {
             meta.chunk_total = Some(total);
             meta.parent_id = Some(parent.id.clone());
             Document {
-                id: format!("{}_{}", parent.id, i),
+                id: suffixed_id(&parent.id, &format!("_{i}")),
                 title,
                 content: text,
                 fields,
@@ -390,25 +390,17 @@ fn chunk_document(parent: &Document, cfg: &Config) -> Vec<Document> {
 ///
 /// Non-UTF-8 input is rejected rather than silently mangled: a binary file reaching
 /// the chunker means the pipeline is missing an extractor step.
-fn document_from_text(blob: meili_ingest_plugin_sdk::Blob) -> Result<Document, PluginError> {
-    let content = String::from_utf8(blob.data).map_err(|_| {
+fn document_from_text(mut blob: meili_ingest_plugin_sdk::Blob) -> Result<Document, PluginError> {
+    // `id_stem("")` is a fresh UUID when the blob has neither a filename nor an origin.
+    let id = blob.id_stem("");
+    let content = String::from_utf8(std::mem::take(&mut blob.data)).map_err(|_| {
         PluginError::InvalidInput(
             "chunker received bytes that are not valid UTF-8 text; add an extractor step \
              (pdf_extractor, docx_extractor, ...) before the chunker"
                 .to_string(),
         )
     })?;
-    let stem = blob
-        .filename
-        .as_deref()
-        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
-        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
-        .filter(|s| !s.is_empty())
-        .map(meili_ingest_plugin_sdk::sanitize_id);
-    let mut doc = match stem {
-        Some(id) => Document::with_id(id, content),
-        None => Document::new(content),
-    };
+    let mut doc = Document::with_id(id, content);
     doc.meta.source = blob.filename.clone();
     doc.meta.filename = blob.filename;
     doc.meta.mime = Some(blob.mime);
@@ -639,6 +631,25 @@ mod tests {
         assert_eq!(c.meta.page, Some(4), "parent meta is kept");
         assert_eq!(c.title.as_deref(), Some("T"));
         assert_eq!(c.fields["k"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn chunk_ids_of_a_long_parent_id_fit_and_stay_distinct() {
+        let parent_id = "p".repeat(511);
+        let text = "One sentence here. ".repeat(40);
+        let out = run(
+            vec![doc(&parent_id, &text)],
+            json!({"chunk_size": 50, "overlap": 0, "min_chunk_size": 1}),
+        )
+        .await;
+        assert!(out.len() >= 2, "{}", out.len());
+        let ids: std::collections::BTreeSet<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), out.len(), "chunk ids collide");
+        for (i, c) in out.iter().enumerate() {
+            assert!(c.id.len() <= 511, "{} bytes", c.id.len());
+            assert!(c.id.ends_with(&format!("_{i}")), "{}", c.id);
+            assert_eq!(c.meta.parent_id.as_deref(), Some(parent_id.as_str()));
+        }
     }
 
     #[tokio::test]

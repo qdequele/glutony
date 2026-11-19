@@ -16,8 +16,8 @@ use chrono::{DateTime, Utc};
 
 use meili_ingest_plugin_sdk::{
     INDEXER_PLUGIN, IndexReport, JobStatus, PipelineWorkflowInput, PipelineWorkflowOutput,
-    PluginInput, PluginOutput, StepActivityInput, StepDefinition, StepResult, UsageUnits,
-    WorkflowProgress, inject_meili_context,
+    PluginInput, PluginOutput, StepActivityInput, StepDefinition, WorkflowProgress,
+    inject_meili_context,
 };
 use meili_ingest_router::plugin_task_queue;
 use meili_ingest_usage::JobUsageInput;
@@ -32,7 +32,10 @@ use temporalio_sdk::{
 };
 
 use crate::activity::{FanOutActivityInput, JobStartedInput, StepActivities};
-use crate::dag::{FanOut, fan_out_branches, ready_steps, resolve_input, retry_params};
+use crate::dag::{
+    BranchError, FanOut, RoundEnd, StepFailure, StepMetering, StepOutcome, fan_out_branches,
+    merge_branches, merge_total, ready_steps, resolve_input, retry_params, settle_round,
+};
 
 /// Upper bound on parallel activities scheduled by one fan-out step (keeps the
 /// workflow history well under Temporal's event limits).
@@ -127,62 +130,41 @@ impl PipelineWorkflow {
             }
             let results = join_all(step_futs).await;
 
-            for (step, result) in ready.iter().zip(results) {
-                match result {
-                    Ok(outcome) => {
-                        if let PluginOutput::Indexed(r) = &outcome.output
-                            && step.plugin == INDEXER_PLUGIN
-                        {
-                            index_report = Some(r.clone());
-                        }
-                        ctx.state_mut(|s| {
-                            s.progress.completed_steps += 1;
-                            s.progress.steps.push(StepResult {
-                                step_id: step.id.clone(),
-                                plugin: step.plugin.clone(),
-                                status: JobStatus::Succeeded,
-                                document_count: outcome.output.document_count(),
-                                branches: outcome.branches,
-                                error: None,
-                                duration_ms: outcome.duration_ms,
-                                input_bytes: outcome.input_bytes,
-                                usage: outcome.usage,
-                            });
-                        });
-                        done.insert(step.id.clone(), outcome.output);
-                    }
-                    Err(StepFailure::Cancelled) => {
-                        return Self::finish_cancelled(ctx, &input, started_at).await;
-                    }
-                    Err(StepFailure::Failed(msg)) => {
-                        let full = format!("step {} ({}) failed: {msg}", step.id, step.plugin);
-                        ctx.state_mut(|s| {
-                            s.progress.status = JobStatus::Failed;
-                            s.progress.error = Some(full.clone());
-                            s.progress.steps.push(StepResult {
-                                step_id: step.id.clone(),
-                                plugin: step.plugin.clone(),
-                                status: JobStatus::Failed,
-                                document_count: 0,
-                                branches: 1,
-                                error: Some(msg.clone()),
-                                duration_ms: 0,
-                                input_bytes: 0,
-                                usage: UsageUnits::none(),
-                            });
-                        });
-                        // A failed job still consumed tokens and CPU, so meter it
-                        // before failing. Cancellation does the same.
-                        Self::emit_usage(
-                            ctx,
-                            &input,
-                            JobStatus::Failed,
-                            started_at,
-                            Some(full.clone()),
-                        )
-                        .await;
-                        return Err(ApplicationFailure::non_retryable(anyhow::anyhow!(full)).into());
-                    }
+            // Every step of the round has finished: record all of them before acting
+            // on a failure or a cancellation, so what the siblings of a failed step
+            // consumed is still metered.
+            let round = settle_round(&ready, results);
+            if round.index_report.is_some() {
+                index_report = round.index_report;
+            }
+            let completed = round.outputs.len();
+            let rows = round.rows;
+            ctx.state_mut(|s| {
+                s.progress.completed_steps += completed;
+                s.progress.steps.extend(rows);
+            });
+            done.extend(round.outputs);
+            match round.end {
+                None => {}
+                Some(RoundEnd::Cancelled) => {
+                    return Self::finish_cancelled(ctx, &input, started_at).await;
+                }
+                Some(RoundEnd::Failed(full)) => {
+                    ctx.state_mut(|s| {
+                        s.progress.status = JobStatus::Failed;
+                        s.progress.error = Some(full.clone());
+                    });
+                    // A failed job still consumed tokens and CPU, so meter it
+                    // before failing. Cancellation does the same.
+                    Self::emit_usage(
+                        ctx,
+                        &input,
+                        JobStatus::Failed,
+                        started_at,
+                        Some(full.clone()),
+                    )
+                    .await;
+                    return Err(ApplicationFailure::non_retryable(anyhow::anyhow!(full)).into());
                 }
             }
         }
@@ -268,33 +250,18 @@ pub(crate) fn to_utc(time: Option<SystemTime>) -> DateTime<Utc> {
         .unwrap_or_else(|| DateTime::<Utc>::from(UNIX_EPOCH))
 }
 
-/// MIME of the job's original input, when it is known.
+/// MIME of the job's original input, when it is known. Documents are JSON whether
+/// the gateway sent them inline or staged them in the blob store.
 fn initial_mime(input: &PluginInput) -> String {
     match input {
         PluginInput::Bytes(b) => b.mime.clone(),
+        PluginInput::Ref(r) if r.mime() == Some(meili_ingest_blob::SPILLED_OUTPUT_MIME) => {
+            "application/json".to_string()
+        }
         PluginInput::Ref(r) => r.mime().unwrap_or("").to_string(),
         PluginInput::Documents(_) => "application/json".to_string(),
         _ => String::new(),
     }
-}
-
-/// What a completed step produced, plus the metering the usage event needs.
-struct StepOutcome {
-    output: PluginOutput,
-    /// Parallel branches the step ran as (1 unless fanned out).
-    branches: usize,
-    /// Wall time, summed across branches.
-    duration_ms: u64,
-    /// Bytes consumed, summed across branches.
-    input_bytes: u64,
-    /// Billable units the plugin reported, summed across branches.
-    usage: UsageUnits,
-}
-
-/// Why a step did not complete.
-enum StepFailure {
-    Cancelled,
-    Failed(String),
 }
 
 impl PipelineWorkflow {
@@ -396,14 +363,26 @@ impl PipelineWorkflow {
         config
     }
 
-    fn map_activity_error(e: ActivityExecutionError) -> StepFailure {
+    fn branch_error(e: ActivityExecutionError) -> BranchError {
         match e {
-            ActivityExecutionError::Cancelled(_) => StepFailure::Cancelled,
-            other => StepFailure::Failed(describe_activity_failure(&other)),
+            ActivityExecutionError::Cancelled(_) => BranchError::Cancelled,
+            other => BranchError::Failed(describe_activity_failure(&other)),
         }
     }
 
-    /// Run one step (all its branches). Returns the merged output and branch count.
+    /// Failure of a step that is one activity: there is nothing to meter, since a
+    /// failed activity returns no output.
+    fn map_activity_error(e: ActivityExecutionError) -> StepFailure {
+        match Self::branch_error(e) {
+            BranchError::Cancelled => StepFailure::Cancelled(None),
+            BranchError::Failed(message) => StepFailure::Failed {
+                message,
+                metering: StepMetering::none(1),
+            },
+        }
+    }
+
+    /// Run one step (all its branches). Returns the merged output and its metering.
     async fn run_step(
         ctx: &WorkflowContext<Self>,
         input: &PipelineWorkflowInput,
@@ -412,6 +391,7 @@ impl PipelineWorkflow {
     ) -> Result<StepOutcome, StepFailure> {
         let opts = Self::activity_options(step);
         let config = Self::step_config(step, input);
+        let merge_total = merge_total(&input.pipeline, &step.id);
         let mk = |branch: Option<usize>, total: Option<usize>, branch_input: PluginInput| {
             StepActivityInput {
                 job_id: input.job_id,
@@ -421,6 +401,7 @@ impl PipelineWorkflow {
                 input: branch_input,
                 branch,
                 branch_total: total,
+                merge_total,
                 tenant_id: input.context.tenant_id.clone(),
             }
         };
@@ -436,10 +417,13 @@ impl PipelineWorkflow {
                 .await
                 .map_err(Self::map_activity_error)?;
             return Ok(StepOutcome {
-                branches: 1,
-                duration_ms: out.duration_ms,
-                input_bytes: out.input_bytes,
-                usage: out.usage,
+                documents: out.documents_out as usize,
+                metering: StepMetering {
+                    branches: 1,
+                    duration_ms: out.duration_ms,
+                    input_bytes: out.input_bytes,
+                    usage: out.usage,
+                },
                 output: out.output,
             });
         };
@@ -473,16 +457,16 @@ impl PipelineWorkflow {
                     .map_err(Self::map_activity_error)?;
                 expanded.branches
             }
+            FanOut::Invalid(why) => {
+                return Err(StepFailure::Failed {
+                    message: format!(
+                        "fan_out {path:?} cannot split the output of step {}: {why}",
+                        step.depends_on.first().map_or("?", String::as_str)
+                    ),
+                    metering: StepMetering::none(1),
+                });
+            }
         };
-        if branches.is_empty() {
-            return Ok(StepOutcome {
-                output: PluginOutput::Many(vec![]),
-                branches: 0,
-                duration_ms: 0,
-                input_bytes: 0,
-                usage: UsageUnits::none(),
-            });
-        }
         let total = branches.len();
         let futs: Vec<_> = branches
             .into_iter()
@@ -496,46 +480,12 @@ impl PipelineWorkflow {
             })
             .collect();
         let results = join_all(futs).await;
-        let mut outputs = Vec::with_capacity(total);
-        let mut cancelled = false;
-        let mut first_error: Option<String> = None;
-        // Metering is summed across branches: one fanned-out step is one billable
-        // line, however many activities carried it out.
-        let mut duration_ms = 0u64;
-        let mut input_bytes = 0u64;
-        let mut usage = UsageUnits::none();
-        for r in results {
-            match r {
-                Ok(o) => {
-                    duration_ms += o.duration_ms;
-                    input_bytes += o.input_bytes;
-                    usage.merge(o.usage);
-                    outputs.push(o.output);
-                }
-                Err(ActivityExecutionError::Cancelled(_)) => cancelled = true,
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(describe_activity_failure(&e));
-                    }
-                }
-            }
-        }
-        if let Some(msg) = first_error {
-            return Err(StepFailure::Failed(format!(
-                "{} of {total} branches failed; first error: {msg}",
-                total - outputs.len()
-            )));
-        }
-        if cancelled {
-            return Err(StepFailure::Cancelled);
-        }
-        Ok(StepOutcome {
-            output: PluginOutput::Many(outputs),
-            branches: total,
-            duration_ms,
-            input_bytes,
-            usage,
-        })
+        merge_branches(
+            results
+                .into_iter()
+                .map(|r| r.map_err(Self::branch_error))
+                .collect(),
+        )
     }
 }
 
@@ -549,6 +499,33 @@ mod tests {
             cause: cause.map(Box::new),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn documents_report_the_same_input_mime_inline_or_staged() {
+        use meili_ingest_plugin_sdk::{Blob, ContentRef, Document, PluginInput};
+        let inline = PluginInput::Documents(vec![Document::with_id("1", "x")]);
+        // What the gateway sends for documents above INLINE_MAX_BYTES.
+        let staged = PluginInput::Ref(ContentRef::Staged {
+            uri: "jobs/j/gateway/documents.json".into(),
+            mime: Some(meili_ingest_blob::SPILLED_OUTPUT_MIME.into()),
+            filename: None,
+            origin: None,
+            charset: None,
+        });
+        assert_eq!(super::initial_mime(&inline), "application/json");
+        assert_eq!(super::initial_mime(&staged), "application/json");
+        // Every other input keeps its own type.
+        let upload = PluginInput::Ref(ContentRef::Staged {
+            uri: "jobs/j/input/a.pdf".into(),
+            mime: Some("application/pdf".into()),
+            filename: Some("a.pdf".into()),
+            origin: None,
+            charset: None,
+        });
+        assert_eq!(super::initial_mime(&upload), "application/pdf");
+        let bytes = PluginInput::Bytes(Blob::new(vec![1], "text/csv", None));
+        assert_eq!(super::initial_mime(&bytes), "text/csv");
     }
 
     #[test]

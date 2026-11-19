@@ -5,7 +5,7 @@
 #
 # Starts Postgres and Meilisearch in Docker, a Temporal dev server, a local
 # stand-in for Tinybird (so the usage dashboard has data), then the control
-# plane, the gateway and two workers. Seeds a few jobs so the API has data to
+# plane, the gateway and a worker. Seeds a few jobs so the API has data to
 # show. Ctrl-C tears everything down.
 #
 # Requirements: docker, the temporal CLI, curl, jq, python3, cargo.

@@ -4,7 +4,9 @@ description: Job lifecycle, status, progress and cancellation
 ---
 
 Every ingest request creates one **job** = one Temporal `PipelineWorkflow`
-execution with id `ingest-<job_id>`.
+execution with id `ingest-<job_id>`. An [archive](/concepts/archives) upload creates
+an archive job (an `ArchiveWorkflow`, same id scheme) that starts one job per file
+it holds; `GET /jobs?parent_job_id=<archive job>` lists them.
 
 ## Lifecycle
 
@@ -65,7 +67,12 @@ Temporal is the source of truth. The gateway writes a row to the control
 plane's `jobs` table when it starts a job and refreshes it each time
 `GET /jobs/:id` is served. When Temporal no longer knows the workflow
 (retention expired, typically after days) the cached row is returned instead,
-so status never 404s for a job that existed.
+so status never 404s for a job that existed. Rows are kept forever unless the
+control plane sets `JOBS_RETENTION_DAYS`, which deletes finished jobs (and source
+runs) older than that many days.
+
+`GET /jobs` returns one page and a `total` of matching jobs. Counting stops at
+10 000, so `total: 10000` means "10 000 or more".
 
 ## Cancellation
 
@@ -97,6 +104,15 @@ Per step, from the pipeline definition:
 Retryable errors (network, rate limits, transient upstream failures) go through
 this policy. Non-retryable ones (`InvalidInput`, `InvalidConfig`,
 `NonRetryable`) fail the step at once.
+
+The AI plugins (`llm_enricher`, `jev_enricher`, `image_captioner`) first retry
+each request on their own: a `429`, a `5xx` or a dropped connection is tried up to
+4 times in all, with exponential backoff and jitter (about 1 s, 2 s, 4 s), honouring
+a `Retry-After` of up to 20 s and waiting at most 30 s per request. Only once that is
+spent, or when `Retry-After` asks for longer, does the error reach the step's retry
+policy, so one rate-limited document no longer restarts the whole batch. A timed-out
+request and a Lab Gateway `401` (which needs a fresh key) go to the step's policy
+directly. Failed attempts are not metered.
 
 When a step's input is a URL (`POST /ingest {"url": ...}`), the worker fetches it
 before the plugin runs. A transport error, `408`, `429` or `5xx` goes through the

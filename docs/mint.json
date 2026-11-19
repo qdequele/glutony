@@ -49,6 +49,7 @@
         "concepts/pipelines",
         "concepts/plugins",
         "concepts/jobs",
+        "concepts/archives",
         "concepts/connections",
         "concepts/sources",
         "concepts/usage"

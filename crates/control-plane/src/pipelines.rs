@@ -138,9 +138,17 @@ impl PipelineRepo {
     /// archived, so the caller can delete their Temporal schedules.
     ///
     /// Deleting is **never blocked** by a source referencing the pipeline. Archiving
-    /// rather than cascade-deleting the sources keeps the credentials a tenant supplied
-    /// by hand: destroying those as a side effect of an unrelated delete is not
-    /// recoverable, whereas an archived source can be repointed and unarchived.
+    /// rather than cascade-deleting the sources keeps each source, its run history and
+    /// the credentials a tenant supplied by hand visible (`GET /sources/{uid}`,
+    /// `include_archived`) instead of destroying them as a side effect of an unrelated
+    /// delete. Archive is one-way: an archived source never runs again and keeps its uid
+    /// until it is deleted (creating another source with that uid is a 409).
+    ///
+    /// A source resolves its pipeline like [`PipelineRepo::get`]: the tenant's own row,
+    /// then the global one. Deleting a **global** pipeline therefore also archives the
+    /// sources of every tenant that has no pipeline of that uid of its own, since they
+    /// were running on the row being deleted. A tenant that shadows the uid keeps its
+    /// sources. Deleting a tenant's pipeline archives that tenant's sources only.
     pub async fn delete_cascading(
         &self,
         uid: &str,
@@ -151,8 +159,11 @@ impl PipelineRepo {
         let archived: Vec<(uuid::Uuid,)> = sqlx::query_as(
             "UPDATE sources SET archived_at = now(), paused = true, updated_at = now() \
              WHERE pipeline_uid = $1 \
-               AND COALESCE(tenant_id, '') = COALESCE($2, '') \
                AND archived_at IS NULL \
+               AND (COALESCE(tenant_id, '') = COALESCE($2, '') \
+                    OR ($2::text IS NULL \
+                        AND NOT EXISTS (SELECT 1 FROM pipelines p \
+                                        WHERE p.uid = $1 AND p.tenant_id = sources.tenant_id))) \
              RETURNING id",
         )
         .bind(uid)
@@ -236,6 +247,12 @@ fn check_step_configs(def: &PipelineDefinition) -> Result<BTreeMap<String, Strin
     }
 }
 
+/// The uid no pipeline may take: `/pipelines/validate` is a literal, POST-only route
+/// (here and on the gateway) that wins over `/pipelines/{uid}`, so a pipeline with
+/// this uid could be created and would route uploads, but could never be fetched or
+/// deleted.
+pub const RESERVED_UID: &str = "validate";
+
 /// Static checks shared by the handler and unit tests: reserved uid, normalization,
 /// structural validation and per-step config compile checks. Mutates `def`
 /// (normalization) on success. Returns the program each Builder-mode `document_script`
@@ -249,8 +266,13 @@ pub fn prepare_definition(
             def.uid
         )));
     }
+    if def.uid == RESERVED_UID {
+        return Err(CpError::Validation(format!(
+            "pipeline uid {RESERVED_UID:?} is reserved: it is the path of the validation route"
+        )));
+    }
     def.normalize();
-    def.validate()
+    def.validate_for_save()
         .map_err(|e| CpError::Validation(e.to_string()))?;
     let generated = check_step_configs(def)?;
     def.builtin = false;
@@ -301,10 +323,15 @@ pub fn config_errors(def: &PipelineDefinition, manifests: &[PluginManifest]) -> 
 /// plugin's schema and indexer connections that do not exist for the tenant (both 422
 /// `validation`).
 ///
-/// The connection lookup is the one the worker does at run time: the tenant's own row for
+/// The connection lookup is keyed on the **pipeline's** scope: the tenant's own row for
 /// a tenant pipeline (a global connection is a template, never usable by a tenant), the
-/// global row for a global pipeline. A pipeline that passes here therefore does not fail
-/// later with "connection not found" unless the connection is deleted in between.
+/// global row for a global pipeline. The worker keys its lookup on the **job's** tenant
+/// instead (`scope=tenant`, the tenant's own row only). The two agree for a tenant
+/// pipeline and for a global pipeline run by a tenantless job, so such a pipeline that
+/// passes here does not fail later with "connection not found" unless the connection is
+/// deleted in between. They cannot agree for a global pipeline run by a tenant job, so
+/// a global pipeline pinned to a connection is standalone-only: with tenants on
+/// ([`AppState::tenants`]) it is refused.
 async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> Result<(), CpError> {
     let manifests = crate::plugins::registered_manifests(&state.pool).await?;
     let registered: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
@@ -319,6 +346,15 @@ async fn check_against_registry(state: &AppState, def: &PipelineDefinition) -> R
         let Some(uid) = pinned_connection(&step.config) else {
             continue;
         };
+        if def.tenant_id.is_none() && state.tenants {
+            errors.push(format!(
+                "step {:?} ({}): a global pipeline cannot pin connection {uid:?} on a \
+                 deployment that serves tenants: a tenant job only resolves its own \
+                 connections, so create the pipeline in each tenant instead",
+                step.id, step.plugin
+            ));
+            continue;
+        }
         let found = match def.tenant_id.as_deref() {
             Some(t) => connections.get_owned(uid, t).await?,
             None => connections.get(uid, None).await?,
@@ -549,6 +585,47 @@ mod tests {
         let mut d = def("builtin.pdf", &["pdf_extractor"]);
         let err = prepare_definition(&mut d).err().map(|e| e.code());
         assert_eq!(err, Some("builtin"));
+    }
+
+    #[test]
+    fn prepare_rejects_the_uid_shadowed_by_the_validate_route() {
+        // `/pipelines/validate` is a literal POST-only route: a pipeline with that uid
+        // could be created but never fetched or deleted.
+        let mut d = def("validate", &["pdf_extractor"]);
+        let err = prepare_definition(&mut d)
+            .err()
+            .map(|e| (e.code(), e.to_string()));
+        assert_eq!(
+            err,
+            Some((
+                "validation",
+                "pipeline uid \"validate\" is reserved: it is the path of the validation route"
+                    .to_string()
+            ))
+        );
+        // Only the exact uid is reserved.
+        prepare_definition(&mut def("validate-pdf", &["pdf_extractor"])).unwrap();
+        prepare_definition(&mut def("Validate", &["pdf_extractor"])).unwrap();
+    }
+
+    #[test]
+    fn prepare_rejects_an_oversized_filename_pattern() {
+        use meili_ingest_plugin_sdk::{MAX_FILENAME_PATTERN_LEN, PipelineTrigger};
+        let mut d = def("globby", &["pdf_extractor", "meili_indexer"]);
+        d.trigger = Some(PipelineTrigger {
+            filename_pattern: Some("*a".repeat(MAX_FILENAME_PATTERN_LEN)),
+            ..Default::default()
+        });
+        let err = prepare_definition(&mut d)
+            .err()
+            .map(|e| (e.code(), e.to_string()));
+        assert_eq!(
+            err,
+            Some((
+                "validation",
+                "trigger.filename_pattern is 512 characters long, the maximum is 256".to_string()
+            ))
+        );
     }
 
     #[test]

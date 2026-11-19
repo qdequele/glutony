@@ -34,9 +34,9 @@ use serde::{Deserialize, Serialize};
 
 pub use error::RuntimeError;
 #[cfg(feature = "grpc")]
-pub use grpc::GrpcPlugin;
+pub use grpc::{GrpcConnectOptions, GrpcPlugin};
 #[cfg(feature = "wasm")]
-pub use wasm::WasmPlugin;
+pub use wasm::{WasmLimits, WasmPlugin};
 
 /// One entry of the `EXTERNAL_PLUGINS` list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,7 +45,10 @@ pub struct ExternalPluginSpec {
     pub kind: PluginKind,
     /// File path (WASM) or endpoint URI (gRPC).
     pub location: String,
-    /// Optional manifest override (see [`WasmPlugin::from_file`] / [`GrpcPlugin::connect_with_manifest`]).
+    /// Optional manifest override (see [`WasmPlugin::from_file`] /
+    /// [`GrpcPlugin::connect_with_manifest`]), for hosts that build specs in code.
+    /// [`parse_env`] never sets it, so plugins the worker loads from `EXTERNAL_PLUGINS`
+    /// always describe themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PluginManifest>,
 }
@@ -105,6 +108,9 @@ pub fn parse_env(value: &str) -> Vec<ExternalPluginSpec> {
 }
 
 /// Load one external plugin.
+///
+/// A gRPC plugin that cannot be reached or does not answer `GetManifest` yet is
+/// retried for thirty seconds (`grpc::LOAD_RETRY_FOR`) before the load fails.
 pub async fn load(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError> {
     match spec.kind {
         PluginKind::Wasm => load_wasm(spec),
@@ -115,9 +121,10 @@ pub async fn load(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeE
 
 #[cfg(feature = "wasm")]
 fn load_wasm(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError> {
-    Ok(Arc::new(WasmPlugin::from_file(
+    Ok(Arc::new(WasmPlugin::from_file_with_limits(
         &spec.location,
         spec.manifest.clone(),
+        WasmLimits::from_env()?,
     )?))
 }
 
@@ -130,8 +137,15 @@ fn load_wasm(_spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError
 
 #[cfg(feature = "grpc")]
 async fn load_grpc(spec: &ExternalPluginSpec) -> Result<Arc<dyn Plugin>, RuntimeError> {
+    // The plugin container often starts alongside the worker: wait for it a little
+    // rather than leave the plugin missing until the worker restarts.
+    let options = grpc::GrpcConnectOptions {
+        retry_for: grpc::LOAD_RETRY_FOR,
+        ..grpc::GrpcConnectOptions::default()
+    };
     Ok(Arc::new(
-        GrpcPlugin::connect_with_manifest(spec.location.clone(), spec.manifest.clone()).await?,
+        GrpcPlugin::connect_with_options(spec.location.clone(), spec.manifest.clone(), options)
+            .await?,
     ))
 }
 

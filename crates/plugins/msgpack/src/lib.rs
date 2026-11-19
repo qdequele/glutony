@@ -24,12 +24,24 @@
 //! | `title_field`    | none    | flattened key mapped onto `title` (removed from `fields`) |
 //! | `flatten_arrays` | `false` | flatten arrays of objects into `a.0.b` keys instead of keeping them as JSON arrays |
 //! | `max_depth`      | `8`     | nesting depth beyond which objects are kept as-is |
-//! | `max_records`    | unlimited | stop after this many documents |
+//! | `max_records`    | none    | stop after this many documents (truncates) |
+//!
+//! Whatever the step says, the worker's [`DecodeLimits`] (`PARSER_MAX_ROWS`,
+//! `PARSER_MAX_DECODED_MB`) bound what one payload may decode: a payload over either
+//! fails the step as invalid input instead of being truncated. Each value is
+//! measured by walking its bytes before it is decoded, so a value too large to fit
+//! is refused before any of it is allocated.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::DateTime;
-use meili_ingest_plugin_json::{FlattenConfig, documents_from_values, id_stem, select_roots};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use meili_ingest_plugin_json::limits::NODE_BYTES;
+use meili_ingest_plugin_json::{
+    DecodeBudget, DecodeLimits, FlattenConfig, UniqueKeys, documents_from_values, id_stem,
+    select_roots,
+};
 use meili_ingest_plugin_sdk::prelude::*;
 use rmpv::Utf8String;
 use rmpv::Value as Mp;
@@ -42,14 +54,21 @@ pub const NAME: &str = "msgpack_parser";
 /// The MessagePack extension type reserved for timestamps.
 const EXT_TIMESTAMP: i8 = -1;
 
-/// The MessagePack parser plugin. Stateless; construct with [`MsgpackParserPlugin::new`].
+/// The MessagePack parser plugin. Construct with [`MsgpackParserPlugin::new`].
 #[derive(Debug, Clone, Default)]
-pub struct MsgpackParserPlugin;
+pub struct MsgpackParserPlugin {
+    limits: DecodeLimits,
+}
 
 impl MsgpackParserPlugin {
-    /// Create the plugin.
+    /// Create the plugin with the default [`DecodeLimits`].
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create the plugin with the worker's [`DecodeLimits`].
+    pub fn with_limits(limits: DecodeLimits) -> Self {
+        Self { limits }
     }
 }
 
@@ -142,7 +161,8 @@ fn utf8_string(s: Utf8String) -> String {
 }
 
 /// Render a map key as a string: strings stay as they are, everything else is
-/// rendered the way it would read in JSON so no entry is silently dropped.
+/// rendered the way it would read in JSON. A key that then repeats another gets a
+/// `_2`, `_3`, … suffix ([`UniqueKeys`]), so no entry is silently dropped.
 fn map_key(key: Mp) -> String {
     match key {
         Mp::String(s) => utf8_string(s),
@@ -175,8 +195,10 @@ fn convert(value: Mp) -> Value {
         Mp::Array(items) => Value::Array(items.into_iter().map(convert).collect()),
         Mp::Map(entries) => {
             let mut out = Map::with_capacity(entries.len());
+            let mut keys = UniqueKeys::default();
             for (k, v) in entries {
-                out.insert(map_key(k), convert(v));
+                // Integer 7 and string "7" both render as "7": keep both.
+                keys.insert(&mut out, map_key(k), convert(v));
             }
             Value::Object(out)
         }
@@ -192,31 +214,176 @@ fn convert(value: Mp) -> Value {
     }
 }
 
-/// Read every concatenated MessagePack value in the payload.
-fn decode_payload(data: &[u8]) -> Result<Vec<Value>, PluginError> {
+/// Value nodes walked between two cancellation checks while measuring.
+const CANCEL_EVERY_NODES: u64 = 1 << 16;
+
+/// Base64 length of `n` bytes.
+fn base64_len(n: u64) -> u64 {
+    n.div_ceil(3) * 4
+}
+
+/// Estimated decoded size, in [`decoded_size`](meili_ingest_plugin_json::decoded_size)
+/// units, of the first MessagePack value of `data`, found by walking its markers
+/// without allocating anything. Fails as soon as the value cannot fit in `budget`,
+/// so a huge value is refused before it is decoded. `Ok(None)` when the bytes end
+/// before the value does, or hold a marker MessagePack never uses.
+fn measure_value(
+    data: &[u8],
+    budget: &DecodeBudget,
+    cancelled: &AtomicBool,
+) -> Result<Option<u64>, PluginError> {
+    let mut pos = 0usize;
+    // Big-endian length of `width` bytes at `pos`.
+    let read_len = |pos: &mut usize, width: usize| -> Option<u64> {
+        let bytes = data.get(*pos..*pos + width)?;
+        *pos += width;
+        Some(bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+    };
+    let mut pending: u64 = 1;
+    let mut size: u64 = 0;
+    let mut nodes: u64 = 0;
+    while pending > 0 {
+        pending -= 1;
+        nodes += 1;
+        if nodes.is_multiple_of(CANCEL_EVERY_NODES) {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(PluginError::Cancelled);
+            }
+            budget.check_bytes(size)?;
+        }
+        let Some(&marker) = data.get(pos) else {
+            return Ok(None);
+        };
+        pos += 1;
+        size += NODE_BYTES;
+        // Payload bytes to skip, and the decoded text they add.
+        let (skip, text): (u64, u64) = match marker {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => {
+                pending += 2 * u64::from(marker & 0x0f);
+                (0, 0)
+            }
+            0x90..=0x9f => {
+                pending += u64::from(marker & 0x0f);
+                (0, 0)
+            }
+            0xa0..=0xbf => {
+                let n = u64::from(marker & 0x1f);
+                (n, n)
+            }
+            0xc4..=0xc6 => {
+                let Some(n) = read_len(&mut pos, 1 << (marker - 0xc4)) else {
+                    return Ok(None);
+                };
+                (n, base64_len(n))
+            }
+            0xc7..=0xc9 => {
+                let Some(n) = read_len(&mut pos, 1 << (marker - 0xc7)) else {
+                    return Ok(None);
+                };
+                // The type byte, then the data; rendered as base64 or a timestamp.
+                (n + 1, base64_len(n).max(40))
+            }
+            0xca => (4, 0),
+            0xcb => (8, 0),
+            0xcc..=0xcf => (1 << (marker - 0xcc), 0),
+            0xd0..=0xd3 => (1 << (marker - 0xd0), 0),
+            0xd4..=0xd8 => {
+                let n = 1u64 << (marker - 0xd4);
+                (n + 1, base64_len(n).max(40))
+            }
+            0xd9..=0xdb => {
+                let Some(n) = read_len(&mut pos, 1 << (marker - 0xd9)) else {
+                    return Ok(None);
+                };
+                (n, n)
+            }
+            0xdc | 0xdd => {
+                let Some(n) = read_len(&mut pos, if marker == 0xdc { 2 } else { 4 }) else {
+                    return Ok(None);
+                };
+                pending += n;
+                (0, 0)
+            }
+            0xde | 0xdf => {
+                let Some(n) = read_len(&mut pos, if marker == 0xde { 2 } else { 4 }) else {
+                    return Ok(None);
+                };
+                pending += 2 * n;
+                (0, 0)
+            }
+            // Never used by MessagePack.
+            0xc1 => return Ok(None),
+        };
+        let Some(end) = usize::try_from(skip).ok().and_then(|s| pos.checked_add(s)) else {
+            return Ok(None);
+        };
+        if end > data.len() {
+            return Ok(None);
+        }
+        pos = end;
+        size += text;
+        // Every pending item takes at least one more byte: a count past the bytes
+        // left is a truncated value, not a reason to keep walking.
+        if pending > (data.len() - pos) as u64 {
+            return Ok(None);
+        }
+    }
+    budget.check_bytes(size)?;
+    Ok(Some(size))
+}
+
+/// Read the concatenated MessagePack values in the payload: all of them, or the
+/// first `max_records` when set. Each value is measured against `limits` before it
+/// is decoded, and the records produced are counted against them.
+fn decode_payload(
+    data: &[u8],
+    max_records: Option<usize>,
+    limits: DecodeLimits,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Value>, PluginError> {
     if data.is_empty() {
         return Err(PluginError::InvalidInput(format!(
             "{NAME}: payload is empty"
         )));
     }
+    let mut budget = DecodeBudget::new(limits, NAME);
     let mut rest = data;
     let mut values = Vec::new();
     while !rest.is_empty() {
-        let value = rmpv::decode::read_value(&mut rest).map_err(|e| {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(PluginError::Cancelled);
+        }
+        if max_records.is_some_and(|max| values.len() >= max) {
+            // More values follow, so the payload is a concatenation: one record each.
+            break;
+        }
+        let (count, offset) = (values.len(), data.len() - rest.len());
+        let invalid = |why: &dyn std::fmt::Display| {
             PluginError::InvalidInput(format!(
-                "{NAME}: invalid MessagePack after {} value(s) at byte {}: {e}",
-                values.len(),
-                data.len() - rest.len()
+                "{NAME}: invalid MessagePack after {count} value(s) at byte {offset}: {why}"
             ))
-        })?;
+        };
+        budget.add_rows(1)?;
+        let size = measure_value(rest, &budget, cancelled)?
+            .ok_or_else(|| invalid(&"the value is truncated or uses a reserved marker"))?;
+        budget.add_bytes(size)?;
+        let value = rmpv::decode::read_value(&mut rest).map_err(|e| invalid(&e))?;
         values.push(convert(value));
     }
     // One value behaves like a JSON document: an array or a wrapper object holds
     // the records. Several concatenated values are already one record each.
-    Ok(match values.len() {
-        1 => select_roots(values.pop().expect("len checked")),
-        _ => values,
-    })
+    let mut roots = if values.len() == 1 && rest.is_empty() {
+        select_roots(values.pop().expect("len checked"))
+    } else {
+        values
+    };
+    if let Some(max) = max_records {
+        roots.truncate(max);
+    }
+    // The records a single value holds were counted as one row above.
+    budget.check_rows(roots.len() as u64)?;
+    Ok(roots)
 }
 
 #[async_trait]
@@ -266,7 +433,7 @@ impl Plugin for MsgpackParserPlugin {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "default": null,
-                        "description": "Stop after this many documents."
+                        "description": "Stop after this many documents. The worker's PARSER_MAX_ROWS still applies."
                     }
                 }
             }))
@@ -280,31 +447,34 @@ impl Plugin for MsgpackParserPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let flatten = cfg.flatten()?;
-        let blob = input.into_bytes()?;
+        let mut blob = input.into_bytes()?;
         ctx.check_cancelled()?;
 
-        let data = blob.data.clone();
-        let mut roots = run_blocking(move || decode_payload(&data)).await??;
-        if let Some(max) = cfg.max_records {
-            roots.truncate(max);
-        }
-
-        let stem = id_stem(blob.filename.as_deref(), "msgpack");
+        let stem = id_stem(&blob, "msgpack");
         let meta = DocumentMeta {
             source: blob.filename.clone(),
             filename: blob.filename.clone(),
             mime: Some(blob.mime.clone()),
             ..Default::default()
         };
-        let items = roots
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (v, format!("{stem}_{i}")))
-            .collect();
-
-        Ok(PluginOutput::Documents(documents_from_values(
-            ctx, items, &flatten, &meta, NAME,
-        )?))
+        // Moved, not cloned: nothing below reads the bytes again.
+        let data = std::mem::take(&mut blob.data);
+        let max_records = cfg.max_records;
+        let limits = self.limits;
+        let ctx = ctx.clone();
+        // Decoding and flattening are CPU-bound: keep them off the async runtime.
+        let docs = run_blocking(move || {
+            let roots = decode_payload(&data, max_records, limits, &ctx.cancellation_flag())?;
+            drop(data);
+            let items = roots
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (v, format!("{stem}_{i}")))
+                .collect();
+            documents_from_values(&ctx, items, &flatten, &meta, NAME)
+        })
+        .await??;
+        Ok(PluginOutput::Documents(docs))
     }
 }
 
@@ -346,7 +516,7 @@ mod tests {
 
     #[test]
     fn manifest_is_correct() {
-        let m = MsgpackParserPlugin.manifest();
+        let m = MsgpackParserPlugin::new().manifest();
         assert_eq!(m.name, NAME);
         assert_eq!(m.accepts, vec![InputKind::Bytes]);
         assert_eq!(m.produces, OutputKind::Documents);
@@ -408,6 +578,41 @@ mod tests {
 
         let docs = run(data, None, json!({"max_records": 2})).await;
         assert_eq!(docs.len(), 2, "max_records truncates");
+    }
+
+    #[tokio::test]
+    async fn keys_that_stringify_alike_both_survive() {
+        let value = Mp::Map(vec![
+            (Mp::Integer(7.into()), Mp::String("by-int".into())),
+            (Mp::String("7".into()), Mp::String("by-str".into())),
+        ]);
+        let docs = run(pack_raw(&value), None, json!({})).await;
+        let f = &docs[0].fields;
+        assert_eq!(f["7"], json!("by-int"));
+        assert_eq!(f["7_2"], json!("by-str"));
+    }
+
+    #[tokio::test]
+    async fn a_map_of_one_repeated_key_is_converted_in_linear_time() {
+        // Each repeat used to search the suffixes from `_2` again: n^2/2 lookups.
+        let n = 30_000;
+        let value = Mp::Map(
+            (0..n)
+                .map(|i| (Mp::String("k".into()), Mp::Integer(i.into())))
+                .collect(),
+        );
+        let started = std::time::Instant::now();
+        let docs = run(pack_raw(&value), None, json!({})).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+        let f = &docs[0].fields;
+        assert_eq!(f["k"], json!(0));
+        for i in 2..=n {
+            assert_eq!(f[&format!("k_{i}")], json!(i - 1), "k_{i}");
+        }
     }
 
     #[tokio::test]
@@ -504,6 +709,111 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PluginError::InvalidInput(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn concatenated_values_over_the_default_row_limit_fail() {
+        // One `nil` byte per value.
+        let rows = meili_ingest_plugin_json::limits::DEFAULT_MAX_ROWS as usize + 1;
+        let err = MsgpackParserPlugin::new()
+            .execute(
+                &ActivityContext::noop(),
+                bytes(vec![0xC0; rows], None),
+                Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_worker_limits_bound_records_and_decoded_bytes_before_decoding() {
+        let never = AtomicBool::new(false);
+        let rows_cap = DecodeLimits {
+            max_rows: 3,
+            ..DecodeLimits::default()
+        };
+        // Concatenated values, and the elements of a single array value.
+        for data in [vec![0xC0; 4], pack(&json!([1, 2, 3, 4]))] {
+            let err = decode_payload(&data, None, rows_cap, &never).unwrap_err();
+            assert!(
+                matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_ROWS")),
+                "{err}"
+            );
+            // Truncating below the cap is the step's own choice; above it is not.
+            assert_eq!(
+                decode_payload(&data, Some(3), rows_cap, &never)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert!(decode_payload(&data, Some(4), rows_cap, &never).is_err());
+        }
+        // `max_records` reading only the first value still treats the payload as
+        // a concatenation, as before.
+        let mut two = pack(&json!([1, 2]));
+        two.extend(pack(&json!([3])));
+        assert_eq!(
+            decode_payload(&two, Some(1), DecodeLimits::default(), &never).unwrap(),
+            vec![json!([1, 2])]
+        );
+
+        // One map holding an array of a million nils: a ~1 MB value whose decode
+        // would take ~32 MB. It is refused before rmpv allocates it.
+        let mut data = vec![0x81, 0xA1, b'v', 0xDD];
+        data.extend(1_000_000u32.to_be_bytes());
+        data.extend(vec![0xC0; 1_000_000]);
+        let bytes_cap = DecodeLimits {
+            max_decoded_bytes: 1024 * 1024,
+            ..DecodeLimits::default()
+        };
+        let err = decode_payload(&data, None, bytes_cap, &never).unwrap_err();
+        assert!(
+            matches!(&err, PluginError::InvalidInput(m) if m.contains("PARSER_MAX_DECODED_MB")),
+            "{err}"
+        );
+        assert_eq!(
+            decode_payload(&data, None, DecodeLimits::default(), &never)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_measured_size_matches_the_decoded_values() {
+        let never = AtomicBool::new(false);
+        let budget = DecodeBudget::new(DecodeLimits::default(), NAME);
+        let value = json!({"id": 1, "name": "Alice", "tags": ["a", "b"], "n": null, "f": 1.5});
+        let size = measure_value(&pack(&value), &budget, &never)
+            .unwrap()
+            .unwrap();
+        let string = std::mem::size_of::<String>() as u64;
+        // The measure counts keys as nodes; the decoded map as key strings.
+        let decoded = meili_ingest_plugin_json::decoded_size(&value);
+        assert!(
+            size + 5 * string >= decoded && size <= decoded + 5 * NODE_BYTES,
+            "{size} vs {decoded}"
+        );
+        // Truncated values and the reserved marker are not measured.
+        assert_eq!(measure_value(&[0x92, 0xC0], &budget, &never).unwrap(), None);
+        assert_eq!(measure_value(&[0xC1], &budget, &never).unwrap(), None);
+        assert_eq!(
+            measure_value(&[0xDD, 0xFF, 0xFF, 0xFF, 0xFF], &budget, &never).unwrap(),
+            None,
+            "a count past the bytes left is not walked"
+        );
+    }
+
+    #[test]
+    fn a_cancel_stops_the_decode_loop() {
+        let cancelled = AtomicBool::new(true);
+        let err =
+            decode_payload(&[0xC0; 10], None, DecodeLimits::default(), &cancelled).unwrap_err();
+        assert!(matches!(err, PluginError::Cancelled), "{err}");
     }
 
     #[tokio::test]

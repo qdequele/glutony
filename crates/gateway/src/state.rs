@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use meili_ingest_blob::BlobStore;
 use meili_ingest_plugin_sdk::{
-    JobStatus, PipelineDefinition, PipelineWorkflowInput, PluginManifest, WorkflowProgress,
+    ARCHIVE_WORKFLOW_TYPE, ArchiveWorkflowInput, JobStatus, PipelineDefinition,
+    PipelineWorkflowInput, PluginManifest, WorkflowProgress,
 };
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
@@ -34,24 +35,59 @@ pub const WORKFLOW_TYPE: &str = "PipelineWorkflow";
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration of the read-side usage analytics API.
+/// Where the read-side usage analytics API (`GET /usage`) reads from.
 #[derive(Clone)]
-pub struct UsageApiConfig {
-    /// Tinybird API base URL for the workspace's region.
-    pub base_url: String,
-    /// Read token. Held server-side only; never sent to a browser.
-    pub token: String,
-    /// Endpoint pipe name backing the dashboard.
-    pub pipe: String,
+pub enum UsageApiConfig {
+    /// A Tinybird endpoint pipe.
+    Tinybird {
+        /// Tinybird API base URL for the workspace's region.
+        base_url: String,
+        /// Read token. Held server-side only; never sent to a browser.
+        token: String,
+        /// Endpoint pipe name backing the dashboard.
+        pipe: String,
+    },
+    /// The usage table in a self-hosted ClickHouse (`USAGE_CLICKHOUSE_*`).
+    ClickHouse(meili_ingest_usage::clickhouse::ClickHouseConfig),
 }
 
 impl std::fmt::Debug for UsageApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UsageApiConfig")
-            .field("base_url", &self.base_url)
-            .field("pipe", &self.pipe)
-            .field("token", &"<redacted>")
-            .finish()
+        match self {
+            Self::Tinybird { base_url, pipe, .. } => f
+                .debug_struct("Tinybird")
+                .field("base_url", base_url)
+                .field("pipe", pipe)
+                .field("token", &"<redacted>")
+                .finish(),
+            // ClickHouseConfig redacts its own password.
+            Self::ClickHouse(c) => f.debug_tuple("ClickHouse").field(c).finish(),
+        }
+    }
+}
+
+impl UsageApiConfig {
+    /// `TINYBIRD_READ_TOKEN` (Tinybird) or `USAGE_CLICKHOUSE_URL` (ClickHouse); neither
+    /// is `None` (`GET /usage` answers 501), both is an error.
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let clickhouse = meili_ingest_usage::clickhouse::ClickHouseConfig::from_env()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match (env_opt("TINYBIRD_READ_TOKEN"), clickhouse) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "both TINYBIRD_READ_TOKEN and USAGE_CLICKHOUSE_URL are set: pick one usage store"
+            ),
+            // The dashboard proxy needs a READ token, which is a different token from
+            // the append token the workers use to write usage events.
+            (Some(token), None) => Ok(Some(Self::Tinybird {
+                base_url: env_or("TINYBIRD_BASE_URL", "https://api.tinybird.co")
+                    .trim_end_matches('/')
+                    .to_string(),
+                token,
+                pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
+            })),
+            (None, Some(c)) => Ok(Some(Self::ClickHouse(c))),
+            (None, None) => Ok(None),
+        }
     }
 }
 
@@ -66,7 +102,7 @@ pub struct GatewayConfig {
     pub temporal_namespace: String,
     /// Internal control plane base URL (`CONTROL_PLANE_URL`).
     pub control_plane_url: String,
-    /// Bearer token for the control plane's `/internal/*` routes (`CONTROL_PLANE_TOKEN`).
+    /// Bearer token for the control plane, sent on every request (`CONTROL_PLANE_TOKEN`).
     pub control_plane_token: Option<String>,
     /// Standalone fallback Meilisearch host (`MEILI_URL`).
     pub meili_url: Option<String>,
@@ -76,6 +112,10 @@ pub struct GatewayConfig {
     pub default_index: String,
     /// Maximum upload size in MiB (`MAX_UPLOAD_MB`, default 500).
     pub max_upload_mb: usize,
+    /// Request body the ingest routes may hold in memory at once, in MiB
+    /// (`MAX_INFLIGHT_UPLOAD_MB`). `None` is twice `max_upload_mb`, `Some(0)` turns the
+    /// budget off. See [`UploadBudget`].
+    pub max_inflight_upload_mb: Option<usize>,
     /// Shared secret that must be carried in `X-Meili-Envoy-Secret` for the `X-Meili-*`
     /// headers to be honoured (`ENVOY_TRUSTED_HEADER`). `None` = trust everyone (dev mode).
     pub envoy_trusted_header: Option<String>,
@@ -122,6 +162,7 @@ impl std::fmt::Debug for GatewayConfig {
             )
             .field("default_index", &self.default_index)
             .field("max_upload_mb", &self.max_upload_mb)
+            .field("max_inflight_upload_mb", &self.max_inflight_upload_mb)
             .field(
                 "envoy_trusted_header",
                 &self.envoy_trusted_header.as_ref().map(|_| "<redacted>"),
@@ -155,6 +196,7 @@ impl Default for GatewayConfig {
             meili_api_key: None,
             default_index: "documents".into(),
             max_upload_mb: 500,
+            max_inflight_upload_mb: None,
             envoy_trusted_header: None,
             blob_store_url: "file://./blobs".into(),
             inline_max_bytes: 1_048_576,
@@ -181,22 +223,24 @@ impl GatewayConfig {
             meili_api_key: env_opt("MEILI_API_KEY"),
             default_index: env_or("DEFAULT_INDEX", &d.default_index),
             max_upload_mb: env_parse("MAX_UPLOAD_MB", d.max_upload_mb)?,
+            max_inflight_upload_mb: env_opt("MAX_INFLIGHT_UPLOAD_MB")
+                .map(|v| {
+                    v.parse::<usize>()
+                        .map_err(|e| anyhow::anyhow!("invalid MAX_INFLIGHT_UPLOAD_MB={v:?}: {e}"))
+                })
+                .transpose()?,
             envoy_trusted_header: env_opt("ENVOY_TRUSTED_HEADER"),
             blob_store_url: env_or("BLOB_STORE_URL", &d.blob_store_url),
             inline_max_bytes: env_parse("INLINE_MAX_BYTES", d.inline_max_bytes)?,
-            // The dashboard proxy needs a READ token, which is a different token from
-            // the append token the workers use to write usage events.
-            usage_api: env_opt("TINYBIRD_READ_TOKEN").map(|token| UsageApiConfig {
-                base_url: env_or("TINYBIRD_BASE_URL", "https://api.tinybird.co")
-                    .trim_end_matches('/')
-                    .to_string(),
-                token,
-                pipe: env_or("TINYBIRD_USAGE_PIPE", "tenant_usage"),
-            }),
+            usage_api: UsageApiConfig::from_env()?,
             cors_allow_origins: env_opt("CORS_ALLOW_ORIGINS")
                 .map(|v| split_list(&v))
                 .unwrap_or_default(),
-            write_preflight: env_parse("WRITE_PREFLIGHT", d.write_preflight)?,
+            write_preflight: flag_or(
+                "WRITE_PREFLIGHT",
+                env_opt("WRITE_PREFLIGHT"),
+                d.write_preflight,
+            ),
             lab_service_token: env_opt("LAB_SERVICE_TOKEN"),
             admin_api_key: env_opt("ADMIN_API_KEY"),
         })
@@ -245,6 +289,127 @@ impl GatewayConfig {
     pub fn max_upload_bytes(&self) -> usize {
         self.max_upload_mb.saturating_mul(1024 * 1024)
     }
+
+    /// Bytes of request body the ingest routes may hold at once, or `None` when the
+    /// budget is off (`MAX_INFLIGHT_UPLOAD_MB=0`). Never less than one maximum-size
+    /// upload, so an idle gateway always admits any request it would accept.
+    pub fn inflight_upload_bytes(&self) -> Option<usize> {
+        let mb = self
+            .max_inflight_upload_mb
+            .unwrap_or_else(|| self.max_upload_mb.saturating_mul(2));
+        if mb == 0 {
+            return None;
+        }
+        Some(mb.max(self.max_upload_mb).saturating_mul(1024 * 1024))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-flight upload budget
+// ---------------------------------------------------------------------------
+
+/// How long a request waits for room in the [`UploadBudget`] before a 503.
+pub const UPLOAD_BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `Retry-After` of a 503 [`GatewayError::Overloaded`], in seconds.
+pub const OVERLOADED_RETRY_AFTER_SECS: u32 = 5;
+
+/// The budget is counted in KiB, so a `u32` permit count covers any body.
+const BUDGET_UNIT: usize = 1024;
+
+/// A byte-weighted bound on the request bodies the ingest routes hold at once.
+///
+/// The ingest routes buffer the whole body before anything else, so without a bound a
+/// few concurrent maximum-size uploads exhaust the gateway's memory. Each request is
+/// charged its declared `Content-Length`, or the whole upload limit when it declares
+/// none, before its body is read, and holds that charge until its response is built.
+/// One that does not fit waits up to [`UPLOAD_BUDGET_WAIT`] (in arrival order), then
+/// is refused with a 503. The budget is never smaller than the upload limit, so an
+/// idle gateway always admits one request.
+#[derive(Clone)]
+pub struct UploadBudget {
+    permits: Option<Arc<tokio::sync::Semaphore>>,
+    total_units: u32,
+    max_charge: usize,
+    wait: std::time::Duration,
+}
+
+impl std::fmt::Debug for UploadBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadBudget")
+            .field("enabled", &self.permits.is_some())
+            .field("total_kib", &self.total_units)
+            .field("max_charge", &self.max_charge)
+            .field("wait", &self.wait)
+            .finish()
+    }
+}
+
+fn budget_units(bytes: usize) -> u32 {
+    u32::try_from(bytes.div_ceil(BUDGET_UNIT)).unwrap_or(u32::MAX)
+}
+
+impl UploadBudget {
+    /// A budget of `total` bytes (`None`: unbounded) for bodies of at most `max_charge`
+    /// bytes. `total` is raised to `max_charge` if it is smaller.
+    pub fn new(total: Option<usize>, max_charge: usize, wait: std::time::Duration) -> Self {
+        let total_units = total.map_or(0, |t| budget_units(t.max(max_charge)));
+        Self {
+            permits: total.map(|_| Arc::new(tokio::sync::Semaphore::new(total_units as usize))),
+            total_units,
+            max_charge,
+            wait,
+        }
+    }
+
+    /// The budget [`GatewayConfig`] asks for.
+    pub fn from_config(config: &GatewayConfig) -> Self {
+        if let Some(mb) = config.max_inflight_upload_mb
+            && mb != 0
+            && mb < config.max_upload_mb
+        {
+            tracing::warn!(
+                max_inflight_upload_mb = mb,
+                max_upload_mb = config.max_upload_mb,
+                "MAX_INFLIGHT_UPLOAD_MB is below MAX_UPLOAD_MB; raised to it so one \
+                 maximum-size upload always fits"
+            );
+        }
+        Self::new(
+            config.inflight_upload_bytes(),
+            config.max_upload_bytes(),
+            UPLOAD_BUDGET_WAIT,
+        )
+    }
+
+    /// The same budget with another wait, for tests.
+    pub fn with_wait(mut self, wait: std::time::Duration) -> Self {
+        self.wait = wait;
+        self
+    }
+
+    /// Reserve room for a body that declares `declared` bytes (`None`: unknown, charged
+    /// the whole upload limit). The reservation is released when the guard drops.
+    pub async fn admit(
+        &self,
+        declared: Option<u64>,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, GatewayError> {
+        let Some(permits) = &self.permits else {
+            return Ok(None);
+        };
+        let bytes = declared.map_or(self.max_charge, |d| {
+            usize::try_from(d).map_or(self.max_charge, |d| d.min(self.max_charge))
+        });
+        let units = budget_units(bytes).min(self.total_units);
+        match tokio::time::timeout(self.wait, permits.clone().acquire_many_owned(units)).await {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            // The semaphore is never closed.
+            Ok(Err(e)) => Err(GatewayError::Internal(format!("upload budget: {e}"))),
+            Err(_) => Err(GatewayError::Overloaded(
+                "the gateway is holding as many uploads as it can; retry later".into(),
+            )),
+        }
+    }
 }
 
 /// The value the example Secret ships for every secret (`k8s/secrets.example.yaml`).
@@ -275,6 +440,13 @@ fn split_list(value: &str) -> Vec<String> {
 
 fn env_or(name: &str, default: &str) -> String {
     env_opt(name).unwrap_or_else(|| default.to_string())
+}
+
+/// A boolean flag ([`meili_ingest_plugin_sdk::env::flag`]); `default` when unset or blank.
+fn flag_or(name: &str, raw: Option<String>, default: bool) -> bool {
+    raw.map_or(default, |v| {
+        meili_ingest_plugin_sdk::env::flag(name, Some(&v))
+    })
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T>
@@ -320,6 +492,12 @@ pub struct JobSnapshot {
 pub trait WorkflowStarter: Send + Sync {
     /// Start a `PipelineWorkflow` for `input`.
     async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError>;
+    /// Start an `ArchiveWorkflow` for `input`, under the same `ingest-<job_id>` id
+    /// scheme, so `progress` and `cancel` work on it unchanged.
+    async fn start_archive(
+        &self,
+        input: &ArchiveWorkflowInput,
+    ) -> Result<StartedWorkflow, GatewayError>;
     /// Describe + `progress`-query the workflow of `job_id`. `Ok(None)` when Temporal does
     /// not know the workflow.
     async fn progress(&self, job_id: Uuid) -> Result<Option<JobSnapshot>, GatewayError>;
@@ -373,19 +551,24 @@ pub fn combine_status(described: JobStatus, progress: Option<&WorkflowProgress>)
     }
 }
 
-#[async_trait]
-impl WorkflowStarter for TemporalStarter {
-    async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError> {
+impl TemporalStarter {
+    /// Start workflow `workflow_type` for job `job_id` on [`WORKFLOW_TASK_QUEUE`].
+    async fn start_job<T: Serialize + 'static>(
+        &self,
+        workflow_type: &str,
+        job_id: Uuid,
+        input: &T,
+    ) -> Result<StartedWorkflow, GatewayError> {
         let conv = PayloadConverter::default();
         let raw = RawValue::from_value(input, &conv);
         let handle = self
             .0
             .start_workflow(
-                UntypedWorkflow::new(WORKFLOW_TYPE),
+                UntypedWorkflow::new(workflow_type),
                 raw,
                 WorkflowStartOptions::new(
                     WORKFLOW_TASK_QUEUE,
-                    PipelineWorkflowInput::workflow_id(input.job_id),
+                    PipelineWorkflowInput::workflow_id(job_id),
                 )
                 .build(),
             )
@@ -395,6 +578,21 @@ impl WorkflowStarter for TemporalStarter {
             workflow_id: handle.info().workflow_id.clone(),
             run_id: handle.info().run_id.clone(),
         })
+    }
+}
+
+#[async_trait]
+impl WorkflowStarter for TemporalStarter {
+    async fn start(&self, input: &PipelineWorkflowInput) -> Result<StartedWorkflow, GatewayError> {
+        self.start_job(WORKFLOW_TYPE, input.job_id, input).await
+    }
+
+    async fn start_archive(
+        &self,
+        input: &ArchiveWorkflowInput,
+    ) -> Result<StartedWorkflow, GatewayError> {
+        self.start_job(ARCHIVE_WORKFLOW_TYPE, input.job_id, input)
+            .await
     }
 
     async fn progress(&self, job_id: Uuid) -> Result<Option<JobSnapshot>, GatewayError> {
@@ -606,6 +804,25 @@ impl ControlPlaneClient {
         format!("{}{}", self.base_url, path)
     }
 
+    /// `{base}/pipelines/{uid}`, with `uid` as one percent-encoded path segment, so a
+    /// name carrying `?`, `#` or `/` can never rewrite the query or the path of a
+    /// request sent with the control plane token. An empty name or a dot segment
+    /// addresses no pipeline and is a [`GatewayError::NotFound`] without a request.
+    fn pipeline_url(&self, uid: &str) -> Result<url::Url, GatewayError> {
+        if matches!(uid, "" | "." | "..") {
+            return Err(GatewayError::NotFound(format!(
+                "pipeline {uid:?} not found"
+            )));
+        }
+        let mut url = url::Url::parse(&self.url("/pipelines/"))
+            .map_err(|e| GatewayError::Internal(format!("control plane url: {e}")))?;
+        url.path_segments_mut()
+            .map_err(|()| GatewayError::Internal("control plane url cannot be a base".into()))?
+            .pop_if_empty()
+            .push(uid);
+        Ok(url)
+    }
+
     pub(crate) fn tenant_query(tenant_id: Option<&str>) -> Vec<(&'static str, String)> {
         tenant_id
             .map(|p| vec![("tenant_id", p.to_string())])
@@ -632,6 +849,7 @@ impl ControlPlaneClient {
         match status {
             StatusCode::NOT_FOUND => GatewayError::NotFound(msg),
             StatusCode::FORBIDDEN => GatewayError::Forbidden(msg),
+            StatusCode::CONFLICT => GatewayError::Conflict(msg),
             StatusCode::BAD_REQUEST => GatewayError::BadRequest(msg),
             StatusCode::UNPROCESSABLE_ENTITY if code.as_deref() == Some("invalid_step_config") => {
                 GatewayError::InvalidStepConfig {
@@ -701,7 +919,7 @@ impl ControlPlaneClient {
     ) -> Result<PipelineDefinition, GatewayError> {
         self.send_json(
             self.http
-                .get(self.url(&format!("/pipelines/{uid}")))
+                .get(self.pipeline_url(uid)?)
                 .query(&Self::tenant_query(tenant_id)),
             "get pipeline",
         )
@@ -767,7 +985,7 @@ impl ControlPlaneClient {
         let resp = self
             .authed(
                 self.http
-                    .delete(self.url(&format!("/pipelines/{uid}")))
+                    .delete(self.pipeline_url(uid)?)
                     .query(&Self::tenant_query(tenant_id)),
             )
             .send()
@@ -854,8 +1072,14 @@ pub struct AppState {
     pub schedules: Arc<dyn crate::schedules::ScheduleClient>,
     /// Which hosts a source may fetch from (`SOURCE_FETCH_HOSTS`), checked on save.
     pub fetch_policy: meili_ingest_source::HostPolicy,
+    /// Client for probing the type of an ingest URL whose name says nothing. Follows no
+    /// redirect on its own, so `fetch_policy` sees every hop.
+    pub probe_http: reqwest::Client,
     /// The Lab, when this deployment reports to one (`LAB_URL` + `LAB_INSTANCE_*`).
     pub lab: Option<Arc<crate::lab::LabClient>>,
+    /// Bound on the request bodies the ingest routes hold at once
+    /// (`MAX_INFLIGHT_UPLOAD_MB`).
+    pub upload_budget: UploadBudget,
 }
 
 impl std::fmt::Debug for AppState {
@@ -866,6 +1090,7 @@ impl std::fmt::Debug for AppState {
             .field("blob", &self.blob)
             .field("connections", &self.connections)
             .field("lab", &self.lab)
+            .field("upload_budget", &self.upload_budget)
             .finish_non_exhaustive()
     }
 }
@@ -880,7 +1105,9 @@ impl AppState {
     ) -> Self {
         let control_plane = ControlPlaneClient::new(config.control_plane_url.clone(), http.clone())
             .with_token(config.control_plane_token.clone());
+        let upload_budget = UploadBudget::from_config(&config);
         Self {
+            upload_budget,
             config: Arc::new(config),
             temporal,
             control_plane,
@@ -889,6 +1116,7 @@ impl AppState {
             connections: crate::connections::ConnectionConfig::default(),
             schedules: Arc::new(crate::schedules::DisabledSchedules),
             fetch_policy: meili_ingest_source::HostPolicy::default(),
+            probe_http: meili_ingest_source::ResolveRuntime::http_client(),
             lab: None,
         }
     }
@@ -912,6 +1140,12 @@ impl AppState {
         self
     }
 
+    /// Replace the in-flight upload budget (tests use a shorter wait).
+    pub fn with_upload_budget(mut self, upload_budget: UploadBudget) -> Self {
+        self.upload_budget = upload_budget;
+        self
+    }
+
     /// Attach the Lab client: hosted deployments then pre-check credits before each job.
     pub fn with_lab(mut self, lab: Arc<crate::lab::LabClient>) -> Self {
         self.lab = Some(lab);
@@ -922,6 +1156,20 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_preflight_takes_every_boolean_spelling() {
+        let parse = |raw: Option<&str>| flag_or("WRITE_PREFLIGHT", raw.map(str::to_owned), false);
+        assert!(parse(Some("1")));
+        assert!(parse(Some("TRUE")));
+        assert!(parse(Some("on")));
+        assert!(!parse(Some("0")));
+        assert!(
+            !parse(Some("maybe")),
+            "unrecognised is off, not a boot error"
+        );
+        assert!(!parse(None));
+    }
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1031,6 +1279,83 @@ mod tests {
         assert!(!dbg.contains("lab-secret-value"));
         assert!(!dbg.contains("admin-secret-value"));
         assert_eq!(cfg.max_upload_bytes(), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_inflight_budget_defaults_to_twice_the_upload_limit_and_never_below_it() {
+        const MIB: usize = 1024 * 1024;
+        let with = |max_upload_mb, max_inflight_upload_mb| GatewayConfig {
+            max_upload_mb,
+            max_inflight_upload_mb,
+            ..Default::default()
+        };
+        assert_eq!(
+            GatewayConfig::default().inflight_upload_bytes(),
+            Some(1000 * MIB)
+        );
+        assert_eq!(with(10, Some(64)).inflight_upload_bytes(), Some(64 * MIB));
+        assert_eq!(
+            with(10, Some(3)).inflight_upload_bytes(),
+            Some(10 * MIB),
+            "raised so one maximum-size upload always fits"
+        );
+        assert_eq!(with(10, Some(0)).inflight_upload_bytes(), None, "off");
+    }
+
+    #[tokio::test]
+    async fn the_upload_budget_admits_what_fits_and_refuses_the_rest() {
+        use std::time::Duration;
+        const MIB: usize = 1024 * 1024;
+        let wait = Duration::from_millis(20);
+        // Configured below the upload limit: an idle gateway still admits a maximum one.
+        let budget = UploadBudget::new(Some(MIB / 2), MIB, wait);
+        let full = budget
+            .admit(Some(MIB as u64))
+            .await
+            .expect("idle admits the max");
+        let err = budget.admit(Some(1)).await.expect_err("nothing left");
+        assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), "overloaded");
+        drop(full);
+        budget
+            .admit(Some(1))
+            .await
+            .expect("room again once released");
+
+        // A body that declares no length is charged the whole limit.
+        let budget = UploadBudget::new(Some(2 * MIB), MIB, wait);
+        let unknown = budget.admit(None).await.expect("first");
+        let small = budget
+            .admit(Some(1000))
+            .await
+            .expect("small fits beside it");
+        budget
+            .admit(None)
+            .await
+            .expect_err("a second unknown does not");
+        drop((unknown, small));
+
+        // A declared length over the limit (refused with 413 before this) is capped.
+        UploadBudget::new(Some(MIB), MIB, wait)
+            .admit(Some(u64::MAX))
+            .await
+            .expect("capped at the limit");
+
+        // Off: everything is admitted.
+        let off = UploadBudget::new(None, MIB, wait);
+        let held: Vec<_> = admit_unbounded(&off, 8).await;
+        assert!(held.iter().all(Option::is_none));
+    }
+
+    async fn admit_unbounded(
+        budget: &UploadBudget,
+        n: usize,
+    ) -> Vec<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let mut held = Vec::new();
+        for _ in 0..n {
+            held.push(budget.admit(None).await.expect("unbounded"));
+        }
+        held
     }
 
     #[test]
@@ -1296,5 +1621,96 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{cfg:?}").contains("cp-token-value"));
+    }
+
+    /// The control plane guards every route but `/health` and `/metrics`, so the
+    /// registry, job list and plugin calls must carry the bearer too.
+    #[tokio::test]
+    async fn the_control_plane_token_is_sent_on_the_registry_routes() {
+        let server = MockServer::start().await;
+        let bearer = || wiremock::matchers::header("authorization", "Bearer cp-token");
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plugins"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jobs"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/pipelines/p"))
+            .and(bearer())
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new())
+            .with_token(Some("cp-token".into()));
+        cp.list_pipelines(None).await.unwrap();
+        cp.list_plugins().await.unwrap();
+        cp.list_jobs(&[]).await.unwrap();
+        cp.delete_pipeline("p", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_uid_stays_one_path_segment() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let cp = ControlPlaneClient::new(server.uri(), reqwest::Client::new());
+        for (uid, encoded) in [
+            ("a?tenant_id=v", "/pipelines/a%3Ftenant_id=v"),
+            ("a#b", "/pipelines/a%23b"),
+            ("../metrics", "/pipelines/..%2Fmetrics"),
+            ("a/b", "/pipelines/a%2Fb"),
+        ] {
+            server.reset().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let _ = cp.get_pipeline(uid, None).await;
+            let _ = cp.delete_pipeline(uid, None).await;
+            let seen = server.received_requests().await.unwrap();
+            assert_eq!(seen.len(), 2, "{uid}");
+            for req in &seen {
+                assert_eq!(req.url.path(), encoded, "{uid}");
+                assert_eq!(req.url.query(), None, "{uid}");
+            }
+        }
+        // A dot segment names no pipeline at all: nothing is sent.
+        server.reset().await;
+        for uid in ["..", ".", ""] {
+            assert!(
+                matches!(
+                    cp.get_pipeline(uid, None).await,
+                    Err(GatewayError::NotFound(_))
+                ),
+                "{uid:?}"
+            );
+            assert!(
+                matches!(
+                    cp.delete_pipeline(uid, None).await,
+                    Err(GatewayError::NotFound(_))
+                ),
+                "{uid:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

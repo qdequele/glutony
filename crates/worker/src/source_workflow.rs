@@ -176,10 +176,16 @@ impl SourceRunWorkflow {
     }
 }
 
-/// Fetching can move hundreds of MiB, so the timeout is generous; transient network
-/// failures get a few retries before the run is given up until the next tick.
+/// Start-to-close of one `resolve_source` attempt. The download alone may take
+/// `UrlGuard::total_timeout` (10 minutes); the rest is for inflating what was fetched
+/// and staging it into the blob store.
+const RESOLVE_START_TO_CLOSE: Duration = Duration::from_secs(15 * 60);
+
+/// Each attempt gets [`RESOLVE_START_TO_CLOSE`], which outlasts the fetch's own deadline;
+/// transient network failures get a few retries before the run is given up until the
+/// next tick.
 fn resolve_options() -> ActivityOptions {
-    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(15 * 60))
+    ActivityOptions::with_start_to_close_timeout(RESOLVE_START_TO_CLOSE)
         .retry_policy(
             RetryPolicy::builder()
                 .maximum_attempts(3)
@@ -223,6 +229,18 @@ fn summarize_failures(failures: &[String], total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fetch_at_its_deadline_still_fits_in_the_activity() {
+        // The fetch's own deadline must expire first, with time left to stage the
+        // bytes: Temporal cannot interrupt an activity that does not heartbeat, so a
+        // fetch outliving its attempt would keep downloading next to the retry.
+        let fetch = meili_ingest_source::UrlGuard::default().total_timeout;
+        assert!(
+            fetch + Duration::from_secs(4 * 60) <= RESOLVE_START_TO_CLOSE,
+            "fetch {fetch:?} vs start-to-close {RESOLVE_START_TO_CLOSE:?}"
+        );
+    }
 
     #[test]
     fn a_single_failure_is_reported_verbatim() {

@@ -1,7 +1,8 @@
 //! `TemporalSchedules` against a real Temporal server.
 //!
 //! Skips cleanly unless `TEMPORAL_TEST_URL` is set (e.g. `http://localhost:57233`), so
-//! the suite stays green without a server. These tests exist to check what unit tests
+//! the suite stays green without a server; when `CI` is set it fails instead (the CI
+//! `test` job runs a Temporal dev server). These tests exist to check what unit tests
 //! cannot: that Temporal itself rejects a malformed cron with `InvalidArgument`, which
 //! is what the gateway's 422 mapping relies on (spec Decision 10).
 
@@ -14,7 +15,15 @@ use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Ur
 use uuid::Uuid;
 
 async fn schedules() -> Option<TemporalSchedules> {
-    let raw = std::env::var("TEMPORAL_TEST_URL").ok()?;
+    let Ok(raw) = std::env::var("TEMPORAL_TEST_URL") else {
+        // CI starts a Temporal dev server for these: a lost TEMPORAL_TEST_URL there
+        // must fail the run, not turn every test into a silent pass.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but TEMPORAL_TEST_URL is not: the Temporal tests would skip"
+        );
+        return None;
+    };
     let url = Url::from_str(&raw).expect("TEMPORAL_TEST_URL is a url");
     let connection = Connection::connect(ConnectionOptions::new(url).build())
         .await

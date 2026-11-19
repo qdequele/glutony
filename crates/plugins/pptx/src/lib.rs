@@ -20,11 +20,16 @@
 //! │   │   ├── slide2.xml
 //! │   │   └── _rels/slide1.xml.rels
 //! │   └── notesSlides/
-//! │       └── notesSlide1.xml     ← speaker notes, numbered like the slides
+//! │       └── notesSlide1.xml     ← speaker notes, numbered on their own
 //! └── docProps/…
 //! ```
 //!
-//! Every other entry (layouts, masters, themes, media, rels) is ignored.
+//! A slide's notes part is the target of the `notesSlide` relationship in the
+//! slide's `_rels/slide<N>.xml.rels`: notes parts are numbered independently of the
+//! slides (PowerPoint numbers them in the order notes were added), so `notesSlide1`
+//! can belong to slide 2. Only when a slide has no relationship part at all is its
+//! notes part assumed to share its number. Every other entry (layouts, masters,
+//! themes, media, other relationships) is ignored.
 //!
 //! Slide parts are ordered **numerically** by the `N` in `slide<N>.xml`, never
 //! lexicographically — `slide10.xml` must come after `slide9.xml`.
@@ -159,13 +164,7 @@ fn parse_config(value: serde_json::Value) -> Result<Config, PluginError> {
 
 /// Meilisearch-safe id derived from the blob's filename stem (a UUID when unknown).
 fn base_id(blob: &Blob) -> String {
-    let stem = blob
-        .filename
-        .as_deref()
-        .and_then(|f| std::path::Path::new(f).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    sanitize_id(stem)
+    blob.id_stem("")
 }
 
 /// Provenance metadata shared by every document produced from `blob`.
@@ -243,6 +242,77 @@ fn read_part<R: Read + std::io::Seek>(
     }
     *budget -= buf.len() as u64;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// `ppt/slides/slide3.xml` → `ppt/slides/_rels/slide3.xml.rels`.
+fn rels_part_name(part: &str) -> String {
+    match part.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
+        None => format!("_rels/{part}.rels"),
+    }
+}
+
+/// Resolve a relationship `Target` of `part` to a zip entry name: package-absolute
+/// (`/ppt/notesSlides/notesSlide1.xml`) or relative to the part's folder
+/// (`../notesSlides/notesSlide1.xml`).
+fn resolve_target(part: &str, target: &str) -> String {
+    let mut segments: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        part.rsplit_once('/').map_or_else(Vec::new, |(dir, _)| {
+            dir.split('/').filter(|s| !s.is_empty()).collect()
+        })
+    };
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
+}
+
+/// The internal target of the first `notesSlide` relationship in a slide's
+/// relationship part, resolved against `part` (the slide). `None` when the slide has
+/// no notes relationship.
+///
+/// The relationship is matched on its `Type`, whose transitional and strict OOXML
+/// forms both end in `/notesSlide`; external targets are skipped.
+fn notes_target(rels_xml: &str, part: &str) -> Result<Option<String>, quick_xml::Error> {
+    let mut reader = Reader::from_str(rels_xml);
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref tag) | Event::Empty(ref tag)
+                if tag.local_name().as_ref() == b"Relationship" =>
+            {
+                let mut is_notes = false;
+                let mut external = false;
+                let mut target = None;
+                for attr in tag.attributes().flatten() {
+                    let Ok(value) = attr.normalized_value(XmlVersion::Explicit1_0) else {
+                        continue;
+                    };
+                    match attr.key.local_name().as_ref() {
+                        b"Type" => is_notes = value.ends_with("/notesSlide"),
+                        b"TargetMode" => external = value.eq_ignore_ascii_case("External"),
+                        b"Target" => target = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                if is_notes
+                    && !external
+                    && let Some(target) = target
+                {
+                    return Ok(Some(resolve_target(part, &target)));
+                }
+            }
+            Event::Eof => return Ok(None),
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +541,38 @@ fn notes_text(shapes: Vec<Shape>) -> String {
 // Extraction
 // ---------------------------------------------------------------------------
 
+/// The notes part of slide `part` (number `number`), if it has one in the archive.
+///
+/// The slide's relationship part is authoritative: notes parts are numbered on their
+/// own, so `notesSlide1.xml` may belong to slide 2. A relationship part without a
+/// notes relationship means no notes, and a target missing from the archive is
+/// treated the same rather than failing the deck. Only a slide with no readable
+/// relationship part falls back to the notes part sharing its number.
+fn slide_notes_part<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    part: &str,
+    number: u32,
+    notes_parts: &BTreeMap<u32, String>,
+    budget: &mut u64,
+) -> Result<Option<String>, PluginError> {
+    let rels_part = rels_part_name(part);
+    if archive.index_for_name(&rels_part).is_some() {
+        let rels = read_part(archive, &rels_part, budget)?;
+        match notes_target(&rels, part) {
+            Ok(target) => {
+                return Ok(target.filter(|name| archive.index_for_name(name).is_some()));
+            }
+            Err(e) => tracing::debug!(
+                plugin = NAME,
+                part = rels_part.as_str(),
+                error = %e,
+                "unreadable slide relationships; matching notes by number"
+            ),
+        }
+    }
+    Ok(notes_parts.get(&number).cloned())
+}
+
 /// Whole synchronous parse: unzip, read the slide parts in numeric order, build the
 /// documents. Runs inside [`run_blocking`] because zip inflation and XML parsing are
 /// CPU-bound.
@@ -513,12 +615,12 @@ fn extract(ctx: &ActivityContext, blob: Blob, cfg: &Config) -> Result<Vec<Docume
         // `meta.page` is the slide's position in the deck, not the part number: the
         // `N` in `slide<N>.xml` is an arbitrary part id that need not be contiguous.
         let mut slide = SlideText::from_shapes(index as u32 + 1, parse_part(&xml, part)?);
-        // Notes are matched to slides by part number. The authoritative mapping lives
-        // in `ppt/slides/_rels/slide<N>.xml.rels`, but PowerPoint and every exporter
-        // we have seen number the notes part after its slide part.
-        if let Some(notes_part) = notes_parts.get(number) {
-            let notes_xml = read_part(&mut archive, notes_part, &mut budget)?;
-            slide.notes = notes_text(parse_part(&notes_xml, notes_part)?);
+        if cfg.include_notes
+            && let Some(notes_part) =
+                slide_notes_part(&mut archive, part, *number, &notes_parts, &mut budget)?
+        {
+            let notes_xml = read_part(&mut archive, &notes_part, &mut budget)?;
+            slide.notes = notes_text(parse_part(&notes_xml, &notes_part)?);
         }
         slides.push(slide);
     }
@@ -856,7 +958,7 @@ mod tests {
         .await;
 
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0].id, "Q3_all_hands_s1");
+        assert_eq!(docs[0].id, "decks_Q3_all_hands_s1");
         assert_eq!(docs[0].title.as_deref(), Some("Agenda"));
         assert_eq!(docs[0].meta.page, Some(1));
         assert_eq!(docs[0].meta.section.as_deref(), Some("Agenda"));
@@ -867,7 +969,7 @@ mod tests {
         assert_eq!(docs[0].meta.mime.as_deref(), Some(PPTX_MIME));
         // Bullets end up on their own lines, and `&amp;` is decoded.
         assert_eq!(docs[0].content, "Agenda\nNumbers\nRoadmap\nQ&A");
-        assert_eq!(docs[1].id, "Q3_all_hands_s2");
+        assert_eq!(docs[1].id, "decks_Q3_all_hands_s2");
         assert_eq!(docs[1].meta.page, Some(2));
         assert_eq!(docs[1].content, "Numbers\nRevenue up 12%");
     }
@@ -889,7 +991,7 @@ mod tests {
         for (i, doc) in docs.iter().enumerate() {
             let n = i + 1;
             assert_eq!(doc.meta.page, Some(n as u32), "position {i}");
-            assert_eq!(doc.id, format!("Q3_all_hands_s{n}"), "position {i}");
+            assert_eq!(doc.id, format!("decks_Q3_all_hands_s{n}"), "position {i}");
             assert_eq!(doc.title.as_deref(), Some(format!("Slide {n}").as_str()));
         }
         assert_eq!(docs[8].title.as_deref(), Some("Slide 9"));
@@ -905,7 +1007,7 @@ mod tests {
         .await;
 
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].id, "Q3_all_hands");
+        assert_eq!(docs[0].id, "decks_Q3_all_hands");
         assert_eq!(docs[0].title.as_deref(), Some("One"));
         assert_eq!(docs[0].meta.page, None);
         assert_eq!(docs[0].content, "One\nfirst\n\nTwo\nsecond");
@@ -940,6 +1042,105 @@ mod tests {
         )
         .await;
         assert!(docs[0].fields.get("notes").is_none());
+    }
+
+    /// A slide's relationship part, holding a layout relationship plus one
+    /// relationship per `(type suffix, target, external)` entry.
+    fn slide_rels(relationships: &[(&str, &str, bool)]) -> String {
+        let mut xml = String::from(concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>"#,
+        ));
+        for (i, (kind, target, external)) in relationships.iter().enumerate() {
+            let mode = if *external {
+                r#" TargetMode="External""#
+            } else {
+                ""
+            };
+            xml.push_str(&format!(
+                r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}" Target="{target}"{mode}/>"#,
+                i + 2
+            ));
+        }
+        xml.push_str("</Relationships>");
+        xml
+    }
+
+    /// PowerPoint numbers notes parts in the order notes were added, not after their
+    /// slide: the slide's relationship part says which notes part is its own.
+    #[tokio::test]
+    async fn speaker_notes_follow_the_slide_relationships() {
+        let slides = [("One", "first"), ("Two", "second"), ("Three", "third")];
+        let mut parts: Vec<(String, String)> = slides
+            .iter()
+            .enumerate()
+            .map(|(i, (title, body))| {
+                (
+                    format!("{SLIDE_PREFIX}{}{XML_SUFFIX}", i + 1),
+                    slide_xml(title, body),
+                )
+            })
+            .collect();
+        let rels = |n: u32| format!("ppt/slides/_rels/slide{n}.xml.rels");
+        parts.extend([
+            // Slide 1: a layout only, so no notes.
+            (rels(1), slide_rels(&[])),
+            // Slide 2: notesSlide1, by a relative target.
+            (
+                rels(2),
+                slide_rels(&[("notesSlide", "../notesSlides/notesSlide1.xml", false)]),
+            ),
+            // Slide 3: notesSlide2, by a package-absolute target.
+            (
+                rels(3),
+                slide_rels(&[
+                    ("hyperlink", "https://example.com/notesSlide9.xml", true),
+                    ("notesSlide", "/ppt/notesSlides/notesSlide2.xml", false),
+                ]),
+            ),
+            (
+                format!("{NOTES_PREFIX}1{XML_SUFFIX}"),
+                notes_xml("Notes of two"),
+            ),
+            (
+                format!("{NOTES_PREFIX}2{XML_SUFFIX}"),
+                notes_xml("Notes of three"),
+            ),
+        ]);
+
+        let docs = run(package(&parts), serde_json::json!({})).await;
+        assert_eq!(docs.len(), 3, "{docs:#?}");
+        assert!(
+            docs[0].fields.get("notes").is_none(),
+            "{:?}",
+            docs[0].fields
+        );
+        assert_eq!(docs[1].fields["notes"], "Notes of two");
+        assert_eq!(docs[2].fields["notes"], "Notes of three");
+    }
+
+    /// A relationship to a notes part missing from the package means no notes.
+    #[tokio::test]
+    async fn a_dangling_notes_relationship_means_no_notes() {
+        let parts = vec![
+            (
+                format!("{SLIDE_PREFIX}1{XML_SUFFIX}"),
+                slide_xml("One", "first"),
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels".to_string(),
+                slide_rels(&[("notesSlide", "../notesSlides/notesSlide7.xml", false)]),
+            ),
+            (format!("{NOTES_PREFIX}1{XML_SUFFIX}"), notes_xml("Stray")),
+        ];
+        let docs = run(package(&parts), serde_json::json!({})).await;
+        assert_eq!(docs.len(), 1);
+        assert!(
+            docs[0].fields.get("notes").is_none(),
+            "{:?}",
+            docs[0].fields
+        );
     }
 
     #[tokio::test]

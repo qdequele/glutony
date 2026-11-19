@@ -20,6 +20,10 @@ pub enum CpError {
     /// No pipeline matches the request (404, `no_pipeline`).
     #[error("{0}")]
     NoPipeline(String),
+    /// The name is held by a row the caller cannot see by default, e.g. an archived
+    /// source (409, `conflict`).
+    #[error("{0}")]
+    Conflict(String),
     /// Pipeline failed structural validation (422, `validation`).
     #[error("{0}")]
     Validation(String),
@@ -29,7 +33,7 @@ pub enum CpError {
     /// One or more steps carry a config their plugin rejects (422, `invalid_step_config`).
     #[error("{}", step_config_summary(.0))]
     StepConfig(Vec<StepDiagnostic>),
-    /// Missing or wrong `CONTROL_PLANE_TOKEN` on an internal route (401, `unauthorized`).
+    /// Missing or wrong `CONTROL_PLANE_TOKEN` on a guarded route (401, `unauthorized`).
     #[error("missing or invalid control plane token")]
     Unauthorized,
     /// A Lab account is out of credits or inactive (402, `insufficient_credits`).
@@ -93,6 +97,7 @@ impl CpError {
             CpError::NotFound(_) | CpError::NoPipeline(_) | CpError::NoGateway(_) => {
                 StatusCode::NOT_FOUND
             }
+            CpError::Conflict(_) => StatusCode::CONFLICT,
             CpError::Validation(_) | CpError::UnknownPlugin(_) | CpError::StepConfig(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -108,6 +113,7 @@ impl CpError {
             CpError::Builtin(_) => "builtin",
             CpError::NotFound(_) => "not_found",
             CpError::NoPipeline(_) => "no_pipeline",
+            CpError::Conflict(_) => "conflict",
             CpError::Validation(_) => "validation",
             CpError::UnknownPlugin(_) => "unknown_plugin",
             CpError::StepConfig(_) => "invalid_step_config",
@@ -185,6 +191,11 @@ mod tests {
                 CpError::NoPipeline("x".into()),
                 StatusCode::NOT_FOUND,
                 "no_pipeline",
+            ),
+            (
+                CpError::Conflict("x".into()),
+                StatusCode::CONFLICT,
+                "conflict",
             ),
             (
                 CpError::Validation("x".into()),

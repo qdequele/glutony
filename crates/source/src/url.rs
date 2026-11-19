@@ -6,6 +6,8 @@ use futures::StreamExt as _;
 
 use crate::SourceError;
 use crate::connector::{Resolution, ResolveRuntime, ResolvedItem, SourceConnector};
+use crate::guard::UrlGuard;
+use crate::host_policy::HostPolicy;
 use crate::model::{FetchAuth, IncrementalState, Location};
 use crate::template::render;
 
@@ -43,16 +45,20 @@ impl SourceConnector for UrlConnector {
 
         // Redirects are followed here, not by the client, so the host policy sees every
         // hop: a public host redirecting to 169.254.169.254 is the obvious bypass.
+        // One deadline for the whole fetch, redirects and body included. reqwest's
+        // per-request timeout runs until the body has been read, so each hop is given
+        // what is left of it.
+        let deadline = tokio::time::Instant::now() + rt.limits.total_timeout;
         let mut current = parsed.clone();
         let mut hops = 0usize;
         let response = loop {
             if let Some(policy) = &rt.policy {
-                policy.check(&current).await?;
+                policy.check_disclosing(&current, rt.list_allowed).await?;
             }
             let mut req = rt
                 .http
                 .request(method.clone(), current.clone())
-                .timeout(std::time::Duration::from_secs(300));
+                .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
             for (name, value) in headers {
                 req = req.header(name, value);
             }
@@ -122,17 +128,42 @@ impl SourceConnector for UrlConnector {
 
         let etag = header_string(&response, reqwest::header::ETAG);
         let last_modified = header_string(&response, reqwest::header::LAST_MODIFIED);
-        let header_mime = header_string(&response, reqwest::header::CONTENT_TYPE)
+        let content_type = header_string(&response, reqwest::header::CONTENT_TYPE);
+        let header_mime = content_type
+            .as_deref()
             .and_then(|ct| ct.split(';').next().map(|s| s.trim().to_ascii_lowercase()))
             .filter(|m| !m.is_empty() && m != "application/octet-stream");
+        // Kept apart from the MIME, which routing compares as a bare essence.
+        let charset = content_type.as_deref().and_then(content_type_charset);
 
         // Stream rather than `.bytes()`: a TMDB export is ~50 MB and several sources may
         // run at once. The cap is enforced DURING the stream, not after.
         let mut hasher = blake3::Hasher::new();
         let mut body: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| SourceError::Fetch(format!("reading {parsed}: {e}")))?;
+        let idle = rt.limits.idle_timeout;
+        loop {
+            // A body that keeps arriving may take the whole deadline; one that stops
+            // arriving is given up after `idle`, not held until the deadline.
+            let next = tokio::time::timeout(idle, stream.next())
+                .await
+                .map_err(|_| {
+                    SourceError::Fetch(format!(
+                        "reading {parsed}: no data received for {} s",
+                        idle.as_secs_f32()
+                    ))
+                })?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|e| {
+                SourceError::Fetch(if e.is_timeout() {
+                    format!(
+                        "reading {parsed}: the download did not finish within {} s",
+                        rt.limits.total_timeout.as_secs_f32()
+                    )
+                } else {
+                    format!("reading {parsed}: {e}")
+                })
+            })?;
             if body.len() as u64 + chunk.len() as u64 > max_bytes {
                 return Err(SourceError::TooLarge(format!(
                     "GET {parsed}: body exceeds the {max_bytes} byte cap"
@@ -149,17 +180,25 @@ impl SourceConnector for UrlConnector {
             return Ok(Resolution::Unchanged);
         }
 
+        // Inflating and sniffing up to `max_bytes` is seconds of CPU: off the async
+        // worker threads, which the worker's other activities share.
         let filename = last_segment(parsed.path());
-        let (bytes, filename) = maybe_gunzip(body, filename, max_bytes)?;
-        let mime = header_mime
-            .or_else(|| detect_mime(&bytes, filename.as_deref()))
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let (bytes, filename, mime) = tokio::task::spawn_blocking(move || {
+            let (bytes, filename) = maybe_gunzip(body, filename, max_bytes)?;
+            let mime = header_mime
+                .or_else(|| detect_mime(&bytes, filename.as_deref()))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            Ok::<_, SourceError>((bytes, filename, mime))
+        })
+        .await
+        .map_err(|e| SourceError::Fetch(format!("decoding {parsed}: {e}")))??;
 
         Ok(Resolution::Items {
             items: vec![ResolvedItem {
                 bytes,
                 mime,
                 filename,
+                charset,
             }],
             state: IncrementalState {
                 etag,
@@ -168,6 +207,62 @@ impl SourceConnector for UrlConnector {
             },
         })
     }
+}
+
+/// Learn the media type behind `url` without downloading it, for a URL whose name says
+/// nothing (`https://example.com/`, `/api/users`).
+///
+/// Sends a `HEAD`, then a `GET` whose body is never read when the `HEAD` fails or names
+/// no type (some servers refuse `HEAD`). Redirects are followed here, not by `http`, so
+/// `policy` sees every hop, as in [`UrlConnector`]. `Ok(None)` when the server names no
+/// type, only `application/octet-stream`, or answers with an error; a hop refused by
+/// `policy` is an error.
+pub async fn probe_content_type(
+    http: &reqwest::Client,
+    policy: Option<&HostPolicy>,
+    url: &url::Url,
+    limits: &UrlGuard,
+) -> Result<Option<String>, SourceError> {
+    for method in [reqwest::Method::HEAD, reqwest::Method::GET] {
+        let mut current = url.clone();
+        let mut hops = 0usize;
+        let response = loop {
+            if let Some(policy) = policy {
+                policy.check(&current).await?;
+            }
+            let sent = http
+                .request(method.clone(), current.clone())
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+            let Ok(response) = sent else { break None };
+            let status = response.status();
+            if !status.is_redirection() {
+                break Some(response);
+            }
+            let next = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|location| current.join(location).ok());
+            match next {
+                Some(next) if hops < limits.max_redirects => {
+                    current = next;
+                    hops += 1;
+                }
+                _ => break None,
+            }
+        };
+        let mime = response
+            .filter(|r| r.status().is_success())
+            .and_then(|r| header_string(&r, reqwest::header::CONTENT_TYPE))
+            .and_then(|ct| ct.split(';').next().map(|s| s.trim().to_ascii_lowercase()))
+            .filter(|m| !m.is_empty() && m != "application/octet-stream");
+        if mime.is_some() {
+            return Ok(mime);
+        }
+    }
+    Ok(None)
 }
 
 /// Attach a credential to the request.
@@ -195,6 +290,19 @@ fn header_string(
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+}
+
+/// The `charset` parameter of a `Content-Type` value, unquoted and lower-cased;
+/// `None` when there is none or it is empty.
+fn content_type_charset(value: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|param| {
+        let (name, raw) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = raw.trim().trim_matches('"').trim().to_ascii_lowercase();
+        (!label.is_empty()).then_some(label)
+    })
 }
 
 fn last_segment(path: &str) -> Option<String> {
@@ -246,24 +354,28 @@ fn detect_mime(bytes: &[u8], filename: Option<&str>) -> Option<String> {
     by_ext
 }
 
-/// Whether `bytes` look like newline-delimited JSON: at least two non-empty lines, each
-/// of which parses as a standalone JSON value.
+/// Whether `bytes` look like newline-delimited JSON: at least two non-empty lines, the
+/// first five of which each parse as a standalone JSON value.
 ///
 /// A JSON array or a single pretty-printed object must NOT match — those are ordinary
 /// JSON and the json plugin handles them as one document.
+///
+/// The body can be hundreds of MiB, so nothing here is proportional to it in memory. A
+/// second line is looked for before anything is parsed: a minified document is one
+/// line, and parsing it to learn that it is not NDJSON would build its whole tree. The
+/// lines that are checked are validated without being materialised.
 fn sniff_ndjson(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
+    let mut lines = bytes
+        .split(|b| *b == b'\n')
+        .map(<[u8]>::trim_ascii)
+        .filter(|line| !line.is_empty());
+    let (Some(first), Some(second)) = (lines.next(), lines.next()) else {
         return false;
     };
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let mut seen = 0usize;
-    for line in lines.by_ref().take(5) {
-        if serde_json::from_str::<serde_json::Value>(line.trim()).is_err() {
-            return false;
-        }
-        seen += 1;
-    }
-    seen >= 2
+    [first, second]
+        .into_iter()
+        .chain(lines.take(3))
+        .all(|line| serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok())
 }
 
 /// Minimal extension → MIME map for the formats a source realistically serves.
@@ -302,6 +414,7 @@ mod tests {
         ResolveRuntime {
             http: ResolveRuntime::http_client(),
             policy: None,
+            list_allowed: false,
             limits: UrlGuard::default(),
             scheduled_at,
             timezone: "UTC".to_string(),
@@ -398,6 +511,49 @@ mod tests {
             state.hash.is_some(),
             "hash is recorded for etag-less servers"
         );
+    }
+
+    #[tokio::test]
+    async fn the_declared_charset_is_kept_apart_from_the_mime() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/legacy.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=\"ISO-8859-1\"")
+                    .set_body_bytes(b"<p>Caf\xE9</p>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/feed.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&server)
+            .await;
+
+        let resolve = |p: &str| {
+            let location = url_location(format!("{}{p}", server.uri()));
+            async move {
+                let got = UrlConnector
+                    .resolve(
+                        &location,
+                        None,
+                        &IncrementalState::default(),
+                        &rt_without_guard(now()),
+                    )
+                    .await
+                    .expect("resolves");
+                let Resolution::Items { mut items, .. } = got else {
+                    panic!("expected items");
+                };
+                items.remove(0)
+            }
+        };
+        let item = resolve("/legacy.html").await;
+        assert_eq!(item.mime, "text/html");
+        assert_eq!(item.charset.as_deref(), Some("iso-8859-1"));
+        assert_eq!(item.bytes, b"<p>Caf\xE9</p>");
+        assert_eq!(resolve("/feed.json").await.charset, None);
     }
 
     #[tokio::test]
@@ -580,8 +736,8 @@ mod tests {
         // what rejects this, not the address check.
         let mut rt = rt_without_guard(now());
         rt.limits = UrlGuard {
-            max_redirects: 5,
             max_bytes: 1024,
+            ..UrlGuard::default()
         };
         let err = UrlConnector
             .resolve(
@@ -712,6 +868,116 @@ mod tests {
         );
     }
 
+    /// A server that answers any request with `chunks` one-byte pieces of body, `gap`
+    /// apart. wiremock can only delay a whole response, not trickle its body.
+    async fn dripping_server(chunks: usize, gap: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                            _ => return,
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                         content-length: {chunks}\r\nconnection: close\r\n\r\n"
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for _ in 0..chunks {
+                        tokio::time::sleep(gap).await;
+                        if socket.write_all(b"x").await.is_err() {
+                            return;
+                        }
+                        let _ = socket.flush().await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn fetch_dripping(
+        chunks: usize,
+        gap_ms: u64,
+        limits: UrlGuard,
+    ) -> (Result<Resolution, SourceError>, std::time::Duration) {
+        let server = dripping_server(chunks, std::time::Duration::from_millis(gap_ms)).await;
+        let mut rt = rt_without_guard(now());
+        rt.limits = limits;
+        let started = std::time::Instant::now();
+        let got = UrlConnector
+            .resolve(
+                &url_location(format!("{server}/slow.txt")),
+                None,
+                &IncrementalState::default(),
+                &rt,
+            )
+            .await;
+        (got, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn a_slow_body_that_keeps_arriving_is_read_to_the_end() {
+        // 1.5 s of body, far longer than the idle timeout: only a gap counts as idle.
+        let limits = UrlGuard {
+            idle_timeout: std::time::Duration::from_millis(500),
+            total_timeout: std::time::Duration::from_secs(30),
+            ..UrlGuard::default()
+        };
+        let (got, _) = fetch_dripping(30, 50, limits).await;
+        let Resolution::Items { items, .. } = got.expect("a progressing download completes") else {
+            panic!("expected items");
+        };
+        assert_eq!(items[0].bytes, vec![b'x'; 30]);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stalls_is_given_up_after_the_idle_timeout() {
+        let limits = UrlGuard {
+            idle_timeout: std::time::Duration::from_millis(200),
+            total_timeout: std::time::Duration::from_secs(30),
+            ..UrlGuard::default()
+        };
+        let (got, took) = fetch_dripping(3, 5_000, limits).await;
+        let err = got.expect_err("a stalled body fails");
+        assert!(
+            matches!(&err, SourceError::Fetch(m) if m.contains("no data received")),
+            "retryable, and says why: {err:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "long before the total deadline: {took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_whole_fetch_has_one_deadline() {
+        // Never idle, but 10 s of body against a 500 ms deadline.
+        let limits = UrlGuard {
+            idle_timeout: std::time::Duration::from_secs(30),
+            total_timeout: std::time::Duration::from_millis(500),
+            ..UrlGuard::default()
+        };
+        let (got, took) = fetch_dripping(200, 50, limits).await;
+        let err = got.expect_err("past the deadline");
+        assert!(
+            matches!(&err, SourceError::Fetch(m) if m.contains("did not finish within 0.5 s")),
+            "retryable, and says why: {err:?}"
+        );
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
     #[test]
     fn sniff_ndjson_distinguishes_ndjson_from_plain_json() {
         assert!(
@@ -733,6 +999,44 @@ mod tests {
         );
         assert!(!sniff_ndjson(b""), "empty input is not ndjson");
         assert!(!sniff_ndjson(&[0xff, 0xfe]), "non-utf8 is not ndjson");
+    }
+
+    #[test]
+    fn a_single_line_document_is_not_ndjson_whatever_its_size() {
+        // A minified export: one line, with or without a trailing newline.
+        let mut doc = String::from("[");
+        for i in 0..50_000 {
+            if i > 0 {
+                doc.push(',');
+            }
+            doc.push_str(&format!("{{\"id\":{i},\"title\":\"movie {i}\"}}"));
+        }
+        doc.push(']');
+        assert!(!sniff_ndjson(doc.as_bytes()));
+        assert!(!sniff_ndjson(format!("{doc}\n").as_bytes()));
+        assert!(!sniff_ndjson(format!("\n\n{doc}\r\n\n").as_bytes()));
+    }
+
+    #[test]
+    fn ndjson_with_very_long_records_is_still_ndjson() {
+        // Records carrying embeddings or long text run to megabytes per line.
+        let record = format!("{{\"id\":1,\"text\":\"{}\"}}", "x".repeat(2 << 20));
+        let body = format!("{record}\n{record}\n");
+        assert!(sniff_ndjson(body.as_bytes()));
+        assert_eq!(
+            detect_mime(body.as_bytes(), Some("export.json")).as_deref(),
+            Some("application/x-ndjson"),
+        );
+    }
+
+    #[test]
+    fn ndjson_sniffing_tolerates_crlf_and_blank_lines() {
+        assert!(sniff_ndjson(b"{\"a\":1}\r\n\r\n{\"a\":2}\r\n"));
+        assert!(!sniff_ndjson(b"{\"a\":1}\nnot json\n"));
+        assert!(
+            sniff_ndjson(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n{\"a\":4}\n{\"a\":5}\nnot json\n"),
+            "only the first five lines are inspected"
+        );
     }
 
     #[test]
@@ -778,5 +1082,123 @@ mod tests {
             maybe_gunzip(b"plain".to_vec(), Some("a.json".into()), 1024).expect("no gzip");
         assert_eq!(bytes, b"plain");
         assert_eq!(name.as_deref(), Some("a.json"));
+    }
+
+    #[tokio::test]
+    async fn fetches_send_a_user_agent() {
+        // Wikimedia and several CDNs answer 403 to a request without one.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("user-agent", crate::USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let got = UrlConnector
+            .resolve(
+                &url_location(format!("{}/a.txt", server.uri())),
+                None,
+                &IncrementalState::default(),
+                &rt_without_guard(now()),
+            )
+            .await
+            .expect("the mock only answers a request carrying the user agent");
+        assert!(matches!(got, Resolution::Items { .. }));
+    }
+
+    #[tokio::test]
+    async fn probe_reads_the_type_from_a_head_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=UTF-8"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = url::Url::parse(&format!("{}/", server.uri())).unwrap();
+        let got = probe_content_type(
+            &ResolveRuntime::http_client(),
+            None,
+            &url,
+            &UrlGuard::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("text/html"));
+    }
+
+    #[tokio::test]
+    async fn probe_falls_back_to_get_when_head_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/users"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&server)
+            .await;
+        let url = url::Url::parse(&format!("{}/users", server.uri())).unwrap();
+        let got = probe_content_type(
+            &ResolveRuntime::http_client(),
+            None,
+            &url,
+            &UrlGuard::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn probe_knows_nothing_from_octet_stream_or_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(path("/bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("x", "application/octet-stream"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/gone"))
+            .respond_with(ResponseTemplate::new(404).set_body_raw("x", "text/html"))
+            .mount(&server)
+            .await;
+        for p in ["/bin", "/gone"] {
+            let url = url::Url::parse(&format!("{}{p}", server.uri())).unwrap();
+            let got = probe_content_type(
+                &ResolveRuntime::http_client(),
+                None,
+                &url,
+                &UrlGuard::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, None, "{p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_checks_every_redirect_hop_against_the_policy() {
+        let allowed = MockServer::start().await;
+        let other = MockServer::start().await;
+        Mock::given(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/elsewhere", other.uri()).as_str()),
+            )
+            .mount(&allowed)
+            .await;
+        Mock::given(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/html"))
+            .expect(0)
+            .mount(&other)
+            .await;
+        let rt = rt_allowing(&[&allowed]);
+        let url = url::Url::parse(&format!("{}/start", allowed.uri())).unwrap();
+        let err = probe_content_type(&rt.http, rt.policy.as_ref(), &url, &rt.limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::Blocked(_)), "{err:?}");
     }
 }

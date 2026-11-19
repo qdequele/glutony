@@ -692,6 +692,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
+]
+
+[[package]]
 name = "calamine"
 version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1905,6 +1914,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2982,6 +3001,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32f454fd6831a29c0e827ed075bca2a15be201bd57f4168f0fd1041124eab17e"
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3276,12 +3301,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "meili-ingest-archive"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "tar",
+ "thiserror 2.0.20",
+ "zip",
+]
+
+[[package]]
 name = "meili-ingest-blob"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "futures",
  "meili-ingest-plugin-sdk",
  "mime_guess",
  "object_store",
@@ -3338,12 +3374,13 @@ dependencies = [
  "bytes",
  "chrono",
  "http-body-util",
+ "jsonschema",
  "meili-ingest-blob",
  "meili-ingest-lab",
  "meili-ingest-plugin-sdk",
  "meili-ingest-router",
  "meili-ingest-source",
- "mime_guess",
+ "meili-ingest-usage",
  "regex",
  "reqwest 0.13.5",
  "serde",
@@ -3427,6 +3464,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "csv",
+ "encoding_rs",
  "meili-ingest-plugin-sdk",
  "serde",
  "serde_json",
@@ -3444,6 +3482,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -3452,6 +3491,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ego-tree",
+ "encoding_rs",
  "meili-ingest-plugin-sdk",
  "scraper",
  "serde",
@@ -3648,6 +3688,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "blake3",
  "extism-pdk",
  "futures",
  "serde",
@@ -3689,12 +3730,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
 name = "meili-ingest-router"
 version = "0.1.0"
 dependencies = [
+ "cfb",
  "infer",
  "meili-ingest-plugin-sdk",
  "mime_guess",
@@ -3753,6 +3796,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "jsonschema",
+ "meili-ingest-archive",
  "meili-ingest-blob",
  "meili-ingest-lab",
  "meili-ingest-plugin-audio-transcriber",
@@ -3779,6 +3823,7 @@ dependencies = [
  "meili-ingest-router",
  "meili-ingest-source",
  "meili-ingest-usage",
+ "object_store",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -3796,6 +3841,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -6516,6 +6562,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6693,6 +6750,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -6711,6 +6769,7 @@ dependencies = [
  "derive_more",
  "enum-iterator",
  "enum_dispatch",
+ "flate2",
  "futures",
  "futures-util",
  "gethostname",
@@ -6723,11 +6782,13 @@ dependencies = [
  "prost",
  "prost-wkt-types",
  "rand 0.10.2",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "siphasher",
  "slotmap",
  "sysinfo",
+ "tar",
  "temporalio-client",
  "temporalio-common",
  "temporalio-macros",
@@ -6739,6 +6800,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -8618,6 +8680,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8757,12 +8829,14 @@ version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
+ "bzip2",
  "crc32fast",
  "flate2",
  "indexmap",
  "memchr",
  "typed-path",
  "zopfli",
+ "zstd",
 ]
 
 [[package]]

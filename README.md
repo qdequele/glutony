@@ -43,14 +43,10 @@ Documentation: [`docs/`](docs/) (Mintlify) — start with `docs/quickstart.mdx`.
                         │              Temporal Server                 │
                         └──────────────┬───────────────────────────────┘
                                        │  dispatches activities
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                  workers-general               workers-io
-                  (pdf,docx,xlsx,               (s3_downloader)
-                   chunker,indexer,
-                   AI steps, ocr)
-                         │                           │
-                         └─────────────┬─────────────┘
+                                       ▼
+                                workers-general
+                         (pdf,docx,xlsx,chunker,indexer,
+                          AI steps, ocr, every plugin)
                                        │
                         ┌──────────────▼───────────────────────────────┐
                         │            Meilisearch instance              │
@@ -97,7 +93,7 @@ export INGEST=http://localhost:8080
 curl -F "file=@report.pdf" $INGEST/ingest
 curl -F "file=@report.pdf" -F "index=contracts" $INGEST/ingest
 
-# JSON with URL reference (gateway fetches it inline for small files)
+# JSON with URL reference (the worker fetches it, under SOURCE_FETCH_HOSTS)
 curl -d '{"url":"https://example.com/doc.pdf"}' \
      -H "Content-Type: application/json" $INGEST/ingest
 
@@ -264,7 +260,8 @@ variables behaves as a standalone one. See
 ## Usage & metering
 
 Every job records per-tenant usage — documents, bytes, LLM tokens, transcription
-seconds, pages — into Tinybird (managed ClickHouse) for analytics (dashboards,
+seconds, pages — into Tinybird (managed ClickHouse) or a self-hosted ClickHouse
+(`USAGE_CLICKHOUSE_URL`) for analytics (dashboards,
 `GET /usage`, reconciliation). Billing is the Meilisearch Lab's: see
 [docs/deployment/meilisearch-lab.mdx](docs/deployment/meilisearch-lab.mdx). Reporting
 runs as a Temporal activity, so it is retried until it lands and survives worker
@@ -273,15 +270,17 @@ double-counts. Read `usage_daily_billing` for deduplicated daily totals; see
 [docs/concepts/usage.mdx](docs/concepts/usage.mdx) and
 [tinybird/README.md](tinybird/README.md).
 
-Without `TINYBIRD_TOKEN` the reporting step is a no-op, so self-hosted deployments need
-no analytics account.
+Without `TINYBIRD_TOKEN` or `USAGE_CLICKHOUSE_URL` the reporting step is a no-op, so
+self-hosted deployments need no analytics account.
 
 ## Deployment
 
 - **Local / dev:** `docker compose watch` (see [`compose.yaml`](compose.yaml)).
 - **Kubernetes:** `kubectl apply -k k8s/` — gateway (HPA + PDB), control plane,
-  three worker pools with KEDA `ScaledObject`s on Temporal queue backlog, and a
-  reference Temporal deployment (use Temporal Cloud in production).
+  one `workers-general` worker pool with a KEDA `ScaledObject` on the Temporal queue
+  backlog, and a
+  reference Temporal deployment (use your own Temporal cluster in production; the
+  connection has no TLS or authentication, so Temporal Cloud is not supported yet).
 - **Meilisearch Cloud:** deploy behind Envoy with `ENVOY_TRUSTED_HEADER` set;
   see `docs/deployment/meilisearch-cloud.mdx`.
 

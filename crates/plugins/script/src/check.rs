@@ -114,6 +114,16 @@ mod tests {
         assert_eq!(result.diagnostics[0].path, "config");
     }
 
+    /// The check's engine is the runtime's: `print` and `debug` stay callable (their
+    /// output is discarded at run time), so a script using them is valid.
+    #[test]
+    fn print_and_debug_compile() {
+        assert_eq!(
+            check_config(&json!({"script": "print(\"x\"); debug(1);"})),
+            CheckResult::default()
+        );
+    }
+
     /// The check compiles only. An endless loop compiles fine and returns at once.
     #[test]
     fn the_check_never_executes_the_script() {

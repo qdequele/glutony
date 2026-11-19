@@ -7,11 +7,19 @@
 //! this process. The key is therefore never part of the activity input, and never
 //! recorded in Temporal history.
 //!
+//! A job with a tenant only ever resolves a connection that tenant owns: it asks the
+//! control plane with `scope=tenant`, which never falls back to a global row, and this
+//! module re-checks the owner of whatever comes back, so a tenant's pipeline naming a
+//! global connection uid can never write with the operator's key. A job without a
+//! tenant resolves global connections, as before.
+//!
 //! Failure modes are deliberately split: anything that retrying cannot fix (unknown
-//! connection, missing or wrong `SOURCE_SECRET_KEY`, a host the policy forbids) is
-//! non-retryable and names the connection; transport and DNS trouble is retryable.
+//! connection, a connection the job's tenant does not own, missing or wrong
+//! `SOURCE_SECRET_KEY`, a host the policy forbids) is non-retryable and names the
+//! connection; transport and DNS trouble is retryable.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, PluginError, pinned_connection};
 use meili_ingest_source::{HostPolicy, SecretKey, SourceError};
@@ -33,9 +41,23 @@ pub struct ConnectionSettings {
 /// rather than imported so the worker does not link the control plane.
 #[derive(Deserialize)]
 struct ConnectionRow {
+    /// Owner; absent for a global connection.
+    #[serde(default, alias = "project_id")]
+    tenant_id: Option<String>,
     host: String,
     api_key: Vec<u8>,
 }
+
+/// How long one control plane request may take, connection and body included.
+///
+/// The control plane answers from Postgres or, at worst, after its own 10 s call to
+/// the Lab. A request still pending after this is a control plane that accepted the
+/// connection and went silent (frozen pod, exhausted pool): fail the attempt as
+/// retryable instead of holding an activity slot for as long as it stays silent.
+/// Kept under the shortest start-to-close timeout of the activities that call it
+/// (30 s, `record_job_started`), so an attempt ends on its own before Temporal gives
+/// up on it.
+pub const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where to reach the control plane, and how.
 pub struct ControlPlane<'a> {
@@ -45,10 +67,24 @@ pub struct ControlPlane<'a> {
     pub base_url: Option<&'a str>,
     /// `CONTROL_PLANE_TOKEN`, presented as a bearer.
     pub token: Option<&'a str>,
+    /// Deadline of each request ([`CONTROL_PLANE_TIMEOUT`] outside tests).
+    pub timeout: Duration,
 }
 
-/// Present the control plane token, when there is one.
+/// Prepare a control plane request: present the token, when there is one, and bound
+/// the request by [`CONTROL_PLANE_TIMEOUT`]. Every control plane call of the worker
+/// goes through here or through [`authed_within`], so none can wait forever.
 pub fn authed(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    authed_within(req, token, CONTROL_PLANE_TIMEOUT)
+}
+
+/// [`authed`] with an explicit deadline.
+pub fn authed_within(
+    req: reqwest::RequestBuilder,
+    token: Option<&str>,
+    timeout: Duration,
+) -> reqwest::RequestBuilder {
+    let req = req.timeout(timeout);
     match token {
         Some(t) => req.bearer_auth(t),
         None => req,
@@ -82,14 +118,19 @@ pub async fn resolve_connection(
         .base_url
         .ok_or_else(|| fail("no control plane is configured on this worker".into()))?;
 
-    let row = fetch(
-        control_plane.http,
-        base,
-        control_plane.token,
-        &name,
-        tenant_id,
-    )
-    .await?;
+    let row = fetch(control_plane, base, &name, tenant_id).await?;
+    // The control plane already scopes the lookup; this holds even against one that
+    // falls back (an older binary, or a bug), and before the key is ever opened.
+    if row.tenant_id.as_deref() != tenant_id {
+        return Err(fail(match (tenant_id, row.tenant_id.as_deref()) {
+            (Some(t), None) => format!(
+                "it is a global connection, and jobs for tenant {t:?} can only use \
+                 connections that tenant owns; create a connection named {name:?} for \
+                 the tenant"
+            ),
+            _ => "it belongs to another tenant".into(),
+        }));
+    }
 
     let api_key = key.open(&row.api_key).map_err(|_| {
         fail(
@@ -116,9 +157,8 @@ pub async fn resolve_connection(
 }
 
 async fn fetch(
-    http: &reqwest::Client,
+    control_plane: &ControlPlane<'_>,
     base: &str,
-    token: Option<&str>,
     name: &str,
     tenant_id: Option<&str>,
 ) -> Result<ConnectionRow, PluginError> {
@@ -136,10 +176,14 @@ async fn fetch(
             .append_pair("scope", "tenant");
     }
 
-    let resp = authed(http.get(url), token)
-        .send()
-        .await
-        .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
+    let resp = authed_within(
+        control_plane.http.get(url),
+        control_plane.token,
+        control_plane.timeout,
+    )
+    .send()
+    .await
+    .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(PluginError::NonRetryable(format!(
@@ -213,6 +257,7 @@ mod tests {
             http: &http,
             base_url: Some("http://unused.invalid"),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let s = settings(HostPolicy::Any);
         let cfg = serde_json::json!({ "connection": "prod-movies" });
@@ -238,6 +283,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let out = resolve_connection(
             &cp,
@@ -262,6 +308,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -288,6 +335,7 @@ mod tests {
             http: &http,
             base_url: Some("http://unused.invalid"),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -315,6 +363,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -345,6 +394,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -377,6 +427,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let _ = resolve_connection(
             &cp,
@@ -387,6 +438,54 @@ mod tests {
         )
         .await;
         // `expect(1)` is verified when the server drops.
+    }
+
+    #[tokio::test]
+    async fn a_tenant_job_never_uses_a_global_connection() {
+        // A control plane that still falls back to the global row (an older one, or a
+        // bug) must not be enough to hand a tenant the operator's key.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/connections/prod-movies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "11111111-1111-1111-1111-111111111111",
+                "uid": "prod-movies",
+                "name": "Movies",
+                "host": "http://meilisearch:7700",
+                "api_key": sealed_key(),
+                "created_at": "2026-09-23T00:00:00Z",
+                "updated_at": "2026-09-23T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let base = server.uri();
+        let cp = ControlPlane {
+            http: &http,
+            base_url: Some(&base),
+            token: None,
+            timeout: CONTROL_PLANE_TIMEOUT,
+        };
+        let err = resolve_connection(
+            &cp,
+            &settings(HostPolicy::Any),
+            INDEXER_PLUGIN,
+            serde_json::json!({ "connection": "prod-movies" }),
+            Some("tenant-1"),
+        )
+        .await
+        .expect_err("a global connection is not the tenant's");
+        let PluginError::NonRetryable(msg) = err else {
+            panic!("retrying cannot make the connection the tenant's: {err:?}");
+        };
+        assert!(
+            msg.contains("prod-movies") && msg.contains("global"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(PLAINTEXT_KEY),
+            "an error must never carry the key"
+        );
     }
 
     #[tokio::test]
@@ -406,6 +505,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: Some("cp-token"),
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let err = resolve_connection(
             &cp,
@@ -437,6 +537,7 @@ mod tests {
             http: &http,
             base_url: Some(&base),
             token: None,
+            timeout: CONTROL_PLANE_TIMEOUT,
         };
         let _ = resolve_connection(
             &cp,
@@ -448,5 +549,23 @@ mod tests {
         .await;
         let req = &server.received_requests().await.unwrap()[0];
         assert!(req.url.query().is_none(), "{:?}", req.url);
+    }
+
+    #[test]
+    fn every_control_plane_request_has_a_deadline() {
+        // `authed` is what the source, archive and manifest calls go through.
+        let http = reqwest::Client::new();
+        let req = authed(http.get("http://cp.invalid/internal/plugins"), Some("t"))
+            .build()
+            .expect("request");
+        assert_eq!(req.timeout(), Some(&CONTROL_PLANE_TIMEOUT));
+        let req = authed_within(
+            http.get("http://cp.invalid/internal/plugins"),
+            None,
+            Duration::from_millis(100),
+        )
+        .build()
+        .expect("request");
+        assert_eq!(req.timeout(), Some(&Duration::from_millis(100)));
     }
 }

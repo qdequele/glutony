@@ -27,6 +27,11 @@
 //! accepted ([`check_object_ref`]): `file://` and `memory://` would otherwise read the
 //! worker's own filesystem or process memory.
 //!
+//! Both kinds of ref are held to a size cap ([`BlobStore::with_ref_max_bytes`],
+//! `REF_MAX_MB`, 512 MiB by default): the request that names one is a few bytes
+//! whatever it points at, and the content is read into the worker's memory. A guarded
+//! URL fetch also gives up on a server that stops sending ([`FETCH_READ_TIMEOUT`]).
+//!
 //! Supported store URLs: `file://<dir>` (created when missing), `memory://`,
 //! `s3://bucket/prefix`, `gs://bucket/prefix`, `az://container/prefix`. Cloud stores
 //! are configured from the provider's environment variables (`AWS_*`, `GOOGLE_*`,
@@ -36,9 +41,10 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use meili_ingest_plugin_sdk::{Blob, ContentRef, PluginInput, PluginOutput};
+use meili_ingest_plugin_sdk::{Blob, ContentRef, Document, PluginInput, PluginOutput};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -57,6 +63,21 @@ pub const DEFAULT_STORE_URL: &str = "file://./blobs";
 
 /// Fallback MIME type when nothing better is known.
 const OCTET_STREAM: &str = "application/octet-stream";
+
+/// `User-Agent` sent when fetching a URL ref. Several hosts (Wikimedia, some CDNs)
+/// answer `403` to a request that carries none, which reqwest sends by default.
+pub const FETCH_USER_AGENT: &str = concat!(
+    "meili-ingest/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/qdequele/glutony)"
+);
+
+/// How long a guarded URL fetch waits for the connection to open.
+pub const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a guarded URL fetch waits for the next bytes of the response, headers
+/// included, before it gives up on a server that went silent.
+pub const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Errors returned by [`BlobStore`].
 #[derive(Debug, thiserror::Error)]
@@ -84,9 +105,38 @@ pub enum BlobError {
     #[error("blocked url: {0}")]
     Blocked(String),
     /// A URL fetch got a client error other than 408 / 429 (404, 403, 410, ...), on the
-    /// URL itself or on a redirect target. Permanent: the same request gets the same answer.
+    /// URL itself or on a redirect target, or a URL or object ref turned out larger than
+    /// the ref size cap ([`BlobStore::with_ref_max_bytes`]). Permanent: the same request
+    /// gets the same answer.
     #[error("rejected url: {0}")]
     Rejected(String),
+}
+
+/// Megabytes (MiB) a URL or object ref may weigh; larger ones fail the step.
+pub const REF_MAX_MB_ENV: &str = "REF_MAX_MB";
+
+/// Default cap on a URL or object ref: 512 MiB, the cap of a scheduled source.
+pub const DEFAULT_REF_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The ref size cap from [`REF_MAX_MB_ENV`], in bytes.
+pub fn ref_max_bytes_from_env() -> anyhow::Result<u64> {
+    ref_max_bytes(std::env::var(REF_MAX_MB_ENV).ok().as_deref())
+}
+
+/// Parse [`REF_MAX_MB_ENV`]: a positive integer of MiB, [`DEFAULT_REF_MAX_BYTES`] when
+/// unset or blank. Anything else is an error: a typo must not lift the cap.
+pub fn ref_max_bytes(value: Option<&str>) -> anyhow::Result<u64> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_REF_MAX_BYTES);
+    };
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|mb| *mb > 0)
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .ok_or_else(|| {
+            anyhow::anyhow!("{REF_MAX_MB_ENV} must be a positive integer, got {value:?}")
+        })
 }
 
 /// Schemes a [`ContentRef::S3`] ref may use: cloud object stores, each with a bucket or
@@ -95,7 +145,8 @@ pub enum BlobError {
 pub const OBJECT_REF_SCHEMES: &[&str] = &["s3", "s3a", "gs", "az", "adl", "azure", "abfs", "abfss"];
 
 /// Parse a tenant-supplied object-store URI (`{"s3": …}` ingest bodies) and refuse any
-/// scheme outside [`OBJECT_REF_SCHEMES`], or one without a bucket. A refusal is
+/// scheme outside [`OBJECT_REF_SCHEMES`], one without a bucket, or an `adl://` /
+/// `azure://` URI with userinfo. A refusal is
 /// [`BlobError::Blocked`]: permanent, retrying reads the same forbidden location.
 pub fn check_object_ref(uri: &str) -> Result<Url, BlobError> {
     let parsed = Url::parse(uri).map_err(|e| BlobError::Url(format!("{uri:?}: {e}")))?;
@@ -109,6 +160,17 @@ pub fn check_object_ref(uri: &str) -> Result<Url, BlobError> {
     if parsed.host_str().is_none_or(str::is_empty) {
         return Err(BlobError::Blocked(format!(
             "object ref {uri:?} names no bucket"
+        )));
+    }
+    // `adl://` and `azure://` name the container as the host and ignore the userinfo: one
+    // that carries any reads another container than the one it appears to name.
+    if matches!(parsed.scheme(), "adl" | "azure")
+        && (!parsed.username().is_empty() || parsed.password().is_some())
+    {
+        return Err(BlobError::Blocked(format!(
+            "object ref {uri:?} carries a user: {}:// names the container as the host \
+             (use abfss://<container>@<account>.dfs.core.windows.net/... to name both)",
+            parsed.scheme()
         )));
     }
     Ok(parsed)
@@ -143,18 +205,12 @@ impl ObjectRefPolicy {
         )
     }
 
-    /// Parse the two variables. An unrecognised flag value is an error rather than a
-    /// silent default: a typo must not decide whose credentials sign tenant reads.
+    /// Parse the two variables. The flag is a shared boolean
+    /// ([`meili_ingest_plugin_sdk::env::flag`]): an unrecognised value is off, with a
+    /// warning, so a typo never makes the ambient credentials sign tenant reads.
     pub fn parse(ambient: Option<&str>, buckets: Option<&str>) -> anyhow::Result<Self> {
-        let ambient_credentials = match ambient.map(str::trim).unwrap_or("") {
-            "" | "0" => false,
-            "1" => true,
-            v if v.eq_ignore_ascii_case("false") => false,
-            v if v.eq_ignore_ascii_case("true") => true,
-            other => anyhow::bail!(
-                "{OBJECT_REF_AMBIENT_CREDENTIALS_ENV} must be true or false, got {other:?}"
-            ),
-        };
+        let ambient_credentials =
+            meili_ingest_plugin_sdk::env::flag(OBJECT_REF_AMBIENT_CREDENTIALS_ENV, ambient);
         let buckets = match buckets.map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
             Some(list) => {
@@ -198,11 +254,11 @@ fn bucket_of(url: &Url) -> Option<Bucket> {
     let (provider, name) = match url.scheme() {
         "s3" | "s3a" => (Provider::S3, host?),
         "gs" => (Provider::Gcs, host?),
-        // `abfs[s]://<container>@<account>.dfs.core.windows.net/...` names the container
-        // as the user; every other form names it as the host.
-        "az" | "adl" | "azure" | "abfs" | "abfss" if !url.username().is_empty() => {
-            (Provider::Azure, url.username())
-        }
+        // Same reading as object_store's Azure builder, which is what the request is
+        // built from: `abfs[s]://<container>@<account>.dfs.core.windows.net/...` (and the
+        // `az://` spelling of it) names the container as the user; `adl://` and
+        // `azure://` ignore the userinfo and name it as the host, like every other form.
+        "az" | "abfs" | "abfss" if !url.username().is_empty() => (Provider::Azure, url.username()),
         "az" | "adl" | "azure" | "abfs" | "abfss" => (Provider::Azure, host?),
         _ => return None,
     };
@@ -326,8 +382,10 @@ async fn tenant_store(
 /// the policy's crate.
 #[async_trait::async_trait]
 pub trait UrlCheck: Send + Sync {
-    /// `Err(reason)` refuses the URL.
-    async fn check(&self, url: &Url) -> Result<(), String>;
+    /// `Err(reason)` refuses the URL. `list_allowed` says whether the reason may
+    /// describe the policy (what is allowed): `false` for a tenant's fetch, see
+    /// [`BlobStore::with_guard_disclosure`].
+    async fn check(&self, url: &Url, list_allowed: bool) -> Result<(), String>;
 }
 
 /// Guarded fetching of [`ContentRef::Url`]: a [`UrlCheck`] plus a client that never
@@ -337,6 +395,8 @@ pub struct FetchGuard {
     check: Arc<dyn UrlCheck>,
     http: reqwest::Client,
     max_redirects: usize,
+    /// Passed to [`UrlCheck::check`]; `true` unless set for a tenant's fetch.
+    list_allowed: bool,
 }
 
 impl fmt::Debug for FetchGuard {
@@ -347,6 +407,19 @@ impl fmt::Debug for FetchGuard {
     }
 }
 
+/// The guard's client: no redirects of its own, and timeouts on connecting and on each
+/// read. Not a total timeout, which would cut a large download from a slow but live
+/// server; a server that goes silent is dropped after `read`.
+fn guard_client(connect: Duration, read: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(FETCH_USER_AGENT)
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+        .unwrap_or_default()
+}
+
 impl FetchGuard {
     /// Guard every URL fetch with `check`, following at most 5 redirects.
     pub fn new(check: Arc<dyn UrlCheck>) -> Self {
@@ -355,12 +428,17 @@ impl FetchGuard {
             // Redirects are followed by `get` below, never by the client: a client that
             // followed them would fetch whatever internal address a public host
             // redirects to without the check ever seeing it.
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_default(),
+            http: guard_client(FETCH_CONNECT_TIMEOUT, FETCH_READ_TIMEOUT),
             max_redirects: 5,
+            list_allowed: true,
         }
+    }
+
+    /// Replace the default timeouts ([`FETCH_CONNECT_TIMEOUT`], [`FETCH_READ_TIMEOUT`]).
+    /// `read` bounds each wait for data, headers included, not the whole download.
+    pub fn with_timeouts(mut self, connect: Duration, read: Duration) -> Self {
+        self.http = guard_client(connect, read);
+        self
     }
 
     /// GET `url`, checking it and every redirect target before requesting it.
@@ -369,7 +447,7 @@ impl FetchGuard {
         let mut hops = 0usize;
         loop {
             self.check
-                .check(&current)
+                .check(&current, self.list_allowed)
                 .await
                 .map_err(BlobError::Blocked)?;
             let response = self
@@ -423,8 +501,12 @@ pub struct BlobStore {
     url: String,
     fetch_guard: Option<FetchGuard>,
     object_refs: ObjectRefPolicy,
+    /// Largest URL or object ref [`BlobStore::fetch_ref`] reads, in bytes.
+    ref_max_bytes: u64,
     /// The bucket this store lives in, refused to tenant object refs.
     own_bucket: Option<Bucket>,
+    /// The directory of a `file://` store, whose emptied job folders are removed.
+    local_root: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for BlobStore {
@@ -459,7 +541,9 @@ impl BlobStore {
                 url: url.to_owned(),
                 fetch_guard: None,
                 object_refs: ObjectRefPolicy::default(),
+                ref_max_bytes: DEFAULT_REF_MAX_BYTES,
                 own_bucket: None,
+                local_root: None,
             });
         }
         if let Some(rest) = url.strip_prefix("file://") {
@@ -473,7 +557,9 @@ impl BlobStore {
                 url: url.to_owned(),
                 fetch_guard: None,
                 object_refs: ObjectRefPolicy::default(),
+                ref_max_bytes: DEFAULT_REF_MAX_BYTES,
                 own_bucket: None,
+                local_root: Some(std::path::PathBuf::from(dir)),
             });
         }
         Self::from_cloud_url(url, &process_env())
@@ -510,21 +596,44 @@ impl BlobStore {
             url: url.to_owned(),
             fetch_guard: None,
             object_refs: ObjectRefPolicy::default(),
+            ref_max_bytes: DEFAULT_REF_MAX_BYTES,
             own_bucket,
+            local_root: None,
         })
     }
 
     /// Fetch every [`ContentRef::Url`] through `guard`. Without one, URL refs are fetched
-    /// with the caller's client and its redirect policy, unchecked.
+    /// with the caller's client, its redirect policy and its timeouts (none by default),
+    /// unchecked. The size cap applies either way.
     pub fn with_fetch_guard(mut self, guard: FetchGuard) -> Self {
         self.fetch_guard = Some(guard);
         self
+    }
+
+    /// This store, with its fetch guard told whether a refusal may describe the policy
+    /// (`list_allowed`, passed to [`UrlCheck::check`]). A worker fetching for a tenant
+    /// passes `false`: the allowlist is deployment config the tenant does not see.
+    /// Cheap: a clone sharing the same store and client.
+    pub fn with_guard_disclosure(&self, list_allowed: bool) -> Self {
+        let mut store = self.clone();
+        if let Some(guard) = &mut store.fetch_guard {
+            guard.list_allowed = list_allowed;
+        }
+        store
     }
 
     /// Read tenant object refs ([`ContentRef::S3`]) under `policy`. Without this, the
     /// default policy applies: anonymous reads, any bucket but this store's.
     pub fn with_object_ref_policy(mut self, policy: ObjectRefPolicy) -> Self {
         self.object_refs = policy;
+        self
+    }
+
+    /// Refuse URL and object refs larger than `max_bytes` (default
+    /// [`DEFAULT_REF_MAX_BYTES`]). Staged objects are not held to it: the gateway
+    /// accepted them under its own upload limit.
+    pub fn with_ref_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.ref_max_bytes = max_bytes;
         self
     }
 
@@ -567,7 +676,18 @@ impl BlobStore {
             url: "memory://".to_owned(),
             fetch_guard: None,
             object_refs: ObjectRefPolicy::default(),
+            ref_max_bytes: DEFAULT_REF_MAX_BYTES,
             own_bucket: None,
+            local_root: None,
+        }
+    }
+
+    /// A store over any [`ObjectStore`], without a key prefix: for tests that need a
+    /// store which is slow, fails or counts what it is asked.
+    pub fn from_object_store(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            ..Self::memory()
         }
     }
 
@@ -616,6 +736,37 @@ impl BlobStore {
             .map_err(BlobError::from_store)
     }
 
+    /// Delete everything a job left in the store (`jobs/<job_id>/`): its staged input,
+    /// its spilled step outputs, an archive's manifest. Returns how many objects were
+    /// deleted. Idempotent: an object already gone is not an error.
+    pub async fn delete_job(&self, job_id: Uuid) -> Result<usize, BlobError> {
+        use futures::{StreamExt, TryStreamExt};
+        let prefix = self.full_path(&format!("jobs/{job_id}"));
+        let locations = self
+            .store
+            .list(Some(&prefix))
+            .map_ok(|meta| meta.location)
+            .boxed();
+        let mut results = self.store.delete_stream(locations);
+        let mut deleted = 0;
+        while let Some(result) = results.next().await {
+            match result {
+                Ok(_) => deleted += 1,
+                // Deleted meanwhile (another sweep): what was asked is done.
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(BlobError::Store(e)),
+            }
+        }
+        // A folder store keeps the directories it created for the job's keys.
+        if let Some(root) = &self.local_root {
+            let dir = prefix
+                .parts()
+                .fold(root.clone(), |dir, part| dir.join(part.as_ref()));
+            remove_empty_dirs(&dir);
+        }
+        Ok(deleted)
+    }
+
     /// Fetch the content behind a [`ContentRef`].
     ///
     /// * [`ContentRef::Url`] → HTTP GET with `http`; MIME from the hint or the
@@ -629,6 +780,14 @@ impl BlobStore {
     ///   extension. Refused refs (`file://`, the blob store's bucket, ...) are
     ///   [`BlobError::Blocked`].
     /// * [`ContentRef::Staged`] → read from this store.
+    ///
+    /// A URL or object ref larger than the cap ([`BlobStore::with_ref_max_bytes`]) is
+    /// [`BlobError::Rejected`]: the body is streamed and dropped as soon as it passes
+    /// the cap, never buffered whole. Staged objects are not capped.
+    ///
+    /// The blob's [`Blob::origin`] is the URL without its query string, the object
+    /// URI, or the staged ref's own `origin`, so generated document ids stay distinct
+    /// per origin and stable across re-ingests.
     pub async fn fetch_ref(
         &self,
         r: &ContentRef,
@@ -652,6 +811,7 @@ impl BlobStore {
                     Some(guard) => guard.get(&parsed).await?,
                     None => http
                         .get(parsed.clone())
+                        .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
                         .send()
                         .await
                         .map_err(|e| BlobError::Http(format!("GET {url}: {e}")))?,
@@ -672,15 +832,14 @@ impl BlobStore {
                         BlobError::Rejected(message)
                     });
                 }
-                let header_mime = response
+                let content_type = response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(strip_mime_params);
-                let data = response
-                    .bytes()
-                    .await
-                    .map_err(|e| BlobError::Http(format!("GET {url}: reading body: {e}")))?;
+                    .and_then(|v| v.to_str().ok());
+                let header_mime = content_type.and_then(strip_mime_params);
+                // Kept apart from the MIME, which routing compares as a bare essence.
+                let charset = content_type.and_then(mime_charset);
+                let data = read_capped_response(response, self.ref_max_bytes, url).await?;
                 let name = filename
                     .clone()
                     .or_else(|| last_segment(parsed.path()).map(str::to_owned));
@@ -689,7 +848,9 @@ impl BlobStore {
                     .or(header_mime)
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name))
+                Ok(Blob::new(data, mime, name)
+                    .with_origin(Some(url_origin(&parsed)))
+                    .with_charset(charset))
             }
             ContentRef::S3 {
                 uri,
@@ -705,7 +866,7 @@ impl BlobStore {
                 )
                 .await?;
                 let result = store.get(&path).await.map_err(BlobError::from_store)?;
-                let data = result.bytes().await.map_err(BlobError::from_store)?;
+                let data = read_capped_object(result, self.ref_max_bytes, uri).await?;
                 let name = filename
                     .clone()
                     .or_else(|| last_segment(path.as_ref()).map(str::to_owned));
@@ -713,12 +874,14 @@ impl BlobStore {
                     .clone()
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name))
+                Ok(Blob::new(data, mime, name).with_origin(Some(uri.clone())))
             }
             ContentRef::Staged {
                 uri,
                 mime,
                 filename,
+                origin,
+                charset,
             } => {
                 let data = self.get(uri).await?;
                 let name = filename
@@ -728,7 +891,10 @@ impl BlobStore {
                     .clone()
                     .or_else(|| name.as_deref().and_then(guess_mime))
                     .unwrap_or_else(|| OCTET_STREAM.to_owned());
-                Ok(Blob::new(data.to_vec(), mime, name))
+                // Not capped: the gateway accepted it under its own upload limit.
+                Ok(Blob::new(Vec::from(data), mime, name)
+                    .with_origin(origin.clone())
+                    .with_charset(charset.clone()))
             }
         }
     }
@@ -783,9 +949,11 @@ impl BlobStore {
 
     /// Spill an oversized step output to the store.
     ///
-    /// When `output.approx_size() > threshold`, the output is serialized to JSON and
-    /// stored at `staged_key(job_id, "<step_id>[-<branch>].json")`; the returned value
-    /// is a [`PluginOutput::Ref`] to a [`ContentRef::Staged`] with MIME
+    /// When the output serializes to more than `threshold` bytes of JSON (what it would
+    /// weigh in the activity result, see [`PluginOutput::serialized_size_exceeds`]), that
+    /// JSON is stored at `jobs/<job>/steps/<step>/output.json`, or
+    /// `.../branch-<b>.json` for a fan-out branch (see [`BlobStore::spill_key`]); the
+    /// returned value is a [`PluginOutput::Ref`] to a [`ContentRef::Staged`] with MIME
     /// [`SPILLED_OUTPUT_MIME`]. Otherwise the output is returned unchanged.
     pub async fn spill_output(
         &self,
@@ -795,35 +963,91 @@ impl BlobStore {
         output: PluginOutput,
         threshold: usize,
     ) -> Result<PluginOutput, BlobError> {
-        let size = output.approx_size();
-        if size <= threshold {
+        let kind = match branch {
+            Some(b) => SpillKind::Branch(b),
+            None => SpillKind::Output,
+        };
+        self.spill(job_id, step_id, kind, output, threshold).await
+    }
+
+    /// [`BlobStore::spill_output`] for input `index` of the fan-out of step `step_id`
+    /// (`jobs/<job>/steps/<step>/fanout-<index>.json`), which never shares a key with
+    /// any step's output.
+    pub async fn spill_fan_out_input(
+        &self,
+        job_id: Uuid,
+        step_id: &str,
+        index: usize,
+        output: PluginOutput,
+        threshold: usize,
+    ) -> Result<PluginOutput, BlobError> {
+        self.spill(
+            job_id,
+            step_id,
+            SpillKind::FanOutInput(index),
+            output,
+            threshold,
+        )
+        .await
+    }
+
+    /// Key of a spilled object: `jobs/<job>/steps/<step>/<file>`. The step id is one
+    /// key segment (`/` and `%` percent-encoded) and each kind has its own file name
+    /// inside it, so two different steps, or two kinds of one step, never map to the
+    /// same key, and no step id reaches the upload namespace `input/`.
+    ///
+    /// Keys written before this layout (`jobs/<job>/<step>[-<branch>].json`) are still
+    /// read: a ref carries its full key, and [`BlobStore::hydrate_output`] accepts both.
+    fn spill_key(job_id: Uuid, step_id: &str, kind: SpillKind) -> String {
+        let step = step_id.replace('%', "%25").replace('/', "%2F");
+        let file = match kind {
+            SpillKind::Output => "output.json".to_owned(),
+            SpillKind::Branch(b) => format!("branch-{b}.json"),
+            SpillKind::FanOutInput(i) => format!("fanout-{i}.json"),
+        };
+        Self::staged_key(job_id, &format!("steps/{step}/{file}"))
+    }
+
+    async fn spill(
+        &self,
+        job_id: Uuid,
+        step_id: &str,
+        kind: SpillKind,
+        output: PluginOutput,
+        threshold: usize,
+    ) -> Result<PluginOutput, BlobError> {
+        if !output.serialized_size_exceeds(threshold) {
             return Ok(output);
         }
-        let name = match branch {
-            Some(b) => format!("{step_id}-{b}.json"),
-            None => format!("{step_id}.json"),
-        };
-        let key = Self::staged_key(job_id, &name);
+        let key = Self::spill_key(job_id, step_id, kind);
         let bytes = serde_json::to_vec(&output)?;
-        tracing::debug!(job_id = %job_id, step_id = %step_id, ?branch, approx_size = size, key = %key, "spilling step output to blob store");
+        tracing::debug!(job_id = %job_id, step_id = %step_id, ?kind, size = bytes.len(), key = %key, "spilling step output to blob store");
         self.put(&key, Bytes::from(bytes)).await?;
         Ok(PluginOutput::Ref(ContentRef::Staged {
             uri: key,
             mime: Some(SPILLED_OUTPUT_MIME.to_owned()),
             filename: None,
+            origin: None,
+            charset: None,
         }))
     }
 
     /// Undo [`BlobStore::spill_output`]: a `Ref(Staged{ mime == SPILLED_OUTPUT_MIME })`
-    /// is read back and deserialized into the original output. `Many` is walked
-    /// recursively; every other variant (including non-spilled refs) is returned unchanged.
+    /// whose key is one `spill_output` writes is read back and deserialized into the
+    /// original output. `Many` is walked recursively; every other variant (including
+    /// non-spilled refs) is returned unchanged.
+    ///
+    /// The MIME alone is not proof: what is deserialized here is trusted as a
+    /// worker-written output, and its refs may name any key of the store. A staged
+    /// upload (`jobs/<job>/input/...`) holds tenant bytes and is never read that way,
+    /// whatever MIME its ref carries.
     pub async fn hydrate_output(&self, output: PluginOutput) -> Result<PluginOutput, BlobError> {
         match output {
             PluginOutput::Ref(ContentRef::Staged {
                 uri,
                 mime: Some(mime),
                 ..
-            }) if mime == SPILLED_OUTPUT_MIME => {
+            }) if mime == SPILLED_OUTPUT_MIME && is_spill_key(&uri) => {
                 let bytes = self.get(&uri).await?;
                 let inner: PluginOutput = serde_json::from_slice(&bytes)?;
                 Box::pin(self.hydrate_output(inner)).await
@@ -840,14 +1064,23 @@ impl BlobStore {
     }
 
     /// Gateway helper: inline the upload when `blob.data.len() <= inline_max`,
-    /// otherwise stage it at `staged_key(job_id, "input/<filename or upload.bin>")`
-    /// and return a [`PluginInput::Ref`] carrying the blob's MIME and filename.
+    /// otherwise stage it at `staged_key(job_id, "input/upload.<ext>")` (`upload.bin`
+    /// without a short ASCII extension) and return a [`PluginInput::Ref`] carrying the
+    /// blob's MIME and filename. The filename is never part of the key.
     pub async fn stage_upload(
         &self,
         job_id: Uuid,
         blob: Blob,
         inline_max: usize,
     ) -> Result<PluginInput, BlobError> {
+        let mut blob = blob;
+        // [`SPILLED_OUTPUT_MIME`] is the worker's to give. The MIME of an upload comes
+        // from the tenant (a multipart part, a source's `Content-Type`), and a staged ref
+        // carrying that one would be deserialized as a step output.
+        if is_spilled_output_mime(&blob.mime) {
+            tracing::warn!(job_id = %job_id, "upload claims the reserved spilled-output MIME; staging it as {OCTET_STREAM}");
+            blob.mime = OCTET_STREAM.to_owned();
+        }
         if blob.data.len() <= inline_max {
             return Ok(PluginInput::Bytes(blob));
         }
@@ -855,11 +1088,10 @@ impl BlobStore {
             data,
             mime,
             filename,
+            origin,
+            charset,
         } = blob;
-        let object_name = filename
-            .as_deref()
-            .and_then(last_segment)
-            .unwrap_or("upload.bin");
+        let object_name = staged_object_name(filename.as_deref());
         let key = Self::staged_key(job_id, &format!("input/{object_name}"));
         tracing::debug!(job_id = %job_id, key = %key, size = data.len(), "staging upload in blob store");
         self.put(&key, Bytes::from(data)).await?;
@@ -867,11 +1099,64 @@ impl BlobStore {
             uri: key,
             mime: Some(mime),
             filename,
+            origin,
+            charset,
+        }))
+    }
+
+    /// Gateway helper for inline documents: keep them in the workflow input when they
+    /// serialize to at most `inline_max` bytes, otherwise store them at
+    /// `staged_key(job_id, "gateway/documents.json")` and return a [`PluginInput::Ref`]
+    /// with MIME [`SPILLED_OUTPUT_MIME`].
+    ///
+    /// The object is the JSON of a [`PluginOutput::Documents`], the encoding of a
+    /// spilled step output, so [`BlobStore::resolve_input`] hands the first step the
+    /// same documents it would have received inline, not a blob of JSON bytes.
+    ///
+    /// It lives under `gateway/`, which nothing else can write: a step output is one
+    /// key segment (`<step>.json`, `/` percent-encoded) and an upload goes under
+    /// `input/`, which [`BlobStore::hydrate_output`] refuses to read as documents
+    /// because its content is the tenant's.
+    pub async fn stage_documents(
+        &self,
+        job_id: Uuid,
+        documents: Vec<Document>,
+        inline_max: usize,
+    ) -> Result<PluginInput, BlobError> {
+        let output = PluginOutput::Documents(documents);
+        // The exact size, not `approx_size`: what is kept inline goes into a Temporal
+        // payload, which has a hard limit.
+        let bytes = serde_json::to_vec(&output)?;
+        if bytes.len() <= inline_max {
+            return Ok(PluginInput::from(output));
+        }
+        let key = Self::staged_key(job_id, "gateway/documents.json");
+        tracing::debug!(job_id = %job_id, key = %key, size = bytes.len(), "staging inline documents in blob store");
+        self.put(&key, Bytes::from(bytes)).await?;
+        Ok(PluginInput::Ref(ContentRef::Staged {
+            uri: key,
+            mime: Some(SPILLED_OUTPUT_MIME.to_owned()),
+            filename: None,
+            origin: None,
+            charset: None,
         }))
     }
 }
 
 /// `type/subtype; params` → `type/subtype` (lower-cased); `None` when empty.
+/// Remove `dir` and the directories under it, as far as they are empty. Best effort:
+/// what cannot be removed (a file written meanwhile) stays.
+fn remove_empty_dirs(dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_empty_dirs(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 fn strip_mime_params(value: &str) -> Option<String> {
     let essence = value
         .split(';')
@@ -886,9 +1171,149 @@ fn strip_mime_params(value: &str) -> Option<String> {
     }
 }
 
+/// The `charset` parameter of a `Content-Type` value, unquoted and lower-cased;
+/// `None` when there is none or it is empty.
+fn mime_charset(value: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|param| {
+        let (name, raw) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = raw.trim().trim_matches('"').trim().to_ascii_lowercase();
+        (!label.is_empty()).then_some(label)
+    })
+}
+
+/// The [`Blob::origin`] of a fetched URL: the URL without its query string, fragment
+/// or credentials. Query strings of one-off URL ingests are mostly signatures and
+/// tokens (pre-signed links) that change on every request, and re-ingesting the same
+/// file must replace its documents, not duplicate them.
+fn url_origin(url: &Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    // Only fails for URLs that cannot carry credentials, which then have none.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
 /// Last non-empty `/`-separated segment of a path or key.
 fn last_segment(path: &str) -> Option<&str> {
     path.rsplit('/').find(|s| !s.is_empty())
+}
+
+/// Whether a MIME type, whatever its case and parameters, is [`SPILLED_OUTPUT_MIME`].
+fn is_spilled_output_mime(mime: &str) -> bool {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case(SPILLED_OUTPUT_MIME)
+}
+
+/// What a spilled object is, which picks its file name under `steps/<step>/`.
+#[derive(Debug, Clone, Copy)]
+enum SpillKind {
+    /// The output of a step that is not fanned out.
+    Output,
+    /// The output of branch `n` of a fanned-out step.
+    Branch(usize),
+    /// Input `n` of a step's fan-out.
+    FanOutInput(usize),
+}
+
+/// Whether `key` can be a spilled output: `jobs/<job>/steps/...` (the current layout),
+/// or any older `jobs/<job>/<name>` (still held by refs of jobs in flight), outside the
+/// upload namespace `jobs/<job>/input/`, where [`BlobStore::stage_upload`] writes. Empty
+/// segments are skipped, as the store does when it turns a key into a path.
+fn is_spill_key(key: &str) -> bool {
+    let mut segments = key.split('/').filter(|s| !s.is_empty());
+    segments.next() == Some("jobs")
+        && segments.next().is_some()
+        && segments.next().is_some_and(|name| name != "input")
+}
+
+/// The error for a ref larger than the cap. [`BlobError::Rejected`]: permanent, the
+/// next attempt would download the same content.
+fn over_cap(what: &str, size: Option<u64>, max_bytes: u64) -> BlobError {
+    let size = match size {
+        Some(size) => format!("is {size} bytes"),
+        None => "is larger".to_owned(),
+    };
+    BlobError::Rejected(format!(
+        "{what}: the content {size}, over the {max_bytes} byte cap ({REF_MAX_MB_ENV})"
+    ))
+}
+
+/// Read the body of a URL fetch, refusing more than `max_bytes`: up front when the
+/// server announces a larger `Content-Length`, and while streaming in any case, since a
+/// chunked response announces nothing and a length can lie.
+async fn read_capped_response(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    url: &str,
+) -> Result<Vec<u8>, BlobError> {
+    let what = format!("GET {url}");
+    let announced = response.content_length();
+    if announced.is_some_and(|len| len > max_bytes) {
+        return Err(over_cap(&what, announced, max_bytes));
+    }
+    // Reserved once when the length is known (and within the cap), so the body is not
+    // copied again and again as the buffer grows.
+    let mut body = Vec::with_capacity(announced.unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| BlobError::Http(format!("{what}: reading body: {e}")))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(over_cap(&what, None, max_bytes));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Read an object, refusing one larger than `max_bytes` before any of it is read: the
+/// store reports the size with the response headers, ahead of the body.
+async fn read_capped_object(
+    result: object_store::GetResult,
+    max_bytes: u64,
+    uri: &str,
+) -> Result<Vec<u8>, BlobError> {
+    let size = result.meta.size;
+    if size > max_bytes {
+        return Err(over_cap(uri, Some(size), max_bytes));
+    }
+    let data = result.bytes().await.map_err(BlobError::from_store)?;
+    Ok(Vec::from(data))
+}
+
+/// Longest filename extension kept in a staged upload's key.
+const STAGED_EXTENSION_MAX: usize = 16;
+
+/// Name of the object an upload is staged under: `upload.<ext>`, or `upload.bin` when
+/// the filename has no short ASCII alphanumeric extension.
+///
+/// The filename itself stays out of the key. object_store percent-encodes every
+/// non-ASCII byte of a key segment (three characters per byte), so a moderately long
+/// non-Latin name overflows the 255-byte file name limit of a `file://` store, and a
+/// longer one the 1024-byte key limit of S3. A job stages one upload, so the fixed
+/// name cannot collide; the extension is only there for whoever lists the store.
+fn staged_object_name(filename: Option<&str>) -> String {
+    let extension = filename
+        .and_then(last_segment)
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+        .filter(|ext| {
+            (1..=STAGED_EXTENSION_MAX).contains(&ext.len())
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    match extension {
+        Some(ext) => format!("upload.{}", ext.to_ascii_lowercase()),
+        None => "upload.bin".to_owned(),
+    }
 }
 
 /// MIME guessed from a filename's extension.
@@ -936,7 +1361,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl UrlCheck for AllowOnly {
-        async fn check(&self, url: &Url) -> Result<(), String> {
+        async fn check(&self, url: &Url, _list_allowed: bool) -> Result<(), String> {
             let authority = format!(
                 "{}:{}",
                 url.host_str().unwrap_or_default(),
@@ -1009,6 +1434,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn url_fetches_send_a_user_agent_guarded_or_not() {
+        // Wikimedia answers 403 to a request without one: the image pipeline failed on
+        // every upload.wikimedia.org URL.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::header("user-agent", FETCH_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let url = format!("{}/a.png", server.uri());
+        let guarded =
+            BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+                authority(&server),
+            ]))));
+        assert_eq!(
+            guarded
+                .fetch_ref(&url_ref(url.clone()), &reqwest::Client::new())
+                .await
+                .unwrap()
+                .data,
+            b"ok"
+        );
+        assert_eq!(
+            BlobStore::memory()
+                .fetch_ref(&url_ref(url), &reqwest::Client::new())
+                .await
+                .unwrap()
+                .data,
+            b"ok"
+        );
+    }
+
+    #[tokio::test]
     async fn guarded_fetch_follows_an_allowed_relative_redirect() {
         let allowed = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1034,6 +1492,177 @@ mod tests {
             .unwrap();
         assert_eq!(blob.data, b"hello");
         assert_eq!(blob.filename.as_deref(), Some("old"));
+    }
+
+    /// A server that answers every connection with `response`, then holds it open
+    /// without sending anything more.
+    async fn raw_server(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket.write_all(&response).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn guarded(base: &str) -> BlobStore {
+        BlobStore::memory().with_fetch_guard(FetchGuard::new(Arc::new(AllowOnly(vec![
+            base.trim_start_matches("http://").to_owned(),
+        ]))))
+    }
+
+    #[tokio::test]
+    async fn a_url_ref_over_the_size_cap_is_rejected_guarded_or_not() {
+        // A `{"url": …}` body is a few bytes whatever it points at: the whole body was
+        // buffered (twice) in the worker, with no limit.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 2000]))
+            .mount(&server)
+            .await;
+        let r = url_ref(format!("{}/big.bin", server.uri()));
+        let http = reqwest::Client::new();
+        for store in [BlobStore::memory(), guarded(&server.uri())] {
+            let err = store
+                .clone()
+                .with_ref_max_bytes(1999)
+                .fetch_ref(&r, &http)
+                .await
+                .map(|blob| blob.data.len())
+                .expect_err("over the cap");
+            // Permanent: the next attempt downloads the same body.
+            assert!(matches!(err, BlobError::Rejected(_)), "{err:?}");
+            assert!(err.to_string().contains("1999 byte cap"), "{err}");
+            // A body of exactly the cap passes.
+            let blob = store
+                .with_ref_max_bytes(2000)
+                .fetch_ref(&r, &http)
+                .await
+                .unwrap();
+            assert_eq!(blob.data, vec![7u8; 2000]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_url_ref_without_a_content_length_is_capped_while_streaming() {
+        let mut response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..64 {
+            response.extend_from_slice(b"400\r\n");
+            response.extend_from_slice(&[b'x'; 1024]);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let base = raw_server(response).await;
+        let r = url_ref(format!("{base}/stream"));
+        let http = reqwest::Client::new();
+        for store in [BlobStore::memory(), guarded(&base)] {
+            let err = store
+                .clone()
+                .with_ref_max_bytes(10 * 1024)
+                .fetch_ref(&r, &http)
+                .await
+                .map(|blob| blob.data.len())
+                .expect_err("over the cap");
+            assert!(matches!(err, BlobError::Rejected(_)), "{err:?}");
+            let blob = store
+                .with_ref_max_bytes(64 * 1024)
+                .fetch_ref(&r, &http)
+                .await
+                .unwrap();
+            assert_eq!(blob.data.len(), 64 * 1024);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_url_fetch_times_out() {
+        // No timeout at all: a server that accepted the connection and went silent held
+        // the activity until its start-to-close timeout, on every attempt.
+        use std::time::Duration;
+        for (what, response) in [
+            ("before the headers", Vec::new()),
+            (
+                "in the middle of the body",
+                b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc".to_vec(),
+            ),
+        ] {
+            let base = raw_server(response).await;
+            let store = BlobStore::memory().with_fetch_guard(
+                FetchGuard::new(Arc::new(AllowOnly(vec![
+                    base.trim_start_matches("http://").to_owned(),
+                ])))
+                .with_timeouts(Duration::from_secs(5), Duration::from_millis(200)),
+            );
+            let r = url_ref(format!("{base}/slow"));
+            let http = reqwest::Client::new();
+            let fetch = store.fetch_ref(&r, &http);
+            let err = tokio::time::timeout(Duration::from_secs(10), fetch)
+                .await
+                .unwrap_or_else(|_| panic!("stalled {what}: the fetch never gave up"))
+                .expect_err("stalled");
+            // Transient: the next attempt may find the server answering.
+            assert!(matches!(err, BlobError::Http(_)), "{what}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_object_over_the_size_cap_is_rejected_before_it_is_read() {
+        let store = InMemory::new();
+        let location = Path::from("exports/big.bin");
+        store
+            .put(&location, PutPayload::from(vec![7u8; 2000]))
+            .await
+            .unwrap();
+        let err = read_capped_object(
+            store.get(&location).await.unwrap(),
+            1999,
+            "s3://exports/big.bin",
+        )
+        .await
+        .map(|data| data.len())
+        .expect_err("over the cap");
+        assert!(matches!(err, BlobError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("s3://exports/big.bin"), "{err}");
+        let data = read_capped_object(store.get(&location).await.unwrap(), 2000, "s3://x/y")
+            .await
+            .unwrap();
+        assert_eq!(data, vec![7u8; 2000]);
+    }
+
+    #[tokio::test]
+    async fn staged_refs_are_not_held_to_the_ref_size_cap() {
+        // The gateway accepted the upload under its own limit; the worker must read it.
+        let store = BlobStore::memory().with_ref_max_bytes(10);
+        let blob = Blob::new(vec![1u8; 100], "application/pdf", Some("a.pdf".into()));
+        let staged = store
+            .stage_upload(Uuid::new_v4(), blob.clone(), 0)
+            .await
+            .unwrap();
+        let resolved = store
+            .resolve_input(staged, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(resolved, PluginInput::Bytes(blob));
+    }
+
+    #[test]
+    fn the_ref_size_cap_is_read_in_megabytes() {
+        assert_eq!(ref_max_bytes(None).unwrap(), DEFAULT_REF_MAX_BYTES);
+        assert_eq!(ref_max_bytes(Some(" ")).unwrap(), DEFAULT_REF_MAX_BYTES);
+        assert_eq!(DEFAULT_REF_MAX_BYTES, 512 * 1024 * 1024);
+        assert_eq!(ref_max_bytes(Some(" 2048 ")).unwrap(), 2048 * 1024 * 1024);
+        for bad in ["0", "-1", "1.5", "lots", "99999999999999999999"] {
+            assert!(ref_max_bytes(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(BlobStore::memory().ref_max_bytes, DEFAULT_REF_MAX_BYTES);
     }
 
     #[tokio::test]
@@ -1120,6 +1749,85 @@ mod tests {
         ));
     }
 
+    /// What a job leaves in the store: a staged input, a spilled output and an archive
+    /// manifest, under `jobs/<job>/`.
+    async fn leave_job_objects(store: &BlobStore, job: Uuid) {
+        store
+            .stage_upload(
+                job,
+                Blob::new(vec![7; 32], "application/pdf", Some("q3/a.pdf".into())),
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &BlobStore::staged_key(job, "extract.json"),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &BlobStore::staged_key(job, "archive/manifest.json"),
+                Bytes::from_static(b"[]"),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn keys(store: &BlobStore) -> Vec<String> {
+        use futures::TryStreamExt;
+        let mut keys: Vec<String> = store
+            .store
+            .list(None)
+            .map_ok(|m| m.location.to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_removes_everything_under_its_prefix_and_nothing_else() {
+        for store in [
+            BlobStore::memory(),
+            BlobStore::from_url("memory:///tenant-a").unwrap(),
+        ] {
+            let (job, other) = (Uuid::new_v4(), Uuid::new_v4());
+            leave_job_objects(&store, job).await;
+            leave_job_objects(&store, other).await;
+            assert_eq!(keys(&store).await.len(), 6);
+
+            assert_eq!(store.delete_job(job).await.unwrap(), 3);
+            let left = keys(&store).await;
+            assert_eq!(left.len(), 3, "{left:?}");
+            assert!(
+                left.iter().all(|k| k.contains(&other.to_string())),
+                "{left:?}"
+            );
+            // Idempotent: a job already swept, or one that never staged anything.
+            assert_eq!(store.delete_job(job).await.unwrap(), 0);
+            assert_eq!(store.delete_job(Uuid::new_v4()).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_on_disk_leaves_no_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::from_url(&format!("file://{}", dir.path().display())).unwrap();
+        let (job, other) = (Uuid::new_v4(), Uuid::new_v4());
+        leave_job_objects(&store, job).await;
+        leave_job_objects(&store, other).await;
+        assert_eq!(store.delete_job(job).await.unwrap(), 3);
+        let jobs = dir.path().join("jobs");
+        assert!(!jobs.join(job.to_string()).exists());
+        assert!(jobs.join(other.to_string()).is_dir());
+        assert_eq!(keys(&store).await.len(), 3);
+        assert_eq!(store.delete_job(job).await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn stage_upload_inlines_small_blobs() {
         let store = BlobStore::memory();
@@ -1137,13 +1845,15 @@ mod tests {
         let job = Uuid::new_v4();
         let blob = Blob::new(vec![7u8; 100], "application/pdf", Some("big.pdf".into()));
         let input = store.stage_upload(job, blob, 99).await.unwrap();
-        let expected_key = BlobStore::staged_key(job, "input/big.pdf");
+        let expected_key = BlobStore::staged_key(job, "input/upload.pdf");
         assert_eq!(
             input,
             PluginInput::Ref(ContentRef::Staged {
                 uri: expected_key.clone(),
                 mime: Some("application/pdf".into()),
                 filename: Some("big.pdf".into()),
+                origin: None,
+                charset: None,
             })
         );
         assert_eq!(
@@ -1174,6 +1884,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_documents_resolve_back_to_the_same_documents() {
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let mut documents = docs(3);
+        documents[0].title = Some("a title".into());
+        documents[0]
+            .fields
+            .insert("year".into(), serde_json::json!(1999));
+        let exact = serde_json::to_vec(&PluginOutput::Documents(documents.clone()))
+            .unwrap()
+            .len();
+
+        // At the limit they stay inline, and nothing is written.
+        let inline = store
+            .stage_documents(job, documents.clone(), exact)
+            .await
+            .unwrap();
+        assert_eq!(inline, PluginInput::Documents(documents.clone()));
+        let key = BlobStore::staged_key(job, "gateway/documents.json");
+        assert!(matches!(store.get(&key).await, Err(BlobError::NotFound(_))));
+
+        // One byte over, they are staged, and the worker reads the same documents.
+        let staged = store
+            .stage_documents(job, documents.clone(), exact - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            staged,
+            PluginInput::Ref(ContentRef::Staged {
+                uri: key,
+                mime: Some(SPILLED_OUTPUT_MIME.into()),
+                filename: None,
+                origin: None,
+                charset: None,
+            })
+        );
+        let resolved = store
+            .resolve_input(staged, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(resolved, PluginInput::Documents(documents));
+    }
+
+    #[tokio::test]
+    async fn stage_upload_takes_any_filename_on_a_file_store() {
+        // object_store percent-encodes every non-ASCII byte of a key segment, so a
+        // 30-character CJK name became a 270+ byte file name: ENAMETOOLONG on the
+        // default `file://` store, and a 500 for the upload.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::from_url(&format!("file://{}", dir.path().display())).unwrap();
+        let http = reqwest::Client::new();
+        for name in [
+            format!("{}.pdf", "日".repeat(30)),
+            format!("{}.pdf", "ж".repeat(60)),
+            format!("report.{}", "日".repeat(90)),
+            format!("{}.pdf", "a".repeat(300)),
+            "sub/dir/100% #1 ?.PDF".to_owned(),
+        ] {
+            let blob = Blob::new(vec![7u8; 16], "application/pdf", Some(name.clone()));
+            let input = store
+                .stage_upload(Uuid::new_v4(), blob.clone(), 0)
+                .await
+                .unwrap_or_else(|e| panic!("staging {name:?}: {e}"));
+            assert!(matches!(input, PluginInput::Ref(_)), "{name}");
+            // The name travels in the ref, not in the key.
+            let resolved = store.resolve_input(input, &http).await.unwrap();
+            assert_eq!(resolved, PluginInput::Bytes(blob), "{name}");
+        }
+    }
+
+    #[test]
+    fn staged_object_names_are_short_and_ascii() {
+        let n = |f: &str| staged_object_name(Some(f));
+        assert_eq!(n("big.pdf"), "upload.pdf");
+        assert_eq!(n("a/b/Report.final.DOCX"), "upload.docx");
+        assert_eq!(n("archive.tar.gz"), "upload.gz");
+        assert_eq!(n("README"), "upload.bin");
+        assert_eq!(n("trailing."), "upload.bin");
+        assert_eq!(n("dir/"), "upload.bin");
+        assert_eq!(n("x.日本"), "upload.bin");
+        assert_eq!(n("x.a%b"), "upload.bin");
+        assert_eq!(n(&format!("x.{}", "a".repeat(17))), "upload.bin");
+        assert_eq!(staged_object_name(None), "upload.bin");
+    }
+
+    #[tokio::test]
     async fn spill_below_threshold_is_unchanged() {
         let store = BlobStore::memory();
         let output = PluginOutput::Documents(docs(2));
@@ -1182,6 +1978,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same, output);
+    }
+
+    #[tokio::test]
+    async fn spill_decision_measures_the_serialized_output() {
+        // What must stay under Temporal's payload limit is the JSON the activity
+        // returns: metadata and escaping count, not only ids, content and fields.
+        const MIB: usize = 1024 * 1024;
+        let store = BlobStore::memory();
+        let is_spilled = |output: PluginOutput| {
+            let store = store.clone();
+            async move {
+                let serialized = serde_json::to_vec(&output).unwrap().len();
+                let out = store
+                    .spill_output(Uuid::new_v4(), "step", None, output, MIB)
+                    .await
+                    .unwrap();
+                (matches!(out, PluginOutput::Ref(_)), serialized)
+            }
+        };
+
+        // One document carrying 3 MiB of extra metadata (an external plugin's output).
+        let mut heavy = Document::with_id("a", "tiny");
+        heavy
+            .meta
+            .extra
+            .insert("raw".into(), serde_json::json!("x".repeat(3 * MIB)));
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(vec![heavy])).await;
+        assert!(spilled, "{serialized} bytes went inline");
+
+        // Chunker-shaped: many tiny chunks that each repeat a long path three times.
+        let path = "d/".repeat(150);
+        let chunks: Vec<Document> = (0..1700)
+            .map(|i| {
+                let mut doc = Document::with_id(format!("{path}_{i}"), "c".repeat(50));
+                doc.meta.source = Some(path.clone());
+                doc.meta.filename = Some(path.clone());
+                doc.meta.parent_id = Some(path.clone());
+                doc
+            })
+            .collect();
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(chunks)).await;
+        assert!(serialized > 2 * MIB, "{serialized}");
+        assert!(spilled, "{serialized} bytes went inline");
+
+        // Content that doubles once escaped.
+        let quotes = Document::with_id("q", "\"".repeat(600 * 1024));
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(vec![quotes])).await;
+        assert!(spilled, "{serialized} bytes went inline");
+
+        // And an output that does fit stays inline, however many documents it has.
+        let small: Vec<Document> = (0..5000)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let (spilled, serialized) = is_spilled(PluginOutput::Documents(small)).await;
+        assert!(serialized < MIB, "{serialized}");
+        assert!(!spilled, "{serialized} bytes were spilled");
     }
 
     #[tokio::test]
@@ -1200,15 +2052,17 @@ mod tests {
         assert_eq!(
             spilled,
             PluginOutput::Ref(ContentRef::Staged {
-                uri: BlobStore::staged_key(job, "chunk-3.json"),
+                uri: BlobStore::staged_key(job, "steps/chunk/branch-3.json"),
                 mime: Some(SPILLED_OUTPUT_MIME.into()),
                 filename: None,
+                origin: None,
+                charset: None,
             })
         );
         let hydrated = store.hydrate_output(spilled).await.unwrap();
         assert_eq!(hydrated, output);
 
-        // Without a branch the key has no suffix.
+        // Without a branch the step's output has its own file.
         let spilled = store
             .spill_output(job, "chunk", None, output.clone(), 0)
             .await
@@ -1216,11 +2070,209 @@ mod tests {
         assert_eq!(spilled.kind(), meili_ingest_plugin_sdk::OutputKind::Ref);
         assert!(
             store
-                .get(&BlobStore::staged_key(job, "chunk.json"))
+                .get(&BlobStore::staged_key(job, "steps/chunk/output.json"))
                 .await
                 .is_ok()
         );
         assert_eq!(store.hydrate_output(spilled).await.unwrap(), output);
+    }
+
+    /// A staged PDF of another job, and the JSON of a `PluginOutput` pointing at it.
+    async fn secret_and_forged_output(store: &BlobStore) -> Vec<u8> {
+        let victim = BlobStore::staged_key(Uuid::new_v4(), "input/upload.pdf");
+        store
+            .put(&victim, Bytes::from_static(b"%PDF secret"))
+            .await
+            .unwrap();
+        serde_json::to_vec(&PluginOutput::Ref(ContentRef::Staged {
+            uri: victim,
+            mime: Some("application/pdf".into()),
+            filename: Some("report.pdf".into()),
+            origin: None,
+            charset: None,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upload_claiming_the_spilled_output_mime_stays_bytes() {
+        // The MIME of an upload is the tenant's to choose (a source's Content-Type, a
+        // multipart part's). One that claimed the spilled-output type was deserialized
+        // as a worker-written `PluginOutput`, whose refs name any key of the store.
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let body = secret_and_forged_output(&store).await;
+        for mime in [
+            SPILLED_OUTPUT_MIME.to_owned(),
+            SPILLED_OUTPUT_MIME.to_ascii_uppercase(),
+            format!("{SPILLED_OUTPUT_MIME}; charset=utf-8"),
+        ] {
+            let blob = Blob::new(body.clone(), mime.clone(), None);
+            let staged = store
+                .stage_upload(Uuid::new_v4(), blob.clone(), 0)
+                .await
+                .unwrap();
+            let PluginInput::Ref(ContentRef::Staged {
+                mime: Some(staged_mime),
+                ..
+            }) = &staged
+            else {
+                panic!("expected a staged ref, got {staged:?}");
+            };
+            assert_eq!(staged_mime, OCTET_STREAM, "{mime}");
+            let resolved = store.resolve_input(staged, &http).await.unwrap();
+            assert!(
+                matches!(&resolved, PluginInput::Bytes(b) if b.data == body && b.mime == OCTET_STREAM),
+                "{mime}: {resolved:?}"
+            );
+            // Inlined uploads lose the reserved type as well.
+            let inlined = store
+                .stage_upload(Uuid::new_v4(), blob, usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                inlined,
+                PluginInput::Bytes(Blob::new(body.clone(), OCTET_STREAM, None)),
+                "{mime}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_spilled_output_mime_is_ignored_on_an_upload_key() {
+        // A staged ref written before uploads lost the reserved MIME (Temporal history
+        // of a workflow in flight) still carries it: the key says it is an upload.
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let body = secret_and_forged_output(&store).await;
+        let job = Uuid::new_v4();
+        for key in [
+            BlobStore::staged_key(job, "input/evil.json"),
+            format!("jobs/{job}//input/evil.json"),
+            format!("/jobs/{job}/input/nested/evil.json"),
+            "elsewhere/evil.json".to_owned(),
+        ] {
+            store.put(&key, Bytes::from(body.clone())).await.unwrap();
+            let forged = ContentRef::Staged {
+                uri: key.clone(),
+                mime: Some(SPILLED_OUTPUT_MIME.into()),
+                filename: None,
+                origin: None,
+                charset: None,
+            };
+            assert_eq!(
+                store
+                    .hydrate_output(PluginOutput::Ref(forged.clone()))
+                    .await
+                    .unwrap(),
+                PluginOutput::Ref(forged.clone()),
+                "{key}"
+            );
+            let resolved = store
+                .resolve_input(PluginInput::Ref(forged), &http)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&resolved, PluginInput::Bytes(b) if b.data == body),
+                "{key}: {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spilled_output_never_lands_in_the_upload_namespace() {
+        // Step ids are free text: one starting with `input/` must not make its spilled
+        // output look like an upload (and stop being hydrated).
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let output = PluginOutput::Documents(docs(2));
+        for (step, name) in [
+            ("input/extract", "steps/input%2Fextract/output.json"),
+            ("a/b", "steps/a%2Fb/output.json"),
+            ("50%/done", "steps/50%25%2Fdone/output.json"),
+            ("plain", "steps/plain/output.json"),
+        ] {
+            let spilled = store
+                .spill_output(job, step, None, output.clone(), 0)
+                .await
+                .unwrap();
+            let PluginOutput::Ref(ContentRef::Staged { uri, .. }) = &spilled else {
+                panic!("expected a staged ref, got {spilled:?}");
+            };
+            assert_eq!(uri, &BlobStore::staged_key(job, name), "{step}");
+            assert_eq!(store.hydrate_output(spilled).await.unwrap(), output);
+        }
+    }
+
+    #[tokio::test]
+    async fn look_alike_step_ids_spill_to_distinct_keys() {
+        // Step ids are only unique: branch 0 of `enrich` and the plain output of a step
+        // named `enrich-0` must not share an object, or one overwrites the other.
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let a = PluginOutput::Documents(docs(1));
+        let b = PluginOutput::Documents(docs(2));
+        let branch = store
+            .spill_output(job, "enrich", Some(0), a.clone(), 0)
+            .await
+            .unwrap();
+        let plain = store
+            .spill_output(job, "enrich-0", None, b.clone(), 0)
+            .await
+            .unwrap();
+        assert_ne!(branch, plain);
+        assert_eq!(store.hydrate_output(branch).await.unwrap(), a);
+        assert_eq!(store.hydrate_output(plain).await.unwrap(), b);
+    }
+
+    #[tokio::test]
+    async fn fan_out_inputs_have_their_own_key() {
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let input = PluginOutput::Documents(docs(1));
+        let spilled = store
+            .spill_fan_out_input(job, "x", 0, input.clone(), 0)
+            .await
+            .unwrap();
+        let PluginOutput::Ref(ContentRef::Staged { uri, .. }) = &spilled else {
+            panic!("expected a staged ref, got {spilled:?}");
+        };
+        assert_eq!(uri, &BlobStore::staged_key(job, "steps/x/fanout-0.json"));
+        let branch = store
+            .spill_output(
+                job,
+                "x-fanout",
+                Some(0),
+                PluginOutput::Documents(docs(2)),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_ne!(spilled, branch);
+        assert_eq!(store.hydrate_output(spilled).await.unwrap(), input);
+    }
+
+    #[tokio::test]
+    async fn keys_of_the_previous_layout_still_hydrate() {
+        // A job in flight across a deploy still holds refs to `<step>[-<b>].json`.
+        let store = BlobStore::memory();
+        let job = Uuid::new_v4();
+        let output = PluginOutput::Documents(docs(2));
+        for name in ["chunk.json", "chunk-3.json", "enrich-fanout-0.json"] {
+            let key = BlobStore::staged_key(job, name);
+            store
+                .put(&key, Bytes::from(serde_json::to_vec(&output).unwrap()))
+                .await
+                .unwrap();
+            let old = PluginOutput::Ref(ContentRef::Staged {
+                uri: key,
+                mime: Some(SPILLED_OUTPUT_MIME.into()),
+                filename: None,
+                origin: None,
+                charset: None,
+            });
+            assert_eq!(store.hydrate_output(old).await.unwrap(), output, "{name}");
+        }
     }
 
     #[tokio::test]
@@ -1236,6 +2288,8 @@ mod tests {
             uri: "jobs/x/raw.bin".into(),
             mime: Some("application/pdf".into()),
             filename: None,
+            origin: None,
+            charset: None,
         });
         let many = PluginOutput::Many(vec![spilled, raw_ref.clone(), PluginOutput::Empty]);
         let hydrated = store.hydrate_output(many).await.unwrap();
@@ -1269,6 +2323,8 @@ mod tests {
             uri: "jobs/j/input/report.pdf".into(),
             mime: None,
             filename: None,
+            origin: None,
+            charset: None,
         });
         let resolved = store.resolve_input(input, &http).await.unwrap();
         assert_eq!(
@@ -1303,6 +2359,8 @@ mod tests {
             uri: staged_key,
             mime: Some("audio/wav".into()),
             filename: Some("a.wav".into()),
+            origin: None,
+            charset: None,
         });
 
         let plain = PluginOutput::Documents(docs(1));
@@ -1375,6 +2433,10 @@ mod tests {
         assert_eq!(blob.data, b"%PDF-1.4 fake".to_vec());
         assert_eq!(blob.mime, "application/pdf");
         assert_eq!(blob.filename.as_deref(), Some("report.pdf"));
+        // The origin is the URL without its query string: a pre-signed link fetched
+        // again with a new signature still names the same file.
+        let origin = format!("{}/files/report.pdf", server.uri());
+        assert_eq!(blob.origin.as_deref(), Some(origin.as_str()));
 
         // Hints win over the response headers / URL.
         let r = ContentRef::Url {
@@ -1385,6 +2447,7 @@ mod tests {
         let blob = store.fetch_ref(&r, &http).await.unwrap();
         assert_eq!(blob.mime, "application/x-custom");
         assert_eq!(blob.filename.as_deref(), Some("renamed.pdf"));
+        assert_eq!(blob.origin.as_deref(), Some(origin.as_str()));
 
         // Through resolve_input the ref becomes bytes.
         let input = PluginInput::Ref(ContentRef::Url {
@@ -1394,6 +2457,126 @@ mod tests {
         });
         let resolved = store.resolve_input(input, &http).await.unwrap();
         assert!(matches!(resolved, PluginInput::Bytes(b) if b.mime == "application/pdf"));
+    }
+
+    #[test]
+    fn url_origins_drop_the_query_fragment_and_credentials_only() {
+        let origin = |u: &str| url_origin(&Url::parse(u).unwrap());
+        assert_eq!(
+            origin("https://user:pw@A.example/export/data.json?sig=1#top"),
+            "https://a.example/export/data.json"
+        );
+        // Same filename, different host or path: different origins.
+        assert_ne!(
+            origin("https://a.example/export/data.json"),
+            origin("https://b.example/export/data.json")
+        );
+        assert_ne!(
+            origin("https://a.example/v1/data.json"),
+            origin("https://a.example/v2/data.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staged_blob_keeps_its_origin() {
+        // A source stages what it fetched; the worker reads it back before the first
+        // step, and the origin must survive the round trip for ids to be tagged.
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let blob = Blob::new(b"[]".to_vec(), "application/json", Some("data.json".into()))
+            .with_origin(Some("source:t1/products".into()));
+        let staged = store.stage_upload(Uuid::new_v4(), blob, 0).await.unwrap();
+        let PluginInput::Ref(r @ ContentRef::Staged { .. }) = &staged else {
+            panic!("expected a staged ref, got {staged:?}");
+        };
+        let back = store.fetch_ref(r, &http).await.unwrap();
+        assert_eq!(back.origin.as_deref(), Some("source:t1/products"));
+        assert_eq!(back.filename.as_deref(), Some("data.json"));
+
+        // An upload has none, staged or not.
+        let upload = Blob::new(b"[]".to_vec(), "application/json", Some("data.json".into()));
+        let staged = store.stage_upload(Uuid::new_v4(), upload, 0).await.unwrap();
+        let PluginInput::Ref(r) = &staged else {
+            panic!("expected a staged ref, got {staged:?}");
+        };
+        assert_eq!(store.fetch_ref(r, &http).await.unwrap().origin, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_ref_url_keeps_the_declared_charset_out_of_the_mime() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/legacy.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "Text/HTML; Charset=\"Windows-1252\"")
+                    .set_body_bytes(b"<p>Caf\xE9</p>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plain.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"<p>Cafe</p>".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let fetch = |p: &str| ContentRef::Url {
+            url: format!("{}{p}", server.uri()),
+            mime: None,
+            filename: None,
+        };
+        let blob = store
+            .fetch_ref(&fetch("/legacy.html"), &http)
+            .await
+            .unwrap();
+        assert_eq!(blob.mime, "text/html", "routing sees the bare essence");
+        assert_eq!(blob.charset.as_deref(), Some("windows-1252"));
+        // The bytes are handed over as fetched, not decoded.
+        assert_eq!(blob.data, b"<p>Caf\xE9</p>".to_vec());
+
+        let blob = store.fetch_ref(&fetch("/plain.html"), &http).await.unwrap();
+        assert_eq!(blob.charset, None);
+    }
+
+    #[tokio::test]
+    async fn a_staged_blob_keeps_its_charset() {
+        let store = BlobStore::memory();
+        let http = reqwest::Client::new();
+        let blob = Blob::new(
+            b"<p>Caf\xE9</p>".to_vec(),
+            "text/html",
+            Some("a.html".into()),
+        )
+        .with_charset(Some("windows-1252".into()));
+        let staged = store.stage_upload(Uuid::new_v4(), blob, 0).await.unwrap();
+        let PluginInput::Ref(r @ ContentRef::Staged { .. }) = &staged else {
+            panic!("expected a staged ref, got {staged:?}");
+        };
+        let back = store.fetch_ref(r, &http).await.unwrap();
+        assert_eq!(back.charset.as_deref(), Some("windows-1252"));
+        assert_eq!(back.mime, "text/html");
+    }
+
+    #[test]
+    fn the_charset_is_read_from_the_content_type_parameters() {
+        assert_eq!(
+            mime_charset("text/html; charset=UTF-8").as_deref(),
+            Some("utf-8")
+        );
+        assert_eq!(
+            mime_charset("text/html;foo=bar; CHARSET = \"Shift_JIS\" ").as_deref(),
+            Some("shift_jis")
+        );
+        assert_eq!(mime_charset("text/html"), None);
+        assert_eq!(mime_charset("text/html; charset="), None);
+        assert_eq!(mime_charset("text/html; charset=\"\""), None);
+        assert_eq!(mime_charset("text/html; boundary=x"), None);
     }
 
     /// Non-success statuses and whether retrying the fetch could ever change them.
@@ -1506,6 +2689,8 @@ mod tests {
             uri: "jobs/nope".into(),
             mime: None,
             filename: None,
+            origin: None,
+            charset: None,
         };
         assert!(matches!(
             store.fetch_ref(&r, &http).await,
@@ -1598,7 +2783,7 @@ mod tests {
             ObjectRefPolicy::parse(None, None).unwrap(),
             ObjectRefPolicy::default()
         );
-        for on in ["true", "TRUE", "1", " true\n"] {
+        for on in ["true", "TRUE", "1", " true\n", "yes", "On"] {
             assert!(
                 ObjectRefPolicy::parse(Some(on), None)
                     .unwrap()
@@ -1606,7 +2791,8 @@ mod tests {
                 "{on:?}"
             );
         }
-        for off in ["", "false", "0", "False"] {
+        // Not a boolean: off (anonymous reads, the safe side), never a boot failure.
+        for off in ["", "false", "0", "False", "no", "off", "sure"] {
             assert!(
                 !ObjectRefPolicy::parse(Some(off), None)
                     .unwrap()
@@ -1614,7 +2800,6 @@ mod tests {
                 "{off:?}"
             );
         }
-        assert!(ObjectRefPolicy::parse(Some("yes"), None).is_err());
         let p = ObjectRefPolicy::parse(None, Some(" Exports, public-data ,,")).unwrap();
         assert_eq!(
             p.buckets,
@@ -1786,6 +2971,73 @@ mod tests {
         ));
         assert!(matches!(
             store.authorize_object_ref("file:///etc/passwd"),
+            Err(BlobError::Blocked(_))
+        ));
+    }
+
+    #[test]
+    fn azure_refs_name_their_container_the_way_object_store_reads_it() {
+        // object_store takes the container of `adl://` and `azure://` from the host and
+        // ignores the userinfo; only `az` / `abfs[s]` read it from the user.
+        let b = |u: &str| bucket_of(&Url::parse(u).unwrap()).unwrap().name;
+        assert_eq!(b("azure://ctr/k"), "ctr");
+        assert_eq!(b("adl://ctr/k"), "ctr");
+        assert_eq!(b("azure://x@ctr/k"), "ctr");
+        assert_eq!(b("adl://x@ctr/k"), "ctr");
+        assert_eq!(b("abfs://ctr@acct.blob.core.windows.net/k"), "ctr");
+        assert_eq!(b("az://ctr@acct.dfs.fabric.microsoft.com/k"), "ctr");
+    }
+
+    #[test]
+    fn azure_userinfo_cannot_relabel_the_container() {
+        // The userinfo of `adl://` / `azure://` was taken as the container by the checks
+        // while the read went to the host: a free label that passed for any container.
+        let mut own = BlobStore::memory().with_object_ref_policy(ObjectRefPolicy {
+            ambient_credentials: true,
+            buckets: None,
+        });
+        own.own_bucket = bucket_of(&Url::parse("az://lab-blobs/glutony").unwrap());
+        let listed = BlobStore::memory()
+            .with_object_ref_policy(ObjectRefPolicy::parse(None, Some("exports")).unwrap());
+        for scheme in ["azure", "adl"] {
+            for uri in [
+                format!("{scheme}://exports@lab-blobs/glutony/jobs/x/input/secret.pdf"),
+                format!("{scheme}://lab-blobs/glutony/jobs/x/input/secret.pdf"),
+                format!("{scheme}://:pw@lab-blobs/k"),
+            ] {
+                assert!(
+                    matches!(own.authorize_object_ref(&uri), Err(BlobError::Blocked(_))),
+                    "{uri}"
+                );
+            }
+            let uri = format!("{scheme}://exports@private/k");
+            assert!(
+                matches!(
+                    listed.authorize_object_ref(&uri),
+                    Err(BlobError::Blocked(_))
+                ),
+                "{uri}"
+            );
+            assert!(matches!(check_object_ref(&uri), Err(BlobError::Blocked(_))));
+            // Without userinfo the host is the container, checked as such.
+            assert!(
+                listed
+                    .authorize_object_ref(&format!("{scheme}://exports/k"))
+                    .is_ok()
+            );
+            assert!(matches!(
+                listed.authorize_object_ref(&format!("{scheme}://private/k")),
+                Err(BlobError::Blocked(_))
+            ));
+        }
+        // The forms that do name the container as the user keep working.
+        assert!(
+            listed
+                .authorize_object_ref("abfss://exports@acct.dfs.core.windows.net/k")
+                .is_ok()
+        );
+        assert!(matches!(
+            own.authorize_object_ref("abfss://lab-blobs@acct.dfs.core.windows.net/k"),
             Err(BlobError::Blocked(_))
         ));
     }

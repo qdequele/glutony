@@ -39,9 +39,12 @@
 // INTERNAL are retried, INVALID_ARGUMENT / UNAUTHENTICATED / PERMISSION_DENIED /
 // UNIMPLEMENTED / NOT_FOUND / FAILED_PRECONDITION are not.
 //
-// Message size: the worker allows 64 MiB per message in both directions. Large inputs
-// are usually spilled to blob storage by the worker before the plugin is called, so
-// most `input_json` payloads are well below that.
+// Message size: the worker allows 64 MiB per message in both directions, and the limit
+// is fixed. The worker resolves staged and object-store references into bytes before
+// calling the plugin (a plugin never receives a `ref`), and `input_json` carries those
+// bytes as base64, so about 48 MiB of raw bytes is the largest input a gRPC plugin can
+// be sent. A larger input fails the step without a retry, before anything is sent.
+// Raise your server's own receive limit to 64 MiB (gRPC servers default to 4 MiB).
 //
 // ---------------------------------------------------------------------------------
 // Implementing the service in Python (grpcio):
@@ -107,8 +110,8 @@ package meili_ingest.plugin.v1;
 
 // One external plugin container. Exactly one plugin per service endpoint.
 service PluginService {
-  // Describe the plugin. Called once when the worker loads the plugin (unless the
-  // operator supplied a manifest override in `EXTERNAL_PLUGINS` configuration).
+  // Describe the plugin. Called when the worker loads the plugin, so every plugin
+  // container must implement it.
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
 
   // Run the plugin on one input. Called once per pipeline step invocation (once per

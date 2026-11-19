@@ -6,7 +6,7 @@
 //! knows the workflow.
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use meili_ingest_plugin_sdk::{JobStatus, WorkflowProgress};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::{Scope, authorize_job_read};
 use crate::error::GatewayError;
+use crate::handlers::Query;
 use crate::state::{AppState, JobRecord, JobUpdate};
 
 /// Response of `GET /jobs/{id}`.
@@ -73,7 +74,8 @@ pub async fn ensure_job_visible(
     }
 }
 
-/// `GET /jobs?status=&pipeline_uid=&limit=&offset=` — recent jobs, newest first.
+/// `GET /jobs?status=&pipeline_uid=&parent_job_id=&limit=&offset=` — recent jobs, newest
+/// first. `parent_job_id` lists the file jobs of an archive job.
 ///
 /// Scoped to the caller's tenant: the `tenant_id` filter is taken from the resolved
 /// context, never from the query string, so one tenant cannot list another's jobs.
@@ -83,7 +85,7 @@ pub async fn list_jobs(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let mut query: Vec<(String, String)> = Vec::new();
-    for key in ["status", "pipeline_uid", "limit", "offset"] {
+    for key in ["status", "pipeline_uid", "parent_job_id", "limit", "offset"] {
         if let Some(v) = params.get(key) {
             query.push((key.to_string(), v.clone()));
         }
@@ -124,6 +126,20 @@ pub async fn get_job(
                         None
                     }
                 };
+            // A workflow that cannot answer the query (closed, or no worker polling
+            // its queue) leaves the last step and the failure message to the cached
+            // row, as when Temporal has forgotten the job. A live answer always wins:
+            // the row's step can lag, and its error is never cleared, so it is only
+            // shown for a job that did not end well.
+            let (current_step, error) = match (&progress, &record) {
+                (None, Some(row)) => (
+                    row.current_step.clone(),
+                    row.error.clone().filter(|_| {
+                        matches!(snapshot.status, JobStatus::Failed | JobStatus::Cancelled)
+                    }),
+                ),
+                _ => (current_step, error),
+            };
             Ok(Json(JobResponse {
                 job_id,
                 status: snapshot.status,
@@ -290,6 +306,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_job_keeps_its_error_when_the_workflow_cannot_answer() {
+        // No worker polls the queue (deploy, scale to zero): Temporal still describes
+        // the failed workflow but the `progress` query has no answer. The cached row
+        // holds the failure message and the last step.
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        let mut rec = record(job_id);
+        rec.status = JobStatus::Failed;
+        rec.error = Some("boom".into());
+        rec.current_step = Some("enrich".into());
+        Mock::given(method("PATCH"))
+            .and(path(format!("/internal/jobs/{job_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&rec))
+            .mount(&server)
+            .await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        starter.set_snapshot(
+            job_id,
+            JobSnapshot {
+                status: JobStatus::Failed,
+                progress: None,
+            },
+        );
+        let resp = app
+            .oneshot(
+                Request::get(format!("/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_body(resp).await;
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["error"], "boom");
+        assert_eq!(json["current_step"], "enrich");
+        assert!(json["progress"].is_null());
+        // The row is refreshed with what Temporal said, not with its own old values.
+        let patch = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        assert_eq!(body, json!({"status": "failed"}));
+    }
+
+    #[tokio::test]
+    async fn a_live_answer_wins_over_the_cached_row() {
+        // The row's `error` is never cleared and its step can lag: while the workflow
+        // answers, only its own view is reported.
+        let server = MockServer::start().await;
+        let job_id = Uuid::new_v4();
+        let mut rec = record(job_id);
+        rec.status = JobStatus::Running;
+        rec.error = Some("stale failure".into());
+        rec.current_step = Some("stale-step".into());
+        Mock::given(method("PATCH"))
+            .and(path(format!("/internal/jobs/{job_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&rec))
+            .mount(&server)
+            .await;
+        let (app, starter) = test_app(&server, GatewayConfig::default()).await;
+        starter.set_snapshot(
+            job_id,
+            JobSnapshot {
+                status: JobStatus::Running,
+                progress: Some(WorkflowProgress {
+                    status: JobStatus::Running,
+                    current_step: None,
+                    completed_steps: 1,
+                    total_steps: 3,
+                    ..Default::default()
+                }),
+            },
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = json_body(resp).await;
+        assert_eq!(json["status"], "running");
+        assert!(json.get("error").is_none(), "{json}");
+        assert!(json.get("current_step").is_none(), "{json}");
+
+        // A job that has not failed never shows the row's old error, even when the
+        // workflow cannot answer.
+        starter.set_snapshot(
+            job_id,
+            JobSnapshot {
+                status: JobStatus::Running,
+                progress: None,
+            },
+        );
+        let resp = app
+            .oneshot(
+                Request::get(format!("/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = json_body(resp).await;
+        assert_eq!(json["status"], "running");
+        assert!(json.get("error").is_none(), "{json}");
+    }
+
+    #[tokio::test]
     async fn cache_failure_does_not_fail_the_request() {
         let server = MockServer::start().await;
         let job_id = Uuid::new_v4();
@@ -314,6 +445,7 @@ mod tests {
         assert_eq!(json["status"], "succeeded");
         assert!(json["progress"].is_null());
         assert!(json.get("pipeline_used").is_none());
+        assert_matches_openapi("GET", "/jobs/{job_id}", 200, &json);
     }
 
     #[tokio::test]

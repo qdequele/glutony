@@ -7,18 +7,20 @@
 //! 3. `X-Meili-Tenant-Id`, else `X-Meili-Project-Id` → tenant_id
 //! 4. `X-Meili-Index` → index (starting point)
 //! 5. `?index=` query param → index (overrides the header)
-//! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback)
+//! 6. `Authorization: Bearer <key>` → api_key (self-hosted fallback). A bearer equal to
+//!    `LAB_SERVICE_TOKEN` or `ADMIN_API_KEY` is a management token, never the key.
 //! 7. `MEILI_URL` / `MEILI_API_KEY` env vars → host / api_key (self-hosted fallback, only
 //!    without a tenant)
 //!
 //! Steps 1–4 (and `X-Meili-Region`) are only applied when the `X-Meili-*` headers are
 //! trusted: either `ENVOY_TRUSTED_HEADER` is unset (dev mode), or the request carries
-//! `X-Meili-Envoy-Secret` equal to it. Otherwise every `X-Meili-*` header is ignored and
-//! the request is treated as standalone.
+//! `X-Meili-Envoy-Secret` equal to it (compared in constant time). Otherwise every
+//! `X-Meili-*` header is ignored and the request is treated as standalone.
 
 use axum::http::HeaderMap;
 use meili_ingest_plugin_sdk::MeiliContext;
 use meili_ingest_router::mime_to_default_index;
+use subtle::ConstantTimeEq;
 
 use crate::error::GatewayError;
 use crate::state::GatewayConfig;
@@ -52,8 +54,22 @@ pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 pub fn envoy_headers_trusted(headers: &HeaderMap, config: &GatewayConfig) -> bool {
     match &config.envoy_trusted_header {
         None => true,
-        Some(secret) => header(headers, H_ENVOY_SECRET).as_deref() == Some(secret.as_str()),
+        Some(secret) => header(headers, H_ENVOY_SECRET).is_some_and(|got| secret_eq(secret, &got)),
     }
+}
+
+/// Whether a `SOURCE_FETCH_HOSTS` refusal may name the allowed hosts: only on a
+/// standalone deployment (no tenant edge, `ENVOY_TRUSTED_HEADER` unset) and for a request
+/// without a tenant. Behind a tenant edge, a request without the edge secret resolves no
+/// tenant but is still not the operator, so it is not told the allowlist either.
+pub fn lists_fetch_allowlist(config: &GatewayConfig, tenant_id: Option<&str>) -> bool {
+    tenant_id.is_none() && config.envoy_trusted_header.is_none()
+}
+
+/// Compare a received credential with a configured secret in constant time, so the
+/// time a mismatch takes says nothing about how much of the secret was right.
+pub(crate) fn secret_eq(expected: &str, got: &str) -> bool {
+    bool::from(expected.as_bytes().ct_eq(got.as_bytes()))
 }
 
 /// Read an `X-Meili-*` header, but only when the request is trusted.
@@ -161,9 +177,20 @@ pub fn resolve_request_context(
         index = Some(q.to_string());
     }
 
-    // 6: Authorization: Bearer fallback for the key.
+    // 6: Authorization: Bearer fallback for the key. A bearer that is one of the
+    // gateway's own management tokens authenticates a management route, it is not a
+    // Meilisearch key: it must never be sent to Meilisearch or stored in a workflow.
     if api_key.is_none() {
-        api_key = bearer_token(headers);
+        api_key = bearer_token(headers).filter(|token| {
+            let management = crate::auth::is_management_token(config, token);
+            if management {
+                tracing::debug!(
+                    "ignoring the Authorization bearer as a Meilisearch key: it is a \
+                     management token"
+                );
+            }
+            !management
+        });
     }
 
     // 7: env fallbacks, standalone only. A request that carries a tenant never falls
@@ -368,6 +395,55 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_management_token_is_never_the_meilisearch_key() {
+        // Operator mode: the admin key sent on an ingest route must not shadow
+        // `MEILI_API_KEY`, nor travel to Meilisearch or into workflow history.
+        let cfg = GatewayConfig {
+            admin_api_key: Some("adm".into()),
+            ..cfg_env()
+        };
+        let h = headers(&[("authorization", "Bearer adm")]);
+        let ctx = resolve_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key.as_deref(), Some("envKey"));
+        assert_eq!(ctx.host.as_deref(), Some("http://env:7700"));
+
+        // The Lab service token with a trusted host and no key: nothing supplies a key.
+        let cfg = GatewayConfig {
+            lab_service_token: Some("lab".into()),
+            ..Default::default()
+        };
+        let h = headers(&[(H_HOST, "http://h"), ("authorization", "Bearer lab")]);
+        let err = resolve_context(&h, None, &cfg).unwrap_err();
+        assert!(
+            matches!(&err, GatewayError::MissingContext(m) if m.contains("API key")),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("lab"), "{err}");
+        let ctx = resolve_request_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key, None);
+    }
+
+    #[test]
+    fn another_bearer_is_still_the_key_when_management_auth_is_on() {
+        let cfg = GatewayConfig {
+            admin_api_key: Some("adm".into()),
+            lab_service_token: Some("lab".into()),
+            ..cfg_env()
+        };
+        let h = headers(&[("authorization", "Bearer bearerKey")]);
+        let ctx = resolve_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key.as_deref(), Some("bearerKey"));
+        // A trusted `X-Meili-Api-Key` is used whatever the bearer is.
+        let h = headers(&[
+            (H_HOST, "http://h"),
+            (H_API_KEY, "envoyKey"),
+            ("authorization", "Bearer adm"),
+        ]);
+        let ctx = resolve_context(&h, None, &cfg).unwrap();
+        assert_eq!(ctx.api_key.as_deref(), Some("envoyKey"));
+    }
+
     // --- step 7: env fallbacks ------------------------------------------------------
 
     #[test]
@@ -480,6 +556,27 @@ mod tests {
             resolve_context(&h, None, &cfg_secret()),
             Err(GatewayError::MissingContext(_))
         ));
+    }
+
+    #[test]
+    fn only_the_exact_secret_is_trusted() {
+        for (value, trusted) in [
+            ("s3cret", true),
+            ("  s3cret  ", true),
+            ("s3creT", false),
+            ("x3cret", false),
+            ("s3cre", false),
+            ("s3cret2", false),
+            ("s", false),
+        ] {
+            let mut h = envoy_headers();
+            h.insert(H_ENVOY_SECRET, HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                envoy_headers_trusted(&h, &cfg_secret()),
+                trusted,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

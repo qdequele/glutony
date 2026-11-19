@@ -12,6 +12,10 @@ use crate::runner::sandboxed_engine;
 
 /// Largest `script` accepted, in bytes.
 pub(crate) const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+/// Highest `max_ops` honoured; larger values are clamped to it.
+pub(crate) const MAX_OPS_CEILING: u64 = 100_000_000;
+/// Highest `timeout_ms` honoured; larger values are clamped to it.
+pub(crate) const MAX_TIMEOUT_MS: u64 = 30_000;
 
 /// What a per-document script error does to that document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -39,9 +43,9 @@ pub(crate) struct Config {
     pub(crate) source: Source,
     /// What a per-document error does.
     pub(crate) on_error: OnError,
-    /// Rhai operations one document may use.
+    /// Rhai operations one document may use, clamped to [`MAX_OPS_CEILING`].
     pub(crate) max_ops: u64,
-    /// Wall-clock milliseconds one document may use.
+    /// Wall-clock milliseconds one document may use, clamped to [`MAX_TIMEOUT_MS`].
     pub(crate) timeout_ms: u64,
 }
 
@@ -71,6 +75,10 @@ fn default_timeout_ms() -> u64 {
 
 impl Config {
     /// Every problem with `value`, or the parsed config.
+    ///
+    /// `max_ops` and `timeout_ms` are tenant-authored, so they are clamped to
+    /// [`MAX_OPS_CEILING`] and [`MAX_TIMEOUT_MS`] rather than rejected: a pipeline
+    /// saved with a larger value keeps working, within the server's bounds.
     pub(crate) fn check(value: Value, engine: &Engine) -> Result<Self, Vec<Diagnostic>> {
         let raw: RawConfig = serde_json::from_value(value)
             .map_err(|e| vec![Diagnostic::at("config", e.to_string())])?;
@@ -127,8 +135,8 @@ impl Config {
             Some(source) if diagnostics.is_empty() => Ok(Config {
                 source,
                 on_error: raw.on_error,
-                max_ops: raw.max_ops,
-                timeout_ms: raw.timeout_ms,
+                max_ops: raw.max_ops.min(MAX_OPS_CEILING),
+                timeout_ms: raw.timeout_ms.min(MAX_TIMEOUT_MS),
             }),
             _ => Err(diagnostics),
         }

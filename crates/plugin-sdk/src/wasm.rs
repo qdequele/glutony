@@ -4,9 +4,13 @@
 //! The host calls two exports on the module:
 //!
 //! * `execute(bytes) -> bytes`: input is a JSON [`ExecuteEnvelope`]
-//!   (`{"input": PluginInput, "config": {...}}`), output is a JSON [`ExecuteReply`]
+//!   (`{"input": PluginInput, "config": {...}, "job_id": "...", "step_id": "...",
+//!   "attempt": 1}`), output is a JSON [`ExecuteReply`]
 //!   (`{"ok": PluginOutput}` or `{"error": {"message": "...", "retryable": bool}}`).
-//! * `manifest() -> bytes` (optional): a JSON `PluginManifest`.
+//! * `manifest() -> bytes`: a JSON `PluginManifest`. Required for modules the worker
+//!   loads from `EXTERNAL_PLUGINS`, which has no way to supply a manifest: a module
+//!   without this export fails to load. Only a host using `meili-ingest-plugin-runtime`
+//!   directly can do without it, by passing a manifest override to `WasmPlugin::from_file`.
 //!
 //! [`run_plugin`] and [`manifest_json`] implement both so a guest only has to wrap them
 //! in `#[extism_pdk::plugin_fn]` exports:
@@ -23,8 +27,11 @@
 //! ```
 //!
 //! There is no tokio inside WASM: `execute` runs on `futures::executor::block_on`, so
-//! plugins must not spawn tasks or use tokio I/O. Heartbeats are discarded (the host
-//! heartbeats once per call) and cancellation is never observed.
+//! plugins must not spawn tasks or use tokio I/O. The context carries the real
+//! `job_id`, `step_id` and `attempt`, but heartbeats are discarded (the host heartbeats
+//! once per call), cancellation is never observed, `previous_progress` is always `None`
+//! and `record_usage` is discarded: the step's usage is what the host measures, never
+//! what a guest reports.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +51,31 @@ pub struct ExecuteEnvelope {
     /// The step `config:` block.
     #[serde(default)]
     pub config: serde_json::Value,
+    /// The job the step belongs to ([`ActivityContext::job_id`]). `None` from a host
+    /// that predates it: the context then has the nil id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<uuid::Uuid>,
+    /// The pipeline step id ([`ActivityContext::step_id`]), `"test"` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    /// The attempt number, 1-based ([`ActivityContext::attempt`]), 1 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+}
+
+impl ExecuteEnvelope {
+    /// The context the guest runs the plugin with: the ids the host sent, no
+    /// heartbeats, no cancellation, no usage reporting, no AI target.
+    fn context(&self) -> ActivityContext {
+        let noop = ActivityContext::noop();
+        ActivityContext::detached(
+            self.job_id.unwrap_or_else(|| noop.job_id()),
+            self.step_id
+                .clone()
+                .unwrap_or_else(|| noop.step_id().into()),
+            self.attempt.unwrap_or_else(|| noop.attempt()),
+        )
+    }
 }
 
 /// Structured failure in an [`ExecuteReply`].
@@ -86,7 +118,7 @@ const SERIALIZE_FAILURE: &str =
 pub fn run_plugin<P: Plugin>(plugin: &P, input_json: &[u8]) -> Vec<u8> {
     let reply = match serde_json::from_slice::<ExecuteEnvelope>(input_json) {
         Ok(envelope) => {
-            let ctx = ActivityContext::noop();
+            let ctx = envelope.context();
             match futures::executor::block_on(plugin.execute(&ctx, envelope.input, envelope.config))
             {
                 Ok(out) => ExecuteReply::Ok(out),
@@ -147,6 +179,9 @@ mod tests {
         let env = ExecuteEnvelope {
             input: PluginInput::Documents(vec![Document::with_id("a", "hi")]),
             config: serde_json::json!({}),
+            job_id: None,
+            step_id: None,
+            attempt: None,
         };
         let out = run_plugin(&Upper, &serde_json::to_vec(&env).unwrap());
         let reply: ExecuteReply = serde_json::from_slice(&out).unwrap();
@@ -178,6 +213,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Answers with the ids its context carries.
+    struct Ids;
+
+    #[async_trait]
+    impl Plugin for Ids {
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("ids", "0.1.0")
+        }
+        async fn execute(
+            &self,
+            ctx: &ActivityContext,
+            _input: PluginInput,
+            _config: serde_json::Value,
+        ) -> Result<PluginOutput, PluginError> {
+            Ok(PluginOutput::Documents(vec![Document::with_id(
+                ctx.job_id().to_string(),
+                format!("{}#{}", ctx.step_id(), ctx.attempt()),
+            )]))
+        }
+    }
+
+    fn ids_reply(envelope: serde_json::Value) -> Document {
+        let out = run_plugin(&Ids, &serde_json::to_vec(&envelope).unwrap());
+        match serde_json::from_slice(&out).unwrap() {
+            ExecuteReply::Ok(PluginOutput::Documents(mut d)) => d.remove(0),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_guest_context_carries_the_step_it_runs() {
+        let doc = ids_reply(serde_json::json!({
+            "input": {"type": "empty"},
+            "config": {},
+            "job_id": "6b0e8f4e-3c0a-4a5e-9d3f-1f2a3b4c5d6e",
+            "step_id": "enrich",
+            "attempt": 2,
+        }));
+        assert_eq!(doc.id, "6b0e8f4e-3c0a-4a5e-9d3f-1f2a3b4c5d6e");
+        assert_eq!(doc.content, "enrich#2");
+    }
+
+    #[test]
+    fn an_envelope_from_an_older_host_still_runs() {
+        // Hosts before the ids were added send only `input` and `config`.
+        let doc = ids_reply(serde_json::json!({"input": {"type": "empty"}, "config": {}}));
+        assert_eq!(doc.id, uuid::Uuid::nil().to_string());
+        assert_eq!(doc.content, "test#1");
     }
 
     #[test]

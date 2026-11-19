@@ -30,7 +30,8 @@ pub enum Location {
 }
 
 /// How a source authenticates. Always stored sealed; never returned by the API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` prints `<redacted>` in place of the token, the password and header values.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FetchAuth {
     /// `Authorization: Bearer <token>`.
@@ -50,6 +51,25 @@ pub enum FetchAuth {
         /// Header name → value.
         headers: BTreeMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for FetchAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "<redacted>";
+        match self {
+            FetchAuth::Bearer { .. } => f.debug_struct("Bearer").field("token", &REDACTED).finish(),
+            FetchAuth::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &REDACTED)
+                .finish(),
+            FetchAuth::Headers { headers } => {
+                let masked: BTreeMap<&str, &str> =
+                    headers.keys().map(|k| (k.as_str(), REDACTED)).collect();
+                f.debug_struct("Headers").field("headers", &masked).finish()
+            }
+        }
+    }
 }
 
 /// Masked view of a credential, safe to return from the API and to log.
@@ -201,6 +221,37 @@ impl FromStr for RunOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_prints_a_credential() {
+        let bearer = format!(
+            "{:?}",
+            FetchAuth::Bearer {
+                token: "SECRET".into()
+            }
+        );
+        assert!(!bearer.contains("SECRET"), "{bearer}");
+        assert!(bearer.contains("Bearer") && bearer.contains("<redacted>"));
+
+        let basic = format!(
+            "{:?}",
+            FetchAuth::Basic {
+                username: "alice".into(),
+                password: "SECRET".into()
+            }
+        );
+        assert!(!basic.contains("SECRET"), "{basic}");
+        assert!(basic.contains("alice"), "{basic}");
+
+        let headers = FetchAuth::Headers {
+            headers: BTreeMap::from([("X-Api-Key".to_string(), "SECRET".to_string())]),
+        };
+        for shown in [format!("{headers:?}"), format!("{headers:#?}")] {
+            assert!(!shown.contains("SECRET"), "{shown}");
+            // Header names are not secret.
+            assert!(shown.contains("X-Api-Key"), "{shown}");
+        }
+    }
 
     #[test]
     fn location_is_tagged_by_kind() {

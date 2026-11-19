@@ -172,6 +172,96 @@ async fn partial_accept_leaves_the_rest_pending() {
 }
 
 #[tokio::test]
+async fn a_failed_batch_counts_every_event_it_held() {
+    // `failed_total` counts events for every reason, like `not_accepted` and the
+    // sibling `delivered_total` / `dropped_total`: a refused batch of two is two.
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&lab)
+        .await;
+    let (s, repo, metrics) = sender(&t, &lab).await;
+    repo.insert_many(&[event(Uuid::new_v4()), event(Uuid::new_v4())])
+        .await
+        .unwrap();
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Failed {
+            reason: "auth",
+            pending: 2
+        }
+    );
+    let text = render(&metrics);
+    assert!(
+        text.contains("glutony_lab_events_failed_total{reason=\"auth\"} 2"),
+        "{text}"
+    );
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn events_that_could_not_be_marked_delivered_are_not_counted() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(accept_all)
+        .mount(&lab)
+        .await;
+    let (s, repo, metrics) = sender(&t, &lab).await;
+    repo.insert_many(&[event(Uuid::new_v4())]).await.unwrap();
+
+    // Only `mark_delivered` writes `delivered_at`: make exactly that statement fail,
+    // as a pool timeout or a Postgres restart would.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_delivery() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'delivered_at is not writable'; END $$; \
+         CREATE TRIGGER refuse_delivery BEFORE UPDATE OF delivered_at ON lab_events \
+         FOR EACH ROW EXECUTE FUNCTION refuse_delivery();",
+    )
+    .execute(&t.pool)
+    .await
+    .unwrap();
+
+    // The Lab accepted it, so the batch result still says so (the drain loop relies
+    // on it), but the row is still pending and will be sent again: counting it now
+    // would count it twice.
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Sent {
+            delivered: 1,
+            pending: 0
+        }
+    );
+    assert_eq!(repo.stats().await.unwrap().pending, 1);
+    let text = render(&metrics);
+    assert!(
+        text.contains("glutony_lab_events_delivered_total 0"),
+        "{text}"
+    );
+
+    // Once the write works, the second delivery is the one that counts.
+    sqlx::raw_sql("DROP TRIGGER refuse_delivery ON lab_events")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE lab_events SET next_attempt = now()")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Sent {
+            delivered: 1,
+            pending: 0
+        }
+    );
+    assert_eq!(repo.stats().await.unwrap().pending, 0);
+    assert!(render(&metrics).contains("glutony_lab_events_delivered_total 1"));
+    t.drop_schema().await;
+}
+
+#[tokio::test]
 async fn failures_back_off_and_never_drop() {
     let Some(t) = setup().await else { return };
     let lab = MockServer::start().await;
@@ -339,24 +429,120 @@ async fn an_oversized_ack_is_malformed_and_stays_pending() {
     t.drop_schema().await;
 }
 
-#[tokio::test]
-async fn maintain_drops_rows_never_acknowledged_for_24h_and_counts_them() {
-    let Some(t) = setup().await else { return };
-    let lab = MockServer::start().await;
-    let (s, repo, metrics) = sender(&t, &lab).await;
-    let (old, fresh) = (Uuid::new_v4(), Uuid::new_v4());
-    repo.insert_many(&[event(old), event(fresh)]).await.unwrap();
-    sqlx::query("UPDATE lab_events SET created_at = now() - interval '25 hours', attempts = 300 WHERE id = $1")
-        .bind(old)
-        .execute(&t.pool)
-        .await
-        .unwrap();
-    s.maintain().await;
-    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM lab_events")
+async fn backdate(t: &TestDb, id: Uuid, interval: &str) {
+    sqlx::query(
+        "UPDATE lab_events SET created_at = now() - $2::interval, next_attempt = now() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(interval)
+    .execute(&t.pool)
+    .await
+    .unwrap();
+}
+
+async fn left(t: &TestDb) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT id FROM lab_events ORDER BY created_at")
         .fetch_all(&t.pool)
         .await
+        .unwrap()
+}
+
+/// A row the Lab never answered for (401, 5xx, unreachable) is no proof it was
+/// rejected: it is kept and retried for 7 days, not dropped after 24 h.
+#[tokio::test]
+async fn rows_the_lab_never_answered_for_are_kept_for_7_days() {
+    let Some(t) = setup().await else { return };
+    for answer in [Some(401), Some(503), None] {
+        let lab = MockServer::start().await;
+        let (s, repo, metrics) = match answer {
+            Some(status) => {
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&lab)
+                    .await;
+                sender(&t, &lab).await
+            }
+            None => {
+                // Nothing listens on the port of a server that was started and dropped.
+                let gone = MockServer::start().await;
+                let uri = gone.uri();
+                drop(gone);
+                let repo = LabEventRepo::new(t.pool.clone());
+                let config = LabConfig::from_values(
+                    Some(uri),
+                    Some(INSTANCE_ID.into()),
+                    Some(SECRET.into()),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+                let metrics = LabMetrics::default();
+                let s = LabSender::new(repo.clone(), config, metrics.clone(), Default::default())
+                    .unwrap();
+                (s, repo, metrics)
+            }
+        };
+        let (day_old, week_old) = (Uuid::new_v4(), Uuid::new_v4());
+        repo.insert_many(&[event(day_old), event(week_old)])
+            .await
+            .unwrap();
+        backdate(&t, day_old, "25 hours").await;
+        backdate(&t, week_old, "7 days 1 hour").await;
+        assert!(
+            matches!(s.deliver_once().await, Delivery::Failed { pending: 2, .. }),
+            "{answer:?}"
+        );
+        s.maintain().await;
+        assert_eq!(left(&t).await, vec![day_old], "{answer:?}");
+        assert!(
+            render(&metrics).contains("glutony_lab_events_dropped_total 1"),
+            "{answer:?}"
+        );
+        sqlx::query("DELETE FROM lab_events")
+            .execute(&t.pool)
+            .await
+            .unwrap();
+    }
+    t.drop_schema().await;
+}
+
+/// A row the Lab answered 200 for without accepting it was skipped on purpose: it is
+/// dropped 24 h after the first skip, whatever its age when that skip happened.
+#[tokio::test]
+async fn rows_the_lab_skipped_are_dropped_24h_after_the_first_skip() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted": []})))
+        .mount(&lab)
+        .await;
+    let (s, repo, metrics) = sender(&t, &lab).await;
+    let (skipped_long_ago, skipped_now) = (Uuid::new_v4(), Uuid::new_v4());
+    repo.insert_many(&[event(skipped_long_ago), event(skipped_now)])
+        .await
         .unwrap();
-    assert_eq!(left, vec![fresh]);
+    // Waited out a 30 h outage, then skipped once just now: kept for 24 h more.
+    backdate(&t, skipped_now, "30 hours").await;
+    assert_eq!(
+        s.deliver_once().await,
+        Delivery::Sent {
+            delivered: 0,
+            pending: 2
+        }
+    );
+    // A later skip does not restart the clock of the first one.
+    sqlx::query(
+        "UPDATE lab_events SET first_skipped_at = now() - interval '25 hours', next_attempt = now() \
+         WHERE id = $1",
+    )
+    .bind(skipped_long_ago)
+    .execute(&t.pool)
+    .await
+    .unwrap();
+    s.deliver_once().await;
+    s.maintain().await;
+    assert_eq!(left(&t).await, vec![skipped_now]);
     assert!(render(&metrics).contains("glutony_lab_events_dropped_total 1"));
     t.drop_schema().await;
 }
@@ -479,5 +665,36 @@ async fn a_converted_row_keeps_its_lease_and_backs_off_on_failure() {
     assert_eq!(attempts, 1);
     assert!(!due, "the row backs off after the failure");
     assert_eq!(s.deliver_once().await, Delivery::Idle);
+    t.drop_schema().await;
+}
+
+/// A pre-v2 row the Lab skipped (it rejects that shape) gets a fresh window once
+/// converted: the skips of the old shape must not drop the converted event.
+#[tokio::test]
+async fn a_converted_row_forgets_the_skips_of_its_pre_v2_shape() {
+    let Some(t) = setup().await else { return };
+    let lab = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&lab)
+        .await;
+    let (s, _, _) = sender(&t, &lab).await;
+    let (id, _) = insert_pre_v2(&t).await;
+    sqlx::query(
+        "UPDATE lab_events SET first_skipped_at = now() - interval '25 hours' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&t.pool)
+    .await
+    .unwrap();
+    s.deliver_once().await;
+    s.maintain().await;
+    let skipped: Option<Option<chrono::DateTime<chrono::Utc>>> =
+        sqlx::query_scalar("SELECT first_skipped_at FROM lab_events WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&t.pool)
+            .await
+            .unwrap();
+    assert_eq!(skipped, Some(None), "kept, with no skip on record");
     t.drop_schema().await;
 }

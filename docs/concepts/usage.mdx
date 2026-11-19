@@ -1,11 +1,12 @@
 ---
 title: "Usage & metering"
-description: "Per-tenant usage data: what is recorded, how it reaches Tinybird, and which table to read."
+description: "Per-tenant usage data: what is recorded, how it reaches Tinybird or ClickHouse, and which table to read."
 ---
 
 Every job records what it consumed, per tenant, so you can chart it and reconcile it.
-The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse) and is
-written by the worker, never by the gateway. Tinybird holds the analytics. Behind the
+The data lands in [Tinybird](https://www.tinybird.co) (managed ClickHouse), or in a
+ClickHouse you run yourself ([ClickHouse instead of Tinybird](#clickhouse-instead-of-tinybird)),
+and is written by the worker, never by the gateway. Tinybird holds the analytics. Behind the
 Meilisearch Lab, billing is the Lab's, from a separate stream of events described in
 [Analytics and the Lab](#analytics-and-the-lab).
 
@@ -24,7 +25,14 @@ One row per pipeline step, plus one row per job.
 Volume is observed by the worker. Cost units come from the plugins themselves, because
 only the plugin knows what it spent on an external service: the enricher reports the
 token counts the provider returned, the transcriber reports the audio seconds it was
-billed for, the extractors report pages. Plugins report through
+billed for, the extractors report pages. Local work reports no cost units:
+`video_audio_extractor` decodes on the worker, so it records no `audio_seconds`, and
+the transcriber after it is the only step that reports the audio, once. When the transcription response carries no
+duration, an uncompressed WAV upload is measured from its header: the rate comes from
+its sample rate, channels and bits per sample (never the informational bytes-per-second
+field) and the audio is every byte after the `data` header, so a forged header cannot
+shrink the billed seconds. Compressed audio without a duration counts the request only.
+Plugins report through
 `ActivityContext::record_usage`, and the accumulator is shared across clones so a
 plugin fanning out concurrently is not undercounted.
 
@@ -66,8 +74,9 @@ sorting key.
 `documents_out` on a step row counts a document once per stage, so a pipeline that
 extracts then chunks then indexes reports it three times. That measures work done,
 not corpus size. The rollups expose `documents_indexed` for the number that actually
-reached Meilisearch, taken from the job row's final-step count — that is the figure
-to report.
+reached Meilisearch, taken from the job row: the documents its `meili_indexer` steps
+wrote (0 for a job cancelled before indexing), or the final step's count for a
+succeeded pipeline with no indexer. That is the figure to report.
 </Note>
 
 | Table | Freshness | Deduplicated | Retention | Use for |
@@ -126,8 +135,61 @@ deployments need no analytics account.
 
 Deploy the schema and pipes with the Tinybird Forward CLI from the `tinybird/` directory
 (`tb --local deploy` against Tinybird Local, `tb --cloud deploy` against a workspace).
-The deployment also mints the gateway's read token, `glutony_gateway_read`
-(`TINYBIRD_READ_TOKEN`); see `tinybird/README.md`.
+The deployment also mints the gateway's read token, `glutony_gateway_read`; see
+`tinybird/README.md`.
+
+Reading usage back (`GET /usage`, the Lab's Pipelines **Usage** page) is configured on
+the gateway:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TINYBIRD_READ_TOKEN` | — | Read token for the `tenant_usage` endpoint (`glutony_gateway_read`). Absent: `GET /usage` answers `501` ("usage analytics is not configured on this deployment"). |
+| `TINYBIRD_BASE_URL` | `https://api.tinybird.co` | Same region URL as the workers'. |
+| `TINYBIRD_USAGE_PIPE` | `tenant_usage` | Endpoint pipe to read. |
+
+Set both tokens: with only the read token the page is empty because nothing is recorded,
+and with only the append token usage is recorded but `GET /usage` still answers `501`.
+Only jobs that run after `TINYBIRD_TOKEN` is set are counted.
+
+### ClickHouse instead of Tinybird
+
+Tinybird is managed ClickHouse, so a ClickHouse server you already run can hold the same
+rows. Set `USAGE_CLICKHOUSE_URL` on the workers **and** the gateway instead of the
+Tinybird tokens; setting both is refused at boot.
+
+| Variable | Default | Description |
+|---|---|---|
+| `USAGE_CLICKHOUSE_URL` | — | ClickHouse HTTP interface, e.g. `http://127.0.0.1:8123`. Absent: not this store. |
+| `USAGE_CLICKHOUSE_DATABASE` | `default` | Must exist. |
+| `USAGE_CLICKHOUSE_TABLE` | `meili_ingest_usage` | Created by the workers if missing. |
+| `USAGE_CLICKHOUSE_USER` | `default` | Workers need `INSERT`, `SELECT` and `CREATE TABLE` on the database, plus `ALTER ADD COLUMN` on the table to upgrade it themselves; the gateway `SELECT`. |
+| `USAGE_CLICKHOUSE_PASSWORD` | empty | Sent in `X-ClickHouse-Key`, never logged. |
+| `USAGE_CLICKHOUSE_TIMEOUT_SECS` | `20` | Worker HTTP timeout. |
+
+The workers create the table on boot (and retry on the first report if that failed): the
+Tinybird data source's columns, `ReplacingMergeTree` engine, `(project_id, ts, event_id)`
+sorting key, monthly partitions and 180-day TTL. Rows go in with `INSERT … FORMAT
+JSONEachRow`, which rejects an unknown field, so schema drift fails loudly as it does
+in Tinybird.
+
+Two changes to the table are repaired on the spot, then the insert is tried once more:
+
+- **A table from an older release** that lacks a column added since: the workers run
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for every column. Without the `ALTER` grant
+  the insert fails as before; add the column by hand. A changed type or a renamed
+  column is never repaired.
+- **A table dropped while the workers run**: they create it again.
+
+`GET /usage` returns the same columns as `tenant_usage`, from one query over the raw
+table with `FINAL`: redelivered rows are collapsed before they are counted, and there is
+no hourly lag. The tenant and dates are bound as typed query parameters. Days are UTC,
+as on Tinybird, whatever the ClickHouse server's time zone. Before the first row is
+written (no table yet) it answers an empty list.
+
+With either store, usage is recorded when a job finishes, so only jobs that finish after
+the store is configured are counted. Nothing is backfilled: older jobs, succeeded or
+failed, still appear in `GET /jobs` but not in `GET /usage`, and a usage total for a
+period that starts before the store was set up is lower than the job count.
 
 ## Usage data is not monitoring
 

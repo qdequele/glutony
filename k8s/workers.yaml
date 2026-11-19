@@ -39,7 +39,8 @@ metadata:
     app.kubernetes.io/component: worker
     meili-ingest/task-queue: workers-general
 spec:
-  replicas: 1
+  # No `replicas`: the ScaledObject below owns the count (1-20), and a value here
+  # would reset it on every `kubectl apply -k`. Without KEDA, set it by hand.
   selector:
     matchLabels:
       app.kubernetes.io/name: workers-general
@@ -96,6 +97,13 @@ spec:
                   name: meili-ingest-secrets
                   key: TINYBIRD_TOKEN
                   optional: true
+            # Password of USAGE_CLICKHOUSE_USER when usage lives in ClickHouse.
+            - name: USAGE_CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: meili-ingest-secrets
+                  key: USAGE_CLICKHOUSE_PASSWORD
+                  optional: true
             # Presented on every control-plane call.
             - name: CONTROL_PLANE_TOKEN
               valueFrom:
@@ -112,6 +120,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: meili-ingest-config
+          # An archive expansion (one at a time per worker) holds the archive (up to
+          # MAX_UPLOAD_MB) plus at most ARCHIVE_INFLIGHT_MB of its files, about 1 GiB
+          # with the defaults, plus ARCHIVE_MAX_FILE_MB per nested archive level. Raise
+          # the limit with those variables. See docs/concepts/archives.mdx, "Memory".
           resources:
             requests:
               cpu: 500m

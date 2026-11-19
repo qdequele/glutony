@@ -21,6 +21,7 @@ default = []
 [dependencies]
 # internal
 meili-ingest-plugin-sdk.workspace = true
+meili-ingest-usage.workspace = true
 meili-ingest-router.workspace = true
 meili-ingest-blob.workspace = true
 meili-ingest-source.workspace = true
@@ -51,7 +52,6 @@ uuid.workspace = true
 chrono.workspace = true
 url.workspace = true
 subtle.workspace = true
-mime_guess.workspace = true
 
 # errors / logging
 anyhow.workspace = true
@@ -64,3 +64,4 @@ wiremock.workspace = true
 tower = { workspace = true, features = ["util"] }
 regex.workspace = true
 http-body-util = "0.1"
+jsonschema = { version = "0.45", default-features = false }

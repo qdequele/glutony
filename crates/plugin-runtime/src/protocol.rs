@@ -4,16 +4,43 @@
 //! are duplicated here so the worker never has to enable the SDK `wasm` feature (which
 //! pulls in `extism-pdk`).
 
-use meili_ingest_plugin_sdk::{PluginError, PluginInput, PluginOutput};
+use meili_ingest_plugin_sdk::{ActivityContext, PluginError, PluginInput, PluginOutput};
 use serde::{Deserialize, Serialize};
 
 /// What the host sends to a WASM guest's `execute` export.
+///
+/// `input` stays first. The ids come last and are additive: a guest built before them
+/// ignores them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecuteEnvelope {
     /// The plugin input.
     pub input: PluginInput,
     /// The step `config:` block.
     pub config: serde_json::Value,
+    /// The job the step belongs to.
+    #[serde(default)]
+    pub job_id: uuid::Uuid,
+    /// The pipeline step id.
+    #[serde(default)]
+    pub step_id: String,
+    /// The attempt number, 1-based.
+    #[serde(default)]
+    pub attempt: u32,
+}
+
+impl ExecuteEnvelope {
+    /// The envelope of one call: `input` and `config` plus the step `ctx` runs. Only
+    /// the ids cross the boundary: the AI target (a team key) and the usage
+    /// accumulator stay on the host.
+    pub fn for_step(ctx: &ActivityContext, input: PluginInput, config: serde_json::Value) -> Self {
+        Self {
+            input,
+            config,
+            job_id: ctx.job_id(),
+            step_id: ctx.step_id().to_string(),
+            attempt: ctx.attempt(),
+        }
+    }
 }
 
 /// Structured failure returned by an external plugin.
@@ -60,7 +87,7 @@ impl ExecuteReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meili_ingest_plugin_sdk::Document;
+    use meili_ingest_plugin_sdk::{ActivityContext, Document};
 
     #[test]
     fn reply_json_shape() {
@@ -75,13 +102,77 @@ mod tests {
     }
 
     #[test]
+    fn the_envelope_carries_the_step_the_guest_runs() {
+        let job = uuid::Uuid::from_u128(7);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ActivityContext::new(job, "enrich", 3, tx, Default::default());
+        let env = ExecuteEnvelope::for_step(&ctx, PluginInput::Empty, serde_json::json!({}));
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["job_id"], job.to_string());
+        assert_eq!(v["step_id"], "enrich");
+        assert_eq!(v["attempt"], 3);
+    }
+
+    #[test]
     fn envelope_roundtrip() {
-        let env = ExecuteEnvelope {
-            input: PluginInput::Empty,
-            config: serde_json::json!({"a": 1}),
-        };
+        let env = ExecuteEnvelope::for_step(
+            &ActivityContext::noop(),
+            PluginInput::Empty,
+            serde_json::json!({"a": 1}),
+        );
         let back: ExecuteEnvelope =
             serde_json::from_slice(&serde_json::to_vec(&env).unwrap()).unwrap();
         assert_eq!(back, env);
+    }
+
+    // The guest-side copies of these types live in `meili_ingest_plugin_sdk::wasm`,
+    // behind a feature the workspace tests do not build. The literals below are the
+    // wire format both sides must agree on; `tests/wasm_roundtrip.rs` sends them
+    // through a real module.
+
+    #[test]
+    fn envelope_wire_format_is_pinned() {
+        let env = ExecuteEnvelope::for_step(
+            &ActivityContext::noop(),
+            PluginInput::Documents(vec![Document::with_id("a", "x")]),
+            serde_json::json!({"a": 1}),
+        );
+        assert_eq!(
+            serde_json::to_value(&env).unwrap(),
+            serde_json::json!({
+                "input": {
+                    "type": "documents",
+                    "value": [{"id": "a", "content": "x", "meta": {}}],
+                },
+                "config": {"a": 1},
+                "job_id": "00000000-0000-0000-0000-000000000000",
+                "step_id": "test",
+                "attempt": 1,
+            })
+        );
+        // The guest reads `input` first: the envelope starts with it.
+        assert!(
+            serde_json::to_string(&env)
+                .unwrap()
+                .starts_with(r#"{"input":"#)
+        );
+    }
+
+    #[test]
+    fn reply_wire_format_is_pinned() {
+        let ok: ExecuteReply = serde_json::from_str(r#"{"ok":{"type":"empty"}}"#).unwrap();
+        assert_eq!(ok, ExecuteReply::Ok(PluginOutput::Empty));
+
+        // What the SDK's `run_plugin` falls back to; `retryable` may also be left out.
+        let err: ExecuteReply = serde_json::from_str(
+            r#"{"error":{"message":"plugin reply could not be serialized","retryable":false}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            err.into_result(),
+            Err(PluginError::NonRetryable(_))
+        ));
+        let err: ExecuteReply = serde_json::from_str(r#"{"error":{"message":"m"}}"#).unwrap();
+        assert!(matches!(err.into_result(), Err(PluginError::NonRetryable(m)) if m == "m"));
     }
 }

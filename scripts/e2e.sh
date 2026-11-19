@@ -3,8 +3,8 @@
 #
 # Starts: Temporal dev server (temporal CLI), Postgres + Meilisearch (Docker),
 # then the control plane, gateway and a general worker from this workspace, ingests a
-# PDF and a JSON document through the gateway, and checks that documents land in
-# Meilisearch. Everything is torn down at the end.
+# PDF, a JSON document and a zip archive through the gateway, and checks that
+# documents land in Meilisearch. Everything is torn down at the end.
 #
 # Pass --lab to also run the Meilisearch Lab leg: a fake Lab (platform contract v2,
 # scripts/fake_lab.py) the control plane and a second gateway report to with instance
@@ -364,6 +364,39 @@ done
 sleep 1
 UHITS=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_url/search" -H 'Content-Type: application/json' -d '{"q":"lightning"}' | jq '.estimatedTotalHits')
 echo "e2e_url hits for 'lightning': $UHITS"; [ "$UHITS" -ge 1 ] || exit 1
+
+echo "--- ingest an archive (one job per file)"
+python3 - "${WORK}" <<'PY'
+import os, sys, zipfile
+work = sys.argv[1]
+with zipfile.ZipFile(os.path.join(work, "bundle.zip"), "w", zipfile.ZIP_DEFLATED) as z:
+    z.write(os.path.join(work, "sample.pdf"), "reports/sample.pdf")
+    z.writestr("guides/eu/intro.md", "# Shipping in Europe\n\nParcels across the archipelago take five days.\n")
+    z.writestr("guides/us/intro.md", "# Shipping in the US\n\nParcels across the archipelago take three days.\n")
+    z.writestr("guides/empty.txt", "")
+    z.writestr("__MACOSX/guides/._intro.md", "junk")
+PY
+RESP_A=$(curl -fsS -F "file=@${WORK}/bundle.zip" -F "index=e2e_archive" "${GW}/ingest")
+echo "$RESP_A" | jq .
+[ "$(echo "$RESP_A" | jq -r .pipeline_used)" = "archive" ] || { echo "expected an archive job" >&2; exit 1; }
+JOB_A=$(echo "$RESP_A" | jq -r .job_id)
+for _ in $(seq 1 120); do
+  S=$(curl -fsS "${GW}/jobs/${JOB_A}" | jq -r .status)
+  [ "$S" = succeeded ] && break
+  [ "$S" = failed ] && { curl -fsS "${GW}/jobs/${JOB_A}" | jq .; tail -60 "${WORK}/worker.log"; exit 1; }
+  sleep 1
+done
+[ "$S" = succeeded ] || { echo "archive job state $S"; curl -fsS "${GW}/jobs/${JOB_A}" | jq .; exit 1; }
+ARCH=$(curl -fsS "${GW}/jobs/${JOB_A}" | jq -c .progress.archive)
+echo "archive progress: $ARCH"
+[ "$(echo "$ARCH" | jq .files_succeeded)" = 3 ] || { echo "expected 3 files ingested" >&2; exit 1; }
+[ "$(echo "$ARCH" | jq .files_skipped)" = 1 ] || { echo "expected the empty file skipped" >&2; exit 1; }
+CHILDREN=$(curl -fsS "${GW}/jobs?parent_job_id=${JOB_A}" | jq .total)
+echo "file jobs of the archive: $CHILDREN"; [ "$CHILDREN" = 3 ] || exit 1
+sleep 1
+# Same filename in two folders: two documents, neither overwriting the other.
+AHITS=$(curl -fsS -H "Authorization: Bearer masterKey" "${MEILI_URL}/indexes/e2e_archive/search" -H 'Content-Type: application/json' -d '{"q":"archipelago"}' | jq '.estimatedTotalHits')
+echo "e2e_archive hits for 'archipelago': $AHITS"; [ "$AHITS" -ge 2 ] || exit 1
 
 echo "--- Envoy trust: headers without the shared secret are ignored"
 # The gateway runs with ENVOY_TRUSTED_HEADER set, so X-Meili-* headers only count

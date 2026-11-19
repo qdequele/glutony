@@ -19,7 +19,18 @@ extism plugin-input / plugin-output buffers.
 | Export | Input | Output |
 |---|---|---|
 | `manifest` | — | `PluginManifest` JSON (`kind` is set to `wasm` by the host) |
-| `execute` | `{ "input": PluginInput, "config": object }` | `PluginOutput` JSON, or an extism error whose message starts with `retryable:` / `non_retryable:` |
+| `execute` | `{ "input": PluginInput, "config": object, "job_id": uuid, "step_id": string, "attempt": number }` | `{ "ok": PluginOutput }` or `{ "error": { "message": string, "retryable": bool } }` |
+
+`input` always comes first in the envelope. `job_id`, `step_id` and `attempt`
+(1-based) name the step being run; a guest may ignore them. Older workers do
+not send them, so read them as optional. A reply without `retryable`, a reply
+that is not this JSON, an extism error and a trap all fail the step without a
+retry.
+
+With the Rust SDK, `ctx.job_id()`, `ctx.step_id()` and `ctx.attempt()` return
+these values. `ctx.record_usage(..)` is discarded: the host does not take billable
+usage from external plugins. `ctx.previous_progress()` is always `None`,
+cancellation is never observed and `ctx.ai_target()` is never set.
 
 `PluginInput` / `PluginOutput` use the tagged JSON shape from the SDK:
 
@@ -30,6 +41,14 @@ extism plugin-input / plugin-output buffers.
 
 The host resolves `Ref` inputs before calling you and spills large outputs
 after, so the module only ever sees `bytes`, `documents`, `many` or `empty`.
+
+Fetched bytes (a URL, an object ref, a scheduled source) also carry an `origin`
+string. Generating ids from it keeps two fetched files of the same name apart:
+the Rust SDK's `Blob::id_stem` does it the way the built-in plugins do.
+Bytes fetched over HTTP whose `Content-Type` declares a `charset` carry it as
+`charset` (lower-cased, for example `"windows-1252"`), while `mime` stays the
+bare type. It is what the server declared, and the bytes are not decoded;
+uploads have none.
 
 Heartbeats: the host heartbeats on your behalf while the call runs. Keep
 single calls under the step's `timeout_secs`; for big inputs prefer
@@ -63,35 +82,47 @@ crate-type = ["cdylib"]
 
 [dependencies]
 extism-pdk = "1"
-meili-ingest-plugin-sdk = { version = "0.1", features = ["wasm"] }  # types only, no tokio
-serde = { version = "1", features = ["derive"] }
+meili-ingest-plugin-sdk = { version = "0.1", features = ["wasm"] }  # no tokio runtime inside the guest
 serde_json = "1"
 ```
 
 ```rust
-use extism_pdk::*;
-use meili_ingest_plugin_sdk::types::{InputKind, OutputKind, PluginInput, PluginManifest, PluginOutput};
-use serde::Deserialize;
+use extism_pdk::{plugin_fn, FnResult};
+use meili_ingest_plugin_sdk::prelude::*;
+use meili_ingest_plugin_sdk::wasm::{manifest_json, run_plugin};
 
-#[derive(Deserialize)]
-struct Call { input: PluginInput, #[serde(default)] config: serde_json::Value }
+struct Uppercase;
 
-#[plugin_fn]
-pub fn manifest() -> FnResult<Json<PluginManifest>> {
-    Ok(Json(
+#[async_trait]
+impl Plugin for Uppercase {
+    fn manifest(&self) -> PluginManifest {
         PluginManifest::new("uppercase", "0.1.0")
             .description("Upper-cases document content")
             .accepts([InputKind::Documents, InputKind::Many])
-            .produces(OutputKind::Documents),
-    ))
+            .produces(OutputKind::Documents)
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ActivityContext,
+        input: PluginInput,
+        _config: serde_json::Value,
+    ) -> Result<PluginOutput, PluginError> {
+        let docs = input.into_documents()?;
+        let out = docs.into_iter().map(|mut d| { d.content = d.content.to_uppercase(); d }).collect();
+        Ok(PluginOutput::Documents(out))
+    }
 }
 
 #[plugin_fn]
-pub fn execute(Json(call): Json<Call>) -> FnResult<Json<PluginOutput>> {
-    let docs = call.input.into_documents()
-        .map_err(|e| Error::msg(format!("non_retryable: {e}")))?;
-    let out = docs.into_iter().map(|mut d| { d.content = d.content.to_uppercase(); d }).collect();
-    Ok(Json(PluginOutput::Documents(out)))
+pub fn manifest() -> FnResult<Vec<u8>> {
+    Ok(manifest_json(&Uppercase))
+}
+
+// Decodes the envelope, runs `execute` and encodes the `{"ok"|"error"}` reply.
+#[plugin_fn]
+pub fn execute(input: Vec<u8>) -> FnResult<Vec<u8>> {
+    Ok(run_plugin(&Uppercase, &input))
 }
 ```
 
@@ -140,7 +171,19 @@ steps:
 
 - No network or filesystem unless you grant it through extism's manifest
   (`allowed_hosts`, `allowed_paths`) — the host runs modules with none by default.
-- Memory is bounded by the wasm linear memory; keep per-call inputs small
-  (fan out per document).
+- Memory is bounded by the wasm linear memory (4 GiB) unless the operator sets
+  `WASM_PLUGIN_MAX_MEMORY_MB` on the worker. The cap covers the module's own
+  memory plus the buffers holding its input and output, so set it well above
+  the largest input the plugin receives. A call that needs more fails the step
+  without a retry. Keep per-call inputs small (fan out per document).
+- One instance of the module runs one call at a time; other steps using the
+  plugin wait for it.
+- A call is interrupted when its activity is cancelled (the job is cancelled,
+  or Temporal reports the step timed out) or the worker stops waiting for it,
+  and the module starts the next call from a fresh instance,
+  so keep no state between calls. `WASM_PLUGIN_TIMEOUT_SECS` on the worker adds
+  a ceiling for every call whatever the step allows; a call that reaches it
+  fails the step without a retry. The interruption stops the module's code: a
+  module blocked inside a host or WASI call is stopped once that call returns.
 - The module runs on the worker's task queue; the name → queue table only
   knows the built-in names, so a WASM plugin runs wherever it is declared.

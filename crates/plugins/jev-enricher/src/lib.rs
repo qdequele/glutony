@@ -9,8 +9,9 @@
 //! It follows the built-in plugin conventions of `llm_enricher` (the canonical
 //! example): env vars read only in [`JevEnricherPlugin::from_env`], a typed config
 //! with a matching JSON Schema, `Documents` and `Many` input, bounded concurrency with
-//! input order preserved, heartbeats, cancellation, per-call usage and precise error
-//! mapping.
+//! input order preserved, heartbeats, cancellation, per-call usage, precise error
+//! mapping, and a checkpoint of the documents already classified so that an activity
+//! retry resumes instead of paying for them again (see the `checkpoint` module).
 //!
 //! ## Pipeline usage
 //!
@@ -45,7 +46,9 @@
 //!
 //! Behind the Meilisearch Lab the worker attaches the team's [`AiTarget`] (its hosted
 //! Gateway and a per-team key) to the step's [`ActivityContext`]. When one is present the
-//! plugin posts to `{target.base_url}/systemone` instead of the env-configured API, with
+//! plugin posts to `{target.base_url}/decisions` instead of the env-configured API (the
+//! Gateway's decisions route, which takes the TypeSafe format and answers in it; its old
+//! `/v1/systemone` alias is gone and answers `404 LM-1003`), with
 //! the target's `decision_model` (falling back to [`DEFAULT_MODEL`]; a step's
 //! `config.model` still wins), and even a [`JevEnricherPlugin::disabled`] instance works.
 //! A Gateway 401 marks the target rejected and is retried with a fresh key; a 402 means
@@ -71,6 +74,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -79,6 +83,11 @@ use meili_ingest_plugin_sdk::cost::ProviderCosts;
 use meili_ingest_plugin_sdk::prelude::*;
 use meili_ingest_plugin_sdk::vendor::direct_model;
 use serde::{Deserialize, Serialize};
+
+mod checkpoint;
+use checkpoint::{Checkpoint, MAX_CHECKPOINT_BYTES};
+mod retry;
+use retry::{Failure, RetryPolicy, with_retry};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "jev_enricher";
@@ -275,6 +284,14 @@ struct JevClient {
 #[derive(Clone)]
 pub struct JevEnricherPlugin {
     client: Option<JevClient>,
+    /// HTTP client for the Lab's target when there is no env client, built on first use
+    /// and shared by clones, so a keyless worker keeps one connection pool across steps.
+    /// The team key travels per request, so sharing the pool shares no credential.
+    lab_http: Arc<OnceLock<reqwest::Client>>,
+    /// In-plugin retry of one request's transient failures (see [`retry`]).
+    retry: RetryPolicy,
+    /// Most bytes of results a checkpoint holds (see [`checkpoint`]).
+    checkpoint_budget: usize,
 }
 
 impl std::fmt::Debug for JevEnricherPlugin {
@@ -307,7 +324,12 @@ impl JevEnricherPlugin {
 
     /// An instance whose `execute` always fails with `InvalidConfig("TYPESAFE_API_KEY not set")`.
     pub fn disabled() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
+        }
     }
 
     /// Read `TYPESAFE_API_KEY` (required), `TYPESAFE_BASE_URL`, `JEV_MODEL` from the
@@ -340,6 +362,9 @@ impl JevEnricherPlugin {
                 http,
                 lab: None,
             }),
+            lab_http: Arc::default(),
+            retry: RetryPolicy::DEFAULT,
+            checkpoint_budget: MAX_CHECKPOINT_BYTES,
         }
     }
 
@@ -354,12 +379,7 @@ impl JevEnricherPlugin {
         if let Some(target) = ctx.ai_target() {
             let http = match &self.client {
                 Some(c) => c.http.clone(),
-                None => reqwest::Client::builder()
-                    .timeout(DEFAULT_TIMEOUT)
-                    .build()
-                    .map_err(|e| {
-                        PluginError::non_retryable(format!("cannot build HTTP client: {e}"))
-                    })?,
+                None => self.lab_http()?,
             };
             return Ok(JevClient {
                 base_url: target.base_url.trim_end_matches('/').to_string(),
@@ -375,6 +395,19 @@ impl JevEnricherPlugin {
         self.client
             .clone()
             .ok_or_else(|| PluginError::invalid_config(MISSING_KEY))
+    }
+
+    /// The shared client for the Lab's target (see `lab_http`), built on first use.
+    fn lab_http(&self) -> Result<reqwest::Client, PluginError> {
+        if let Some(http) = self.lab_http.get() {
+            return Ok(http.clone());
+        }
+        let built = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(|e| PluginError::non_retryable(format!("cannot build HTTP client: {e}")))?;
+        // Two first steps racing both build; one wins and both use the winner.
+        Ok(self.lab_http.get_or_init(|| built).clone())
     }
 }
 
@@ -408,25 +441,70 @@ impl Plugin for JevEnricherPlugin {
         }
         tracing::debug!(job_id = %ctx.job_id(), plugin = NAME, documents = total, questions = cfg.questions.len(), "classifying documents");
 
-        // Bounded concurrency; results are re-ordered by their original index.
+        // Resume: on an activity retry, the documents the previous attempt finished get
+        // their recorded answers back instead of a new (paid) call. Those calls were the
+        // failed attempt's, which is not billed, so nothing is metered here.
+        let (mut checkpoint, mut resumed) =
+            Checkpoint::resume(NAME, ctx.previous_progress(), &docs, self.checkpoint_budget);
         let mut slots: Vec<Option<Document>> =
             std::iter::repeat_with(|| None).take(total).collect();
-        let mut stream = futures::stream::iter(docs.into_iter().enumerate())
+        let mut pending = Vec::with_capacity(total);
+        let mut done = 0usize;
+        for (i, doc) in docs.into_iter().enumerate() {
+            let saved = resumed
+                .remove(&i)
+                .and_then(|r| serde_json::from_value::<BTreeMap<String, Answer>>(r).ok());
+            // A saved entry that does not answer every question is redone, from the
+            // document as it came in.
+            let applied = saved.and_then(|answers| {
+                let mut resumed_doc = doc.clone();
+                apply_answers(&mut resumed_doc, &cfg, &answers)
+                    .ok()
+                    .map(|()| resumed_doc)
+            });
+            match applied {
+                Some(resumed_doc) => {
+                    slots[i] = Some(resumed_doc);
+                    done += 1;
+                }
+                None => pending.push((i, doc)),
+            }
+        }
+        if done > 0 {
+            tracing::info!(job_id = %ctx.job_id(), plugin = NAME, resumed = done, documents = total, "resuming from the previous attempt's checkpoint");
+            ctx.heartbeat(format!("{NAME}: {done}/{total} documents resumed"));
+        }
+
+        // Bounded concurrency; results are re-ordered by their original index. Every
+        // finished document is checkpointed, so a retry after a failure resumes.
+        let mut stream = futures::stream::iter(pending)
             .map(|(i, doc)| {
-                let (cfg, client) = (&cfg, &client);
-                async move { (i, client.enrich(ctx, cfg, doc).await) }
+                let (cfg, client, retry) = (&cfg, &client, &self.retry);
+                async move { (i, client.enrich(ctx, cfg, retry, doc).await) }
             })
             .buffer_unordered(cfg.max_concurrent);
 
-        let mut done = 0usize;
         while let Some((i, result)) = stream.next().await {
             ctx.check_cancelled()?;
-            let doc = result?;
+            let (doc, answers) = match result {
+                Ok(finished) => finished,
+                Err(e) => {
+                    // Hand the retry everything finished so far.
+                    checkpoint.record(ctx);
+                    return Err(e);
+                }
+            };
+            checkpoint.push(
+                i,
+                &doc.id,
+                serde_json::to_value(&answers).unwrap_or_default(),
+            );
             if let Some(slot) = slots.get_mut(i) {
                 *slot = Some(doc);
             }
             done += 1;
             if done.is_multiple_of(10) || done == total {
+                checkpoint.record(ctx);
                 ctx.heartbeat(format!("{NAME}: {done}/{total} documents classified"));
             }
         }
@@ -533,16 +611,17 @@ struct SystemOneResponse {
     usage: Option<ApiUsage>,
 }
 
-/// One entry of `answers`. Only the field matching the question type is read.
-#[derive(Debug, Default, Deserialize)]
+/// One entry of `answers`. Only the field matching the question type is read. A
+/// checkpoint keeps the answers in this form too (see [`checkpoint`]).
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Answer {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     noul: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     choice: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     score: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     confidence: Option<f64>,
 }
 
@@ -559,12 +638,17 @@ impl JevClient {
     ///
     /// Records the call's usage on `ctx` before returning; the accumulator behind
     /// `ctx` is shared by clones, so concurrent documents sum into one total.
+    ///
+    /// A transient failure (429, 5xx incl. 529, dropped connection) is retried here
+    /// under `retry` before it fails the step, so one overloaded document does not throw
+    /// away the answers already paid for.
     async fn enrich(
         &self,
         ctx: &ActivityContext,
         cfg: &JevEnricherConfig,
+        retry: &RetryPolicy,
         mut doc: Document,
-    ) -> Result<Document, PluginError> {
+    ) -> Result<(Document, BTreeMap<String, Answer>), PluginError> {
         let model = cfg.model.as_deref().unwrap_or(&self.default_model);
         // The Lab's Gateway takes the id as written (`typesafe/jev`); TypeSafe called
         // directly gets it without its own `typesafe/` prefix.
@@ -579,7 +663,7 @@ impl JevClient {
             "questions": cfg.questions,
         });
         // A failed call records nothing: `?` returns before `record_usage`.
-        let reply = self.systemone(&body).await?;
+        let reply = with_retry(retry, ctx, NAME, || self.systemone(&body)).await?;
         let mut usage = match reply.usage {
             Some(u) => UsageUnits::llm(u.input_tokens, u.output_tokens),
             None => UsageUnits {
@@ -590,17 +674,30 @@ impl JevClient {
         ProviderCosts::global().apply(NAME, model, &mut usage);
         ctx.record_usage(usage);
         apply_answers(&mut doc, cfg, &reply.answers)?;
-        Ok(doc)
+        // Only the configured questions' answers matter, to this document and to a
+        // checkpoint.
+        let mut answers = reply.answers;
+        answers.retain(|key, _| cfg.questions.contains_key(key));
+        Ok((doc, answers))
     }
 
-    /// POST `{base_url}/systemone`.
+    /// POST `{base_url}/systemone` to TypeSafe, `{base_url}/decisions` to the Lab's
+    /// Gateway.
     ///
     /// 429 / 5xx (incl. Jev's 529 "overloaded") / transport errors → `Retryable`;
     /// 401 / 403 → `NonRetryable` (credentials); 400 / 422 → `NonRetryable` with the
     /// body; other statuses → `NonRetryable`. With the Lab's target, a Gateway refusal
     /// (401 / 402) is mapped by [`gateway_failure`] first.
-    async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, PluginError> {
-        let url = format!("{}/systemone", self.base_url);
+    ///
+    /// A failure says whether it is transient (see [`transport_failure`] and
+    /// [`http_failure`]), for the in-plugin retry.
+    async fn systemone(&self, body: &serde_json::Value) -> Result<SystemOneResponse, Failure> {
+        let route = if self.lab.is_some() {
+            "decisions"
+        } else {
+            "systemone"
+        };
+        let url = format!("{}/{route}", self.base_url);
         let resp = self
             .http
             .post(&url)
@@ -608,22 +705,58 @@ impl JevClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| PluginError::retryable(format!("Jev request to {url} failed: {e}")))?;
+            .map_err(|e| transport_failure(&e, format!("Jev request to {url} failed: {e}")))?;
 
         let status = resp.status();
+        let retry_after = retry::retry_after(resp.headers());
         let text = resp
             .text()
             .await
-            .map_err(|e| PluginError::retryable(format!("Jev response body unreadable: {e}")))?;
+            .map_err(|e| transport_failure(&e, format!("Jev response body unreadable: {e}")))?;
         if !status.is_success() {
-            return Err(map_http_failure(status.as_u16(), &text, self.lab.as_ref()));
+            return Err(http_failure(
+                status.as_u16(),
+                retry_after,
+                &text,
+                self.lab.as_ref(),
+            ));
         }
         serde_json::from_str(&text).map_err(|e| {
-            PluginError::non_retryable(format!(
+            Failure::Other(PluginError::non_retryable(format!(
                 "Jev response is not a systemone reply ({e}): {}",
                 truncate_chars(&text, 512)
-            ))
+            )))
         })
+    }
+}
+
+/// A request that never got a full answer: `Retryable` either way, and retried in the
+/// plugin unless it timed out (another full timeout would eat the step's budget).
+fn transport_failure(e: &reqwest::Error, message: String) -> Failure {
+    let error = PluginError::retryable(message);
+    if e.is_timeout() {
+        Failure::Other(error)
+    } else {
+        Failure::Transient {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// A non-2xx answer: 429 and 5xx are transient; everything else, including the Lab
+/// Gateway's 401 (only a fresh key helps, and the worker fetches it), is not.
+fn http_failure(
+    code: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+    lab: Option<&AiTarget>,
+) -> Failure {
+    let error = map_http_failure(code, body, lab);
+    if matches!(code, 429 | 500..=599) && error.is_retryable() {
+        Failure::Transient { error, retry_after }
+    } else {
+        Failure::Other(error)
     }
 }
 
@@ -721,12 +854,20 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    /// The env-configured plugin, retrying transient failures without waiting.
     fn plugin(server: &MockServer) -> JevEnricherPlugin {
-        JevEnricherPlugin::with_client(server.uri(), "test-key", "jev-test", reqwest::Client::new())
+        let mut p = JevEnricherPlugin::with_client(
+            server.uri(),
+            "test-key",
+            "jev-test",
+            reqwest::Client::new(),
+        );
+        p.retry = RetryPolicy::IMMEDIATE;
+        p
     }
 
     /// A config asking one question of each type.
@@ -920,6 +1061,149 @@ mod tests {
             matches!(&err, PluginError::NonRetryable(m) if m.contains("quality")),
             "{err:?}"
         );
+    }
+
+    /// Answers [`three_answers`] with the state as the chosen category, except that it
+    /// is overloaded for the state `"busy"` while `busy` is set. Records each state.
+    #[derive(Clone, Default)]
+    struct BusyFor {
+        busy: Arc<AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Respond for BusyFor {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let state = body["state"].as_str().unwrap().to_string();
+            self.seen.lock().unwrap().push(state.clone());
+            if state == "busy" && self.busy.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(529);
+            }
+            let mut reply = three_answers();
+            reply["answers"]["category"]["choice"] = serde_json::json!(state);
+            ResponseTemplate::new(200).set_body_json(reply)
+        }
+    }
+
+    fn busy_docs() -> Vec<Document> {
+        ["a", "b", "busy", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Document::with_id(format!("d{i}"), *c))
+            .collect()
+    }
+
+    /// Attempt 1 with `busy` overloaded, then attempt 2 with it back, handed attempt
+    /// 1's checkpoint. Returns attempt 2's documents, the states it sent and its usage.
+    async fn fail_then_resume(p: &JevEnricherPlugin) -> (Vec<Document>, Vec<String>, UsageUnits) {
+        let server = MockServer::start().await;
+        let responder = BusyFor::default();
+        responder.busy.store(true, Ordering::SeqCst);
+        Mock::given(method("POST"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+        let mut p = p.clone();
+        p.client.as_mut().unwrap().base_url = server.uri();
+        // One at a time, so `a` and `b` are done when `busy` spends its retry budget.
+        let cfg = with_config(serde_json::json!({ "max_concurrent": 1 }));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = ActivityContext::new(uuid::Uuid::nil(), "classify", 1, tx, Arc::default());
+        let err = p
+            .execute(&first, PluginInput::Documents(busy_docs()), cfg.clone())
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
+        assert_eq!(first.usage().llm_requests, 2);
+
+        responder.busy.store(false, Ordering::SeqCst);
+        responder.seen.lock().unwrap().clear();
+        let second = ActivityContext::detached(uuid::Uuid::nil(), "classify", 2)
+            .with_previous_progress(first.progress());
+        let out = p
+            .execute(&second, PluginInput::Documents(busy_docs()), cfg)
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        let seen = responder.seen.lock().unwrap().clone();
+        (out, seen, second.usage())
+    }
+
+    #[tokio::test]
+    async fn an_activity_retry_resumes_from_the_documents_already_classified() {
+        let server = MockServer::start().await;
+        let (out, seen, usage) = fail_then_resume(&plugin(&server)).await;
+        assert_eq!(seen, vec!["busy", "c"]);
+        assert_eq!(
+            out.iter()
+                .map(|d| d.fields["category"].clone())
+                .collect::<Vec<_>>(),
+            ["a", "b", "busy", "c"].map(|c| serde_json::json!(c))
+        );
+        // The resumed answers are applied exactly as fresh ones.
+        assert!(out.iter().all(|d| d.fields["is_outdated"] == false));
+        assert!(out.iter().all(|d| d.fields["quality"] == 1.5));
+        // The failed attempt is not billed again: only this attempt's calls are.
+        assert_eq!(usage.llm_requests, 2);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_past_its_budget_leaves_the_rest_to_redo() {
+        let server = MockServer::start().await;
+        let mut p = plugin(&server);
+        p.checkpoint_budget = 0;
+        let (out, seen, _) = fail_then_resume(&p).await;
+        assert_eq!(seen, vec!["a", "b", "busy", "c"]);
+        assert_eq!(out[1].fields["category"], "b");
+    }
+
+    #[tokio::test]
+    async fn one_overloaded_document_is_retried_without_failing_the_batch() {
+        let server = MockServer::start().await;
+        // Jev's 529 "overloaded" once; every other request succeeds.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(529).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .mount(&server)
+            .await;
+        let docs: Vec<Document> = (0..3)
+            .map(|i| Document::with_id(format!("d{i}"), "x"))
+            .collect();
+        let ctx = ActivityContext::noop();
+        let out = plugin(&server)
+            .execute(&ctx, PluginInput::Documents(docs), three_questions())
+            .await
+            .unwrap()
+            .into_documents()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|d| d.fields["category"] == "api"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+        // Only the calls that answered are metered.
+        assert_eq!(ctx.usage().llm_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_overload_is_retried_a_bounded_number_of_times() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(529))
+            .expect(u64::from(RetryPolicy::IMMEDIATE.attempts))
+            .mount(&server)
+            .await;
+        let err = run(
+            &plugin(&server),
+            vec![Document::with_id("a", "x")],
+            three_questions(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_retryable(), "{err:?}");
     }
 
     #[tokio::test]
@@ -1350,7 +1634,7 @@ mod tests {
             .await;
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/v1/decisions"))
             .and(header("authorization", "Bearer lab-key"))
             .and(body_partial_json(
                 serde_json::json!({"model": "lab-decision"}),
@@ -1362,6 +1646,31 @@ mod tests {
 
         let ctx = ctx_with_target(lab_target(&lab, Some("lab-decision")));
         let out = run_with(&plugin(&env), &ctx, three_questions())
+            .await
+            .unwrap();
+        assert_eq!(out[0].fields["category"], "api");
+    }
+
+    #[tokio::test]
+    async fn the_lab_gateway_is_called_on_decisions_not_systemone() {
+        // The hosted Gateway (LUMEN >= 0.7) answers `/v1/systemone` with 404 LM-1003:
+        // every Jev step of a Lab team failed.
+        let lab = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {"code": "LM-1003", "message": "no route matches the request method and path"}
+            })))
+            .mount(&lab)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/decisions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
+            .expect(1)
+            .mount(&lab)
+            .await;
+        let ctx = ctx_with_target(lab_target(&lab, None));
+        let out = run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
             .await
             .unwrap();
         assert_eq!(out[0].fields["category"], "api");
@@ -1409,7 +1718,7 @@ mod tests {
     async fn jev_enricher_disabled_works_with_a_lab_target() {
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/v1/decisions"))
             .and(header("authorization", "Bearer lab-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(three_answers()))
             .expect(1)
@@ -1419,6 +1728,83 @@ mod tests {
         run_with(&JevEnricherPlugin::disabled(), &ctx, three_questions())
             .await
             .unwrap();
+    }
+
+    /// A keep-alive HTTP/1.1 server that answers every request with `reply` and counts
+    /// the TCP connections it accepted. wiremock does not expose connection counts.
+    async fn counting_server(reply: serde_json::Value) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let body = reply.to_string();
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // One request: headers, then `Content-Length` bytes of body.
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse().unwrap());
+                        while buf.len() < head_end + len {
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        buf.drain(..head_end + len);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/v1"), accepted)
+    }
+
+    #[tokio::test]
+    async fn a_disabled_plugin_reuses_its_lab_connection_across_steps() {
+        let (base_url, accepted) = counting_server(three_answers()).await;
+        let target = AiTarget::new(
+            base_url,
+            "lab-key",
+            "key-1",
+            "lab-model",
+            "lab-vision",
+            None,
+        );
+        let p = JevEnricherPlugin::disabled();
+        for _ in 0..2 {
+            // Each step gets a fresh context, as the worker builds one per activity.
+            run_with(&p, &ctx_with_target(target.clone()), three_questions())
+                .await
+                .unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "one pooled connection");
     }
 
     #[tokio::test]
@@ -1439,10 +1825,12 @@ mod tests {
     #[tokio::test]
     async fn jev_enricher_lab_401_marks_the_target_rejected() {
         let lab = MockServer::start().await;
+        // Only a fresh key helps, which the worker fetches: never retried in-plugin.
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(401).set_body_string(r#"{"error":{"code":"LM-4004"}}"#),
             )
+            .expect(1)
             .mount(&lab)
             .await;
         let ctx = ctx_with_target(lab_target(&lab, None));
@@ -1525,7 +1913,7 @@ mod tests {
     async fn the_lab_gateway_gets_the_prefixed_jev_id() {
         let lab = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/v1/decisions"))
             .and(body_partial_json(
                 serde_json::json!({ "model": "typesafe/jev" }),
             ))

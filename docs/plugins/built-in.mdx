@@ -10,9 +10,30 @@ block; every key is optional unless stated otherwise.
 <Note>
 Documents produced by extractors set `meta.source`, `meta.filename` and
 `meta.mime` from the input blob, and derive ids from the sanitised filename
-plus a page/row suffix (`report_pdf_p3`, `data_csv_r42`).
+without its extension plus a page/row suffix (`report_p3`, `data_r42`).
+A filename or sheet name with non-ASCII characters also ends with a 12-character
+hash of the original name (`報告.pdf` gives `___<hash>_p1`), so two non-Latin
+names never share ids; ASCII names give the ids they always did.
 
-`csv_parser` additionally stores the 1-based row number in a `_row` field. The
+Because the extension is dropped, files that differ only by it share ids when
+they go to the same index: `guide.md` and `guide.html` both give `guide` (or
+`guide_s1`, …), `data.csv` and `data.parquet` both give `data_r1`, …, and the
+one indexed last replaces the other's documents, with both jobs succeeding. The
+same holds inside one archive. Rename one of the files, send them to separate
+indexes, or take ids from the data with `id_column` / `id_field` where the
+extractor has one.
+
+Content fetched rather than uploaded (a URL or object-ref ingest, a scheduled
+source, and the files of such an archive) also carries a 12-character hash of
+where it came from: `https://a.example/export/data.json` gives `data_<hash>_0`,
+so another URL or source ending in `data.json` never overwrites its documents.
+The hash is of the URL without its query string (a pre-signed link keeps its ids
+when its signature changes), of the object URI, or of the source's project and
+`uid` (a templated source URL keeps its ids from run to run). A document's own
+id (`id_field`, `id_column`) is always kept as is.
+
+`csv_parser` additionally stores the 1-based row number in a `_row` field (or
+`_row_2`, … when the file has a `_row` column of its own, which keeps its value). The
 parsers that decode to JSON first — `json_flattener`, `msgpack_parser`,
 `avro_parser`, `parquet_parser` — deliberately do not: their generated id
 already carries the index, and keeping the family uniform matters more than
@@ -28,11 +49,17 @@ Text extraction from PDF (`pdf-extract`). Queue: `workers-general`.
 | Key | Default | Description |
 |---|---|---|
 | `per_page` | `true` | One document per page (`meta.page` set); `false` → one document for the whole file. |
+| `max_pages` | `null` | Read only the first N pages, in both modes. Later pages are never rendered or billed. |
 
 ### `docx_extractor`
 
 Word `.docx` (`docx-rs`). One document; paragraphs joined by `\n\n`, tables
 rendered as tab-separated rows. No config keys.
+
+Decompression is bounded at 64 MiB per XML part and 256 MiB per file, images
+included: a file past either limit fails the step without a retry. Uploads come
+from untrusted tenants and deflate reaches ~1000:1, so an unbounded read would let
+a small crafted file exhaust a worker.
 
 ### `xlsx_extractor`
 
@@ -42,10 +69,33 @@ Excel `.xlsx` / `.xls` (`calamine`).
 |---|---|---|
 | `mode` | `"row"` | `row` → one document per row with header → cell pairs in `fields`, `meta.section` = sheet name. `sheet` → one document per sheet. |
 
+In row mode a column is named after its header cell, or `col_<n>` (1-based) when
+the header is empty. Field names are unique: a repeated header keeps its name on
+its first column and gets the first free `_2`, `_3`, … suffix on the later ones
+(`Name | Notes | Notes` → `Name`, `Notes`, `Notes_2`), so no column overwrites
+another.
+
+Zipped workbooks (`.xlsx`, `.xlsm`, `.xlsb`, `.ods`) are bounded at 256 MiB per
+decompressed part and 512 MiB per file: a workbook past either limit fails the
+step without a retry, for the same zip-bomb reason as `docx_extractor`.
+
+`.xlsx`, `.xlsm` and `.xlsb` sheets are read cell by cell, so memory follows the
+cells a sheet holds, not the rectangle between its outermost cells: a stray value
+in `XFD1048576` costs one cell. `.xls` and `.ods` sheets are still loaded as a
+whole grid by `calamine` when the workbook is opened.
+
 ### `html_extractor`
 
 HTML (`scraper`). One document: `title` from `<title>`, `content` from
 `<body>` minus `script`/`style`/`nav`/`footer`.
+
+Bytes are decoded from a byte order mark, else as UTF-8 when they are valid
+UTF-8, else with the `charset` of the HTTP `Content-Type` the page was fetched
+with (URL ingests and scheduled sources), else with the charset a `<meta charset>`
+(or `<meta http-equiv="Content-Type">`) in the first 1024 bytes declares, such as
+`windows-1252` or `Shift_JIS`. As in the HTML standard, the header wins over
+`<meta>`; unknown labels are skipped. Uploads carry no header charset, so only
+the byte order mark and `<meta>` apply to them.
 
 | Key | Default | Description |
 |---|---|---|
@@ -64,22 +114,71 @@ Markdown (`pulldown-cmark`).
 CSV (`csv`). One document per row: header → `fields`, `content` = values
 joined by a space.
 
+A cell that is entirely an integer, a decimal number or `true`/`false` (any case)
+becomes a JSON number or boolean; anything else stays a string. Cells that look
+like identifiers keep their text, since a number would change them: a leading
+zero (`007`, `01234`), a leading `+` (`+33612345678`), an integer too wide for 64
+bits (`123456789012345678901234`) and exponent notation (`1E5`). Empty cells are
+left out of `fields`.
+
+Field names are unique, so no cell overwrites another. A column is named after its
+header, or `col_<n>` (1-based) when the header is empty or the cell lies past the
+header row. A repeated header keeps its name on its first column and gets the
+first free `_2`, `_3`, … suffix on the later ones (`name,name,name_2` → `name`,
+`name_3`, `name_2`), as in `xlsx_extractor`. `id_column` and `content_columns`
+name the first of the duplicates by the header, the others by their suffixed name.
+
 | Key | Default | Description |
 |---|---|---|
-| `delimiter` | `","` | Single-character field delimiter. |
-| `has_headers` | `true` | First row is the header. Without headers, fields are `col_0`, `col_1`, … |
+| `delimiter` | sniffed | Single-character field delimiter. When omitted, the one of `,` `;` tab `\|` that splits the first records (up to 100 or 64 KiB) into the most consistent number of fields; delimiters inside quoted fields do not count. Ties go to more fields, then to the delimiter less often followed by a space, then to that order. Falls back to `,`. |
+| `has_headers` | `true` | First row is the header. Without headers, fields are `col_1`, `col_2`, … (1-based), and `id_column` / `content_columns` use those names. |
 | `id_column` | — | Column whose value becomes the document id. Otherwise `<filename>_r<row>`. |
+| `content_columns` | all columns | Columns joined by a space into `content`. |
+| `max_rows` | — | Stop after this many data rows. |
+| `trim` | `true` | Trim whitespace around headers and cells. |
+| `encoding` | detected | Character encoding of the file, as a [WHATWG label](https://encoding.spec.whatwg.org/#names-and-labels): `windows-1252`, `iso-8859-15`, `shift_jis`, `utf-16le`, … Bytes it cannot map become U+FFFD. An unknown label fails the step. |
+
+Without `encoding`, the bytes are decoded by the first rule that applies: a byte
+order mark (UTF-8, UTF-16LE, UTF-16BE, as in Excel's "Unicode Text"); UTF-8 when
+the whole file is valid UTF-8; the `charset` of the HTTP `Content-Type` a fetched
+file came with, unless it says UTF-8, which the bytes just contradicted; else
+`windows-1252`. A CSV exported by Excel in a Western European locale therefore
+reads right (`Société`, not a failed job), and a stray byte never fails the file.
+Set `encoding` for anything else, such as a Latin-9 file with `€` signs.
 
 ### `json_flattener`
 
 Accepts **bytes or documents**. Top-level array → one document per element;
-object with a `documents`, `items` or `data` array → those; anything else →
-one document. Nested objects are flattened to dotted keys (`a.b.c`) in
-`fields`; `content` = concatenated string values.
+object with a `documents`, `items`, `data`, `results` or `hits` array (looked up
+in that order) → those, and the rest of the object is dropped; anything else →
+one document. `root` changes that rule (below). Nested objects are flattened to dotted keys (`a.b.c`) in
+`fields`; `content` = concatenated string values. For **documents** input,
+each document's own `content` is kept; the string values only fill an empty
+one (unless `content_fields` is set).
+
+When two values flatten to the same key (`{"a.b": 1, "a": {"b": 2}}`), the later
+one gets the first free `_2`, `_3`, … suffix (`a.b` and `a.b_2`), so no value is
+dropped. The same holds in `msgpack_parser`, `avro_parser` and `parquet_parser`,
+and for MessagePack map keys that render alike (integer `7` and string `"7"`).
+
+Newline-delimited JSON (NDJSON / JSON Lines) gives one document per line. A
+`.ndjson` or `.jsonl` file, or a body with one JSON object or array per line, is
+detected as `application/x-ndjson` and routed to `builtin.json`
+(`application/jsonl`, `application/x-jsonlines`, `application/jsonlines` and
+`application/ndjson` are the same type).
 
 | Key | Default | Description |
 |---|---|---|
 | `id_field` | `"id"` | Field used as document id; generated when missing. |
+| `content_fields` | every string leaf | Keys joined by a space into `content`. When set, they replace an upstream document's `content` too. |
+| `title_field` | — | Key mapped onto `title`. |
+| `root` | wrapper keys | Where the records of a JSON payload are. `"none"`: the payload as is, so `{"id": "order-1", "items": ["hat"]}` is one document with an `items` field (a top-level array is still one document per element). A JSON Pointer such as `"/data/orders"`: the array it points to; a pointer that is missing or not an array fails the step. |
+
+NDJSON lines are never unwrapped by wrapper keys: each line is one document,
+whatever its fields. A one-line NDJSON file cannot be told from a single JSON
+document, so it follows the single-document rule; with `root: "none"` it reads
+like the same line in a longer file. With a pointer, each line is looked into,
+which suits a file of API response pages.
 
 ### `parquet_parser`
 
@@ -88,14 +187,35 @@ schema supplies the types, so nothing is guessed; nested structs flatten to
 dotted keys and null cells are omitted. `columns` is pushed down into the
 reader, so unselected columns are never decoded.
 
+A `DECIMAL` column of precision 15 or less becomes a JSON number, which holds
+every such value exactly. A wider one (`DECIMAL(18,2)`, `DECIMAL(38,10)`, …)
+becomes an exact string, `"12345678901234567890.1234567890"`, as in
+`avro_parser`: a number that wide would be rounded. The choice follows the
+column's declared precision, so a field is never a number in one document and a
+string in the next. Like any string, a wide decimal counts as a string leaf for
+the default `content`; set `content_fields` to keep it out.
+
 | Key | Default | Description |
 |---|---|---|
 | `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_r<row>`. |
 | `content_fields` | every string leaf | Keys joined by a space into `content`. |
 | `title_field` | — | Key mapped onto `title`. |
 | `columns` | all | Columns to read, pushed down as a projection. An unknown name is an error. |
-| `max_rows` | — | Stop after this many rows. |
-| `batch_size` | `1024` | Rows decoded per record batch. |
+| `max_rows` | — | Stop after this many rows. It can only lower the worker's limit below. |
+| `batch_size` | `1024` | Rows decoded per record batch, at most 8192 and at most the worker's `PARSER_MAX_ROWS`. |
+
+<Note>
+`parquet_parser`, `avro_parser` and `msgpack_parser` decode at most
+`PARSER_MAX_ROWS` rows (default 1,000,000) and `PARSER_MAX_DECODED_MB` of decoded
+data (default 512) per step, whatever the step's `max_rows` / `max_records`. A file
+over either fails the step without a retry and nothing of it is indexed: it is not
+truncated. Before any row of a Parquet file is decoded, its row groups' row counts
+and the value counts of its list and map columns' pages are checked (each list
+value, nulls included, counts as at least 32 bytes), so a small file whose one list
+cell holds millions of values is refused up front. Null cells of other columns are
+not counted: they are left out of the documents. Split larger files, or raise the limits on the worker
+([environment variables](/deployment/environment-variables)).
+</Note>
 
 ### `avro_parser`
 
@@ -111,7 +231,7 @@ that was actually written, so `["null","string"]` is just a string.
 | `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_r<row>`. |
 | `content_fields` | every string leaf | Keys joined by a space into `content`. |
 | `title_field` | — | Key mapped onto `title`. |
-| `max_records` | — | Stop after this many records. |
+| `max_records` | — | Stop after this many records. It can only lower the worker's `PARSER_MAX_ROWS` (see `parquet_parser`). |
 
 ### `msgpack_parser`
 
@@ -132,7 +252,7 @@ content type, or route it with an explicit pipeline.
 | `id_field` | `"id"` | Flattened key used as document id. Otherwise `<filename>_<index>`. |
 | `content_fields` | every string leaf | Keys joined by a space into `content`. |
 | `title_field` | — | Key mapped onto `title`. |
-| `max_records` | — | Stop after this many documents. |
+| `max_records` | — | Stop after this many documents. It can only lower the worker's `PARSER_MAX_ROWS` (see `parquet_parser`). |
 
 ### `image_captioner`
 
@@ -149,15 +269,32 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | Key | Default | Description |
 |---|---|---|
 | `model` | `"gpt-4o-mini"` (or `LLM_MODEL`) | Vision-capable chat model. |
-| `prompt` | built-in caption prompt | Instruction sent with the image. |
+| `prompt` | built-in caption prompt | Instruction sent with the image. With `json: true`, a prompt that does not mention JSON gets "Reply with a single JSON object." appended, since OpenAI refuses JSON mode otherwise. |
 | `detail` | `"auto"` | Image detail hint (`low`, `high`, `auto`). |
+| `max_tokens` | `400` | `max_tokens` of the completion. |
+| `json` | `true` | JSON mode: `caption` → `content`, `tags` → `fields.tags`, `text_in_image` → `fields.ocr_text`, other keys → `fields`. With `false` the whole text reply is the `content`. |
+| `max_bytes` | `20971520` (20 MiB) | Largest image accepted, in bytes. A larger one fails as invalid input before it is encoded or sent. |
+| `allow_reserved` | `[]` | Reply keys starting with `_` to keep, for example `["_geo"]`. Any other `_` key in the reply is dropped. |
+| `on_refusal` | `"keep"` | An image the provider declines: `keep` emits its document without a caption and with `fields.llm_declined` set; `fail` fails the step. |
+
+An image the provider declines to describe does not fail the step by default. When
+the reply's first choice has `finish_reason: content_filter`, a `refusal`, or no
+usable content, the document is still emitted, with an empty `content`, the usual
+`meta`, and `fields.llm_declined` set to `content_filter`, `refusal` or `empty`.
+HTTP errors are not refusals: 401, 402, 403 and 400 still fail the step.
+
+Meilisearch reserves keys starting with `_` (`_geo`, `_vectors`, …), and a malformed
+one makes it reject the whole batch, so the plugin drops every such key the model
+returns unless `allow_reserved` lists it.
 
 ## Transformers (documents → documents)
 
 ### `chunker`
 
 Splits each document into overlapping chunks. Sets `meta.chunk_index`,
-`meta.chunk_total`, `meta.parent_id`; chunk id = `<parent_id>_<index>`.
+`meta.chunk_total`, `meta.parent_id`; chunk id = `<parent_id>_<index>`. When
+that would pass Meilisearch's 511-byte id limit, the parent id is shortened and
+followed by a short hash of it (`meta.parent_id` keeps it whole).
 Accepts `documents` and `many`.
 
 | Key | Default | Description |
@@ -166,6 +303,7 @@ Accepts `documents` and `many`.
 | `chunk_size` | `512` | Target chunk size in characters. |
 | `overlap` | `64` | Characters shared between consecutive chunks. |
 | `min_chunk_size` | `32` | Trailing fragments shorter than this are merged into the previous chunk. |
+| `keep_parent_fields` | `true` | Copy the parent's `title`, `fields` and `meta` onto every chunk. With `false`, chunks carry only their text and the chunk metadata. |
 
 ### `document_script`
 
@@ -178,8 +316,8 @@ the document out. Accepts `documents` and `many`. Queue: `workers-general`.
 | `script` | *one of `script`/`ops` required* | The script, run once per document. |
 | `ops` | *one of `script`/`ops` required* | Builder operations, applied in order — see below. |
 | `on_error` | `"fail"` | What a per-document error does: `fail` the step, `skip` that document, or `keep` it untouched. |
-| `max_ops` | `100000` | Rhai operations one document may use before the script is aborted. |
-| `timeout_ms` | `1000` | Wall-clock milliseconds one document may use before the script is aborted. |
+| `max_ops` | `100000` | Rhai operations one document may use before the script is aborted. At most `100000000`; larger values are clamped. |
+| `timeout_ms` | `1000` | Wall-clock milliseconds one document may use before the script is aborted. At most `30000`; larger values are clamped. |
 
 The document is bound as `doc`:
 
@@ -253,18 +391,30 @@ column of the problem.
 
 A script that does not compile fails the step immediately with a config error,
 before any document is touched, whatever `on_error` says. A script that exceeds
-`max_ops` or `timeout_ms` is aborted and treated as a per-document error.
+`max_ops` or `timeout_ms` is aborted and treated as a per-document error. The
+whole step also has a one-hour budget: running past it, or the job being
+cancelled, stops the script mid-run and fails the step whatever `on_error` says.
 
 Float arithmetic that produces NaN or an infinity is also a per-document error.
 Rhai does not raise on `x / 0.0` the way it does on integer division by zero, and
 JSON has no way to spell those values — without the check they would be indexed as
 `null` and the job would report success.
 
+Rhai integers are 64-bit signed, so a field holding an integer above
+9223372036854775807 reaches the script as a float. Left untouched it is written
+back as the original integer; read into another field or used in arithmetic, it
+stays a float.
+
 **Sandbox.** Pipeline configs are tenant-authored, so the engine is built with
 `no_module` (no `import`/`export`), `no_custom_syntax` and `no_time`; rhai has no
-file, network or process API, so a script can only reach `doc`. Every run is
+file, network or process API, so a script can only reach `doc`. `print` and
+`debug` are accepted but their output is discarded, so a script cannot write to
+the worker's logs. Every run is
 additionally bounded by the operation and wall-clock budgets above, and by fixed
-caps on expression depth, call depth, and string, array and map sizes.
+caps on expression depth (64) and call depth (16). Data sizes are capped on top
+of the incoming document: a script may build up to 512 KiB of string bytes,
+10,000 array elements and 10,000 map entries beyond what `doc` already holds, so
+a large document is not rejected for the size it arrived with.
 
 ### `llm_enricher`
 
@@ -286,9 +436,43 @@ Self-hosted, the same id works: calling a vendor's public API directly (`api.ope
 | `max_concurrent` | `8` | Parallel requests inside one activity (`buffer_unordered`). |
 | `temperature` | `0` | Sampling temperature. |
 | `fields_to_merge` | all keys | Restrict which keys of the reply are merged into `fields`. |
+| `allow_reserved` | `[]` | Reply keys starting with `_` to keep, for example `["_geo"]`. Any other `_` key in the reply is dropped. |
+| `on_refusal` | `"keep"` | A document the provider declines: `keep` indexes it un-enriched with `fields.llm_declined` set; `fail` fails the step. |
+
+A document the provider declines to answer for does not fail the batch. When the
+reply's first choice has `finish_reason: content_filter`, a `refusal`, or no
+usable content (none, `null` or blank), the document is kept as it came in, plus
+`fields.llm_declined` set to `content_filter`, `refusal` or `empty`, and the other
+documents go on (add `llm_declined` to the index's filterable attributes to find
+them). Set `on_refusal: fail` to fail the step instead. HTTP errors are not
+refusals: 401, 402 and 403 (including a Lab Gateway 403 for filtered content)
+and 400 still fail the step.
+
+A 429, a 5xx or a dropped connection is retried a few times per request, with
+backoff, before it fails the step. When the step still fails and Temporal retries
+it, the retry resumes: every document finished before the failure keeps its
+recorded reply and is not sent again. The replies travel in the step's Temporal
+heartbeat details, capped at 256 KiB per step; documents past the cap are simply
+redone. Only the attempt that succeeds is metered, so a resumed document is not
+billed twice, and the calls of a failed attempt are not billed.
 
 Reply keys are merged into `fields`; `title` → `title`, `summary` →
 `fields.summary`, `keywords` → `fields.keywords`, `language` → `meta.language`.
+A `title` or `language` that is not a string (for example `null` when the model
+finds none) is ignored, so it never replaces the document's own title.
+
+Reply keys starting with `_` are dropped: Meilisearch reserves them (`_geo`,
+`_vectors`, …), and one the model gets wrong (`"_geo": "Paris"`) makes it reject
+the whole batch. A pipeline that prompts for such a key on purpose lists it in
+`allow_reserved`:
+
+```yaml
+- id: enrich
+  plugin: llm_enricher
+  config:
+    prompt: "Extract as JSON: title, summary, _geo ({lat, lng} of the place described)."
+    allow_reserved: ["_geo"]
+```
 
 ### `jev_enricher`
 
@@ -298,7 +482,8 @@ generated text. The plugin sends the document's title and content as `state` to
 `POST {TYPESAFE_BASE_URL}/systemone` with the questions from your config, and
 writes each answer into `fields.<question key>`. Accepts `documents` and `many`;
 usually used with `fan_out: "$.documents"`. Queue: `workers-general`. Requires
-`TYPESAFE_API_KEY`.
+`TYPESAFE_API_KEY`, except for a Lab team with `LAB_AI_GATEWAY` on: the step then
+calls the team's Gateway on `POST /v1/decisions` (same TypeSafe body and answers).
 
 ```yaml
 - id: classify
@@ -344,28 +529,95 @@ usually used with `fan_out: "$.documents"`. Queue: `workers-general`. Requires
 HTTP 429, 529 (overloaded) and 5xx are retried; 401/403 (bad key) and 400/422
 (invalid questions) fail the step. Usage is reported as LLM tokens.
 
+When the step still fails on one document and Temporal retries it, the retry
+resumes: the documents already classified keep their recorded answers and are not
+sent again. The answers travel in the step's Temporal heartbeat details, capped at
+256 KiB per step; documents past the cap are redone. Only the attempt that
+succeeds is metered, so a resumed document is not billed twice.
+
 ## Sink (documents → indexed)
 
 ### `meili_indexer`
 
 The only plugin that talks to Meilisearch (`meilisearch-sdk`). Accepts
-`documents` and `many`. Host, API key and index come from the `MeiliContext`
-the workflow injects — never from env vars and never from your config.
+`documents` and `many`. Host and API key come from the named
+[`connection`](/concepts/connections) when the step sets one, otherwise from the
+`MeiliContext` the workflow injects, and never from env vars or from keys you
+type. The index is the step's `index` when set, otherwise the one resolved for
+the request.
 
 | Key | Default | Description |
 |---|---|---|
 | `primary_key` | `"id"` | Primary key declared when creating the index, and sent as `?primaryKey` on additions while the index has none. An index that already has a primary key keeps its own. |
-| `auto_create_index` | `true` | Create the index when it does not exist. |
+| `auto_create_index` | `true` | Create the index when it does not exist. When `false`, a missing index fails the step and no documents are sent (Meilisearch would otherwise create the index on the first addition). |
+| `connection` | none | Name of a Meilisearch [connection](/concepts/connections) to index into. It wins over the request's `MeiliContext`, and pipelines run by a scheduled source need one. |
+| `index` | resolved | Pin the target index uid. When unset it comes from the pipeline's `trigger.index_pattern`, then the request, then the deployment default. |
 | `batch_size` | `1000` | Documents per `addDocuments` request. |
+| `max_batch_bytes` | `52428800` (50 MiB) | Serialized bytes per request. A batch is cut at whichever of this and `batch_size` comes first. Keep it under Meilisearch's `http_payload_size_limit`. A single document larger than this fails the step. |
 | `wait_for_completion` | `true` | Wait for Meilisearch tasks before finishing the step. |
+| `task_timeout_secs` | `INDEXER_TASK_TIMEOUT_SECS`, else `120` | How long to wait for one Meilisearch task before the step is retried. Keep it below the step's `timeout_secs`. |
+| `prune` | `false` | After the additions succeed, delete the stale derived documents of every parent this step indexed. See [Pruning stale chunks](#pruning-stale-chunks). |
 
 If the target index already exists with a primary key (for example `uid` on an
 index a Scrapix crawl created), additions are sent without `?primaryKey` and
 Meilisearch uses the index's own key, whatever `primary_key` says. Documents are
 not rewritten: if they lack that field, Meilisearch rejects them and the step
-fails with its error. The index is looked up even with `auto_create_index: false`.
+fails with its error. The index is looked up even with `auto_create_index: false`,
+and a missing one then fails the step (not retried), naming the index uid.
+
+When the step is retried (a task that did not finish within `task_timeout_secs`,
+or a 5xx on a later batch), the retry does not send again the batches the
+previous attempt already enqueued: it waits on their Meilisearch tasks and only
+sends the rest. The task uids travel in the Temporal heartbeat details, so this
+is best effort. The retry sends everything again when it has no checkpoint, when
+the documents or the destination changed, or when Meilisearch no longer knows a
+task (pruned task queue, reset instance); from that batch on, every batch is
+sent again so the additions keep their order. Re-sending is harmless, since
+additions replace documents by id. Every attempt has its own
+`task_timeout_secs`, so a queue slower than all attempts together still fails
+the step: raise `task_timeout_secs` for a Meilisearch shared with busy writers.
 
 Returns `Indexed { index, document_count, task_uids }`.
+
+#### Pruning stale chunks
+
+Chunks get positional ids (`<parent>_<index>`), so when a document is ingested
+again and produces fewer chunks, the extra ones from the earlier run stay
+searchable. With `prune: true`, once every addition of the step has succeeded,
+the indexer deletes, for each `meta.parent_id` among the documents it just sent,
+the documents with that `_meta.parent_id` that it did not send:
+
+```text
+_meta.parent_id IN ["guide_3f2a"] AND NOT id IN ["guide_3f2a_0", …, "guide_3f2a_4"]
+```
+
+The indexer never changes index settings or keys, so before turning it on:
+
+- add `_meta.parent_id` and the index's primary key (`id` by default) to the
+  index's `filterableAttributes`;
+- use a key allowed to delete documents (`documents.delete`) as well as add them;
+- keep `wait_for_completion: true` (a step with `prune` and without it is
+  rejected).
+
+When one of these is missing, the step fails without retrying and says what is
+needed; the documents it added stay in the index. A failed addition never
+prunes, so a failed run does not lose the previous version.
+
+What it covers: documents that carry `meta.parent_id` (`chunker` output,
+`audio_transcriber` segments), and only the parents present in this step. A
+parent that disappeared entirely, such as a PDF page or a Markdown section that
+no longer exists, is not in the step, so its chunks stay. Documents without a
+parent are never deleted. All the derived documents of a parent must reach the
+same indexer invocation, which is how the built-in pipelines work. So `prune`
+cannot be combined with fan-out on the indexer step: a pipeline whose
+`meili_indexer` step has `prune: true` and a `fan_out` other than `$` is
+rejected, since each branch would delete the chunks its sibling branches just
+added. As a second guard, a parent whose chunks carry `meta.chunk_total` is
+pruned only when the step holds exactly that many of them (and they agree on
+the total); otherwise it is skipped with a warning and its stale chunks stay.
+Two uploads with
+the same filename and no origin already share ids, so they count as the same
+parent.
 
 ## `pptx_extractor`
 
@@ -381,6 +633,11 @@ back to the slide's first non-empty line.
 | `notes_in_content` | `false` | Also append notes to `content`. |
 | `skip_empty_slides` | `true` | Drop slides with no text and no notes. |
 | `max_slides` | `null` | Stop after this many slides. |
+
+A slide's speaker notes are the notes page its relationship part
+(`ppt/slides/_rels/slide<N>.xml.rels`) links to, since notes pages are numbered
+on their own: `notesSlide1.xml` can belong to slide 2. Only a slide without a
+relationship part is matched to the notes page with its own number.
 
 Decompression is bounded at 64 MiB per part and 256 MiB per deck. Uploads come
 from untrusted tenants and deflate reaches ~1000:1, so an unbounded read would
@@ -402,7 +659,19 @@ equivalent. Runs on the `workers-general` queue.
 | `temperature` | `null` | Sampling temperature. |
 | `segment_documents` | `false` | One document per segment with `fields.start` / `fields.end`, else one for the whole file. |
 | `timeout_secs` | `600` | Per-request timeout. |
-| `max_bytes` | `26214400` | Reject larger uploads (the OpenAI limit). |
+| `max_bytes` | `26214400` | Largest upload per request (the OpenAI limit). A larger uncompressed WAV is split into windows that fit; any other larger file is rejected. |
+
+An uncompressed (PCM or IEEE-float) WAV over `max_bytes`, which is what
+`video_audio_extractor` emits for anything longer than about 13 min 39 s, is
+cut on frame boundaries into consecutive windows of at most `max_bytes`, each
+sent as its own request, one after the other. The result reads as if one
+request had been made: the transcripts are joined into the same document,
+segment `start` / `end` are offset to the whole recording, `chunk_index` /
+`chunk_total` count across windows, and `audio_seconds` is the whole length.
+Cuts are fixed, so a word that straddles one can be split between windows. A
+retry of the step sends every window again, and the step's timeout has to
+cover all of them. Compressed audio (MP3, FLAC, OGG, M4A, …) cannot be cut this
+way and is still rejected above `max_bytes`.
 
 ## `video_audio_extractor`
 
@@ -414,7 +683,7 @@ and encodes 16 kHz mono 16-bit WAV with `hound` — 100% Rust, no ffmpeg. Feeds
 |---|---|---|
 | `sample_rate` | `16000` | Output rate in Hz. |
 | `mono` | `true` | Downmix all channels to one. |
-| `max_duration_secs` | `null` | Stop decoding after this many seconds. |
+| `max_duration_secs` | `null` | Keep only the first this many seconds. Unset or `null` means a 4-hour ceiling: longer audio fails the step (non-retryable) instead of being truncated. An explicit value may be larger. |
 | `track` | `null` | Decode this track id instead of the default audio track. |
 
 Supported: MP4/MOV, MKV/WebM, OGG, WAV, FLAC, AIFF and CAF containers with
@@ -427,7 +696,7 @@ and you can transcode them or register a gRPC plugin under the same name.
 | Plugin | Queue | Status |
 |---|---|---|
 | `ocr` | `workers-general` | Provide as a gRPC plugin. |
-| `s3_downloader` | `workers-io` | Reserved name; the worker already resolves `s3://` inputs itself. |
+| `s3_downloader` | `workers-general` | Reserved name; the worker already resolves `s3://` inputs itself. |
 
 A step naming an unregistered plugin fails with
 `plugin X is not registered on this worker; deploy a gRPC plugin`.

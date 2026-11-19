@@ -86,12 +86,25 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status]
+                required: [status, version, tenant_id, features]
                 properties:
                   status:
                     type: string
                     const: ok
-              example: { "status": "ok" }
+                  version:
+                    type: string
+                    description: Version of the gateway binary.
+                  tenant_id:
+                    type: [string, "null"]
+                    description: Tenant the request resolves to (trusted edge headers), or `null`.
+                  features:
+                    type: object
+                    required: [usage_analytics]
+                    properties:
+                      usage_analytics:
+                        type: boolean
+                        description: "`GET /usage` is configured (otherwise it answers `501`)."
+              example: { "status": "ok", "version": "1.2.3", "tenant_id": null, "features": { "usage_analytics": false } }
 
   /ingest:
     post:
@@ -103,8 +116,19 @@ paths:
         Accepts a multipart upload, a JSON body (URL / S3 / inline documents) or a
         raw binary body. The pipeline is chosen from the detected MIME type and
         filename; the target index from the [index resolution chain](#).
+
+        An archive (zip, tar, gzip, `.tar.gz`) starts an archive job instead: the
+        worker expands it and ingests every file it holds as its own job, routed by
+        the file's own type and name. The response's `pipeline_used` is `archive` and
+        its `target_index` is `*` unless every file goes to one index (an
+        `/indexes/{index_uid}/…` route, or a forced pipeline that fixes it).
+        `GET /jobs/{job_id}` reports per-file counts under `progress.archive`, and
+        `GET /jobs?parent_job_id=` lists the file jobs. A pipeline whose trigger
+        names the archive type itself (`application/zip`, …) takes the archive whole.
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -150,6 +174,8 @@ paths:
           $ref: "#/components/responses/InsufficientCredits"
         "403":
           $ref: "#/components/responses/WriteForbidden"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
         "422":
           $ref: "#/components/responses/Unprocessable"
         "413":
@@ -159,7 +185,7 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
 
   /ingest/batch:
     post:
@@ -169,6 +195,8 @@ paths:
       security: [{ MeiliKey: [] }, {}]
       parameters:
         - $ref: "#/components/parameters/IndexQuery"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -183,9 +211,10 @@ paths:
             schema:
               $ref: "#/components/schemas/BatchIngestRequest"
             example:
+              index: documents
               items:
                 - { "url": "https://example.com/a.pdf" }
-                - { "s3": "s3://my-bucket/b.mp4", "index": "videos" }
+                - { "s3": "s3://my-bucket/b.pdf", "filename": "b.pdf" }
       responses:
         "202":
           description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
@@ -201,6 +230,8 @@ paths:
           $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/IngestUnavailable"
 
   /ingest/pipeline/{name}:
     post:
@@ -211,7 +242,21 @@ paths:
       description: |
         Same body formats as `POST /ingest`, but the pipeline is chosen by `name`
         (a pipeline `uid`, e.g. `builtin.pdf` or `my-pdf-with-enrichment`).
-        MIME detection still runs to fill document metadata.
+        MIME detection still runs to fill document metadata. A `name` that is not a
+        pipeline uid (`[a-zA-Z0-9._-]+`) is a `400 bad_request`.
+
+        The route names the pipeline: a body whose `pipeline` field, or a
+        `?pipeline=` query parameter, names another one is refused with
+        `400 bad_request` (in an `items` batch, an item naming another one fails
+        alone). Naming the same pipeline is accepted.
+
+        A JSON body with `items` (a `BatchIngestRequest`) runs every item through this
+        pipeline and is answered like `POST /ingest/batch`: `{jobs: [...]}`, one
+        entry per item, a failing item being an `{error, code}` entry.
+
+        An archive is expanded and every file it holds runs through this pipeline,
+        unless the pipeline's trigger names the archive type, in which case it gets
+        the archive whole.
       parameters:
         - name: name
           in: path
@@ -222,6 +267,7 @@ paths:
             pattern: "^[a-zA-Z0-9._-]+$"
           example: my-pdf-with-enrichment
         - $ref: "#/components/parameters/IndexQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -237,14 +283,16 @@ paths:
               $ref: "#/components/schemas/MultipartIngest"
           application/json:
             schema:
-              $ref: "#/components/schemas/JsonIngest"
+              anyOf:
+                - $ref: "#/components/schemas/JsonIngest"
+                - $ref: "#/components/schemas/BatchIngestRequest"
           "*/*":
             schema:
               type: string
               format: binary
       responses:
         "202":
-          $ref: "#/components/responses/IngestAccepted"
+          $ref: "#/components/responses/PipelineIngestAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -262,7 +310,7 @@ paths:
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
 
   /indexes/{index_uid}/ingest:
     post:
@@ -280,98 +328,8 @@ paths:
         that step would write there, not to the path's index.
       parameters:
         - $ref: "#/components/parameters/IndexUid"
-        - $ref: "#/components/parameters/XMeiliProjectId"
-        - $ref: "#/components/parameters/XMeiliTenantId"
-        - $ref: "#/components/parameters/XMeiliHost"
-        - $ref: "#/components/parameters/XMeiliApiKey"
-        - $ref: "#/components/parameters/XMeiliRegion"
-        - $ref: "#/components/parameters/XMeiliEnvoySecret"
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              $ref: "#/components/schemas/MultipartIngest"
-          application/json:
-            schema:
-              $ref: "#/components/schemas/JsonIngest"
-          "*/*":
-            schema:
-              type: string
-              format: binary
-      responses:
-        "202":
-          $ref: "#/components/responses/IngestAccepted"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/WriteUnauthorized"
-        "402":
-          $ref: "#/components/responses/InsufficientCredits"
-        "403":
-          $ref: "#/components/responses/WriteForbidden"
-        "422":
-          $ref: "#/components/responses/Unprocessable"
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
-        "415":
-          $ref: "#/components/responses/NoPipelineMatches"
-        "502":
-          $ref: "#/components/responses/UpstreamUnavailable"
-        "503":
-          $ref: "#/components/responses/LabUnavailable"
-
-  /indexes/{index_uid}/ingest/batch:
-    post:
-      tags: [Ingest]
-      operationId: ingestBatchIntoIndex
-      summary: Ingest several items into a named index (one job each)
-      security: [{ MeiliKey: [] }, {}]
-      description: Like `POST /ingest/batch`; every item goes to the path's index.
-      parameters:
-        - $ref: "#/components/parameters/IndexUid"
-        - $ref: "#/components/parameters/XMeiliProjectId"
-        - $ref: "#/components/parameters/XMeiliTenantId"
-        - $ref: "#/components/parameters/XMeiliHost"
-        - $ref: "#/components/parameters/XMeiliApiKey"
-        - $ref: "#/components/parameters/XMeiliRegion"
-        - $ref: "#/components/parameters/XMeiliEnvoySecret"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/BatchIngestRequest"
-      responses:
-        "202":
-          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BatchIngestResponse"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
-        "502":
-          $ref: "#/components/responses/UpstreamUnavailable"
-
-  /indexes/{index_uid}/ingest/pipeline/{name}:
-    post:
-      tags: [Ingest]
-      operationId: ingestIntoIndexWithPipeline
-      summary: Ingest content into a named index with an explicit pipeline
-      security: [{ MeiliKey: [] }, {}]
-      description: Like `POST /ingest/pipeline/{name}`; the path's index wins over the pipeline trigger's `index_pattern`.
-      parameters:
-        - name: name
-          in: path
-          required: true
-          description: Pipeline `uid`.
-          schema:
-            type: string
-            pattern: "^[a-zA-Z0-9._-]+$"
-        - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
         - $ref: "#/components/parameters/XMeiliProjectId"
         - $ref: "#/components/parameters/XMeiliTenantId"
         - $ref: "#/components/parameters/XMeiliHost"
@@ -408,10 +366,111 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/NoPipelineMatches"
         "502":
           $ref: "#/components/responses/UpstreamUnavailable"
         "503":
-          $ref: "#/components/responses/LabUnavailable"
+          $ref: "#/components/responses/IngestUnavailable"
+
+  /indexes/{index_uid}/ingest/batch:
+    post:
+      tags: [Ingest]
+      operationId: ingestBatchIntoIndex
+      summary: Ingest several items into a named index (one job each)
+      security: [{ MeiliKey: [] }, {}]
+      description: Like `POST /ingest/batch`; every item goes to the path's index.
+      parameters:
+        - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/PipelineQuery"
+        - $ref: "#/components/parameters/FilenameQuery"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
+        - $ref: "#/components/parameters/XMeiliHost"
+        - $ref: "#/components/parameters/XMeiliApiKey"
+        - $ref: "#/components/parameters/XMeiliRegion"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchIngestRequest"
+      responses:
+        "202":
+          description: "One entry per item, in input order. An item that cannot be queued is an `{error, code}` entry instead of a job: on a hosted Lab engine that includes `insufficient_credits` (the Lab account has no credits left) and `lab_unavailable` (the Lab could not be asked; retry later)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchIngestResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/IngestUnavailable"
+
+  /indexes/{index_uid}/ingest/pipeline/{name}:
+    post:
+      tags: [Ingest]
+      operationId: ingestIntoIndexWithPipeline
+      summary: Ingest content into a named index with an explicit pipeline
+      security: [{ MeiliKey: [] }, {}]
+      description: Like `POST /ingest/pipeline/{name}`; the path's index wins over the pipeline trigger's `index_pattern`.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Pipeline `uid`.
+          schema:
+            type: string
+            pattern: "^[a-zA-Z0-9._-]+$"
+        - $ref: "#/components/parameters/IndexUid"
+        - $ref: "#/components/parameters/FilenameQuery"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
+        - $ref: "#/components/parameters/XMeiliHost"
+        - $ref: "#/components/parameters/XMeiliApiKey"
+        - $ref: "#/components/parameters/XMeiliRegion"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/MultipartIngest"
+          application/json:
+            schema:
+              anyOf:
+                - $ref: "#/components/schemas/JsonIngest"
+                - $ref: "#/components/schemas/BatchIngestRequest"
+          "*/*":
+            schema:
+              type: string
+              format: binary
+      responses:
+        "202":
+          $ref: "#/components/responses/PipelineIngestAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/WriteUnauthorized"
+        "402":
+          $ref: "#/components/responses/InsufficientCredits"
+        "403":
+          $ref: "#/components/responses/WriteForbidden"
+        "404":
+          $ref: "#/components/responses/PipelineNotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+        "503":
+          $ref: "#/components/responses/IngestUnavailable"
 
   /jobs:
     get:
@@ -424,6 +483,10 @@ paths:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - { name: status, in: query, schema: { $ref: "#/components/schemas/JobStatus" } }
         - { name: pipeline_uid, in: query, schema: { type: string } }
+        - name: parent_job_id
+          in: query
+          description: Only the file jobs of this archive job.
+          schema: { type: string, format: uuid }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
       responses:
@@ -530,11 +593,11 @@ paths:
         - $ref: "#/components/parameters/XMeiliEnvoySecret"
       responses:
         "202":
-          description: Cancellation requested.
+          description: Cancellation requested. Read the job with `GET /jobs/{job_id}` to see it reach `cancelled`.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JobStatusResponse"
+                $ref: "#/components/schemas/CancelJobResponse"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/JobNotFound"
@@ -583,10 +646,15 @@ paths:
         plugin, cycle, bad `fan_out`, a step `config` that does not satisfy its
         plugin's `config_schema` from `GET /plugins`, a `meili_indexer`
         `config.connection` that is not one of the tenant's own connections, or
-        for a global pipeline not a global connection → `422`) and upserted by `(uid, tenant_id)`;
+        for a global pipeline not a global connection → `422`) and upserted by `(uid, tenant_id)`.
+        A global pipeline that pins a `connection` is standalone-only: on a
+        deployment that serves tenants (control plane with the Lab seams on) it
+        is refused with `422`, since a tenant job only resolves its own
+        connections;
         `version` is bumped on update. `uid`s starting with `builtin.` are
-        rejected with `403`. Behind Envoy the pipeline is scoped to the calling
-        project.
+        rejected with `403`, and the `uid` `validate` with `422` (it is the path
+        of `POST /pipelines/validate`). Behind Envoy the pipeline is scoped to
+        the calling project.
       parameters:
         - $ref: "#/components/parameters/XGlutonyTenantId"
         - $ref: "#/components/parameters/XMeiliProjectId"
@@ -658,7 +726,8 @@ paths:
         against its plugin's `config_schema` (JSON Schema draft 2020-12, as served by
         `GET /plugins`; `format` is not asserted) and every `meili_indexer`
         `config.connection` against the caller's own connections (a tenant pipeline
-        may not name a global connection; global ones are templates). A plugin no worker has registered yet has no schema, so its config is
+        may not name a global connection; global ones are templates; and with
+        tenants on, a global pipeline may not pin any connection). A plugin no worker has registered yet has no schema, so its config is
         not checked. All config and connection problems are reported in one message,
         `; `-separated. Every `document_script` step is also compiled (parsed, never
         executed); a step that does not compile is reported first, as
@@ -706,6 +775,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PipelineDefinition"
+        "400":
+          description: The uid is not a pipeline uid (`[a-zA-Z0-9._-]+`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid pipeline name \"a/b\": must be made of [a-zA-Z0-9._-]", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/PipelineNotFound"
@@ -728,6 +803,12 @@ paths:
       responses:
         "204":
           description: Deleted.
+        "400":
+          description: The uid is not a pipeline uid (`[a-zA-Z0-9._-]+`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid pipeline name \"a/b\": must be made of [a-zA-Z0-9._-]", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: Built-in pipelines cannot be deleted.
@@ -800,6 +881,12 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/UsageResponse" }
+        "400":
+          description: A query parameter is missing or malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid query string: Failed to deserialize query string: missing field `date_from`", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "501": { $ref: "#/components/responses/NotEnabled" }
 
@@ -900,7 +987,13 @@ paths:
       operationId: updateConnection
       summary: Update a connection
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
-      description: Changing `host` or `api_key` re-runs the create-time checks. Omit `api_key` to keep the stored key.
+      description: |
+        Changing `host` or `api_key` re-runs the create-time checks. Omit `api_key`
+        to keep the stored key, as long as `host` stays on the same origin (scheme,
+        host and port; a path change, a trailing slash or a different case is the
+        same origin). Moving `host` to another origin without a new `api_key` is a
+        `422` and nothing changes: the stored key is only ever sent to the host it
+        was saved for.
       requestBody:
         required: true
         content:
@@ -963,6 +1056,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Source"
+        "400":
+          description: A query parameter is missing or malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid query string: Failed to deserialize query string: include_archived: provided string was not `true` or `false`", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "501":
           $ref: "#/components/responses/NotEnabled"
@@ -1013,8 +1112,17 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "404":
-          $ref: "#/components/responses/PipelineNotFound"
+        "409":
+          description: |
+            The `uid` is held by an archived source of this tenant (its pipeline was
+            deleted). Archived sources keep their `uid` and are hidden from
+            `GET /sources` unless `include_archived=true`; delete it to reuse the
+            name. A live source with the same `uid` is a `422`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { "error": "a source named \"daily\" already exists for this tenant: it was archived on 2026-11-02T09:00:00Z when its pipeline \"movies\" was deleted, and archived sources keep their uid. Delete it (DELETE /sources/daily) to reuse the name, or pick another uid", "code": "conflict" }
         "422":
           $ref: "#/components/responses/Unprocessable"
         "501":
@@ -1053,7 +1161,11 @@ paths:
       security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
       description: |
         Any subset of the create fields except `uid`. `auth` omitted keeps it, `null`
-        clears it. `index` omitted keeps it; `null` or a blank string clears the
+        clears it. A `location` (or, for a URL whose host is templated, a
+        `timezone`) that moves the fetch to another origin (scheme, host or port)
+        while a credential is stored is a `422` unless `auth` is sent too, as a new
+        credential or `null`: the stored one is only ever sent to the origin it was
+        saved for. A path change keeps it. `index` omitted keeps it; `null` or a blank string clears the
         override (the pipeline's `index_pattern`, then the MIME default, apply
         again). `cron` follows the create rules (exactly 5 fields).
       requestBody:
@@ -1177,6 +1289,38 @@ paths:
         "503":
           $ref: "#/components/responses/LabUnavailable"
 
+  /sources/{uid}/reset-state:
+    post:
+      tags: [Sources]
+      operationId: resetSourceState
+      summary: Forget a source's incremental state
+      security: [{ LabServiceToken: [] }, { AdminKey: [] }, {}]
+      description: >-
+        Clears the ETag, Last-Modified and content hash the last successful run saved,
+        so the next run (scheduled or `POST /sources/{uid}/run`) fetches in full and
+        ingests even when upstream has not changed. Use it after editing the steps of
+        the source's pipeline: that edit does not reset the state on its own. The
+        schedule is not touched and nothing runs now. A run already in flight still
+        saves the state it learns when it finishes. Only the caller's own sources.
+      parameters:
+        - $ref: "#/components/parameters/XGlutonyTenantId"
+        - $ref: "#/components/parameters/SourceUid"
+        - $ref: "#/components/parameters/XMeiliProjectId"
+        - $ref: "#/components/parameters/XMeiliTenantId"
+        - $ref: "#/components/parameters/XMeiliEnvoySecret"
+      responses:
+        "204":
+          description: The state is cleared.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotEnabled"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
   /sources/{uid}/runs:
     get:
       tags: [Sources]
@@ -1206,6 +1350,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/SourceRun"
+        "400":
+          description: A query parameter is missing or malformed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { "error": "invalid query string: Failed to deserialize query string: limit: invalid digit found in string", "code": "bad_request" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           $ref: "#/components/responses/NotFound"
@@ -1247,10 +1397,34 @@ components:
       name: index
       in: query
       required: false
-      description: Target index. Overrides `X-Meili-Index`; overridden by the pipeline trigger's `index_pattern`.
+      description: |
+        Target index. Overrides `X-Meili-Index`; overridden by the pipeline trigger's
+        `index_pattern`. When it is the index the job writes to, it must be a valid
+        Meilisearch index uid (`^[a-zA-Z0-9_-]{1,400}$`), else the request is refused
+        with `400 bad_request`; the same holds for the `index` body field and
+        `X-Meili-Index`.
       schema:
         type: string
       example: contracts
+    PipelineQuery:
+      name: pipeline
+      in: query
+      required: false
+      description: |
+        Pipeline `uid` to run instead of routing by content type; wins over the body's
+        `pipeline` field. An unknown one is a `404` (on a batch route, an
+        `{error, code}` entry for each item).
+      schema:
+        type: string
+      example: my-pdf-with-enrichment
+    FilenameQuery:
+      name: filename
+      in: query
+      required: false
+      description: Filename hint for MIME detection and `_meta.filename`, for a raw body. Wins over `Content-Disposition`.
+      schema:
+        type: string
+      example: report.pdf
     JobId:
       name: job_id
       in: path
@@ -1381,6 +1555,19 @@ components:
             pipeline_used: builtin.pdf
             target_index: documents
             status: queued
+    PipelineIngestAccepted:
+      description: Job accepted and queued; for an `items` body, one entry per item, in input order (as `POST /ingest/batch`).
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/IngestResponse"
+              - $ref: "#/components/schemas/BatchIngestResponse"
+          example:
+            job_id: 550e8400-e29b-41d4-a716-446655440000
+            pipeline_used: my-pdf-with-enrichment
+            target_index: documents
+            status: queued
     BadRequest:
       description: Malformed request or missing tenant context (no `X-Meili-*` headers, no bearer key and no `MEILI_URL`).
       content:
@@ -1408,7 +1595,7 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example: { "error": "upload exceeds 500 MiB", "code": "payload_too_large" }
+          example: { "error": "request body exceeds the configured size limit", "code": "payload_too_large" }
     NoPipelineMatches:
       description: No pipeline trigger matches the detected MIME type / filename.
       content:
@@ -1438,7 +1625,7 @@ components:
             $ref: "#/components/schemas/Error"
           example: { "error": "source \"tmdb\" not found", "code": "not_found" }
     Unprocessable:
-      description: Validation failed (bad cron — including one without exactly 5 fields — or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline).
+      description: Validation failed (bad cron — including one without exactly 5 fields — or template, forbidden host — including an ingest `url` outside `SOURCE_FETCH_HOSTS` — unreachable Meilisearch or rejected key, unpinned pipeline, or a tenant's job whose pipeline names a global connection).
       content:
         application/json:
           schema:
@@ -1488,6 +1675,27 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
           example: { "error": "the Lab has been unreachable for more than 300s; cannot check account 0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61's credits", "code": "lab_unavailable" }
+    IngestUnavailable:
+      description: |
+        Nothing was queued or started; retry later. Either:
+
+        - `code: overloaded`: the gateway already holds as much request body as
+          `MAX_INFLIGHT_UPLOAD_MB` allows (by default twice `MAX_UPLOAD_MB`), and
+          no room freed up within 2 s. A request is charged its `Content-Length`,
+          or the whole upload limit when it sends none. Comes with `Retry-After`.
+        - `code: lab_unavailable` (hosted Lab engine only): the account's credits
+          could not be checked. The Lab has not yet confirmed this deployment's
+          credentials, or it cannot answer and there is no answer for the account
+          from the last 300 s.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying. Set on `overloaded`.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { "error": "the gateway is holding as many uploads as it can; retry later", "code": "overloaded" }
     UpstreamUnavailable:
       description: Control plane or Temporal unreachable.
       content:
@@ -1516,6 +1724,10 @@ components:
         started_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         source_id: { type: string, format: uuid }
+        parent_job_id:
+          type: string
+          format: uuid
+          description: The archive job this job ingests one file of. Absent for other jobs.
     JobList:
       type: object
       required: [jobs, limit, offset, total]
@@ -1523,7 +1735,12 @@ components:
         jobs: { type: array, items: { $ref: "#/components/schemas/JobRecord" } }
         limit: { type: integer }
         offset: { type: integer }
-        total: { type: integer, description: "Rows matching the filters, ignoring paging." }
+        total:
+          type: integer
+          maximum: 10000
+          description: >-
+            Rows matching the filters, ignoring paging, capped at 10000: counting
+            stops there, so `10000` means "10000 or more".
     ValidationResult:
       type: object
       required: [valid, order, normalized]
@@ -1535,6 +1752,15 @@ components:
           type: object
           additionalProperties: { type: string }
           description: For each `document_script` step configured with `ops`, by step id, the rhai program its `ops` compile to.
+        warnings:
+          type: array
+          items: { type: string }
+          description: |
+            Present only when the body has keys the definition does not know, which a
+            save drops without an error: a top-level `match:` instead of `trigger:`, a
+            misspelled step or `retry` field. One entry per key, for example
+            ``"unknown key `match` is ignored"``. Plugin `config` blocks are checked by
+            their schema instead.
     UsageRow:
       type: object
       required: [day, pipeline_uid, plugin]
@@ -1560,7 +1786,7 @@ components:
         code:
           type: string
           description: Stable snake_case error code.
-          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, internal_error]
+          examples: [missing_context, bad_request, forbidden, insufficient_credits, not_found, payload_too_large, unsupported_media_type, invalid_pipeline, upstream_error, lab_unavailable, overloaded, internal_error]
 
     StepConfigError:
       type: object
@@ -1595,7 +1821,7 @@ components:
           description: The content to ingest. Filename and `Content-Type` of the part are used as MIME hints.
         index:
           type: string
-          description: Target index (same as `?index=`).
+          description: Target index (same as `?index=`, including its uid rule).
         filename:
           type: string
           description: Overrides the part's filename.
@@ -1620,7 +1846,12 @@ components:
           description: "A cloud object-store URI: `s3://`, `s3a://`, `gs://`, `az://`, `adl://`, `azure://`, `abfs://` or `abfss://`, with a bucket. Any other scheme (`file://`, `memory://`, …) is a `422`. The blob store's own bucket, and any bucket outside the deployment's `OBJECT_REF_BUCKETS` when set, is a `422` too. Streamed by the worker anonymously (public objects only) unless the deployment sets `OBJECT_REF_AMBIENT_CREDENTIALS=true`; not subject to `SOURCE_FETCH_HOSTS`."
         documents:
           type: array
-          description: Inline documents, indexed directly (no extraction). Must be JSON objects with an `id`.
+          description: |
+            Inline documents, routed as `application/json` (to `builtin.json` unless a
+            pipeline is named). Each must be a JSON object. `id` is optional: a missing,
+            `null` or empty id gets a UUID, and ids, strings and numbers alike, are
+            sanitised to `[A-Za-z0-9_-]` (`1.5` becomes `1_5`). The content is taken
+            from `content`, else `text`, else `body`, else every string value joined.
           items:
             type: object
             additionalProperties: true
@@ -1629,10 +1860,52 @@ components:
           description: Filename hint used for MIME detection and `_meta.filename`.
         content_type:
           type: string
-          description: MIME hint, used only when magic bytes and extension are inconclusive.
+          description: |
+            MIME hint for a `url` or `s3` ref whose name has no known extension
+            (`https://example.com/`, `/api/users`). The extension wins over it. With
+            neither, a URL's type is asked of its server (`HEAD`, then a `GET` whose body
+            is not read, every hop under `SOURCE_FETCH_HOSTS`) before routing.
         index:
           type: string
-          description: Target index (same as `?index=`).
+          description: Target index (same as `?index=`, including its uid rule).
+        pipeline:
+          type: string
+          description: Pipeline `uid` to run instead of routing by content type (same as `?pipeline=`).
+      oneOf:
+        - required: [url]
+        - required: [s3]
+        - required: [documents]
+
+    BatchIngestItem:
+      type: object
+      description: |
+        One item of a batch: exactly one of `url`, `s3` or `documents`, as in
+        `JsonIngest`. An item's `index` and `pipeline` win over the batch's for that
+        item; the index of an `/indexes/{index_uid}/…` path still wins over both.
+      properties:
+        url: { type: string, format: uri, description: "As `JsonIngest.url`." }
+        s3: { type: string, description: "As `JsonIngest.s3`." }
+        documents:
+          type: array
+          description: As `JsonIngest.documents`.
+          items: { type: object, additionalProperties: true }
+        filename:
+          type: string
+          description: Filename hint used for MIME detection and `_meta.filename`.
+        content_type:
+          type: string
+          description: As `JsonIngest.content_type`.
+        index:
+          type: string
+          description: |
+            Target index for this item. One that is not a valid Meilisearch index uid
+            fails the item with `bad_request` when it is the index the item would be
+            written to; the other items still run.
+        pipeline:
+          type: string
+          description: |
+            Pipeline `uid` for this item. On `/ingest/pipeline/{name}` an item naming
+            another pipeline fails with `bad_request`; the other items still run.
       oneOf:
         - required: [url]
         - required: [s3]
@@ -1646,7 +1919,13 @@ components:
           type: array
           minItems: 1
           items:
-            $ref: "#/components/schemas/JsonIngest"
+            $ref: "#/components/schemas/BatchIngestItem"
+        index:
+          type: string
+          description: Target index for every item (same as `?index=`).
+        pipeline:
+          type: string
+          description: Pipeline `uid` for every item (same as `?pipeline=`).
 
     IngestResponse:
       type: object
@@ -1657,11 +1936,15 @@ components:
           format: uuid
         pipeline_used:
           type: string
-          description: "`uid` of the pipeline that will run."
+          description: |
+            `uid` of the pipeline that will run; `archive` for an archive job, whose
+            files each get their own job and pipeline.
           example: builtin.pdf
         target_index:
           type: string
-          description: Fully resolved Meilisearch index name.
+          description: |
+            Fully resolved Meilisearch index name; `*` for an archive whose files may
+            land in several indexes.
           example: documents
         status:
           $ref: "#/components/schemas/JobStatus"
@@ -1672,8 +1955,11 @@ components:
       properties:
         jobs:
           type: array
+          description: One entry per item, in input order; an item that could not be queued is an `{error, code}` entry.
           items:
-            $ref: "#/components/schemas/IngestResponse"
+            anyOf:
+              - $ref: "#/components/schemas/IngestResponse"
+              - $ref: "#/components/schemas/Error"
 
     StepResult:
       type: object
@@ -1727,10 +2013,72 @@ components:
         cancel_requested:
           type: boolean
           default: false
+        archive:
+          $ref: "#/components/schemas/ArchiveProgress"
 
+    ArchiveProgress:
+      type: object
+      description: |
+        Per-file counts of an archive job. The job succeeds when every file handed
+        to a pipeline succeeded and at least one did; skipped entries do not fail it.
+      required: [files_total, files_started, files_succeeded, files_failed, files_skipped]
+      properties:
+        files_total:
+          type: integer
+          minimum: 0
+          description: Files found, nested archives included, skipped entries excluded.
+        files_started:
+          type: integer
+          minimum: 0
+        files_succeeded:
+          type: integer
+          minimum: 0
+        files_failed:
+          type: integer
+          minimum: 0
+          description: Files whose job failed or that could not get one (no destination, wrong index).
+        files_skipped:
+          type: integer
+          minimum: 0
+          description: |
+            Entries not ingested: unsafe paths, links, empty or oversized files,
+            archives nested too deep, types no pipeline handles.
+        skipped:
+          type: array
+          description: The first 50 skipped entries.
+          items: { $ref: "#/components/schemas/ArchiveFileIssue" }
+        failed:
+          type: array
+          description: The first 50 failed files.
+          items: { $ref: "#/components/schemas/ArchiveFileIssue" }
+
+    ArchiveFileIssue:
+      type: object
+      required: [path, reason]
+      properties:
+        path:
+          type: string
+          description: Path inside the archive (`reports/eu/a.pdf`).
+        reason:
+          type: string
+        job_id:
+          type: string
+          format: uuid
+          description: The file's job, when it got one.
+
+    CancelJobResponse:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          const: cancelling
     JobStatusResponse:
       type: object
-      required: [job_id, status, progress, pipeline_used]
+      required: [job_id, status, progress]
       properties:
         job_id:
           type: string
@@ -1740,9 +2088,16 @@ components:
         current_step:
           type: [string, "null"]
         progress:
-          $ref: "#/components/schemas/WorkflowProgress"
+          description: |
+            The workflow's progress, or `null` when it is not available (the workflow
+            is no longer known to Temporal and the status comes from the job cache, or
+            it has not reported progress yet).
+          oneOf:
+            - $ref: "#/components/schemas/WorkflowProgress"
+            - type: "null"
         pipeline_used:
           type: string
+          description: From the control plane's job cache; absent when that cache could not be updated during this request.
         target_index:
           type: [string, "null"]
         error:
@@ -1812,7 +2167,8 @@ components:
           example: [application/pdf]
         filename_pattern:
           type: string
-          description: Glob on the filename (`*`, `?`), case-insensitive.
+          maxLength: 256
+          description: Glob on the filename (`*`, `?`), case-insensitive. At most 256 characters.
           example: "contract_*.pdf"
         index_pattern:
           type: string
@@ -1825,7 +2181,7 @@ components:
         uid:
           type: string
           pattern: "^[a-zA-Z0-9._-]+$"
-          description: Unique id. `builtin.*` is reserved.
+          description: Unique id. `builtin.*` and `validate` are reserved.
           example: my-pdf-with-enrichment
         name:
           type: string
@@ -2005,7 +2361,7 @@ components:
         api_key:
           type: string
           writeOnly: true
-          description: Omit to keep the stored key.
+          description: Omit to keep the stored key. Required when `host` moves to another origin (scheme, host or port).
 
     SourceLocation:
       type: object
@@ -2104,7 +2460,7 @@ components:
           type: [string, "null"]
           description: Omit to keep, `null` or a blank string to clear the override, a name to replace it.
         auth:
-          description: Omit to keep, `null` to clear, an object to replace.
+          description: Omit to keep, `null` to clear, an object to replace. Required (an object or `null`) when the location moves to another origin while a credential is stored.
           oneOf:
             - $ref: "#/components/schemas/FetchAuth"
             - type: "null"

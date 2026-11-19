@@ -40,9 +40,12 @@
 //! Pipeline configs are tenant-authored, so the engine is locked down. `no_module`
 //! removes `import`/`export`, `no_custom_syntax` removes syntax extension and
 //! `no_time` removes the clock; rhai has no file, network or process API to begin
-//! with, so a script can only reach `doc`. On top of that every run is bounded by an
-//! operation budget (`max_ops`), a wall-clock budget (`timeout_ms`) and fixed caps on
-//! expression depth, call depth, string, array and map sizes.
+//! with, so a script can only reach `doc`. `print` and `debug` are accepted but
+//! their output is discarded, so a script cannot write to the worker's logs. On top
+//! of that every run is bounded by an
+//! operation budget (`max_ops`), a wall-clock budget (`timeout_ms`), fixed caps on
+//! expression depth and call depth, and caps on the string, array and map sizes a
+//! script may build on top of the document it was given.
 //!
 //! Configuration — set exactly one of `script` or `ops`:
 //!
@@ -51,8 +54,13 @@
 //! | `script` | one of `script`/`ops` | the rhai script, run once per document |
 //! | `ops` | one of `script`/`ops` | builder operations (`rename`, `drop`, `set`, `filter`, …), compiled to rhai and applied in order |
 //! | `on_error` | `fail` | what a per-document error does: `fail`, `skip` or `keep` |
-//! | `max_ops` | `100000` | rhai operations one document may use |
-//! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use |
+//! | `max_ops` | `100000` | rhai operations one document may use, at most 100,000,000 |
+//! | `timeout_ms` | `1000` | wall-clock milliseconds one document may use, at most 30,000 |
+//!
+//! Larger budgets are clamped, not rejected. The whole step also has a one-hour
+//! budget; running past it, or being cancelled, stops the script that is running
+//! and fails the step whatever `on_error` says. Scripts run on a blocking thread,
+//! never on the async runtime.
 
 mod check;
 mod codegen;
@@ -69,8 +77,8 @@ pub use diagnostic::Diagnostic;
 
 use meili_ingest_plugin_sdk::prelude::*;
 
-use crate::config::{Config, OnError};
-use crate::runner::{Runner, Verdict};
+use crate::config::Config;
+use crate::runner::{Runner, STEP_BUDGET, run_all};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "document_script";
@@ -135,13 +143,13 @@ impl Plugin for DocumentScriptPlugin {
                         "type": "integer",
                         "minimum": 1,
                         "default": 100000,
-                        "description": "Rhai operations one document may use before the script is aborted."
+                        "description": "Rhai operations one document may use before the script is aborted. Values above 100000000 are clamped to it."
                     },
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
                         "default": 1000,
-                        "description": "Wall-clock milliseconds one document may use before the script is aborted."
+                        "description": "Wall-clock milliseconds one document may use before the script is aborted. Values above 30000 are clamped to it."
                     }
                 }
             }))
@@ -155,34 +163,12 @@ impl Plugin for DocumentScriptPlugin {
     ) -> Result<PluginOutput, PluginError> {
         let cfg = Config::parse(config)?;
         let docs = input.into_documents()?;
-        let runner = Runner::new(&cfg)?;
+        let runner = Runner::build(&cfg, STEP_BUDGET, ctx.cancellation_flag())?;
+        ctx.check_cancelled()?;
 
-        let mut out = Vec::with_capacity(docs.len());
-        for (i, mut doc) in docs.into_iter().enumerate() {
-            if i % HEARTBEAT_EVERY == 0 {
-                ctx.check_cancelled()?;
-                ctx.heartbeat(format!("document {i}"));
-            }
-            match runner.run(&mut doc) {
-                Ok(Verdict::Keep) => out.push(doc),
-                Ok(Verdict::Drop) => {}
-                Err(e) => match cfg.on_error {
-                    OnError::Fail => {
-                        return Err(PluginError::NonRetryable(format!(
-                            "{NAME}: document `{}`: {e}",
-                            doc.id
-                        )));
-                    }
-                    OnError::Skip => {
-                        tracing::warn!(document = %doc.id, error = %e, "{NAME}: dropping document");
-                    }
-                    OnError::Keep => {
-                        tracing::warn!(document = %doc.id, error = %e, "{NAME}: keeping document untouched");
-                        out.push(doc);
-                    }
-                },
-            }
-        }
+        let on_error = cfg.on_error;
+        let ctx = ctx.clone();
+        let out = run_blocking(move || run_all(runner, docs, on_error, &ctx)).await??;
         Ok(PluginOutput::Documents(out))
     }
 }
@@ -190,9 +176,10 @@ impl Plugin for DocumentScriptPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::runner::Runner;
+    use crate::config::{MAX_OPS_CEILING, MAX_TIMEOUT_MS};
+    use crate::runner::MAX_ARRAY_SIZE;
     use serde_json::{Value, json};
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
     fn doc(id: &str, content: &str) -> Document {
@@ -572,6 +559,30 @@ mod tests {
         assert!(!out[0].fields.contains_key("boom"));
     }
 
+    /// The script ran, but reading `doc` back failed after `id`, `title` and
+    /// `content` would already have been converted: none of them may stick.
+    #[tokio::test]
+    async fn on_error_keep_is_untouched_when_the_read_back_fails() {
+        let mut bad = doc("a", "hello");
+        bad.fields.insert("original".into(), json!(true));
+
+        let out = try_run(
+            vec![bad],
+            json!({
+                "script": r#"doc.id = "other"; doc.title = "New"; doc.content = "changed"; doc.fields = 5;"#,
+                "on_error": "keep"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a");
+        assert_eq!(out[0].title, None);
+        assert_eq!(out[0].content, "hello");
+        assert_eq!(out[0].fields.get("original"), Some(&json!(true)));
+    }
+
     #[tokio::test]
     async fn an_endless_loop_is_stopped_by_the_operation_budget() {
         let started = std::time::Instant::now();
@@ -651,6 +662,136 @@ mod tests {
         assert_eq!(out[1].fields.get("n"), Some(&json!(200000)));
     }
 
+    /// Budgets are tenant-authored: without a ceiling `u64::MAX` for both made a
+    /// `loop {}` run for centuries.
+    #[test]
+    fn budgets_are_clamped_to_server_ceilings() {
+        let runner = Runner::new(
+            &Config::parse(json!({
+                "script": "1",
+                "max_ops": u64::MAX,
+                "timeout_ms": u64::MAX
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(runner.engine.max_operations(), MAX_OPS_CEILING);
+        assert_eq!(runner.timeout_ms, MAX_TIMEOUT_MS);
+
+        // Values under the ceiling are kept as configured.
+        let runner = Runner::new(
+            &Config::parse(json!({"script": "1", "max_ops": 5000, "timeout_ms": 50})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(runner.engine.max_operations(), 5000);
+        assert_eq!(runner.timeout_ms, 50);
+    }
+
+    fn cancellable_context() -> (ActivityContext, Arc<std::sync::atomic::AtomicBool>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Keep the receiver alive for the whole test so heartbeats have somewhere to go.
+        std::mem::forget(rx);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_id = ActivityContext::noop().job_id();
+        let ctx = ActivityContext::new(job_id, "script", 1, tx, Arc::clone(&flag));
+        (ctx, flag)
+    }
+
+    /// A cancel must stop a script that is still running, not wait for it to use
+    /// up its own budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_stops_a_running_script() {
+        let (ctx, flag) = cancellable_context();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+
+        let started = std::time::Instant::now();
+        let err = DocumentScriptPlugin::new()
+            .execute(
+                &ctx,
+                PluginInput::Documents(vec![doc("a", "x")]),
+                json!({
+                    "script": "let i = 0; loop { i += 1; }",
+                    "max_ops": 4000000000u64,
+                    "timeout_ms": 5000,
+                    "on_error": "keep"
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PluginError::Cancelled), "got {err:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A running script must not hold the async runtime: other tasks on the same
+    /// (here single-threaded) runtime keep making progress meanwhile.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_running_script_does_not_block_the_runtime() {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let out = try_run(
+            vec![doc("a", "x")],
+            json!({
+                "script": "let i = 0; loop { i += 1; }",
+                "max_ops": 4000000000u64,
+                "timeout_ms": 300,
+                "on_error": "keep"
+            }),
+        )
+        .await
+        .unwrap();
+        ticker.abort();
+
+        assert_eq!(out.len(), 1);
+        let ticks = ticks.load(Ordering::Relaxed);
+        assert!(ticks >= 5, "the runtime only ticked {ticks} times");
+    }
+
+    /// A per-document budget alone still lets documents x timeout run; the whole
+    /// step has its own, and running out of it fails the step whatever `on_error`
+    /// says instead of skipping every remaining document.
+    #[test]
+    fn the_step_budget_fails_the_step() {
+        let cfg = Config::parse(json!({
+            "script": "let i = 0; loop { i += 1; }",
+            "max_ops": 4000000000u64,
+            "timeout_ms": 10000,
+            "on_error": "skip"
+        }))
+        .unwrap();
+        let runner = Runner::with_step_budget(&cfg, std::time::Duration::from_millis(200)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = run_all(
+            runner,
+            vec![doc("a", "x"), doc("b", "x"), doc("c", "x")],
+            cfg.on_error,
+            &ActivityContext::noop(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("step budget")),
+            "got {err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn scripts_cannot_import_modules() {
         let err = try_run(vec![doc("a", "hello")], script(r#"import "std" as s;"#))
@@ -726,6 +867,168 @@ mod tests {
         let out = run(vec![doc("a", "x")], script("doc.fields.v = 10.0 / 4.0;")).await;
 
         assert_eq!(out[0].fields.get("v"), Some(&json!(2.5)));
+    }
+
+    /// Set in the child process [`print_and_debug_do_not_reach_stdout`] spawns.
+    const PRINT_CHILD_ENV: &str = "DOCUMENT_SCRIPT_PRINT_CHILD";
+    const PRINT_MARKER: &str = "forged-log-line-7f3a";
+
+    /// Runs only inside the child process: a script that prints and debugs.
+    #[tokio::test]
+    async fn print_and_debug_child() {
+        if std::env::var_os(PRINT_CHILD_ENV).is_none() {
+            return;
+        }
+        let out = run(
+            vec![doc("a", "x")],
+            script(&format!(
+                r#"print("{PRINT_MARKER}"); debug("{PRINT_MARKER}"); true"#
+            )),
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Tenant scripts must not write to the worker's stdout, where they would
+    /// interleave forged lines with the structured logs. Rhai's default `print` and
+    /// `debug` handlers `println!`, so this runs the script in a child test process
+    /// without output capture and checks what reached its stdout.
+    #[test]
+    fn print_and_debug_do_not_reach_stdout() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::print_and_debug_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PRINT_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "child failed: {stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child test did not run: {stdout}"
+        );
+        assert!(
+            !stdout.contains(PRINT_MARKER),
+            "script output reached stdout: {stdout}"
+        );
+    }
+
+    /// Rhai integers are i64, so a u64 above `i64::MAX` reaches the script as a
+    /// float. One the script never touched must still come back as the same integer.
+    #[tokio::test]
+    async fn untouched_integers_above_i64_max_round_trip() {
+        let big = json!(18446744073709551615u64);
+        let mut d = doc("a", "x");
+        d.fields.insert("snowflake".into(), big.clone());
+        d.fields.insert(
+            "nested".into(),
+            json!({"b": big.clone(), "list": [1, big.clone()]}),
+        );
+
+        let out = run(
+            vec![d],
+            script("doc.fields.seen = true; doc.fields.nested.c = 1;"),
+        )
+        .await;
+
+        assert_eq!(out[0].fields.get("snowflake"), Some(&big));
+        assert_eq!(out[0].fields["nested"]["b"], big);
+        assert_eq!(out[0].fields["nested"]["list"], json!([1, big.clone()]));
+        assert_eq!(out[0].fields["nested"]["c"], json!(1));
+        assert_eq!(out[0].fields["seen"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_large_integer_the_script_rewrites_is_not_restored() {
+        let mut d = doc("a", "x");
+        d.fields.insert("n".into(), json!(18446744073709551615u64));
+
+        let out = run(vec![d], script("doc.fields.n = 2.5;")).await;
+
+        assert_eq!(out[0].fields["n"], json!(2.5));
+    }
+
+    /// The size caps bound what a script builds, not the document it was handed:
+    /// rhai checks the whole `doc` map after every assignment into it and the whole
+    /// string after every method call on it.
+    #[tokio::test]
+    async fn a_large_document_is_not_rejected_by_the_size_caps() {
+        let big = "x".repeat(600 * 1024);
+        let mut d = doc("a", &big);
+        d.fields.insert("name".into(), json!("Widget"));
+
+        let out = try_run(vec![d.clone()], script("doc.title = doc.fields.name;"))
+            .await
+            .unwrap();
+        assert_eq!(out[0].title.as_deref(), Some("Widget"));
+        assert_eq!(out[0].content, big);
+
+        let out = try_run(vec![d], script("doc.content.trim();"))
+            .await
+            .unwrap();
+        assert_eq!(out[0].content, big);
+
+        let mut d = doc("b", "x");
+        d.fields
+            .insert("links".into(), json!(vec!["l"; MAX_ARRAY_SIZE + 1]));
+        let out = try_run(vec![d], script("doc.fields.x = 1;")).await.unwrap();
+        assert_eq!(out[0].fields["x"], json!(1));
+    }
+
+    /// `ops` compile to a program run on the same engine, so the size caps and the
+    /// large-integer restore apply to them as they do to a script.
+    #[tokio::test]
+    async fn ops_on_a_large_document_keep_its_size_and_large_integers() {
+        let big = "x".repeat(600 * 1024);
+        let mut d = doc("a", &big);
+        d.fields.insert("name".into(), json!("Widget"));
+        d.fields.insert("tags".into(), json!("a,b"));
+        d.fields
+            .insert("snowflake".into(), json!(18446744073709551615u64));
+
+        let out = run(
+            vec![d],
+            json!({"ops": [
+                {"promote": {"field": "name", "to": "title"}},
+                {"split": {"field": "tags", "separator": ","}}
+            ]}),
+        )
+        .await;
+
+        assert_eq!(out[0].title.as_deref(), Some("Widget"));
+        assert_eq!(out[0].content, big);
+        assert_eq!(out[0].fields["tags"], json!(["a", "b"]));
+        assert_eq!(out[0].fields["snowflake"], json!(18446744073709551615u64));
+    }
+
+    #[tokio::test]
+    async fn a_script_still_cannot_build_an_oversized_string() {
+        let err = try_run(
+            vec![doc("a", "x")],
+            script("let s = \"xxxxxxxx\"; loop { s += s; }"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("too large")),
+            "got {err:?}"
+        );
+
+        // On a large document the headroom is the same fixed cap, not a multiple.
+        let err = try_run(
+            vec![doc("a", &"x".repeat(600 * 1024))],
+            script("doc.content += doc.content;"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, PluginError::NonRetryable(m) if m.contains("too large")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

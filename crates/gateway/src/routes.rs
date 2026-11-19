@@ -79,6 +79,7 @@ pub const ROUTES: &[RouteSpec] = &[
     mgmt("POST", "/sources/{uid}/pause"),
     mgmt("POST", "/sources/{uid}/unpause"),
     mgmt("POST", "/sources/{uid}/run"),
+    mgmt("POST", "/sources/{uid}/reset-state"),
     mgmt("GET", "/sources/{uid}/runs"),
     mgmt("GET", "/plugins"),
     mgmt("GET", "/catalog"),

@@ -335,7 +335,7 @@ impl SourceRepo {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12) \
              RETURNING {SOURCE_COLUMNS}"
         );
-        let row: SourceRow = sqlx::query_as(AssertSqlSafe(sql))
+        let inserted = sqlx::query_as::<_, SourceRow>(AssertSqlSafe(sql))
             .bind(new.id)
             .bind(&new.uid)
             .bind(&new.name)
@@ -349,22 +349,48 @@ impl SourceRepo {
             .bind(new.fetch_auth.as_deref())
             .bind(&new.schedule_id)
             .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                let duplicate = matches!(
-                    &e,
-                    sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
-                );
-                if duplicate {
-                    CpError::Validation(format!(
-                        "a source named {:?} already exists for this tenant",
-                        new.uid
-                    ))
-                } else {
-                    CpError::Db(e)
-                }
-            })?;
-        Ok(SourceRecord::from(row))
+            .await;
+        match inserted {
+            Ok(row) => Ok(SourceRecord::from(row)),
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+                Err(self.duplicate_uid(new).await)
+            }
+            Err(e) => Err(CpError::Db(e)),
+        }
+    }
+
+    /// The error for an insert whose uid is already taken in its scope. An archived
+    /// holder is hidden from the default list, so the answer names it (409); archive is
+    /// one-way and an archived source keeps its uid until it is deleted.
+    async fn duplicate_uid(&self, new: &NewSource) -> CpError {
+        /// The holder's pipeline and archive time.
+        type Holder = (String, Option<DateTime<Utc>>);
+        let holder: Option<Holder> = match sqlx::query_as(
+            "SELECT pipeline_uid, archived_at FROM sources \
+                 WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '')",
+        )
+        .bind(&new.uid)
+        .bind(new.tenant_id.as_deref())
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => return CpError::Db(e),
+        };
+        match holder {
+            Some((pipeline_uid, Some(archived_at))) => CpError::Conflict(format!(
+                "a source named {:?} already exists for this tenant: it was archived on {} \
+                 when its pipeline {pipeline_uid:?} was deleted, and archived sources keep \
+                 their uid. Delete it (DELETE /sources/{}) to reuse the name, or pick another uid",
+                new.uid,
+                archived_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                new.uid
+            )),
+            _ => CpError::Validation(format!(
+                "a source named {:?} already exists for this tenant",
+                new.uid
+            )),
+        }
     }
 
     /// Apply a partial update to the row in exactly `tenant_id`'s scope. `None` when no
@@ -390,8 +416,22 @@ impl SourceRepo {
             None => (false, None),
             Some(v) => (true, v.as_deref()),
         };
+        // The incremental state says "this content was already ingested", which holds
+        // only for the URL, credential, pipeline and index it was learned with. A real
+        // change to one of them forgets it, so the next run fetches in full and feeds
+        // the new destination. A field resent with its current value is not a change:
+        // compare with the row, not with "present in the patch". In an UPDATE the
+        // column names on the right-hand side are the old values.
+        let reset = "(($5 IS NOT NULL AND $5 IS DISTINCT FROM pipeline_uid) \
+                     OR ($6 IS NOT NULL AND $6 IS DISTINCT FROM location) \
+                     OR ($8 IS NOT NULL AND $8 IS DISTINCT FROM timezone) \
+                     OR ($13 AND $9 IS DISTINCT FROM index_name) \
+                     OR ($10 AND $11 IS DISTINCT FROM fetch_auth))";
         let sql = format!(
             "UPDATE sources SET \
+                last_etag = CASE WHEN {reset} THEN NULL ELSE last_etag END, \
+                last_modified = CASE WHEN {reset} THEN NULL ELSE last_modified END, \
+                last_hash = CASE WHEN {reset} THEN NULL ELSE last_hash END, \
                 name = COALESCE($3, name), \
                 description = COALESCE($4, description), \
                 pipeline_uid = COALESCE($5, pipeline_uid), \
@@ -472,6 +512,28 @@ impl SourceRepo {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Forget the incremental state (ETag, Last-Modified, hash) of the source in exactly
+    /// `tenant_id`'s scope, so its next run fetches and ingests in full. `None` when no
+    /// such row exists. A run already in flight still saves the state it learns.
+    pub async fn reset_state(
+        &self,
+        uid: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<SourceRecord>, CpError> {
+        let sql = format!(
+            "UPDATE sources SET last_etag = NULL, last_modified = NULL, last_hash = NULL, \
+                                updated_at = now() \
+             WHERE uid = $1 AND COALESCE(tenant_id, '') = COALESCE($2, '') \
+             RETURNING {SOURCE_COLUMNS}"
+        );
+        let row: Option<SourceRow> = sqlx::query_as(AssertSqlSafe(sql))
+            .bind(uid)
+            .bind(tenant_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(SourceRecord::from))
     }
 
     /// Persist the incremental state learned by a run.
@@ -673,6 +735,23 @@ pub async fn patch_source(
         .await?
         .map(Json)
         .ok_or_else(|| uid_not_found(&uid, tenant_id.as_deref()))
+}
+
+/// `POST /internal/sources/{uid}/reset-state?tenant_id=` → 200 [`SourceRecord`] with
+/// no incremental state, or 404 when no source is in exactly that scope.
+pub async fn reset_source_state(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<SourceScopeQuery>,
+    headers: HeaderMap,
+) -> Result<Json<SourceRecord>, CpError> {
+    let tenant_id = tenant_scope(q.tenant_id.as_deref(), &headers);
+    let record = repo(&state)
+        .reset_state(&uid, tenant_id.as_deref())
+        .await?
+        .ok_or_else(|| uid_not_found(&uid, tenant_id.as_deref()))?;
+    tracing::info!(uid = %uid, tenant_id = ?tenant_id, "source incremental state reset");
+    Ok(Json(record))
 }
 
 /// `DELETE /internal/sources/{uid}?tenant_id=` → 204; its runs cascade.

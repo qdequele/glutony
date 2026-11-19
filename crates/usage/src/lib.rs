@@ -1,4 +1,4 @@
-//! # `meili-ingest-usage` — per-tenant usage metering into Tinybird
+//! # `meili-ingest-usage` — per-tenant usage metering into Tinybird or ClickHouse
 //!
 //! Postgres only holds the *mutable* status of a job, so nothing durable records how
 //! much work a tenant actually consumed. This crate produces that record: one flat row
@@ -48,9 +48,11 @@
 //!
 //! ## Configuration
 //!
-//! [`UsageClient::from_env`] returns `Ok(None)` when `TINYBIRD_TOKEN` is unset: usage
-//! reporting is optional, and a deployment without it simply logs once that metering
-//! is off.
+//! Two stores, one row format. [`UsageClient::from_env`] picks Tinybird when
+//! `TINYBIRD_TOKEN` is set, a self-hosted ClickHouse when `USAGE_CLICKHOUSE_URL` is set
+//! (see [`clickhouse`]), refuses both at once, and returns `Ok(None)` with neither:
+//! usage reporting is optional, and a deployment without it simply logs once that
+//! metering is off.
 //!
 //! | var | default | notes |
 //! |---|---|---|
@@ -81,13 +83,16 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod clickhouse;
 pub mod lab;
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::{JobStatus, StepResult, UsageUnits};
+use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, JobStatus, StepResult, UsageUnits};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -141,11 +146,12 @@ pub enum UsageError {
     Config(String),
 
     /// Network failure, DNS failure, TLS failure or timeout. Retryable.
-    #[error("usage transport failure talking to Tinybird: {0}")]
+    #[error("usage transport failure talking to the usage store: {0}")]
     Transport(String),
 
-    /// Tinybird is unhappy but might not be next time: HTTP 429 or 5xx. Retryable.
-    #[error("Tinybird returned HTTP {status} (retryable): {body}")]
+    /// The store is unhappy but might not be next time: HTTP 429 or 5xx (for
+    /// ClickHouse, any error that is not about credentials or the request). Retryable.
+    #[error("the usage store returned HTTP {status} (retryable): {body}")]
     Upstream {
         /// HTTP status code.
         status: u16,
@@ -157,8 +163,8 @@ pub enum UsageError {
     /// on the data source. Permanent, and deliberately carries no response body so a
     /// token echoed back by the API can never reach a log.
     #[error(
-        "Tinybird rejected the credentials (HTTP {status}); check {ENV_TOKEN} and its \
-         scope on the data source"
+        "the usage store rejected the credentials (HTTP {status}); check {ENV_TOKEN} and \
+         its scope on the data source, or the USAGE_CLICKHOUSE_USER grants"
     )]
     Auth {
         /// HTTP status code (401 or 403).
@@ -167,7 +173,7 @@ pub enum UsageError {
 
     /// Any other 4xx: the request itself is wrong (unknown data source, malformed
     /// NDJSON, payload too large). Permanent.
-    #[error("Tinybird rejected the request (HTTP {status}): {body}")]
+    #[error("the usage store rejected the request (HTTP {status}): {body}")]
     Rejected {
         /// HTTP status code.
         status: u16,
@@ -274,7 +280,8 @@ pub struct UsageEvent {
     pub step_id: String,
     /// Plugin name, `""` on job rows.
     pub plugin: String,
-    /// Temporal task queue the work ran on (`workers-general`, `workers-io`).
+    /// Temporal task queue the work ran on (`workers-general`; older rows may say
+    /// `workers-io`).
     pub task_queue: String,
     /// [`JobStatus::as_str`] of the step (or of the job on job rows).
     pub status: String,
@@ -289,7 +296,8 @@ pub struct UsageEvent {
     pub input_bytes: u64,
     /// MIME type of the job's original payload, `""` when unknown.
     pub input_mime: String,
-    /// Documents the step produced; on job rows, the documents the final step produced.
+    /// Documents the step produced; on job rows, the documents that reached Meilisearch
+    /// ([`documents_indexed`]).
     pub documents_out: u64,
     /// [`UsageUnits::llm_input_tokens`].
     pub llm_input_tokens: u64,
@@ -386,8 +394,9 @@ pub struct JobUsageInput {
 ///
 /// The job row summarises the pipeline: its `duration_ms` is the wall-clock
 /// `finished_at - started_at` (≥ the sum of the steps, because it includes queueing),
-/// its `input_bytes` is the original payload, its `documents_out` is what the **final**
-/// step produced (summing steps would count a document once per stage), and its usage
+/// its `input_bytes` is the original payload, its `documents_out` is what reached
+/// Meilisearch ([`documents_indexed`]; summing every step would count a document once
+/// per stage), and its usage
 /// units are the sum over all steps. Because the units appear both on the step rows and
 /// on the job row, any aggregation must pick one: the rollup in
 /// `tinybird/pipes/usage_daily_mv.pipe` sums units from `kind = 'step'` rows only.
@@ -420,17 +429,44 @@ pub fn events_for_job(input: &JobUsageInput) -> Vec<UsageEvent> {
     job.status = input.status.as_str().to_string();
     job.duration_ms = wall_clock_ms(input.started_at, input.finished_at);
     job.input_bytes = input.input_bytes;
-    job.documents_out = input
-        .steps
-        .last()
-        .map(|s| s.document_count as u64)
-        .unwrap_or(0);
+    job.documents_out = documents_indexed(input);
     apply_units(&mut job, totals);
     job.error_kind = error_kind_for(input.status, input.error.as_deref()).to_string();
     job.error = truncate_chars(input.error.as_deref().unwrap_or_default(), MAX_ERROR_CHARS);
     events.push(job);
 
     events
+}
+
+/// The documents of a job that reached Meilisearch: the job row's `documents_out`
+/// (rolled up as `documents_indexed`) and the Lab's `documents` unit.
+///
+/// It is the sum over the succeeded [`INDEXER_PLUGIN`] steps, whatever the job status:
+/// a job cancelled before its indexer ran wrote nothing, and one cancelled (or failed)
+/// after it did write those documents. Only when no indexer step ran at all and the
+/// job succeeded is it the final step's output, for a pipeline that does not index.
+/// `steps` holds only the steps that ran, so a cancelled or failed job without an
+/// indexer step reports 0 rather than an intermediate step's count.
+pub fn documents_indexed(input: &JobUsageInput) -> u64 {
+    let mut indexers = input
+        .steps
+        .iter()
+        .filter(|s| s.plugin == INDEXER_PLUGIN)
+        .peekable();
+    if indexers.peek().is_some() {
+        return indexers
+            .filter(|s| s.status == JobStatus::Succeeded)
+            .map(|s| s.document_count as u64)
+            .fold(0, u64::saturating_add);
+    }
+    if input.status != JobStatus::Succeeded {
+        return 0;
+    }
+    input
+        .steps
+        .last()
+        .map(|s| s.document_count as u64)
+        .unwrap_or(0)
 }
 
 /// A row with everything that is common to all rows of a job filled in, and the
@@ -608,34 +644,62 @@ fn truncate_chars(s: &str, max: usize) -> String {
 // Client
 // ---------------------------------------------------------------------------
 
-/// Tinybird Events API client.
+/// Usage store client: the Tinybird Events API, or a self-hosted ClickHouse.
 ///
 /// Cheap to clone (the inner [`reqwest::Client`] is an `Arc`), so the worker builds one
 /// at startup and shares it with every activity.
 #[derive(Clone)]
 pub struct UsageClient {
-    base_url: String,
-    token: String,
-    datasource: String,
+    sink: Sink,
     http: reqwest::Client,
 }
 
-/// Redacts the token: a usage client is routinely printed in worker startup logs.
+#[derive(Clone)]
+enum Sink {
+    Tinybird {
+        base_url: String,
+        token: String,
+        datasource: String,
+    },
+    ClickHouse {
+        config: clickhouse::ClickHouseConfig,
+        /// Set once `CREATE TABLE IF NOT EXISTS` succeeded; shared by every clone.
+        /// Cleared when an insert finds the table gone, so the next try recreates it.
+        /// Two first sends racing may both issue the `CREATE`, which is idempotent.
+        table_ready: Arc<AtomicBool>,
+    },
+}
+
+/// Redacts the token and password: a usage client is printed in worker startup logs.
 impl fmt::Debug for UsageClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UsageClient")
-            .field("base_url", &self.base_url)
-            .field("datasource", &self.datasource)
-            .field("token", &"<redacted>")
-            .finish()
+        match &self.sink {
+            Sink::Tinybird {
+                base_url,
+                datasource,
+                ..
+            } => f
+                .debug_struct("UsageClient")
+                .field("backend", &"tinybird")
+                .field("base_url", base_url)
+                .field("datasource", datasource)
+                .field("token", &"<redacted>")
+                .finish(),
+            Sink::ClickHouse { config, .. } => f
+                .debug_struct("UsageClient")
+                .field("backend", &"clickhouse")
+                .field("config", config)
+                .finish(),
+        }
     }
 }
 
 impl UsageClient {
     /// Build a client from the environment.
     ///
-    /// Returns `Ok(None)` when `TINYBIRD_TOKEN` is absent or empty: usage reporting is
-    /// optional and the worker just logs once that metering is off. Returns
+    /// Tinybird with `TINYBIRD_TOKEN`, ClickHouse with `USAGE_CLICKHOUSE_URL`, and
+    /// [`UsageError::Config`] with both. Returns `Ok(None)` with neither: usage
+    /// reporting is optional and the worker just logs once that metering is off. Returns
     /// [`UsageError::Config`] when a variable is present but unusable — a typo in
     /// `TINYBIRD_TIMEOUT_SECS` should not silently disable billing data.
     ///
@@ -652,20 +716,33 @@ impl UsageClient {
                 .filter(|v| !v.is_empty())
         };
 
-        let Some(token) = non_empty(ENV_TOKEN) else {
-            return Ok(None);
+        let timeout = |var: &str| match non_empty(var) {
+            Some(raw) => raw
+                .parse::<u64>()
+                .map_err(|e| UsageError::Config(format!("{var} must be a number of seconds: {e}"))),
+            None => Ok(DEFAULT_TIMEOUT_SECS),
         };
+        let clickhouse = clickhouse::ClickHouseConfig::from_lookup(&get)?;
+        let Some(token) = non_empty(ENV_TOKEN) else {
+            let Some(config) = clickhouse else {
+                return Ok(None);
+            };
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout(clickhouse::ENV_TIMEOUT_SECS)?))
+                .build()
+                .map_err(|e| UsageError::Config(format!("cannot build the HTTP client: {e}")))?;
+            return Ok(Some(Self::clickhouse(config, http)));
+        };
+        if clickhouse.is_some() {
+            return Err(UsageError::Config(format!(
+                "both {ENV_TOKEN} and {} are set: pick one usage store",
+                clickhouse::ENV_URL
+            )));
+        }
         let base_url = non_empty(ENV_BASE_URL).unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let datasource =
             non_empty(ENV_DATASOURCE).unwrap_or_else(|| DEFAULT_DATASOURCE.to_string());
-        let timeout_secs = match non_empty(ENV_TIMEOUT_SECS) {
-            Some(raw) => raw.parse::<u64>().map_err(|e| {
-                UsageError::Config(format!(
-                    "{ENV_TIMEOUT_SECS} must be a number of seconds: {e}"
-                ))
-            })?,
-            None => DEFAULT_TIMEOUT_SECS,
-        };
+        let timeout_secs = timeout(ENV_TIMEOUT_SECS)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -685,25 +762,119 @@ impl UsageClient {
         http: reqwest::Client,
     ) -> Self {
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            token: token.into(),
-            datasource: datasource.into(),
+            sink: Sink::Tinybird {
+                base_url: base_url.into().trim_end_matches('/').to_string(),
+                token: token.into(),
+                datasource: datasource.into(),
+            },
             http,
         }
     }
 
-    /// Target data source name.
-    pub fn datasource(&self) -> &str {
-        &self.datasource
+    /// A client writing to a self-hosted ClickHouse. The table is created on the first
+    /// [`Self::send`] (or [`Self::prepare`]).
+    pub fn clickhouse(config: clickhouse::ClickHouseConfig, http: reqwest::Client) -> Self {
+        Self {
+            sink: Sink::ClickHouse {
+                config,
+                table_ready: Arc::new(AtomicBool::new(false)),
+            },
+            http,
+        }
     }
 
-    /// Regional API host this client posts to.
+    /// `"tinybird"` or `"clickhouse"`.
+    pub fn backend(&self) -> &'static str {
+        match self.sink {
+            Sink::Tinybird { .. } => "tinybird",
+            Sink::ClickHouse { .. } => "clickhouse",
+        }
+    }
+
+    /// Target data source (Tinybird) or table (ClickHouse) name.
+    pub fn datasource(&self) -> &str {
+        match &self.sink {
+            Sink::Tinybird { datasource, .. } => datasource,
+            Sink::ClickHouse { config, .. } => config.table(),
+        }
+    }
+
+    /// Regional API host (Tinybird) or HTTP interface (ClickHouse) this client posts to.
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        match &self.sink {
+            Sink::Tinybird { base_url, .. } => base_url,
+            Sink::ClickHouse { config, .. } => config.url(),
+        }
+    }
+
+    /// Create the ClickHouse table now if it is missing, so a worker can report a
+    /// misconfigured store at boot. A no-op for Tinybird, whose data source is deployed
+    /// with the `tb` CLI. Optional: [`Self::send`] does it on first use.
+    pub async fn prepare(&self) -> Result<(), UsageError> {
+        match &self.sink {
+            Sink::Tinybird { .. } => Ok(()),
+            Sink::ClickHouse {
+                config,
+                table_ready,
+            } => {
+                if table_ready.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                config.ensure_table(&self.http).await?;
+                table_ready.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    /// Insert into ClickHouse, recovering once from a table that changed under us: one
+    /// dropped since it was created is recreated, and one an older release created
+    /// gets the columns added since. Anything else, or a second failure, is returned
+    /// as is.
+    async fn insert_clickhouse(
+        &self,
+        config: &clickhouse::ClickHouseConfig,
+        table_ready: &AtomicBool,
+        body: &str,
+    ) -> Result<(), UsageError> {
+        self.prepare().await?;
+        let failure = match config.insert(&self.http, body).await {
+            Ok(()) => return Ok(()),
+            Err(f) => f,
+        };
+        if failure.is_unknown_table() {
+            tracing::warn!(
+                table = %config.table(),
+                "usage table is gone: creating it again"
+            );
+            table_ready.store(false, Ordering::Release);
+            self.prepare().await?;
+        } else if failure.is_column_drift() {
+            if let Err(alter) = config.add_missing_columns(&self.http).await {
+                // Most likely no `ALTER` grant: report the drift itself, loudly.
+                tracing::warn!(
+                    table = %config.table(),
+                    error = %alter,
+                    "could not add missing columns to the usage table"
+                );
+                return Err(failure.into());
+            }
+            tracing::info!(
+                table = %config.table(),
+                "added missing columns to the usage table"
+            );
+        } else {
+            return Err(failure.into());
+        }
+        config
+            .insert(&self.http, body)
+            .await
+            .map_err(UsageError::from)
     }
 
     /// Append `events` to the data source through
-    /// `POST {base_url}/v0/events?name={datasource}&wait=true`.
+    /// `POST {base_url}/v0/events?name={datasource}&wait=true`, or to the ClickHouse
+    /// table through `INSERT … FORMAT JSONEachRow` (creating it on first use).
     ///
     /// The body is newline-delimited JSON, one event per line — the Events API format.
     /// `wait=true` makes Tinybird acknowledge the actual write rather than the receipt,
@@ -737,13 +908,30 @@ impl UsageClient {
             body.push('\n');
         }
 
-        let url = format!(
-            "{}/v0/events?name={}&wait=true",
-            self.base_url, self.datasource
-        );
+        let (base_url, token, datasource) = match &self.sink {
+            Sink::Tinybird {
+                base_url,
+                token,
+                datasource,
+            } => (base_url, token, datasource),
+            Sink::ClickHouse {
+                config,
+                table_ready,
+            } => {
+                tracing::debug!(
+                    table = %config.table(),
+                    events = events.len(),
+                    bytes = body.len(),
+                    "sending usage events to ClickHouse"
+                );
+                // `INSERT` is synchronous: a 200 means the rows are written.
+                return self.insert_clickhouse(config, table_ready, &body).await;
+            }
+        };
+        let url = format!("{base_url}/v0/events?name={datasource}&wait=true");
         tracing::debug!(
-            datasource = %self.datasource,
-            base_url = %self.base_url,
+            datasource = %datasource,
+            base_url = %base_url,
             events = events.len(),
             bytes = body.len(),
             "sending usage events to Tinybird"
@@ -752,15 +940,14 @@ impl UsageClient {
         let response = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
             .header("content-type", "application/x-ndjson")
             .body(body)
             .send()
             .await
             .map_err(|e| {
                 UsageError::Transport(format!(
-                    "POST {}/v0/events (name={}) failed: {e}",
-                    self.base_url, self.datasource
+                    "POST {base_url}/v0/events (name={datasource}) failed: {e}"
                 ))
             })?;
 
@@ -778,13 +965,13 @@ impl UsageClient {
         let ack: EventsAck = serde_json::from_str(&text).unwrap_or_default();
         if ack.quarantined_rows > 0 {
             tracing::error!(
-                datasource = %self.datasource,
+                datasource = %datasource,
                 quarantined_rows = ack.quarantined_rows,
                 "Tinybird quarantined usage rows: schema drift"
             );
             return Err(UsageError::Quarantined {
                 count: ack.quarantined_rows,
-                datasource: self.datasource.clone(),
+                datasource: datasource.clone(),
             });
         }
         tracing::debug!(
@@ -1278,7 +1465,10 @@ mod tests {
         assert_eq!(job.duration_ms, 9_000, "wall clock, not the sum of steps");
         assert_eq!(job.input_bytes, 1_000_000);
         assert_eq!(job.input_mime, "application/pdf");
-        assert_eq!(job.documents_out, 0, "documents out of the final step");
+        assert_eq!(
+            job.documents_out, 0,
+            "a failed job without an indexer indexed nothing"
+        );
         // Units are summed across every step.
         assert_eq!(job.pages, 9);
         assert_eq!(job.llm_input_tokens, 400);
@@ -1367,6 +1557,74 @@ mod tests {
         let events = events_for_job(&input);
         assert_eq!(events[0].error_kind, ERROR_KIND_CANCELLED);
         assert_eq!(events[2].error_kind, ERROR_KIND_CANCELLED);
+    }
+
+    /// extract -> chunk -> index, cancelled while (or before) `index` ran: only the
+    /// steps that succeeded were recorded, and nothing reached Meilisearch.
+    #[test]
+    fn a_cancelled_job_before_the_indexer_reports_no_documents() {
+        let mut input = job_input();
+        input.status = JobStatus::Cancelled;
+        input.steps = vec![
+            step(
+                "extract",
+                "pdf_extractor",
+                JobStatus::Succeeded,
+                UsageUnits::none(),
+            ),
+            step("chunk", "chunker", JobStatus::Succeeded, UsageUnits::none()),
+        ];
+        let events = events_for_job(&input);
+        let job = events.last().expect("job row");
+        assert_eq!(job.kind, UsageEventKind::Job);
+        assert_eq!(job.documents_out, 0, "nothing was indexed");
+        assert_eq!(documents_indexed(&input), 0);
+    }
+
+    /// A cancel that lands after the indexer finished: its documents really reached
+    /// Meilisearch, whatever the job status.
+    #[test]
+    fn a_job_counts_what_its_indexer_steps_wrote_not_the_last_step() {
+        let mut input = job_input();
+        let mut index = step(
+            "index",
+            INDEXER_PLUGIN,
+            JobStatus::Succeeded,
+            UsageUnits::none(),
+        );
+        index.document_count = 5;
+        let mut notify = step("notify", "script", JobStatus::Succeeded, UsageUnits::none());
+        notify.document_count = 9;
+        input.steps = vec![
+            step(
+                "extract",
+                "pdf_extractor",
+                JobStatus::Succeeded,
+                UsageUnits::none(),
+            ),
+            index.clone(),
+            notify,
+        ];
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 5);
+
+        input.status = JobStatus::Cancelled;
+        input.steps.pop();
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 5);
+
+        // Several indexer steps (one per index) are summed.
+        input.status = JobStatus::Succeeded;
+        let mut second = index;
+        second.step_id = "index_archive".into();
+        second.document_count = 7;
+        input.steps.push(second);
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 12);
+    }
+
+    #[test]
+    fn a_succeeded_job_without_an_indexer_reports_its_final_step() {
+        let input = job_input();
+        assert!(input.steps.iter().all(|s| s.plugin != INDEXER_PLUGIN));
+        assert_eq!(events_for_job(&input).last().unwrap().documents_out, 12);
     }
 
     #[test]

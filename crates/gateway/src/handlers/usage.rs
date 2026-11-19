@@ -1,21 +1,22 @@
 //! `GET /usage` — per-tenant consumption for the dashboard.
 //!
-//! The browser never talks to Tinybird directly. A read token in front-end code would
-//! be extractable by anyone with dev tools, and Tinybird endpoint parameters are
-//! caller-supplied, so a tenant could simply ask for another tenant's `tenant_id`.
-//! This handler holds the token server-side and forces `tenant_id` to the value
-//! resolved from the request's own context, which the tenant cannot influence when
-//! Envoy is in front.
+//! The browser never talks to the usage store (Tinybird or ClickHouse) directly. A
+//! read token in front-end code would be extractable by anyone with dev tools, and
+//! query parameters are caller-supplied, so a tenant could simply ask for another
+//! tenant's `tenant_id`. This handler holds the credentials server-side and forces
+//! `tenant_id` to the value resolved from the request's own context, which the tenant
+//! cannot influence when Envoy is in front.
 
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Scope;
 use crate::error::GatewayError;
-use crate::state::AppState;
+use crate::handlers::Query;
+use crate::state::{AppState, UsageApiConfig};
 
 /// Query parameters accepted by [`get_usage`].
 #[derive(Debug, Clone, Deserialize)]
@@ -26,7 +27,8 @@ pub struct UsageQuery {
     pub date_to: String,
 }
 
-/// One day of a tenant's consumption, as returned by the Tinybird endpoint.
+/// One day of a tenant's consumption, as returned by the Tinybird endpoint or the
+/// ClickHouse query (same columns).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRow {
     /// Day (`YYYY-MM-DD`).
@@ -72,14 +74,54 @@ pub async fn get_usage(
     validate_date(&q.date_to, "date_to")?;
     let tenant_id = scope.tenant_id.clone().unwrap_or_default();
 
-    let url = format!("{}/v0/pipes/{}.json", usage.base_url, usage.pipe);
-    let resp = state
-        .http
+    let data = match usage {
+        UsageApiConfig::Tinybird {
+            base_url,
+            token,
+            pipe,
+        } => fetch_tinybird(&state.http, base_url, token, pipe, &tenant_id, &q).await?,
+        UsageApiConfig::ClickHouse(config) => {
+            fetch_clickhouse(&state.http, config, &tenant_id, &q).await?
+        }
+    };
+    Ok(Json(UsageResponse { tenant_id, data }))
+}
+
+/// Daily rows from the ClickHouse usage table (deduplicated, no hourly lag).
+async fn fetch_clickhouse(
+    http: &reqwest::Client,
+    config: &meili_ingest_usage::clickhouse::ClickHouseConfig,
+    tenant_id: &str,
+    q: &UsageQuery,
+) -> Result<Vec<UsageRow>, GatewayError> {
+    let rows = config
+        .daily_usage(http, tenant_id, &q.date_from, &q.date_to)
+        .await
+        .map_err(|e| GatewayError::Upstream(format!("usage analytics: {e}")))?;
+    rows.into_iter()
+        .map(|row| {
+            serde_json::from_value(row)
+                .map_err(|e| GatewayError::Upstream(format!("unexpected usage row: {e}")))
+        })
+        .collect()
+}
+
+/// Daily rows from the Tinybird endpoint pipe.
+async fn fetch_tinybird(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    pipe: &str,
+    tenant_id: &str,
+    q: &UsageQuery,
+) -> Result<Vec<UsageRow>, GatewayError> {
+    let url = format!("{base_url}/v0/pipes/{pipe}.json");
+    let resp = http
         .get(&url)
-        .bearer_auth(&usage.token)
+        .bearer_auth(token)
         .query(&[
             // The Tinybird pipe parameter keeps its historical name (spec §3.5).
-            ("project_id", tenant_id.as_str()),
+            ("project_id", tenant_id),
             ("date_from", q.date_from.as_str()),
             ("date_to", q.date_to.as_str()),
         ])
@@ -98,10 +140,7 @@ pub async fn get_usage(
     }
     let parsed: TinybirdResponse = serde_json::from_str(&body)
         .map_err(|e| GatewayError::Upstream(format!("unexpected usage response: {e}")))?;
-    Ok(Json(UsageResponse {
-        tenant_id,
-        data: parsed.data,
-    }))
+    Ok(parsed.data)
 }
 
 #[derive(Deserialize)]
@@ -127,17 +166,340 @@ fn validate_date(value: &str, field: &str) -> Result<(), GatewayError> {
     }
 }
 
+/// At most `max` bytes of `s`, cut on a character boundary (a byte offset can fall
+/// inside a multi-byte character, where slicing panics), with `…` when cut.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use meili_ingest_usage::clickhouse::ClickHouseConfig;
+    use tower::ServiceExt;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn query() -> UsageQuery {
+        UsageQuery {
+            date_from: "2026-11-01".into(),
+            date_to: "2026-11-06".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn clickhouse_rows_come_back_in_the_tinybird_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("param_project_id", "acme"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"day": "2026-11-02", "pipeline_uid": "builtin.pdf", "plugin": "",
+                          "jobs": 2, "documents_indexed": 40, "audio_seconds": 1.5}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config =
+            ClickHouseConfig::new(server.uri(), "glutony", "meili_ingest_usage", "u", None);
+        let rows = fetch_clickhouse(&reqwest::Client::new(), &config, "acme", &query())
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].day, "2026-11-02");
+        assert_eq!(rows[0].pipeline_uid, "builtin.pdf");
+        // Counters pass through as numbers, like Tinybird's.
+        let json = serde_json::to_value(&rows[0]).expect("serializes");
+        assert_eq!(json["jobs"], 2);
+        assert_eq!(json["documents_indexed"], 40);
+    }
+
+    #[tokio::test]
+    async fn a_clickhouse_failure_is_a_bad_gateway_without_the_password() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("X-ClickHouse-Exception-Code", "497")
+                    .set_body_string("Code: 497. Not enough privileges"),
+            )
+            .mount(&server)
+            .await;
+        let config = ClickHouseConfig::new(
+            server.uri(),
+            "glutony",
+            "meili_ingest_usage",
+            "u",
+            Some("ch-secret".into()),
+        );
+        let err = fetch_clickhouse(&reqwest::Client::new(), &config, "acme", &query())
+            .await
+            .expect_err("refused");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, GatewayError::Upstream(_)), "{msg}");
+        assert!(msg.contains("497") && !msg.contains("ch-secret"), "{msg}");
+    }
+
+    /// A body whose byte 300 falls inside `é` (bytes 299..301).
+    fn body_with_a_character_across_byte_300() -> String {
+        format!("{}é{}", "a".repeat(299), "b".repeat(10))
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let cut = truncate(&body_with_a_character_across_byte_300(), 300);
+        assert_eq!(cut, format!("{}…", "a".repeat(299)));
+        // Short and exactly-fitting bodies are untouched.
+        assert_eq!(truncate("short", 300), "short");
+        assert_eq!(truncate(&"a".repeat(300), 300), "a".repeat(300));
+        // A boundary exactly at the limit keeps everything before it.
+        assert_eq!(truncate("ab€", 2), "ab…");
+        assert_eq!(truncate("€uro", 1), "…");
+    }
+
+    #[tokio::test]
+    async fn a_tinybird_failure_is_a_bad_gateway_without_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/pipes/tenant_usage.json"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string(body_with_a_character_across_byte_300()),
+            )
+            .mount(&server)
+            .await;
+        let err = fetch_tinybird(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "tb-read-token",
+            "tenant_usage",
+            "acme",
+            &query(),
+        )
+        .await
+        .expect_err("refused");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, GatewayError::Upstream(_)), "{msg}");
+        assert!(
+            msg.contains("502") && !msg.contains("tb-read-token"),
+            "{msg}"
+        );
+    }
+
+    // -- through the router ------------------------------------------------
+
+    const TOKEN: &str = "tb-read-token";
+    const ENVOY_SECRET: &str = "envoy-secret";
+
+    /// A gateway whose usage store is a Tinybird pipe served by `tinybird`.
+    async fn usage_app(tinybird: &MockServer, mut config: GatewayConfig) -> axum::Router {
+        config.usage_api = Some(UsageApiConfig::Tinybird {
+            base_url: tinybird.uri(),
+            token: TOKEN.into(),
+            pipe: "tenant_usage".into(),
+        });
+        test_app(tinybird, config).await.0
+    }
+
+    /// Mount the Tinybird pipe, answering one row.
+    async fn mount_pipe(tinybird: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v0/pipes/tenant_usage.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"day": "2026-11-02", "pipeline_uid": "builtin.pdf", "plugin": "",
+                          "jobs": 2}]
+            })))
+            .mount(tinybird)
+            .await;
+    }
+
+    fn get(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut req = Request::get(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.body(Body::empty()).unwrap()
+    }
+
+    /// The query pairs of every request the pipe received, plus its bearer token.
+    async fn pipe_calls(tinybird: &MockServer) -> Vec<(Vec<(String, String)>, String)> {
+        tinybird
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/v0/pipes/tenant_usage.json")
+            .map(|r| {
+                let mut pairs: Vec<(String, String)> = r
+                    .url
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                pairs.sort();
+                let auth = r.headers["authorization"].to_str().unwrap().to_string();
+                (pairs, auth)
+            })
+            .collect()
+    }
+
+    fn pairs(project_id: &str) -> Vec<(String, String)> {
+        vec![
+            ("date_from".into(), "2026-11-01".into()),
+            ("date_to".into(), "2026-11-06".into()),
+            ("project_id".into(), project_id.into()),
+        ]
+    }
+
+    /// A caller trying to read another tenant's usage through the query string.
+    const SPOOFED: &str =
+        "/usage?date_from=2026-11-01&date_to=2026-11-06&tenant_id=other&project_id=other";
+
+    #[tokio::test]
+    async fn the_tenant_comes_from_the_trusted_edge_never_from_the_query() {
+        let tinybird = MockServer::start().await;
+        mount_pipe(&tinybird).await;
+        let config = GatewayConfig {
+            envoy_trusted_header: Some(ENVOY_SECRET.into()),
+            ..GatewayConfig::default()
+        };
+        let app = usage_app(&tinybird, config).await;
+
+        let resp = app
+            .clone()
+            .oneshot(get(
+                SPOOFED,
+                &[
+                    ("x-meili-project-id", "acme"),
+                    ("x-meili-envoy-secret", ENVOY_SECRET),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_body(resp).await;
+        assert_eq!(json["tenant_id"], "acme");
+        assert_eq!(json["data"][0]["pipeline_uid"], "builtin.pdf");
+        assert_eq!(json["data"][0]["jobs"], 2);
+
+        // Without the Envoy secret the header is not trusted: no tenant at all, and
+        // still nothing from the query string.
+        let resp = app
+            .oneshot(get(SPOOFED, &[("x-meili-project-id", "acme")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["tenant_id"], "");
+
+        assert_eq!(
+            pipe_calls(&tinybird).await,
+            vec![
+                (pairs("acme"), format!("Bearer {TOKEN}")),
+                (pairs(""), format!("Bearer {TOKEN}")),
+            ],
+            "exactly the forced tenant and the two dates reach the usage store"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_management_auth_the_tenant_is_the_one_the_token_acts_for() {
+        let tinybird = MockServer::start().await;
+        mount_pipe(&tinybird).await;
+        let config = GatewayConfig {
+            admin_api_key: Some("admin-key".into()),
+            ..GatewayConfig::default()
+        };
+        let app = usage_app(&tinybird, config).await;
+
+        // The edge header names another tenant: it fronts ingest, it never manages.
+        let resp = app
+            .clone()
+            .oneshot(get(
+                SPOOFED,
+                &[
+                    ("authorization", "Bearer admin-key"),
+                    ("x-glutony-tenant-id", "acme"),
+                    ("x-meili-project-id", "other"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["tenant_id"], "acme");
+
+        let resp = app
+            .oneshot(get(SPOOFED, &[("x-meili-project-id", "acme")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            pipe_calls(&tinybird).await,
+            vec![(pairs("acme"), format!("Bearer {TOKEN}"))],
+            "an unauthenticated caller never reaches the usage store"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_501_when_no_store_is_configured() {
+        let server = MockServer::start().await;
+        let (app, _) = test_app(&server, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(get("/usage?date_from=2026-11-01&date_to=2026-11-06", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(json_body(resp).await["code"], "not_configured");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bad_date_is_400_before_the_store_is_asked() {
+        let tinybird = MockServer::start().await;
+        mount_pipe(&tinybird).await;
+        let app = usage_app(&tinybird, GatewayConfig::default()).await;
+        for uri in [
+            "/usage?date_from=2026-11-01&date_to=2026-11-06'%20OR%201=1",
+            "/usage?date_from=yesterday&date_to=2026-11-06",
+            "/usage?date_to=2026-11-06",
+        ] {
+            let resp = app.clone().oneshot(get(uri, &[])).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(pipe_calls(&tinybird).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_is_502_with_a_short_body_and_no_token() {
+        let tinybird = MockServer::start().await;
+        // 300 bytes are kept; `TAIL` starts right after them.
+        let upstream = format!("{}TAIL{}", "x".repeat(300), "y".repeat(500));
+        Mock::given(method("GET"))
+            .and(path("/v0/pipes/tenant_usage.json"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(upstream))
+            .mount(&tinybird)
+            .await;
+        let app = usage_app(&tinybird, GatewayConfig::default()).await;
+        let resp = app
+            .oneshot(get("/usage?date_from=2026-11-01&date_to=2026-11-06", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let json = json_body(resp).await;
+        assert_eq!(json["code"], "upstream_error");
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("403"), "{error}");
+        assert!(error.ends_with(&format!("{}…", "x".repeat(300))), "{error}");
+        assert!(!error.contains("TAIL"), "{error}");
+        assert!(!json.to_string().contains(TOKEN), "{json}");
+    }
 
     #[test]
     fn only_plain_dates_are_accepted() {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::RowScope;
+use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, PipelineDefinition, RowScope, pinned_connection};
 use meili_ingest_source::{HostPolicy, SecretKey, SourceError};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -125,8 +125,8 @@ struct ConnectionPatch<'a> {
 // Public API shapes.
 // ---------------------------------------------------------------------------
 
-/// `POST /connections` body.
-#[derive(Debug, Clone, Deserialize)]
+/// `POST /connections` body. `Debug` prints `<redacted>` in place of the key.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateConnection {
     /// Name an indexer step will reference.
@@ -140,8 +140,20 @@ pub struct CreateConnection {
     pub api_key: String,
 }
 
+impl std::fmt::Debug for CreateConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateConnection")
+            .field("uid", &self.uid)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// `PATCH /connections/{uid}` body. Omitting `api_key` keeps the stored one.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `Debug` prints `<redacted>` in place of the key.
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateConnection {
     /// New display name.
@@ -153,6 +165,16 @@ pub struct UpdateConnection {
     /// New plaintext key.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for UpdateConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateConnection")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// A connection as the API returns it: the key is always [`MASK`].
@@ -205,8 +227,20 @@ impl ConnectionView {
 /// Whether `uid` is a usable connection name: the same `[a-zA-Z0-9._-]+` rule as
 /// pipeline uids, at most 128 bytes.
 pub fn valid_uid(uid: &str) -> bool {
+    uid.len() <= 128 && uid_charset(uid)
+}
+
+/// Whether `name` can be the uid of a pipeline: the `[a-zA-Z0-9._-]+` rule pipeline
+/// definitions are validated with, minus the dot segments `.` and `..`, which no URL
+/// path can address. Unlike [`valid_uid`] it sets no length cap, since pipeline
+/// definitions have none.
+pub fn valid_pipeline_uid(name: &str) -> bool {
+    uid_charset(name) && !matches!(name, "." | "..")
+}
+
+/// Non-empty and made of `[a-zA-Z0-9._-]` only.
+fn uid_charset(uid: &str) -> bool {
     !uid.is_empty()
-        && uid.len() <= 128
         && uid
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -223,6 +257,14 @@ pub fn normalize_host(raw: &str) -> Result<(String, Url), GatewayError> {
         )));
     }
     Ok((host, url))
+}
+
+/// Whether two URLs share an origin (scheme, host and effective port), the unit a stored
+/// secret is bound to. A path change stays on the origin; URLs without a tuple origin
+/// (`file:`, `data:`) never match anything.
+pub fn same_origin(a: &Url, b: &Url) -> bool {
+    let (a, b) = (a.origin(), b.origin());
+    a.is_tuple() && a == b
 }
 
 /// Prove a destination works before it is saved: the host policy, then
@@ -279,6 +321,45 @@ pub async fn validate_destination(
             "Meilisearch at {host} answered GET /indexes with {s}"
         ))),
     }
+}
+
+/// Refuse to run `pipeline` for `tenant_id` when one of its `meili_indexer` steps names a
+/// connection that, for this tenant, is a global one.
+///
+/// A tenant's job only ever resolves a connection the tenant owns; the worker fails the
+/// step otherwise. This turns that into a 422 at submit time wherever the gateway can
+/// see it. A connection that does not exist (yet) is not refused here: like a deleted
+/// one, it fails at run time (spec Decision 15). Without a tenant nothing is checked —
+/// untagged jobs keep using global connections.
+pub async fn require_tenant_connections(
+    control_plane: &ControlPlaneClient,
+    pipeline: &PipelineDefinition,
+    tenant_id: Option<&str>,
+) -> Result<(), GatewayError> {
+    let Some(tenant) = tenant_id else {
+        return Ok(());
+    };
+    let mut names: Vec<&str> = pipeline
+        .steps
+        .iter()
+        .filter(|s| s.plugin == INDEXER_PLUGIN)
+        .filter_map(|s| pinned_connection(&s.config))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        // The read falls back to the global row, which is exactly what is refused.
+        let row = control_plane.get_connection(name, Some(tenant)).await?;
+        if row.is_some_and(|r| r.tenant_id.is_none()) {
+            return Err(GatewayError::Unprocessable(format!(
+                "pipeline {:?} writes through {name:?}, a global connection; jobs for \
+                 tenant {tenant:?} can only use connections that tenant owns. Create a \
+                 connection named {name:?} for the tenant, or name one it already has",
+                pipeline.uid
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -435,12 +516,69 @@ mod tests {
     }
 
     #[test]
+    fn an_origin_is_scheme_host_and_effective_port() {
+        let u = |s: &str| Url::parse(s).expect("url");
+        let base = u("https://m.example");
+        assert!(same_origin(&base, &u("https://M.EXAMPLE:443/prefix")));
+        assert!(!same_origin(&base, &u("http://m.example")), "scheme");
+        assert!(!same_origin(&base, &u("https://m.example:8443")), "port");
+        assert!(!same_origin(&base, &u("https://other.example")), "host");
+        assert!(!same_origin(
+            &base,
+            &u("https://m.example.attacker.example")
+        ));
+        let file = u("file:///etc/passwd");
+        assert!(!same_origin(&file, &file), "no tuple origin never matches");
+    }
+
+    #[test]
+    fn request_bodies_never_print_the_key_in_debug() {
+        let create: CreateConnection = serde_json::from_value(serde_json::json!({
+            "uid": "prod", "host": "https://ms.example", "api_key": "SECRET"
+        }))
+        .unwrap();
+        let shown = format!("{create:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(shown.contains("prod") && shown.contains("https://ms.example"));
+
+        let update = UpdateConnection {
+            api_key: Some("SECRET".into()),
+            ..Default::default()
+        };
+        let shown = format!("{update:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        // Whether the request rotates the key stays visible.
+        assert!(shown.contains(r#"api_key: Some("<redacted>")"#), "{shown}");
+        assert!(format!("{:?}", UpdateConnection::default()).contains("api_key: None"));
+    }
+
+    #[test]
     fn uids_follow_the_pipeline_rule() {
         for ok in ["prod-movies", "a", "tmdb.v2", "x_y-z"] {
             assert!(valid_uid(ok), "{ok}");
         }
         for bad in ["", "has space", "../x", "a/b", "é", &"x".repeat(129)] {
             assert!(!valid_uid(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pipeline_uids_are_one_addressable_path_segment() {
+        for ok in ["builtin.pdf", "my-pdf_v2", "a", "...", &"x".repeat(300)] {
+            assert!(valid_pipeline_uid(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a?tenant_id=b",
+            "a#b",
+            "has space",
+            "é",
+        ] {
+            assert!(!valid_pipeline_uid(bad), "{bad:?}");
         }
     }
 

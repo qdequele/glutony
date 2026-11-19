@@ -44,18 +44,24 @@ def aggregate(project_id: str, date_from: str, date_to: str) -> list[dict]:
         if not day or day < date_from or day > date_to:
             continue
         kind = row.get("kind")
+        if kind not in ("job", "step"):
+            continue
         key = (day, row.get("pipeline_uid", ""), row.get("plugin", "") if kind == "step" else "")
         bucket = buckets[key]
         if kind == "job":
-            for k in JOB_COUNTERS:
-                bucket[k] += row.get(k, 0) or 0
-            bucket["jobs"] += 1 if not row.get("jobs") else 0
-            # The job row carries the final step's output: the corpus that landed.
+            # Rows carry the outcome in `status`, which is what the pipe reads: a
+            # cancelled job counts in `jobs` but in neither sub-counter.
+            status = row.get("status")
+            bucket["jobs"] += 1
+            bucket["jobs_succeeded"] += int(status == "succeeded")
+            bucket["jobs_failed"] += int(status == "failed")
+            # The job row carries what reached Meilisearch: the corpus that landed.
             bucket["documents_indexed"] += row.get("documents_out", 0) or 0
-        else:
+        elif kind == "step":
+            bucket["steps"] += 1
             for k in STEP_COUNTERS:
-                bucket[k] += row.get(k, 0) or 0
-            bucket["steps"] += 1 if not row.get("steps") else 0
+                if k != "steps":
+                    bucket[k] += row.get(k, 0) or 0
 
     out = []
     for (day, pipeline_uid, plugin), metrics in sorted(buckets.items()):

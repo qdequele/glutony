@@ -10,7 +10,7 @@ submission time — editing a pipeline never changes a running job.
 ## Anatomy
 
 ```yaml
-uid: my-pdf-with-enrichment            # [a-zA-Z0-9._-]+ ; builtin.* is reserved
+uid: my-pdf-with-enrichment            # [a-zA-Z0-9._-]+ ; builtin.* and validate are reserved
 name: "PDF with LLM enrichment"
 description: "Optional free text"
 version: 1                             # bumped automatically on update
@@ -18,7 +18,7 @@ version: 1                             # bumped automatically on update
 # Optional: auto-select this pipeline on POST /ingest
 trigger:
   content_types: [application/pdf]     # exact or type/* wildcards
-  filename_pattern: "contract_*.pdf"   # glob (* and ?), case-insensitive, optional
+  filename_pattern: "contract_*.pdf"   # glob (* and ?), case-insensitive, ≤ 256 characters, optional
   index_pattern: contracts             # target index, overrides header/query, optional
 
 steps:
@@ -53,7 +53,7 @@ steps:
 | `uid` | yes | Stable id used in URLs and `pipeline_used`. |
 | `name`, `description` | no | Display metadata. `name` defaults to `uid`. |
 | `version` | no | Managed by the control plane. |
-| `trigger` | no | Without a trigger the pipeline is only reachable via `POST /ingest/pipeline/:uid`. |
+| `trigger` | no | Without a trigger the pipeline is only reachable via `POST /ingest/pipeline/:uid`. `content_types` entries are compared case-insensitively and alias spellings are the same type: `audio/mp3` matches an upload detected as `audio/mpeg`, `image/jpg` matches `image/jpeg`, `application/x-zip-compressed` matches `application/zip`. |
 | `steps[]` | yes, ≥ 1 | The DAG. |
 | `steps[].id` | yes | Unique within the pipeline. |
 | `steps[].plugin` | yes | A registered plugin name; unknown → `422`. |
@@ -67,8 +67,13 @@ steps:
 
 - **Implicit sequencing.** A step without `depends_on` (other than the first)
   depends on the step listed right before it. Linear pipelines therefore never
-  need `depends_on`. In a DAG, write `depends_on` on every non-root step and
-  list root steps first.
+  need `depends_on`. `depends_on: []` counts as no `depends_on`, so **only the
+  first step runs on the job's initial input**: two steps cannot both start from
+  it. To branch, have several steps depend on the same step
+  (`depends_on: [extract]`); write `depends_on` on every step after a branch.
+- **Unknown keys are dropped.** A key the definition does not know (a `match:`
+  block instead of `trigger:`, a misspelled step field) is ignored when the
+  pipeline is saved. `POST /pipelines/validate` lists them in `warnings`.
 - **Parallelism.** Steps whose dependencies are all satisfied and that do not
   depend on each other run concurrently.
 - **Input resolution.** No dependency → the job's initial input (bytes, a
@@ -79,18 +84,25 @@ steps:
   (useful to force the step to run on the raw output). Branch results are
   collected into a `Many` output; the next step receives it as its input
   (fan-in). Plugins that accept `documents` flatten `Many` automatically.
+  An upstream output with no documents runs zero branches and the step
+  succeeds with nothing; a `$.documents` fan-out over an output that is not
+  documents (raw bytes, when the steps are in the wrong order) fails the step.
 - **Routing.** Each activity is scheduled on the task queue of its plugin
-  (`workers-general` / `workers-io`). AI steps call hosted APIs, so they run
-  on `workers-general` with parsing; downloads run on `workers-io`.
+  (today `workers-general` for every plugin). AI steps call hosted APIs, so they
+  run there with parsing.
 - **Failure.** A step that exhausts its retries, or returns a non-retryable
   error, fails the job with `status: failed` and the message in `error`.
   Already-completed steps are not rolled back (documents indexed by an
-  earlier indexer step stay indexed).
+  earlier indexer step stay indexed). What the job consumed before it stopped
+  is still metered: steps running alongside the failed one, and the branches
+  of a fanned-out step that completed before one of them failed.
 - **Cancellation.** `POST /jobs/:id/cancel` sets `cancel_requested`; running
   activities are cancelled, no new step starts, status becomes `cancelled`.
 - **Validation** at creation time (and by `POST /pipelines/validate`, which
   saves nothing): unique ids, known dependencies, no cycles (Kahn's algorithm),
-  `fan_out` arity/path, known plugins, each step's `config` against its plugin's
+  `fan_out` arity/path (a `meili_indexer` step with `prune: true` accepts no
+  `fan_out` other than `$`), a `trigger.filename_pattern` of at most 256 characters,
+  known plugins, each step's `config` against its plugin's
   `config_schema` from `GET /plugins` (unknown keys and wrong types are `422`),
   and each `meili_indexer` `connection` against the tenant's connections (its
   own, else a global one). A plugin that no worker has registered yet has no
@@ -99,9 +111,18 @@ steps:
 ## Payload sizes
 
 Temporal payloads are capped at 2 MB, so meili-ingest never relies on them for
-content: uploads above `INLINE_MAX_BYTES` (1 MiB) are staged in the blob store
-and step outputs above `PAYLOAD_SPILL_BYTES` (1 MiB) are spilled there. This is
-invisible to plugins and to pipeline authors.
+content: uploads and inline `documents` above `INLINE_MAX_BYTES` (1 MiB) are
+staged in the blob store and step outputs above `PAYLOAD_SPILL_BYTES` (1 MiB)
+are spilled there. A fanned-out step shares that budget: its branch inputs
+travel as one list and its branch outputs are merged into one input for the
+next step, so branches are spilled as needed to keep each of those under
+`PAYLOAD_SPILL_BYTES` as a whole (a branch output is spilled above
+`PAYLOAD_SPILL_BYTES` divided by the number of branches). The same goes for a
+step with several `depends_on`: their outputs are merged into its one input, so
+each of them is spilled above `PAYLOAD_SPILL_BYTES` divided by the number of
+outputs merged (and by its branches too, when fanned out). This is invisible to
+plugins and to pipeline authors: staged documents reach the first step as
+documents, exactly as inline ones do.
 
 ## Built-in pipelines
 
@@ -115,13 +136,16 @@ invisible to plugins and to pipeline authors.
 | `builtin.text` | `text/plain` | chunker → meili_indexer |
 | `builtin.markdown` | `text/markdown`, `text/x-markdown` | markdown_extractor → meili_indexer |
 | `builtin.csv` | `text/csv` | csv_parser → meili_indexer |
-| `builtin.json` | `application/json` | json_flattener → meili_indexer |
+| `builtin.json` | `application/json`, `application/x-ndjson` | json_flattener → meili_indexer |
 | `builtin.parquet` | `application/vnd.apache.parquet` | parquet_parser → meili_indexer |
 | `builtin.avro` | `application/vnd.apache.avro` | avro_parser → meili_indexer |
 | `builtin.msgpack` | `application/vnd.msgpack` | msgpack_parser → meili_indexer |
 | `builtin.image` | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | image_captioner → meili_indexer |
-| `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4` | whisper_transcriber → meili_indexer |
-| `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm` | video_audio_extractor → whisper_transcriber → meili_indexer |
+| `builtin.audio` | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/mp4`, `audio/flac` | whisper_transcriber → meili_indexer |
+| `builtin.video` | `video/mp4`, `video/quicktime`, `video/webm`, `video/x-matroska` | video_audio_extractor → whisper_transcriber → meili_indexer |
+
+Zip, tar and gzip uploads are not routed to a pipeline: each file inside them is,
+as its own job. See [Archives](/concepts/archives).
 
 Default chunker config: `strategy: sentence, chunk_size: 512, overlap: 64`.
 Default retry: `max_attempts: 3, backoff: exponential`.

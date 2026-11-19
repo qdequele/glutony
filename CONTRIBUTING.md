@@ -15,7 +15,13 @@ cargo test --workspace
 DATABASE_URL=postgres://postgres:dev-password@localhost:5432/postgres cargo test -p meili-ingest-control-plane
 ```
 
-The control-plane DB tests skip without `DATABASE_URL`. `docs/openapi.yaml` is checked against the router by `crates/gateway/src/routes.rs`: a new route goes in `ROUTES`, `lib.rs` and the spec.
+The control-plane DB tests skip without `DATABASE_URL`. The Temporal-backed
+tests (`schedules_temporal`, `archive_temporal`, `source_run_temporal`) skip
+without `TEMPORAL_TEST_URL`: run them against a dev server no other worker
+polls (`temporal server start-dev --headless --port 57233`, then
+`TEMPORAL_TEST_URL=http://127.0.0.1:57233 cargo test --workspace`). CI's `test`
+job starts one, and with `CI` set a missing `TEMPORAL_TEST_URL` fails them
+instead of skipping. `docs/openapi.yaml` is checked against the router by `crates/gateway/src/routes.rs`: a new route goes in `ROUTES`, `lib.rs` and the spec.
 
 ## Rules
 
@@ -37,8 +43,9 @@ Releases are automated; nobody edits a version or pushes a tag by hand.
    any `feat`: minor; otherwise patch), or `patch`, `minor`, `major`, or an
    exact `X.Y.Z`. It runs `scripts/prepare-release.sh`, which bumps
    `[workspace.package] version` and the pinned `version` of the internal path
-   dependencies in `Cargo.toml`, the workspace crates in `Cargo.lock` and
-   `info.version` in `docs/openapi.yaml`, and folds `Unreleased` into
+   dependencies in `Cargo.toml`, the workspace crates in `Cargo.lock`,
+   `info.version` in `docs/openapi.yaml` and the image `newTag` in
+   `k8s/kustomization.yaml` (`X.Y.Z`, no `v`), and folds `Unreleased` into
    `## [X.Y.Z] - YYYY-MM-DD`. It opens or refreshes the PR
    `chore(release): vX.Y.Z` and dispatches CI on it.
 3. **Merge the release PR** on green. `release-on-merge.yml` tags the merge
@@ -51,11 +58,18 @@ Releases are automated; nobody edits a version or pushes a tag by hand.
 Locally, `scripts/prepare-release.sh` with no argument prints the suggested
 bump; `scripts/prepare-release.sh patch` prepares the same commit the workflow
 makes (re-running it is safe: bumps count from the last tag).
-`scripts/prepare-release.sh --check` is CI's `version sync` job.
+`scripts/prepare-release.sh --check` is CI's `version sync` job;
+`scripts/prepare-release.sh --sync` puts the crate version back into
+`k8s/kustomization.yaml` when `--check` reports its `newTag` (it bumps nothing).
 
 A tag pushed with `GITHUB_TOKEN` triggers no workflow, so
 `release-on-merge.yml` calls `release.yml` as a reusable workflow; a tag pushed
-by hand still runs `release.yml` (recovery only).
+by hand still runs `release.yml` (recovery only). Either way `release.yml`
+publishes nothing unless `scripts/prepare-release.sh --verify-tag vX.Y.Z`
+passes on the tagged tree: the crate version is `X.Y.Z`, every copy agrees and
+`CHANGELOG.md` has the `[X.Y.Z]` section. So never create a release or tag from
+GitHub's "Draft a new release" form: it tags `main` as it is, unbumped.
+`scripts/test-prepare-release.sh` tests the script (CI's `version sync` job).
 
 Repository setup: Settings > Actions > General > "Allow GitHub Actions to
 create and approve pull requests". Optional secret `LAB_DISPATCH_TOKEN`: a

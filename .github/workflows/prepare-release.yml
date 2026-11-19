@@ -72,7 +72,7 @@ jobs:
           git switch -C "$branch"
           # Only the files prepare-release.sh rewrote (all tracked).
           git add -u
-          git commit -m "$title" -m "Version $VERSION in the crate, Cargo.lock and the OpenAPI contract; CHANGELOG section for $VERSION."
+          git commit -m "$title" -m "Version $VERSION in the crate, Cargo.lock, the OpenAPI contract and the k8s image tag; CHANGELOG section for $VERSION."
           # The branch is rebuilt from main on every run: force is safe here.
           git push --force origin "$branch"
 

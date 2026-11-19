@@ -4,13 +4,25 @@
 //! [`Document`]s whose `fields` are flat, dotted-key objects (`a.b.c`).
 //!
 //! Input can be raw bytes (a JSON value, or NDJSON with one value per line)
-//! or documents from a previous step, whose `fields` are re-flattened.
+//! or documents from a previous step, whose `fields` are re-flattened. Such a
+//! document keeps its own `content` unless `content_fields` is set; the default
+//! "every string leaf" rule only fills an empty one.
 //!
-//! Document selection from a single JSON value:
+//! Flattened keys are unique: when two values flatten to the same key (`{"a.b": 1,
+//! "a": {"b": 2}}`), the later one gets the first free `_2`, `_3`, … suffix, so no
+//! value is dropped.
+//!
+//! Document selection from a single JSON value, when `root` is not set:
 //! * top-level array → one document per element;
 //! * object with an array under `documents`, `items`, `data`, `results` or
 //!   `hits` → one document per element of that array;
 //! * anything else → one document.
+//!
+//! NDJSON lines are never unwrapped that way: each line is one document. `root`
+//! replaces the rule: `none` reads the payload as is (a top-level array is one
+//! document per element, anything else one document, a one-line NDJSON file like
+//! any other), and a JSON Pointer (`/data/orders`) names the array holding the
+//! records, in the payload or in each NDJSON line.
 //!
 //! Configuration (all keys optional):
 //!
@@ -21,10 +33,15 @@
 //! | `title_field`    | none    | flattened key mapped onto `title` (removed from `fields`) |
 //! | `flatten_arrays` | `false` | flatten arrays of objects into `a.0.b` keys instead of keeping them as JSON arrays |
 //! | `max_depth`      | `8`     | nesting depth beyond which objects are kept as-is |
+//! | `root`           | wrapper keys | `none`, or a JSON Pointer to the record array (see above) |
 
 use meili_ingest_plugin_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
+
+pub mod limits;
+pub use limits::{DecodeBudget, DecodeLimits, decoded_size};
 
 /// Plugin name referenced by `steps[].plugin`.
 pub const NAME: &str = "json_flattener";
@@ -101,16 +118,93 @@ impl FlattenConfig {
     }
 }
 
-/// Parse bytes as a single JSON value, falling back to NDJSON (one value per line).
-fn parse_payload(data: &[u8]) -> Result<Vec<Value>, PluginError> {
+/// Where the records of a byte payload are (`root`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Root {
+    /// Unset: [`select_roots`] on a single value, NDJSON lines as they are.
+    WrapperKeys,
+    /// `none`: the value as is; a top-level array is still one record per element.
+    AsIs,
+    /// A JSON Pointer to the array of records, in the value or in each NDJSON line.
+    Pointer(String),
+}
+
+impl Root {
+    /// Take `root` out of a raw `config:` block, so the rest is a [`FlattenConfig`].
+    fn take(config: &mut Value) -> Result<Self, PluginError> {
+        match config.as_object_mut().and_then(|o| o.remove("root")) {
+            None | Some(Value::Null) => Ok(Self::WrapperKeys),
+            Some(Value::String(s)) if s == "none" => Ok(Self::AsIs),
+            Some(Value::String(s)) if s.starts_with('/') => Ok(Self::Pointer(s)),
+            Some(other) => Err(PluginError::InvalidConfig(format!(
+                "{NAME}: `root` must be \"none\" or a JSON Pointer such as \"/data/items\", \
+                 got {other}"
+            ))),
+        }
+    }
+
+    /// The records of one parsed value: the whole payload, or one NDJSON line.
+    fn select(&self, value: Value, ndjson_line: bool) -> Result<Vec<Value>, PluginError> {
+        match self {
+            Self::WrapperKeys if ndjson_line => Ok(vec![value]),
+            Self::WrapperKeys => Ok(select_roots(value)),
+            Self::AsIs if ndjson_line => Ok(vec![value]),
+            Self::AsIs => Ok(match value {
+                Value::Array(items) => items,
+                other => vec![other],
+            }),
+            Self::Pointer(pointer) => {
+                let mut value = value;
+                match value.pointer_mut(pointer).map(Value::take) {
+                    Some(Value::Array(items)) => Ok(items),
+                    Some(other) => Err(PluginError::InvalidInput(format!(
+                        "{NAME}: `root` {pointer} holds {}, not an array of records",
+                        kind(&other)
+                    ))),
+                    None => Err(PluginError::InvalidInput(format!(
+                        "{NAME}: `root` {pointer} is not in the payload"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// A JSON value's kind, for error messages.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Parse bytes as a single JSON value, falling back to NDJSON (one value per line),
+/// and pick the records by `root`.
+///
+/// Synchronous and CPU-bound: call it from [`run_blocking`]. The NDJSON pass polls
+/// cancellation, since a blocking task cannot be aborted from outside.
+fn parse_payload(
+    ctx: &ActivityContext,
+    data: &[u8],
+    root: &Root,
+) -> Result<Vec<Value>, PluginError> {
     match serde_json::from_slice::<Value>(data) {
-        Ok(v) => Ok(select_roots(v)),
+        Ok(v) => root.select(v, false),
         Err(single_err) => {
+            ctx.check_cancelled()?;
             let text = std::str::from_utf8(data).map_err(|e| {
                 PluginError::InvalidInput(format!("{NAME}: payload is not UTF-8: {e}"))
             })?;
             let mut roots = Vec::new();
+            let mut lines = 0usize;
             for (i, line) in text.lines().enumerate() {
+                if i.is_multiple_of(HEARTBEAT_EVERY) {
+                    ctx.check_cancelled()?;
+                }
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -120,9 +214,10 @@ fn parse_payload(data: &[u8]) -> Result<Vec<Value>, PluginError> {
                         i + 1
                     ))
                 })?;
-                roots.push(v);
+                roots.extend(root.select(v, true)?);
+                lines += 1;
             }
-            if roots.is_empty() {
+            if lines == 0 {
                 return Err(PluginError::InvalidInput(format!(
                     "{NAME}: invalid JSON: {single_err}"
                 )));
@@ -152,6 +247,47 @@ pub fn select_roots(value: Value) -> Vec<Value> {
     }
 }
 
+/// Insert `value` under `key`, or under the first free `<key>_<k>` (`k` from 2)
+/// when `key` is taken, so a collision never drops a value: `{"a.b": 1, "a": {"b": 2}}`
+/// flattens to `a.b` and `a.b_2`. Public so the binary formats apply the same rule
+/// to their own key collisions.
+///
+/// Each call searches the suffixes from `_2`: to insert many keys into one map,
+/// use a [`UniqueKeys`], which picks the same names in amortised constant time.
+pub fn insert_unique(out: &mut Map<String, Value>, key: String, value: Value) {
+    UniqueKeys::default().insert(out, key, value);
+}
+
+/// [`insert_unique`] for many keys into one map: it remembers, per key, the next
+/// suffix to try, so `n` repeats of one key cost `O(n)` lookups instead of
+/// `O(n^2)`. It picks exactly the names [`insert_unique`] would, as long as no key
+/// is removed from the map while it is used (a suffix found taken stays taken).
+#[derive(Debug, Default)]
+pub struct UniqueKeys {
+    next: HashMap<String, usize>,
+}
+
+impl UniqueKeys {
+    /// Insert `value` under `key`, or under the first free `<key>_<k>` (`k` from 2).
+    pub fn insert(&mut self, out: &mut Map<String, Value>, key: String, value: Value) {
+        if !out.contains_key(&key) {
+            out.insert(key, value);
+            return;
+        }
+        // Every suffix below the remembered one is taken already.
+        let mut k = self.next.get(&key).copied().unwrap_or(2);
+        let candidate = loop {
+            let candidate = format!("{key}_{k}");
+            if !out.contains_key(&candidate) {
+                break candidate;
+            }
+            k += 1;
+        };
+        out.insert(candidate, value);
+        self.next.insert(key, k + 1);
+    }
+}
+
 fn is_scalar(v: &Value) -> bool {
     !matches!(v, Value::Object(_) | Value::Array(_))
 }
@@ -174,7 +310,7 @@ fn flatten_into(
     match value {
         Value::Object(obj) => {
             if depth >= cfg.max_depth || obj.is_empty() {
-                out.insert(prefix.to_owned(), Value::Object(obj));
+                insert_unique(out, prefix.to_owned(), Value::Object(obj));
                 return;
             }
             for (k, v) in obj {
@@ -184,16 +320,14 @@ fn flatten_into(
         Value::Array(items) => {
             let all_scalars = items.iter().all(is_scalar);
             if all_scalars || !cfg.flatten_arrays || depth >= cfg.max_depth {
-                out.insert(prefix.to_owned(), Value::Array(items));
+                insert_unique(out, prefix.to_owned(), Value::Array(items));
             } else {
                 for (i, v) in items.into_iter().enumerate() {
                     flatten_into(&key(&i.to_string()), v, depth + 1, cfg, out);
                 }
             }
         }
-        scalar => {
-            out.insert(prefix.to_owned(), scalar);
-        }
+        scalar => insert_unique(out, prefix.to_owned(), scalar),
     }
 }
 
@@ -280,20 +414,26 @@ fn build_document(
         .filter(|s| !s.is_empty())
         .or(fallback.title);
 
-    let content = match &cfg.content_fields {
-        Some(keys) => keys
-            .iter()
-            .filter_map(|k| fields.remove(k))
-            .map(|v| value_text(&v))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
-        None => string_leaves(&fields).join(" "),
-    };
-    let content = if content.is_empty() {
-        fallback.content.unwrap_or_default()
-    } else {
-        content
+    // An upstream document's own content wins unless `content_fields` says
+    // otherwise: the default "every string leaf" rule only fills an empty one.
+    let upstream = fallback.content.filter(|c| !c.is_empty());
+    let content = match (&cfg.content_fields, upstream) {
+        (Some(keys), upstream) => {
+            let joined = keys
+                .iter()
+                .filter_map(|k| fields.remove(k))
+                .map(|v| value_text(&v))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.is_empty() {
+                upstream.unwrap_or_default()
+            } else {
+                joined
+            }
+        }
+        (None, Some(upstream)) => upstream,
+        (None, None) => string_leaves(&fields).join(" "),
     };
 
     Document {
@@ -350,17 +490,13 @@ pub fn documents_from_values(
     build_documents(ctx, items, cfg, label)
 }
 
-/// Filename stem used to build generated ids (`<stem>_<index>`).
+/// Stem used to build generated ids (`<stem>_<index>`): [`Blob::id_stem`].
 ///
 /// `fallback` names the format (`json`, `msgpack`, ...) and is used when there is
-/// no filename to derive a stem from.
-pub fn id_stem(filename: Option<&str>, fallback: &str) -> String {
-    let stem = filename
-        .map(|f| f.rsplit(['/', '\\']).next().unwrap_or(f))
-        .map(|f| f.rsplit_once('.').map(|(s, _)| s).unwrap_or(f))
-        .filter(|s| !s.is_empty())
-        .unwrap_or(fallback);
-    sanitize_id(stem)
+/// no filename to derive a stem from. A fetched blob's stem carries its origin tag,
+/// so `https://a.example/data.json` and `https://b.example/data.json` never share ids.
+pub fn id_stem(blob: &Blob, fallback: &str) -> String {
+    blob.id_stem(fallback)
 }
 
 #[async_trait]
@@ -388,7 +524,7 @@ impl Plugin for JsonFlattenerPlugin {
                         "type": ["array", "null"],
                         "items": {"type": "string"},
                         "default": null,
-                        "description": "Flattened keys joined by a space into `content` (removed from fields). Defaults to every string leaf."
+                        "description": "Flattened keys joined by a space into `content` (removed from fields). Defaults to every string leaf; an upstream document keeps its own non-empty `content` unless this is set."
                     },
                     "title_field": {
                         "type": ["string", "null"],
@@ -405,6 +541,12 @@ impl Plugin for JsonFlattenerPlugin {
                         "minimum": 1,
                         "default": 8,
                         "description": "Nesting depth beyond which objects are kept as JSON values."
+                    },
+                    "root": {
+                        "type": ["string", "null"],
+                        "pattern": "^(none|/.*)$",
+                        "default": null,
+                        "description": "Where the records of a JSON payload are. Unset: a top-level array, or the array under a documents/items/data/results/hits key. \"none\": the payload as is (a top-level array is one document per element, anything else one document). A JSON Pointer such as \"/data/orders\": the array it points to, in the payload or in each NDJSON line."
                     }
                 }
             }))
@@ -416,57 +558,68 @@ impl Plugin for JsonFlattenerPlugin {
         input: PluginInput,
         config: Value,
     ) -> Result<PluginOutput, PluginError> {
+        let mut config = config;
+        let root = Root::take(&mut config)?;
         let cfg = FlattenConfig::parse(config)?;
+        // Parsing and flattening are CPU-bound: keep them off the async runtime.
+        let ctx = ctx.clone();
+        let docs = run_blocking(move || flatten_input(&ctx, input, &cfg, &root)).await??;
+        Ok(PluginOutput::Documents(docs))
+    }
+}
 
-        // (root value, generated id, fallbacks)
-        let items: Vec<(Value, String, Fallback)> = match input {
-            PluginInput::Bytes(blob) => {
-                let stem = id_stem(blob.filename.as_deref(), "json");
-                let meta = DocumentMeta {
-                    source: blob.filename.clone(),
-                    filename: blob.filename.clone(),
-                    mime: Some(blob.mime.clone()),
-                    ..Default::default()
-                };
-                parse_payload(&blob.data)?
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        (
-                            v,
-                            format!("{stem}_{i}"),
-                            Fallback {
-                                meta: meta.clone(),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect()
-            }
-            other => other
-                .into_documents()?
+/// Parse (bytes) or re-flatten (documents) `input`. Synchronous; see [`run_blocking`].
+fn flatten_input(
+    ctx: &ActivityContext,
+    input: PluginInput,
+    cfg: &FlattenConfig,
+    root: &Root,
+) -> Result<Vec<Document>, PluginError> {
+    // (root value, generated id, fallbacks)
+    let items: Vec<(Value, String, Fallback)> = match input {
+        PluginInput::Bytes(blob) => {
+            let stem = id_stem(&blob, "json");
+            let meta = DocumentMeta {
+                source: blob.filename.clone(),
+                filename: blob.filename.clone(),
+                mime: Some(blob.mime.clone()),
+                ..Default::default()
+            };
+            parse_payload(ctx, &blob.data, root)?
                 .into_iter()
                 .enumerate()
-                .map(|(i, d)| {
-                    let generated = format!("{}_{i}", d.id);
+                .map(|(i, v)| {
                     (
-                        Value::Object(d.fields),
-                        generated,
+                        v,
+                        format!("{stem}_{i}"),
                         Fallback {
-                            id: Some(d.id),
-                            title: d.title,
-                            content: Some(d.content),
-                            meta: d.meta,
+                            meta: meta.clone(),
+                            ..Default::default()
                         },
                     )
                 })
-                .collect(),
-        };
-
-        Ok(PluginOutput::Documents(build_documents(
-            ctx, items, &cfg, NAME,
-        )?))
-    }
+                .collect()
+        }
+        other => other
+            .into_documents()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let generated = format!("{}_{i}", d.id);
+                (
+                    Value::Object(d.fields),
+                    generated,
+                    Fallback {
+                        id: Some(d.id),
+                        title: d.title,
+                        content: Some(d.content),
+                        meta: d.meta,
+                    },
+                )
+            })
+            .collect(),
+    };
+    build_documents(ctx, items, cfg, NAME)
 }
 
 #[cfg(test)]
@@ -493,6 +646,81 @@ mod tests {
         }
     }
 
+    fn fetched(data: &str, filename: &str, origin: &str) -> PluginInput {
+        PluginInput::Bytes(
+            Blob::new(
+                data.as_bytes().to_vec(),
+                "application/json",
+                Some(filename.to_owned()),
+            )
+            .with_origin(Some(origin.to_owned())),
+        )
+    }
+
+    #[tokio::test]
+    async fn two_origins_with_the_same_filename_get_distinct_ids() {
+        // Two sources ending in `/data.json` feeding one index used to both write
+        // `data_0`, `data_1`, ... and overwrite each other's documents.
+        let payload = r#"[{"name": "a"}, {"name": "b"}]"#;
+        let a = run(
+            fetched(payload, "data.json", "https://a.example/export/data.json"),
+            json!({}),
+        )
+        .await;
+        let b = run(
+            fetched(payload, "data.json", "https://b.example/v2/data.json"),
+            json!({}),
+        )
+        .await;
+        let ids = |d: &[Document]| d.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+        assert!(
+            ids(&a).iter().all(|id| !ids(&b).contains(id)),
+            "{:?} vs {:?}",
+            ids(&a),
+            ids(&b)
+        );
+        let tag = meili_ingest_plugin_sdk::origin_tag("https://a.example/export/data.json");
+        assert_eq!(ids(&a), [format!("data_{tag}_0"), format!("data_{tag}_1")]);
+    }
+
+    #[tokio::test]
+    async fn re_running_the_same_origin_keeps_the_ids() {
+        // Idempotent re-runs: the second run replaces the first one's documents.
+        let first = run(
+            fetched(r#"[{"v": 1}, {"v": 2}]"#, "json", "source:t1/httpbin"),
+            json!({}),
+        )
+        .await;
+        let second = run(
+            fetched(r#"[{"v": 10}, {"v": 20}]"#, "json", "source:t1/httpbin"),
+            json!({}),
+        )
+        .await;
+        let ids = |d: &[Document]| d.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&second));
+    }
+
+    #[tokio::test]
+    async fn a_documents_own_id_wins_over_the_origin() {
+        // The content's primary key is kept as is: fetched or uploaded, `id: 7` is `7`.
+        let docs = run(
+            fetched(
+                r#"[{"id": 7, "v": 1}]"#,
+                "data.json",
+                "https://a.example/data.json",
+            ),
+            json!({}),
+        )
+        .await;
+        assert_eq!(docs[0].id, "7");
+    }
+
+    #[tokio::test]
+    async fn an_upload_keeps_its_filename_ids() {
+        let docs = run(bytes(r#"[{"v": 1}]"#, Some("data.json")), json!({})).await;
+        assert_eq!(docs[0].id, "data_0");
+    }
+
     #[test]
     fn manifest_is_correct() {
         let m = JsonFlattenerPlugin.manifest();
@@ -513,6 +741,7 @@ mod tests {
             "title_field",
             "flatten_arrays",
             "max_depth",
+            "root",
         ] {
             assert!(props.contains_key(key), "schema missing {key}");
         }
@@ -598,6 +827,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_none_keeps_a_record_with_a_wrapper_named_field_whole() {
+        let order = r#"{"id":"order-1","customer":"Ada","items":["hat","shoe"]}"#;
+        // Unset: today's wrapper-key unwrapping.
+        let docs = run(bytes(order, None), json!({})).await;
+        assert_eq!(docs.len(), 2);
+
+        let docs = run(bytes(order, None), json!({"root": "none"})).await;
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, "order-1");
+        assert_eq!(docs[0].fields["customer"], json!("Ada"));
+        assert_eq!(docs[0].fields["items"], json!(["hat", "shoe"]));
+
+        let empty = r#"{"id":"order-2","items":[]}"#;
+        let docs = run(bytes(empty, None), json!({"root": "none"})).await;
+        assert_eq!(
+            docs.len(),
+            1,
+            "an empty wrapper-named array is just a field"
+        );
+        assert_eq!(docs[0].id, "order-2");
+
+        // A one-line NDJSON file is read like the same line in a longer file.
+        let one = run(
+            bytes("{\"id\":1,\"data\":[1,2]}\n", None),
+            json!({"root": "none"}),
+        )
+        .await;
+        let two = run(
+            bytes("{\"id\":1,\"data\":[1,2]}\n{\"id\":2}\n", None),
+            json!({"root": "none"}),
+        )
+        .await;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].fields, two[0].fields);
+        assert_eq!(one[0].id, two[0].id);
+
+        // A top-level array is still one document per element.
+        let docs = run(
+            bytes(r#"[{"id":"a","items":[1]},{"id":"b"}]"#, None),
+            json!({"root": "none"}),
+        )
+        .await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(docs[0].fields["items"], json!([1]));
+    }
+
+    #[tokio::test]
+    async fn root_pointer_selects_the_record_array() {
+        let page = r#"{"data": {"orders": [{"id": "x"}, {"id": "y"}]}, "items": [{"id": "z"}]}"#;
+        let docs = run(bytes(page, None), json!({"root": "/data/orders"})).await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+
+        // Each NDJSON line is a page of its own.
+        let pages = "{\"r\":[{\"id\":1},{\"id\":2}]}\n{\"r\":[{\"id\":3}]}\n";
+        let docs = run(bytes(pages, None), json!({"root": "/r"})).await;
+        assert_eq!(
+            docs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+
+        let docs = run(bytes(r#"{"r": []}"#, None), json!({"root": "/r"})).await;
+        assert!(docs.is_empty(), "an empty record array is no records");
+
+        let plugin = JsonFlattenerPlugin::new();
+        let ctx = ActivityContext::noop();
+        for (payload, root) in [(page, "/missing"), (page, "/data")] {
+            let err = plugin
+                .execute(&ctx, bytes(payload, None), json!({"root": root}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, PluginError::InvalidInput(m) if m.contains(root)),
+                "{root}: {err}"
+            );
+        }
+        for bad in [
+            json!({"root": "data"}),
+            json!({"root": 3}),
+            json!({"root": "auto"}),
+        ] {
+            let err = plugin
+                .execute(&ctx, bytes(page, None), bad.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PluginError::InvalidConfig(_)), "{bad}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn colliding_flattened_keys_never_drop_a_value() {
+        let docs = run(
+            bytes(
+                r#"{"a.b": 1, "a": {"b": 2}, "c": [{"x": 3}], "c.0.x": 4}"#,
+                None,
+            ),
+            json!({"flatten_arrays": true}),
+        )
+        .await;
+        let f = &docs[0].fields;
+        let mut ab: Vec<Value> = ["a.b", "a.b_2"].iter().map(|k| f[*k].clone()).collect();
+        ab.sort_by_key(|v| v.as_i64());
+        assert_eq!(ab, [json!(1), json!(2)], "{f:?}");
+        let mut cx: Vec<Value> = ["c.0.x", "c.0.x_2"].iter().map(|k| f[*k].clone()).collect();
+        cx.sort_by_key(|v| v.as_i64());
+        assert_eq!(cx, [json!(3), json!(4)], "{f:?}");
+        assert_eq!(f.len(), 4, "{f:?}");
+    }
+
+    #[test]
+    fn insert_unique_takes_the_first_free_suffix() {
+        let mut m = Map::new();
+        insert_unique(&mut m, "k".into(), json!(1));
+        insert_unique(&mut m, "k_2".into(), json!(2));
+        insert_unique(&mut m, "k".into(), json!(3));
+        assert_eq!(m["k"], json!(1));
+        assert_eq!(m["k_2"], json!(2));
+        assert_eq!(m["k_3"], json!(3));
+    }
+
+    #[test]
+    fn unique_keys_pick_the_names_insert_unique_picks() {
+        // Repeats, keys that look like suffixes, and suffixes of suffixes.
+        let keys = [
+            "k", "k_3", "k", "k", "k_2", "k", "j", "k_2", "k_2", "j", "k_6", "k", "k",
+        ];
+        let (mut one_by_one, mut shared) = (Map::new(), Map::new());
+        let mut unique = UniqueKeys::default();
+        for (i, key) in keys.iter().enumerate() {
+            insert_unique(&mut one_by_one, (*key).to_owned(), json!(i));
+            unique.insert(&mut shared, (*key).to_owned(), json!(i));
+        }
+        assert_eq!(shared.len(), keys.len(), "no value dropped");
+        assert_eq!(shared, one_by_one);
+    }
+
+    #[tokio::test]
     async fn title_and_content_fields_are_mapped_and_removed() {
         let payload =
             r#"{"id": "doc 1", "headline": "Hello", "body": "World", "extra": "kept", "n": 3}"#;
@@ -639,8 +1010,18 @@ mod tests {
         assert_eq!(out.title.as_deref(), Some("T"));
         assert_eq!(out.fields["nested.x.y"], json!("deep"));
         assert_eq!(out.fields["nested.list"], json!([1, 2]));
-        assert_eq!(out.content, "deep", "content is rebuilt from string leaves");
+        assert_eq!(
+            out.content, "old content",
+            "an upstream content is kept, not rebuilt from string leaves"
+        );
         assert_eq!(out.meta.page, Some(3), "meta is preserved");
+
+        // An empty upstream content is filled from the string leaves.
+        let mut d = Document::with_id("p1", "");
+        d.fields
+            .insert("nested".into(), json!({"x": {"y": "deep"}}));
+        let docs = run(PluginInput::Documents(vec![d]), json!({})).await;
+        assert_eq!(docs[0].content, "deep");
 
         // Many input is flattened too, and an upstream `content` survives when nothing else is textual.
         let d = Document::with_id("p2", "keep me");
@@ -650,6 +1031,56 @@ mod tests {
         )
         .await;
         assert_eq!(docs[0].content, "keep me");
+    }
+
+    /// Parsing a large payload must not hold the runtime thread: on a
+    /// single-threaded runtime, a ticker task keeps running while it parses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parsing_runs_off_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let ndjson: String = (0..20_000)
+            .map(|i| format!("{{\"id\": {i}, \"name\": \"row {i}\", \"n\": {{\"v\": {i}}}}}\n"))
+            .collect();
+        let docs = run(bytes(&ndjson, None), json!({})).await;
+        ticker.abort();
+        assert_eq!(docs.len(), 20_000);
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the runtime was blocked for the whole parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_content_is_kept_over_string_fields() {
+        // An inline document (or an extractor's output) with a body and other
+        // string fields: the body must not be replaced by those fields.
+        let mut d = Document::with_id("1", "long body");
+        d.fields.insert("author".into(), json!("Ada"));
+        let docs = run(PluginInput::Documents(vec![d]), json!({})).await;
+        assert_eq!(docs[0].content, "long body");
+        assert_eq!(docs[0].fields["author"], json!("Ada"), "fields are kept");
+
+        // An explicit `content_fields` still decides.
+        let mut d = Document::with_id("1", "long body");
+        d.fields.insert("author".into(), json!("Ada"));
+        let docs = run(
+            PluginInput::Documents(vec![d]),
+            json!({"content_fields": ["author"]}),
+        )
+        .await;
+        assert_eq!(docs[0].content, "Ada");
     }
 
     #[tokio::test]

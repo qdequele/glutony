@@ -18,6 +18,8 @@ async fn main() -> anyhow::Result<()> {
         addr,
         internal_token,
         lab: lab_config,
+        jobs_retention_days,
+        blob_ttl_days,
     } = BootConfig::from_env()?;
     if let Some(config) = &lab_config {
         // Also before Postgres: wrong credentials abort boot (spec §3.6).
@@ -37,7 +39,19 @@ async fn main() -> anyhow::Result<()> {
              answers 403 token_required, so LAB_AI_GATEWAY workers cannot run Lab AI steps"
         );
     }
-    let mut state = AppState::new(pool.clone()).with_internal_token(internal_token);
+    // The Lab seams mean tenants: a global pipeline may then pin no connection.
+    let mut state = AppState::new(pool.clone())
+        .with_internal_token(internal_token)
+        .with_tenants(lab_config.is_some())
+        .with_blob_ttl_days(blob_ttl_days);
+    if blob_ttl_days == 0 {
+        tracing::info!("BLOB_TTL_DAYS=0: job blobs are kept until a bucket rule removes them");
+    } else {
+        tracing::info!(
+            days = blob_ttl_days,
+            "workers delete a job's blobs this many days after it ended"
+        );
+    }
     if let Some(creds) = lab_config.as_ref().map(|c| c.credentials()) {
         // Workers ask `GET /internal/lab/credits/{account}` before a source run and
         // `GET /internal/lab/ai/{account}` before an AI step. This client is on that
@@ -77,6 +91,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let retention = jobs_retention_days.map(|days| {
+        tracing::info!(days, "job and source-run history retention enabled");
+        tokio::spawn(
+            meili_ingest_control_plane::retention::Retention::new(pool.clone(), days)
+                .run(cancel.clone()),
+        )
+    });
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
@@ -88,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         .context("http server")?;
 
     cancel.cancel();
-    if let Some(handle) = sender {
+    for handle in [sender, retention].into_iter().flatten() {
         let _ = handle.await;
     }
 

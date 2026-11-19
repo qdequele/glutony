@@ -444,6 +444,7 @@ async fn jobs_insert_patch_get() {
         started_at: now,
         updated_at: now,
         source_id: None,
+        parent_job_id: None,
     };
 
     let (status, body) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
@@ -522,6 +523,82 @@ async fn jobs_insert_patch_get() {
 }
 
 #[tokio::test]
+async fn archive_file_jobs_are_listed_under_their_archive() {
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let now = Utc::now();
+    let record = |id: Uuid, pipeline: &str, parent: Option<Uuid>| JobRecord {
+        job_id: id,
+        workflow_id: format!("ingest-{id}"),
+        pipeline_uid: pipeline.into(),
+        tenant_id: Some("t1".into()),
+        index_name: None,
+        status: JobStatus::Queued,
+        current_step: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+        source_id: None,
+        parent_job_id: parent,
+    };
+    let archive = Uuid::new_v4();
+    let files = [Uuid::new_v4(), Uuid::new_v4()];
+    let mut rows = vec![
+        record(archive, "archive", None),
+        record(Uuid::new_v4(), "builtin.pdf", None),
+    ];
+    rows.extend(
+        files
+            .iter()
+            .map(|f| record(*f, "builtin.pdf", Some(archive))),
+    );
+    for row in &rows {
+        let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", row)).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) = call(
+        app(state.clone()),
+        get(&format!("/jobs?parent_job_id={archive}&tenant_id=t1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let page: serde_json::Value = json(&body);
+    assert_eq!(page["total"], 2);
+    let mut listed: Vec<String> = page["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| {
+            assert_eq!(j["parent_job_id"], serde_json::json!(archive));
+            j["job_id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    listed.sort();
+    let mut expected: Vec<String> = files.iter().map(Uuid::to_string).collect();
+    expected.sort();
+    assert_eq!(listed, expected);
+
+    // A re-insert without the link (the gateway's write-through) keeps it.
+    let mut again = record(files[0], "builtin.pdf", None);
+    again.status = JobStatus::Running;
+    let (_, body) = call(
+        app(state.clone()),
+        req_json("POST", "/internal/jobs", &again),
+    )
+    .await;
+    let stored: JobRecord = json(&body);
+    assert_eq!(stored.parent_job_id, Some(archive));
+
+    // Without the filter every job is listed.
+    let (_, body) = call(app(state.clone()), get("/jobs?tenant_id=t1")).await;
+    let page: serde_json::Value = json(&body);
+    assert_eq!(page["total"], 4);
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
 async fn terminal_status_clears_the_current_step() {
     // A job that succeeded is not "on" a step. The worker patches the terminal status
     // without naming one, so this has to hold server-side or the last running value
@@ -543,6 +620,7 @@ async fn terminal_status_clears_the_current_step() {
         started_at: now,
         updated_at: now,
         source_id: None,
+        parent_job_id: None,
     };
     let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", &job)).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -575,6 +653,119 @@ async fn terminal_status_clears_the_current_step() {
         stored.current_step, None,
         "a finished job must not keep a current step"
     );
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn a_job_status_never_moves_backwards() {
+    // Three writers touch a row without any ordering between them: the gateway's
+    // insert at submit time, its write-through of a Temporal snapshot, and the
+    // worker's patches. A write that carries an older status than the stored one must
+    // not win, or the job list shows finished work as queued or running.
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone());
+    let now = Utc::now();
+    let record = |id: Uuid, status: JobStatus| JobRecord {
+        job_id: id,
+        workflow_id: format!("ingest-{id}"),
+        pipeline_uid: "builtin.pdf".into(),
+        tenant_id: None,
+        index_name: Some("documents".into()),
+        status,
+        current_step: None,
+        error: None,
+        started_at: now,
+        updated_at: now,
+        source_id: None,
+        parent_job_id: None,
+    };
+    let insert = |job: JobRecord| {
+        let state = state.clone();
+        async move {
+            let (status, body) = call(app(state), req_json("POST", "/internal/jobs", &job)).await;
+            assert_eq!(status, StatusCode::CREATED);
+            json::<JobRecord>(&body)
+        }
+    };
+    let patch = |id: Uuid, upd: JobUpdate| {
+        let state = state.clone();
+        async move {
+            let (status, body) = call(
+                app(state),
+                req_json("PATCH", &format!("/internal/jobs/{id}"), &upd),
+            )
+            .await;
+            // Always 200 with the stored row: the gateway uses it as its cached record.
+            assert_eq!(status, StatusCode::OK);
+            json::<JobRecord>(&body)
+        }
+    };
+    let status = |status: JobStatus, step: Option<&str>, error: Option<&str>| JobUpdate {
+        status: Some(status),
+        current_step: step.map(str::to_owned),
+        error: error.map(str::to_owned),
+        index_name: None,
+    };
+
+    // A repeated insert does not reset a finished row, its error or its start time.
+    let failed = Uuid::new_v4();
+    insert(record(failed, JobStatus::Queued)).await;
+    patch(failed, status(JobStatus::Running, Some("extract"), None)).await;
+    patch(failed, status(JobStatus::Failed, None, Some("boom"))).await;
+    let mut again = record(failed, JobStatus::Queued);
+    again.started_at = now + chrono::Duration::hours(1);
+    let stored = insert(again).await;
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.error.as_deref(), Some("boom"));
+    assert_eq!(stored.current_step.as_deref(), Some("extract"));
+    assert_eq!(
+        stored.started_at.timestamp_micros(),
+        now.timestamp_micros(),
+        "a stale insert must not move the job in the list"
+    );
+
+    // A stale `running` snapshot does not reopen a finished job or give it a step.
+    let done = Uuid::new_v4();
+    insert(record(done, JobStatus::Queued)).await;
+    patch(done, status(JobStatus::Succeeded, None, None)).await;
+    let stored = patch(done, status(JobStatus::Running, Some("extract"), Some("x"))).await;
+    assert_eq!(stored.status, JobStatus::Succeeded);
+    assert_eq!(stored.current_step, None);
+    assert_eq!(stored.error, None);
+    let stored = patch(done, status(JobStatus::Queued, None, None)).await;
+    assert_eq!(stored.status, JobStatus::Succeeded);
+
+    // `queued` does not replace `running`, by patch or by insert.
+    let running = Uuid::new_v4();
+    insert(record(running, JobStatus::Queued)).await;
+    patch(running, status(JobStatus::Running, Some("extract"), None)).await;
+    let stored = patch(running, status(JobStatus::Queued, None, None)).await;
+    assert_eq!(stored.status, JobStatus::Running);
+    let stored = insert(record(running, JobStatus::Queued)).await;
+    assert_eq!(stored.status, JobStatus::Running);
+    assert_eq!(stored.current_step.as_deref(), Some("extract"));
+
+    // Forward and sideways writes still apply: a running job moves to its next step,
+    // a field that is not about the status is written whatever the status, and a
+    // terminal status can replace another (a cancel that lands after a failure).
+    let stored = patch(running, status(JobStatus::Running, Some("index"), None)).await;
+    assert_eq!(stored.current_step.as_deref(), Some("index"));
+    let stored = patch(
+        failed,
+        JobUpdate {
+            status: Some(JobStatus::Running),
+            index_name: Some("renamed".into()),
+            ..JobUpdate::default()
+        },
+    )
+    .await;
+    assert_eq!(stored.status, JobStatus::Failed);
+    assert_eq!(stored.index_name.as_deref(), Some("renamed"));
+    let stored = patch(failed, status(JobStatus::Cancelled, None, None)).await;
+    assert_eq!(stored.status, JobStatus::Cancelled);
+    let stored = insert(record(running, JobStatus::Succeeded)).await;
+    assert_eq!(stored.status, JobStatus::Succeeded);
 
     t.drop_schema().await;
 }
@@ -862,6 +1053,403 @@ async fn validate_returns_generated_scripts_for_builder_steps_only() {
         "doc.rename_field(\"a\", \"b\");\n"
     );
     assert!(body["generated_scripts"].get("raw").is_none());
+
+    t.drop_schema().await;
+}
+
+/// A global pipeline pinned to a connection resolves that name per job: a tenantless
+/// job takes the global row, a tenant job only its own row. With tenants on (the Lab
+/// seams), save-time cannot promise either, so the pipeline is refused; standalone
+/// keeps checking it against the global row.
+#[tokio::test]
+async fn a_global_pinned_pipeline_is_standalone_only() {
+    use meili_ingest_control_plane::connections::{ConnectionRepo, NewConnection};
+
+    let Some(t) = setup().await else { return };
+    let global_pinned = |uid: &str, connection: &str| PipelineDefinition {
+        uid: uid.into(),
+        name: String::new(),
+        description: None,
+        version: 1,
+        trigger: None,
+        steps: vec![
+            StepDefinition::new("index", "meili_indexer")
+                .config(serde_json::json!({ "connection": connection })),
+        ],
+        builtin: false,
+        tenant_id: None,
+    };
+    let repo = ConnectionRepo::new(t.pool.clone());
+    for tenant in [None, Some("t1")] {
+        repo.insert(&NewConnection {
+            id: Uuid::new_v4(),
+            uid: "main".into(),
+            name: "main".into(),
+            tenant_id: tenant.map(str::to_owned),
+            host: "https://movies.example".into(),
+            api_key: vec![1, 2, 3],
+        })
+        .await
+        .unwrap();
+    }
+
+    // Standalone: the global row is what every (tenantless) job uses.
+    let standalone = AppState::new(t.pool.clone());
+    let (status, body) = call(
+        app(standalone),
+        req_json("POST", "/pipelines", &global_pinned("g-main", "main")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // With tenants: refused on validate and on create, even though the row exists.
+    let tenants = AppState::new(t.pool.clone()).with_tenants(true);
+    for uri in ["/pipelines/validate", "/pipelines"] {
+        let (status, body) = call(
+            app(tenants.clone()),
+            req_json("POST", uri, &global_pinned("g-main-2", "main")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        let err: ErrorBody = json(&body);
+        assert_eq!(err.code, "validation");
+        assert!(
+            err.error.contains("\"main\"") && err.error.contains("global pipeline"),
+            "{uri}: {}",
+            err.error
+        );
+    }
+    // A tenant pipeline pinned to its own connection is unaffected.
+    let mut own = global_pinned("t-main", "main");
+    own.tenant_id = Some("t1".into());
+    let (status, body) = call(app(tenants.clone()), req_json("POST", "/pipelines", &own)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    // So is a global pipeline that pins nothing.
+    let mut unpinned = global_pinned("g-unpinned", "main");
+    unpinned.steps[0].config = serde_json::json!({});
+    let (status, body) = call(app(tenants), req_json("POST", "/pipelines", &unpinned)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    t.drop_schema().await;
+}
+
+/// `total` stops counting at 10 000: a tenant with more rows gets 10 000, so a page
+/// request never walks the whole history. Smaller sets stay exact (tests above).
+#[tokio::test]
+async fn the_job_total_is_capped_at_10000() {
+    let Some(t) = setup().await else { return };
+    sqlx::query(
+        "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, status) \
+         SELECT gen_random_uuid(), 'wf-' || g, 'builtin.pdf', 'big', 'succeeded' \
+         FROM generate_series(1, 10001) AS g",
+    )
+    .execute(&t.pool)
+    .await
+    .unwrap();
+    let state = AppState::new(t.pool.clone());
+    let (status, body) = call(app(state.clone()), get("/jobs?tenant_id=big&limit=5")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let page: serde_json::Value = json(&body);
+    assert_eq!(page["total"], 10_000);
+    assert_eq!(page["jobs"].as_array().unwrap().len(), 5);
+    // Under the cap the count is exact.
+    sqlx::query("DELETE FROM jobs WHERE job_id IN (SELECT job_id FROM jobs LIMIT 2)")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    let (_, body) = call(app(state), get("/jobs?tenant_id=big&limit=5")).await;
+    assert_eq!(json::<serde_json::Value>(&body)["total"], 9_999);
+    t.drop_schema().await;
+}
+
+async fn insert_job(pool: &PgPool, status: &str, age: &str, parent: Option<Uuid>) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO jobs (job_id, workflow_id, pipeline_uid, tenant_id, status, \
+                           started_at, updated_at, parent_job_id) \
+         VALUES ($1, 'wf', 'builtin.pdf', 't1', $2, now() - $3::interval, \
+                 now() - $3::interval, $4)",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(age)
+    .bind(parent)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn insert_run(pool: &PgPool, source_id: Uuid, age: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO source_runs (run_id, source_id, started_at, finished_at, outcome) \
+         VALUES ($1, $2, now() - $3::interval, now() - $3::interval, 'unchanged')",
+    )
+    .bind(id)
+    .bind(source_id)
+    .bind(age)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// The opt-in retention deletes finished jobs and source runs older than the window,
+/// and nothing else: running jobs, recent rows, and an archive job whose file jobs are
+/// still there all stay.
+#[tokio::test]
+async fn retention_prunes_only_old_finished_jobs_and_runs() {
+    use meili_ingest_control_plane::retention::Retention;
+    use meili_ingest_control_plane::sources::{NewSource, SourceRepo};
+
+    let Some(t) = setup().await else { return };
+    let pool = &t.pool;
+    let old_done = insert_job(pool, "succeeded", "31 days", None).await;
+    let old_failed = insert_job(pool, "failed", "31 days", None).await;
+    let old_cancelled = insert_job(pool, "cancelled", "31 days", None).await;
+    let old_running = insert_job(pool, "running", "31 days", None).await;
+    let recent_done = insert_job(pool, "succeeded", "29 days", None).await;
+    // An archive whose file job is still running keeps its row until the file job goes.
+    let parent = insert_job(pool, "succeeded", "31 days", None).await;
+    let child = insert_job(pool, "running", "31 days", Some(parent)).await;
+
+    let source = NewSource {
+        id: Uuid::new_v4(),
+        uid: "s".into(),
+        name: "s".into(),
+        description: None,
+        tenant_id: Some("t1".into()),
+        pipeline_uid: "p".into(),
+        location: meili_ingest_source::model::Location::Url {
+            url: "https://files.example/a.json".into(),
+            method: None,
+            headers: Default::default(),
+        },
+        cron: "* * * * *".into(),
+        timezone: "UTC".into(),
+        index_name: None,
+        fetch_auth: None,
+        schedule_id: "source-s".into(),
+    };
+    SourceRepo::new(pool.clone()).insert(&source).await.unwrap();
+    insert_run(pool, source.id, "31 days").await;
+    let recent_run = insert_run(pool, source.id, "1 day").await;
+
+    let retention = Retention::new(pool.clone(), 30);
+    let pruned = retention.prune_once().await.unwrap();
+    assert_eq!((pruned.jobs, pruned.source_runs), (3, 1), "{pruned:?}");
+
+    let jobs: Vec<Uuid> = sqlx::query_scalar("SELECT job_id FROM jobs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    for gone in [old_done, old_failed, old_cancelled] {
+        assert!(!jobs.contains(&gone), "{gone} should be pruned");
+    }
+    for kept in [old_running, recent_done, parent, child] {
+        assert!(jobs.contains(&kept), "{kept} should be kept");
+    }
+    let runs: Vec<Uuid> = sqlx::query_scalar("SELECT run_id FROM source_runs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(runs, vec![recent_run]);
+
+    // Once the file job is finished too, it goes, and the archive job after it.
+    sqlx::query("UPDATE jobs SET status = 'succeeded' WHERE job_id = $1")
+        .bind(child)
+        .execute(pool)
+        .await
+        .unwrap();
+    retention.prune_once().await.unwrap();
+    retention.prune_once().await.unwrap();
+    let jobs: Vec<Uuid> = sqlx::query_scalar("SELECT job_id FROM jobs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert!(
+        !jobs.contains(&child) && !jobs.contains(&parent),
+        "{jobs:?}"
+    );
+
+    t.drop_schema().await;
+}
+
+#[tokio::test]
+async fn job_blobs_are_claimed_once_their_ttl_has_passed() {
+    use meili_ingest_control_plane::jobs::{BlobSweepClaim, BlobSweepDone};
+    let Some(t) = setup().await else { return };
+    let state = AppState::new(t.pool.clone()).with_blob_ttl_days(7);
+    let now = Utc::now();
+    let record = |status: JobStatus, pipeline: &str, parent: Option<Uuid>| {
+        let id = Uuid::new_v4();
+        JobRecord {
+            job_id: id,
+            workflow_id: format!("ingest-{id}"),
+            pipeline_uid: pipeline.into(),
+            tenant_id: Some("t1".into()),
+            index_name: None,
+            status,
+            current_step: None,
+            error: None,
+            started_at: now,
+            updated_at: now,
+            source_id: None,
+            parent_job_id: parent,
+        }
+    };
+    let old_ok = record(JobStatus::Succeeded, "builtin.pdf", None);
+    let old_failed = record(JobStatus::Failed, "builtin.pdf", None);
+    let old_cancelled = record(JobStatus::Cancelled, "builtin.pdf", None);
+    let old_running = record(JobStatus::Running, "builtin.pdf", None);
+    let recent_ok = record(JobStatus::Succeeded, "builtin.pdf", None);
+    // An archive over for long, one of whose files still runs: its turn comes later.
+    let archive = record(JobStatus::Failed, "archive", None);
+    let file_done = record(JobStatus::Succeeded, "builtin.pdf", Some(archive.job_id));
+    let file_running = record(JobStatus::Running, "builtin.pdf", Some(archive.job_id));
+    let old = [
+        &old_ok,
+        &old_failed,
+        &old_cancelled,
+        &old_running,
+        &archive,
+        &file_done,
+        &file_running,
+    ];
+    for row in old.iter().copied().chain([&recent_ok]) {
+        let (status, _) = call(app(state.clone()), req_json("POST", "/internal/jobs", row)).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let age = |ids: Vec<Uuid>| {
+        let pool = t.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE jobs SET updated_at = now() - interval '8 days' WHERE job_id = ANY($1)",
+            )
+            .bind(ids)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    age(old.iter().map(|r| r.job_id).collect()).await;
+    let claim = |state: AppState| async move {
+        let (status, body) = call(
+            app(state),
+            req_json(
+                "POST",
+                "/internal/blob-sweep/claim",
+                &serde_json::json!({"limit": 50}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let claim: BlobSweepClaim = json(&body);
+        let mut ids: Vec<Uuid> = claim.jobs.iter().map(|j| j.job_id).collect();
+        ids.sort();
+        (claim, ids)
+    };
+    let sorted = |ids: &[Uuid]| {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids
+    };
+
+    let (first, ids) = claim(state.clone()).await;
+    assert!(first.enabled);
+    assert_eq!(
+        ids,
+        sorted(&[
+            old_ok.job_id,
+            old_failed.job_id,
+            old_cancelled.job_id,
+            file_done.job_id
+        ]),
+        "terminal, over 7 days ago, and no file of theirs still running"
+    );
+    assert!(
+        first.jobs.iter().all(|j| j.pipeline_uid == "builtin.pdf"),
+        "{first:?}"
+    );
+    // Claimed: another worker gets none of them meanwhile.
+    let (_, again) = claim(state.clone()).await;
+    assert!(again.is_empty(), "{again:?}");
+
+    // Swept: never claimed again, even once the lease is over.
+    let (status, _) = call(
+        app(state.clone()),
+        req_json(
+            "POST",
+            "/internal/blob-sweep/done",
+            &BlobSweepDone {
+                job_ids: vec![old_ok.job_id, old_failed.job_id],
+            },
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    sqlx::query("UPDATE jobs SET blobs_claimed_at = now() - interval '2 hours'")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    // The last file finishes, and that was long ago too: the archive is due.
+    let done = JobUpdate {
+        status: Some(JobStatus::Succeeded),
+        ..JobUpdate::default()
+    };
+    let (status, _) = call(
+        app(state.clone()),
+        req_json(
+            "PATCH",
+            &format!("/internal/jobs/{}", file_running.job_id),
+            &done,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (second, ids) = claim(state.clone()).await;
+    assert_eq!(
+        ids,
+        sorted(&[old_cancelled.job_id, archive.job_id, file_done.job_id]),
+        "a lease that ran out is claimed again; the archive's files are all over"
+    );
+    assert!(
+        second
+            .jobs
+            .iter()
+            .any(|j| j.job_id == archive.job_id && j.pipeline_uid == "archive"),
+        "{second:?}"
+    );
+
+    // BLOB_TTL_DAYS=0: nothing is ever claimed.
+    sqlx::query("UPDATE jobs SET blobs_claimed_at = NULL")
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    age(vec![file_running.job_id]).await;
+    let (off, ids) = claim(state.clone().with_blob_ttl_days(0)).await;
+    assert!(!off.enabled);
+    assert!(ids.is_empty());
+    // Back on, the file that just finished is due once aged.
+    let (_, ids) = claim(state.clone()).await;
+    assert!(ids.contains(&file_running.job_id), "{ids:?}");
+    assert!(!ids.contains(&recent_ok.job_id), "{ids:?}");
 
     t.drop_schema().await;
 }

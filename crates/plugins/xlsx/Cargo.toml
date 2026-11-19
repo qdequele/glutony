@@ -16,6 +16,8 @@ tracing.workspace = true
 calamine = { workspace = true, features = ["dates"] }
 # calamine enables chrono without default features; we need std for `format()`.
 chrono.workspace = true
+# Zip-bomb guard: inflate the workbook once, capped, before calamine reads it.
+zip.workspace = true
 
 [dev-dependencies]
 rust_xlsxwriter = "0.99"

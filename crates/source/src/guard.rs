@@ -10,6 +10,7 @@
 //! actual connect. Closing it means pinning the resolved address into the connector.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::time::Duration;
 
 use url::Url;
 
@@ -34,6 +35,10 @@ pub enum AddressClass {
     Unspecified,
     /// Multicast and broadcast ranges.
     Multicast,
+    /// Special-purpose blocks that are not routable on the public internet:
+    /// `0.0.0.0/8`, `192.0.0.0/24`, the documentation and benchmarking ranges,
+    /// `240.0.0.0/4`, and their IPv6 counterparts.
+    Reserved,
 }
 
 impl AddressClass {
@@ -45,20 +50,19 @@ impl AddressClass {
 
 /// Classify one address.
 ///
-/// IPv4-mapped IPv6 addresses are unwrapped first, so `::ffff:127.0.0.1` classifies as
-/// loopback rather than public.
+/// An IPv6 address that carries an IPv4 one is classified as that IPv4 address, so
+/// `::ffff:127.0.0.1` is loopback and the NAT64 form of `10.0.0.5` (`64:ff9b::a00:5`)
+/// is private rather than public. Anything not known to be routable on the public
+/// internet is refused: a range missing from here is reachable, not blocked.
 pub fn classify(ip: IpAddr) -> AddressClass {
     match ip {
         IpAddr::V4(v4) => classify_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => classify_v4(v4),
-            None => classify_v6(v6),
-        },
+        IpAddr::V6(v6) => classify_v6(v6),
     }
 }
 
 fn classify_v4(ip: Ipv4Addr) -> AddressClass {
-    let [a, b, ..] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     if ip.is_unspecified() {
         AddressClass::Unspecified
     } else if ip.is_loopback() {
@@ -71,23 +75,72 @@ fn classify_v4(ip: Ipv4Addr) -> AddressClass {
         AddressClass::Private
     } else if ip.is_multicast() || ip.is_broadcast() {
         AddressClass::Multicast
+    } else if is_reserved_v4(a, b, c) {
+        AddressClass::Reserved
     } else {
         AddressClass::Public
     }
 }
 
+/// IPv4 special-purpose blocks (RFC 6890) that no public host lives in.
+fn is_reserved_v4(a: u8, b: u8, c: u8) -> bool {
+    match (a, b, c) {
+        // 0.0.0.0/8, "this network".
+        (0, ..) => true,
+        // 192.0.0.0/24 protocol assignments, and TEST-NET-1.
+        (192, 0, 0 | 2) => true,
+        // 198.18.0.0/15, benchmarking.
+        (198, 18 | 19, _) => true,
+        // TEST-NET-2 and TEST-NET-3.
+        (198, 51, 100) | (203, 0, 113) => true,
+        // 240.0.0.0/4, reserved.
+        (240.., ..) => true,
+        _ => false,
+    }
+}
+
+/// IPv6 special-purpose blocks that no public host lives in.
+fn is_reserved_v6(s: [u16; 8]) -> bool {
+    // 64:ff9b:1::/48, local-use NAT64.
+    s[..3] == [0x64, 0xff9b, 1]
+        // 2001::/32 Teredo, and 2001:db8::/32 documentation.
+        || s[..2] == [0x2001, 0]
+        || s[..2] == [0x2001, 0xdb8]
+        // 100::/64, discard-only.
+        || s[..4] == [0x100, 0, 0, 0]
+}
+
 fn classify_v6(ip: Ipv6Addr) -> AddressClass {
-    let first = ip.segments()[0];
+    let s = ip.segments();
+    let first = s[0];
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
     if ip.is_unspecified() {
         AddressClass::Unspecified
     } else if ip.is_loopback() {
         AddressClass::Loopback
+    } else if let Some(mapped) = ip.to_ipv4_mapped() {
+        classify_v4(mapped)
+    } else if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        // NAT64 (RFC 6052). Unwrapped rather than refused: in a DNS64 cluster every
+        // IPv4-only public site resolves into this prefix.
+        classify_v4(v4(s[6], s[7]))
+    } else if first == 0x2002 {
+        // 6to4: the IPv4 address of the relay it is tunnelled to.
+        classify_v4(v4(s[1], s[2]))
+    } else if s[..6] == [0; 6] {
+        // IPv4-compatible `::a.b.c.d`, deprecated and never routed as IPv6.
+        match classify_v4(v4(s[6], s[7])) {
+            AddressClass::Public => AddressClass::Reserved,
+            other => other,
+        }
     } else if (first & 0xffc0) == 0xfe80 {
         AddressClass::LinkLocal
     } else if (first & 0xfe00) == 0xfc00 {
         AddressClass::UniqueLocal
     } else if ip.is_multicast() {
         AddressClass::Multicast
+    } else if is_reserved_v6(s) {
+        AddressClass::Reserved
     } else {
         AddressClass::Public
     }
@@ -110,6 +163,13 @@ pub struct UrlGuard {
     pub max_redirects: usize,
     /// Maximum bytes read from a response body.
     pub max_bytes: u64,
+    /// Deadline for one whole fetch: every redirect hop, the response headers and the
+    /// body. It has to stay below the start-to-close timeout of the activity that
+    /// fetches, which must still stage what was downloaded.
+    pub total_timeout: Duration,
+    /// Longest wait for the next piece of a response body. A download that keeps
+    /// moving is bounded by `total_timeout` only; one that stalls is given up early.
+    pub idle_timeout: Duration,
 }
 
 impl Default for UrlGuard {
@@ -117,6 +177,8 @@ impl Default for UrlGuard {
         Self {
             max_redirects: 5,
             max_bytes: 512 * 1024 * 1024,
+            total_timeout: Duration::from_secs(10 * 60),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -129,22 +191,27 @@ impl UrlGuard {
     /// loopback record through, which is a standard SSRF trick.
     pub async fn check_url(&self, url: &Url) -> Result<(), SourceError> {
         check_scheme(url)?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| SourceError::Blocked("url has no host".into()))?
-            .to_owned();
-        let port = url.port_or_known_default().unwrap_or(443);
         let shown = url.clone();
-
-        // `ToSocketAddrs` blocks; keep it off the async worker threads.
-        let resolved = tokio::task::spawn_blocking(move || {
-            (host.as_str(), port)
-                .to_socket_addrs()
-                .map(|it| it.map(|s| s.ip()).collect::<Vec<_>>())
-        })
-        .await
-        .map_err(|e| SourceError::Dns(format!("resolver task failed: {e}")))?
-        .map_err(|e| SourceError::Dns(format!("could not resolve {shown}: {e}")))?;
+        let resolved = match url.host() {
+            None => return Err(SourceError::Blocked("url has no host".into())),
+            // A literal address is classified as it is. Handing it to the resolver
+            // would fail for IPv6, which `url` renders in brackets.
+            Some(url::Host::Ipv4(ip)) => vec![IpAddr::V4(ip)],
+            Some(url::Host::Ipv6(ip)) => vec![IpAddr::V6(ip)],
+            Some(url::Host::Domain(domain)) => {
+                let host = domain.to_owned();
+                let port = url.port_or_known_default().unwrap_or(443);
+                // `ToSocketAddrs` blocks; keep it off the async worker threads.
+                tokio::task::spawn_blocking(move || {
+                    (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map(|it| it.map(|s| s.ip()).collect::<Vec<_>>())
+                })
+                .await
+                .map_err(|e| SourceError::Dns(format!("resolver task failed: {e}")))?
+                .map_err(|e| SourceError::Dns(format!("could not resolve {shown}: {e}")))?
+            }
+        };
 
         if resolved.is_empty() {
             return Err(SourceError::Dns(format!(
@@ -209,6 +276,87 @@ mod tests {
     }
 
     #[test]
+    fn special_purpose_ipv4_blocks_are_not_public() {
+        for reserved in [
+            "0.1.2.3",         // 0.0.0.0/8 "this network"
+            "192.0.0.1",       // IETF protocol assignments
+            "192.0.2.1",       // TEST-NET-1
+            "198.18.0.10",     // benchmarking 198.18.0.0/15
+            "198.19.255.255",  //
+            "198.51.100.7",    // TEST-NET-2
+            "203.0.113.7",     // TEST-NET-3
+            "240.0.0.1",       // reserved 240.0.0.0/4
+            "254.255.255.254", //
+        ] {
+            assert_eq!(classify(ip(reserved)), AddressClass::Reserved, "{reserved}");
+        }
+        // The neighbours of those blocks stay public.
+        for public in [
+            "1.0.0.1",
+            "192.0.1.1",
+            "192.0.3.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "198.51.101.1",
+            "203.0.112.1",
+            "203.0.114.1",
+            "223.255.255.255",
+        ] {
+            assert_eq!(classify(ip(public)), AddressClass::Public, "{public}");
+        }
+    }
+
+    #[test]
+    fn an_ipv4_address_embedded_in_ipv6_is_classified_as_that_ipv4() {
+        // NAT64, 6to4 and IPv4-compatible forms of 10.0.0.5 and of the metadata endpoint.
+        assert_eq!(classify(ip("64:ff9b::a00:5")), AddressClass::Private);
+        assert_eq!(classify(ip("64:ff9b::a9fe:a9fe")), AddressClass::LinkLocal);
+        assert_eq!(classify(ip("2002:0a00:0005::1")), AddressClass::Private);
+        assert_eq!(classify(ip("2002:7f00:0001::")), AddressClass::Loopback);
+        assert_eq!(classify(ip("::10.0.0.5")), AddressClass::Private);
+        assert_eq!(classify(ip("::127.0.0.1")), AddressClass::Loopback);
+        assert_eq!(classify(ip("64:ff9b::c612:a")), AddressClass::Reserved);
+        // In a DNS64 cluster every IPv4-only site resolves into 64:ff9b::/96: a public
+        // IPv4 behind it must stay fetchable.
+        assert_eq!(classify(ip("64:ff9b::101:101")), AddressClass::Public);
+        assert_eq!(classify(ip("2002:0101:0101::1")), AddressClass::Public);
+    }
+
+    #[test]
+    fn special_purpose_ipv6_blocks_are_not_public() {
+        for reserved in [
+            "64:ff9b:1::a00:5", // local-use NAT64
+            "2001:db8::1",      // documentation
+            "2001::1",          // Teredo
+            "100::1",           // discard-only
+        ] {
+            assert_eq!(classify(ip(reserved)), AddressClass::Reserved, "{reserved}");
+        }
+        assert_eq!(classify(ip("2001:4860:4860::8888")), AddressClass::Public);
+        assert_eq!(classify(ip("2a00:1450::1")), AddressClass::Public);
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_literal_is_classified_not_sent_to_the_resolver() {
+        let guard = UrlGuard::default();
+        for bad in [
+            "https://[::1]/x",
+            "https://[fd00::1]/x",
+            "https://[64:ff9b::a00:5]/x",
+            "https://[::ffff:169.254.169.254]/x",
+        ] {
+            let url = Url::parse(bad).expect("url");
+            let err = guard.check_url(&url).await.expect_err(bad);
+            assert!(matches!(err, SourceError::Blocked(_)), "{bad}: {err:?}");
+        }
+        let public = Url::parse("https://[2606:4700::1111]/x").expect("url");
+        guard
+            .check_url(&public)
+            .await
+            .expect("a public IPv6 literal is allowed");
+    }
+
+    #[test]
     fn only_public_addresses_are_allowed() {
         assert!(AddressClass::Public.is_allowed());
         for c in [
@@ -219,6 +367,7 @@ mod tests {
             AddressClass::UniqueLocal,
             AddressClass::Unspecified,
             AddressClass::Multicast,
+            AddressClass::Reserved,
         ] {
             assert!(!c.is_allowed(), "{c:?} must be rejected");
         }
@@ -264,9 +413,11 @@ mod tests {
     }
 
     #[test]
-    fn default_guard_caps_redirects_and_size() {
+    fn default_guard_caps_redirects_size_and_time() {
         let g = UrlGuard::default();
         assert_eq!(g.max_redirects, 5);
         assert_eq!(g.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(g.total_timeout, Duration::from_secs(600));
+        assert_eq!(g.idle_timeout, Duration::from_secs(60));
     }
 }
