@@ -1393,7 +1393,7 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             let fail = self
                 .failing
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             // An archive's files are staged under `jobs/<file job>/input/`.
             let file = location.as_ref().contains("/input/");
