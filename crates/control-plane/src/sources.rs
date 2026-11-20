@@ -159,6 +159,70 @@ pub struct RunRecord {
     pub error: Option<String>,
 }
 
+/// Whether a source works, as `source.status_changed` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceHealth {
+    /// Its last run failed.
+    Failing,
+    /// Its last run ingested or found nothing new.
+    Ok,
+}
+
+/// A run that flipped its source between working and failing: the first failed run
+/// after a run that did not fail (or as the first run ever), or the first run that did
+/// not fail after a failed one. The worker turns it into a Lab `source.status_changed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceStatusChange {
+    /// What the source is now.
+    pub status: SourceHealth,
+    /// Failed runs in a row up to this one, this one included; 0 when ok.
+    pub consecutive_failures: i64,
+    /// The source's name.
+    pub source_name: String,
+    /// The source's tenant; `None` for a global source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// The pipeline the source runs.
+    pub pipeline_uid: String,
+}
+
+/// What `POST /internal/source-runs` answers: the stored run, and the status change it
+/// caused, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedRun {
+    /// The run as stored.
+    #[serde(flatten)]
+    pub run: RunRecord,
+    /// Set when this run flipped the source between ok and failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_change: Option<SourceStatusChange>,
+}
+
+/// How many of the runs before one to look at when counting failures in a row.
+const FAILURE_STREAK_WINDOW: i64 = 1_000;
+
+/// The status change of a run, from the outcomes of the source's runs up to it, newest
+/// first, `outcomes[0]` being the run itself. Depends only on the runs that started
+/// before it, so recording the same run again finds the same change.
+pub fn status_transition(outcomes: &[RunOutcome]) -> Option<SourceHealth> {
+    let (current, earlier) = outcomes.split_first()?;
+    let failed = |o: &RunOutcome| *o == RunOutcome::Failed;
+    match (failed(current), earlier.first().is_some_and(failed)) {
+        (true, false) => Some(SourceHealth::Failing),
+        (false, true) => Some(SourceHealth::Ok),
+        _ => None,
+    }
+}
+
+/// Failed runs in a row at the head of `outcomes` (newest first).
+pub fn failure_streak(outcomes: &[RunOutcome]) -> i64 {
+    outcomes
+        .iter()
+        .take_while(|o| **o == RunOutcome::Failed)
+        .count() as i64
+}
+
 /// Columns selected by every source query, in the order [`SourceRow`] declares them.
 const SOURCE_COLUMNS: &str = "id, uid, name, description, tenant_id, pipeline_uid, location, \
      cron, timezone, paused, index_name, schedule_id, archived_at, fetch_auth, \
@@ -552,8 +616,10 @@ impl SourceRepo {
         Ok(())
     }
 
-    /// Record one run and mirror its outcome onto the source's denormalized columns.
-    pub async fn record_run(&self, run: &RunRecord) -> Result<RunRecord, CpError> {
+    /// Record one run, mirror its outcome onto the source's denormalized columns, and
+    /// say whether it flipped the source between ok and failing ([`status_transition`]).
+    /// Idempotent on `run_id`, status change included.
+    pub async fn record_run(&self, run: &RunRecord) -> Result<RecordedRun, CpError> {
         let mut tx = self.pool.begin().await?;
         let row: RunRow = sqlx::query_as(
             "INSERT INTO source_runs (run_id, source_id, started_at, finished_at, outcome, \
@@ -582,20 +648,50 @@ impl SourceRepo {
             _ => CpError::Db(e),
         })?;
 
-        sqlx::query(
+        let source: Option<(String, Option<String>, String)> = sqlx::query_as(
             "UPDATE sources SET last_run_at = $2, last_status = $3, last_error = $4, \
                                 updated_at = now() \
-             WHERE id = $1",
+             WHERE id = $1 \
+             RETURNING name, tenant_id, pipeline_uid",
         )
         .bind(run.source_id)
         .bind(run.started_at)
         .bind(run.outcome.as_str())
         .bind(run.error.as_deref())
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // This run and the ones that started before it, newest first. The stored
+        // started_at, not the request's: a re-recorded run keeps its first one.
+        let outcomes: Vec<String> = sqlx::query_scalar(
+            "SELECT outcome FROM source_runs \
+             WHERE source_id = $1 AND (started_at, run_id) <= ($2, $3) \
+             ORDER BY started_at DESC, run_id DESC \
+             LIMIT $4",
+        )
+        .bind(run.source_id)
+        .bind(row.started_at)
+        .bind(row.run_id)
+        .bind(FAILURE_STREAK_WINDOW)
+        .fetch_all(&mut *tx)
         .await?;
 
         tx.commit().await?;
-        RunRecord::try_from(row)
+        let outcomes: Vec<RunOutcome> = outcomes.iter().filter_map(|o| o.parse().ok()).collect();
+        let status_change = source.and_then(|(source_name, tenant_id, pipeline_uid)| {
+            let status = status_transition(&outcomes)?;
+            Some(SourceStatusChange {
+                status,
+                consecutive_failures: failure_streak(&outcomes),
+                source_name,
+                tenant_id,
+                pipeline_uid,
+            })
+        });
+        Ok(RecordedRun {
+            run: RunRecord::try_from(row)?,
+            status_change,
+        })
     }
 
     /// Most recent runs of one source, newest first.
@@ -816,8 +912,9 @@ pub async fn list_source_runs(
     ))
 }
 
-/// `POST /internal/source-runs` body [`RunRecord`] → 201. Idempotent on `run_id`, so a
-/// retried activity can record the same run twice safely.
+/// `POST /internal/source-runs` body [`RunRecord`] → 201 [`RecordedRun`]. Idempotent on
+/// `run_id`, so a retried activity can record the same run twice safely, and is told
+/// the same status change each time.
 pub async fn record_source_run(
     State(state): State<AppState>,
     JsonBody(run): JsonBody<RunRecord>,
@@ -844,6 +941,92 @@ mod tests {
             bytes.fetch_auth,
             Some(Some(vec![1, 2])),
             "bytes: replace it"
+        );
+    }
+
+    #[test]
+    fn a_source_changes_status_only_when_a_run_flips_it() {
+        use RunOutcome::{Failed, Ingested, Unchanged};
+        // Newest first: the run being recorded, then the ones before it.
+        assert_eq!(status_transition(&[]), None);
+        assert_eq!(
+            status_transition(&[Failed]),
+            Some(SourceHealth::Failing),
+            "a source whose first run fails is failing"
+        );
+        assert_eq!(
+            status_transition(&[Ingested]),
+            None,
+            "never failed: no news"
+        );
+        assert_eq!(status_transition(&[Unchanged]), None);
+        assert_eq!(
+            status_transition(&[Failed, Ingested, Failed]),
+            Some(SourceHealth::Failing)
+        );
+        assert_eq!(
+            status_transition(&[Failed, Unchanged]),
+            Some(SourceHealth::Failing)
+        );
+        assert_eq!(
+            status_transition(&[Failed, Failed]),
+            None,
+            "still failing: no news"
+        );
+        assert_eq!(
+            status_transition(&[Ingested, Failed, Failed]),
+            Some(SourceHealth::Ok)
+        );
+        assert_eq!(
+            status_transition(&[Unchanged, Failed]),
+            Some(SourceHealth::Ok),
+            "an unchanged skip is a working fetch"
+        );
+        assert_eq!(status_transition(&[Ingested, Unchanged]), None);
+
+        assert_eq!(failure_streak(&[Failed, Failed, Ingested, Failed]), 2);
+        assert_eq!(failure_streak(&[Ingested, Failed]), 0);
+        assert_eq!(failure_streak(&[]), 0);
+    }
+
+    #[test]
+    fn a_recorded_run_answers_the_run_and_its_status_change_flat() {
+        let run = RunRecord {
+            run_id: Uuid::nil(),
+            source_id: Uuid::nil(),
+            started_at: chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            finished_at: None,
+            outcome: RunOutcome::Failed,
+            items: 0,
+            job_ids: vec![],
+            error: Some("boom".into()),
+        };
+        let quiet = serde_json::to_value(RecordedRun {
+            run: run.clone(),
+            status_change: None,
+        })
+        .unwrap();
+        assert_eq!(quiet, serde_json::to_value(&run).unwrap(), "same as before");
+        let changed = serde_json::to_value(RecordedRun {
+            run,
+            status_change: Some(SourceStatusChange {
+                status: SourceHealth::Failing,
+                consecutive_failures: 1,
+                source_name: "tmdb".into(),
+                tenant_id: None,
+                pipeline_uid: "movies".into(),
+            }),
+        })
+        .unwrap();
+        assert_eq!(changed["outcome"], "failed");
+        assert_eq!(
+            changed["status_change"],
+            serde_json::json!({
+                "status": "failing",
+                "consecutive_failures": 1,
+                "source_name": "tmdb",
+                "pipeline_uid": "movies",
+            })
         );
     }
 

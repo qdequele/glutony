@@ -21,6 +21,7 @@ use meili_ingest_plugin_sdk::{
 };
 use meili_ingest_router::plugin_task_queue;
 use meili_ingest_usage::JobUsageInput;
+use meili_ingest_usage::lab::reason::INVALID_CONFIG;
 use temporalio_common::RetryPolicy;
 use temporalio_common::protos::temporal::api::failure::v1::Failure;
 use temporalio_macros::{workflow, workflow_methods};
@@ -73,6 +74,22 @@ impl PipelineWorkflow {
                     s.progress.status = JobStatus::Failed;
                     s.progress.error = Some(msg.clone());
                 });
+                // Report it like any failed job: the status write-back and the Lab's
+                // job.failed go through the usage activity. Nothing ran, so the job
+                // started and ended now.
+                let now = ctx.workflow_time();
+                Self::emit_usage(
+                    ctx,
+                    &input,
+                    JobEnd {
+                        status: JobStatus::Failed,
+                        started_at: now,
+                        error: Some(msg.clone()),
+                        reason: Some(INVALID_CONFIG.to_string()),
+                        index_report: None,
+                    },
+                )
+                .await;
                 return Err(ApplicationFailure::non_retryable(anyhow::anyhow!(msg)).into());
             }
         };
@@ -110,7 +127,8 @@ impl PipelineWorkflow {
 
         loop {
             if ctx.state(|s| s.progress.cancel_requested) {
-                return Self::finish_cancelled(ctx, &input, started_at).await;
+                return Self::finish_cancelled(ctx, &input, started_at, index_report.as_ref())
+                    .await;
             }
             let ready: Vec<StepDefinition> = ready_steps(&input.pipeline, &order, &done)
                 .into_iter()
@@ -147,7 +165,8 @@ impl PipelineWorkflow {
             match round.end {
                 None => {}
                 Some(RoundEnd::Cancelled) => {
-                    return Self::finish_cancelled(ctx, &input, started_at).await;
+                    return Self::finish_cancelled(ctx, &input, started_at, index_report.as_ref())
+                        .await;
                 }
                 Some(RoundEnd::Failed(full)) => {
                     ctx.state_mut(|s| {
@@ -159,9 +178,13 @@ impl PipelineWorkflow {
                     Self::emit_usage(
                         ctx,
                         &input,
-                        JobStatus::Failed,
-                        started_at,
-                        Some(full.clone()),
+                        JobEnd {
+                            status: JobStatus::Failed,
+                            started_at,
+                            error: Some(full.clone()),
+                            reason: None,
+                            index_report: index_report.as_ref(),
+                        },
                     )
                     .await;
                     return Err(ApplicationFailure::non_retryable(anyhow::anyhow!(full)).into());
@@ -173,7 +196,18 @@ impl PipelineWorkflow {
             s.progress.status = JobStatus::Succeeded;
             s.progress.current_step = None;
         });
-        Self::emit_usage(ctx, &input, JobStatus::Succeeded, started_at, None).await;
+        Self::emit_usage(
+            ctx,
+            &input,
+            JobEnd {
+                status: JobStatus::Succeeded,
+                started_at,
+                error: None,
+                reason: None,
+                index_report: index_report.as_ref(),
+            },
+        )
+        .await;
         let steps = ctx.state(|s| s.progress.steps.clone());
         Ok(PipelineWorkflowOutput {
             job_id: input.job_id,
@@ -264,17 +298,54 @@ fn initial_mime(input: &PluginInput) -> String {
     }
 }
 
+/// How a job ended, for [`PipelineWorkflow::emit_usage`].
+struct JobEnd<'a> {
+    status: JobStatus,
+    started_at: Option<SystemTime>,
+    error: Option<String>,
+    /// A Lab `reason` code the workflow knows better than the error text.
+    reason: Option<String>,
+    /// The indexer's report, when it ran.
+    index_report: Option<&'a IndexReport>,
+}
+
+/// The Meilisearch index a job writes to: the one the indexer reported, else the one
+/// every indexer step names itself (it beats the request's), else the request's.
+/// Empty when none is known.
+fn job_index(report: Option<&IndexReport>, input: &PipelineWorkflowInput) -> String {
+    report
+        .map(|r| r.index.as_str())
+        .or_else(|| input.pipeline.fixed_index())
+        .or(input.context.index.as_deref())
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
 impl PipelineWorkflow {
     async fn finish_cancelled(
         ctx: &mut WorkflowContext<Self>,
         input: &PipelineWorkflowInput,
         started_at: Option<SystemTime>,
+        index_report: Option<&IndexReport>,
     ) -> WorkflowResult<PipelineWorkflowOutput> {
         ctx.state_mut(|s| {
             s.progress.status = JobStatus::Cancelled;
             s.progress.current_step = None;
         });
-        Self::emit_usage(ctx, input, JobStatus::Cancelled, started_at, None).await;
+        Self::emit_usage(
+            ctx,
+            input,
+            JobEnd {
+                status: JobStatus::Cancelled,
+                started_at,
+                error: None,
+                reason: None,
+                index_report,
+            },
+        )
+        .await;
         Err(WorkflowTermination::cancelled())
     }
 
@@ -289,10 +360,15 @@ impl PipelineWorkflow {
     async fn emit_usage(
         ctx: &WorkflowContext<Self>,
         input: &PipelineWorkflowInput,
-        status: JobStatus,
-        started_at: Option<SystemTime>,
-        error: Option<String>,
+        end: JobEnd<'_>,
     ) {
+        let JobEnd {
+            status,
+            started_at,
+            error,
+            reason,
+            index_report,
+        } = end;
         let steps = ctx.state(|s| s.progress.steps.clone());
         let usage_input = JobUsageInput {
             job_id: input.job_id,
@@ -301,7 +377,7 @@ impl PipelineWorkflow {
             pipeline_builtin: input.pipeline.builtin,
             tenant_id: input.context.tenant_id.clone().unwrap_or_default(),
             region: input.context.region.clone().unwrap_or_default(),
-            index_name: input.context.index.clone().unwrap_or_default(),
+            index_name: job_index(index_report, input),
             task_queue: "workers-general".to_string(),
             status,
             started_at: to_utc(started_at),
@@ -310,6 +386,8 @@ impl PipelineWorkflow {
             input_mime: initial_mime(&input.input),
             steps,
             error,
+            reason,
+            group: input.group.clone(),
         };
         let opts =
             ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::ScheduleAndStartToClose {
@@ -526,6 +604,56 @@ mod tests {
         assert_eq!(super::initial_mime(&upload), "application/pdf");
         let bytes = PluginInput::Bytes(Blob::new(vec![1], "text/csv", None));
         assert_eq!(super::initial_mime(&bytes), "text/csv");
+    }
+
+    #[test]
+    fn the_job_index_prefers_what_the_indexer_reported() {
+        use meili_ingest_plugin_sdk::{
+            IndexReport, MeiliContext, PipelineDefinition, PipelineWorkflowInput, PluginInput,
+            StepDefinition,
+        };
+        let pipeline = |index: Option<&str>| PipelineDefinition {
+            uid: "movies".into(),
+            name: "movies".into(),
+            description: None,
+            version: 1,
+            trigger: None,
+            steps: vec![
+                StepDefinition::new("index", "meili_indexer").config(match index {
+                    Some(i) => serde_json::json!({ "index": i }),
+                    None => serde_json::json!({}),
+                }),
+            ],
+            builtin: false,
+            tenant_id: None,
+        };
+        let input = |index: Option<&str>, ctx: Option<&str>| PipelineWorkflowInput {
+            job_id: uuid::Uuid::nil(),
+            pipeline: pipeline(index),
+            input: PluginInput::Empty,
+            context: MeiliContext {
+                index: ctx.map(str::to_string),
+                ..Default::default()
+            },
+            group: None,
+        };
+        let report = IndexReport {
+            index: "reported".into(),
+            document_count: 1,
+            task_uids: vec![],
+        };
+        assert_eq!(
+            super::job_index(Some(&report), &input(Some("pinned"), Some("ctx"))),
+            "reported"
+        );
+        assert_eq!(
+            super::job_index(None, &input(Some("pinned"), Some("ctx"))),
+            "pinned",
+            "a step's own index beats the request's"
+        );
+        assert_eq!(super::job_index(None, &input(None, Some("ctx"))), "ctx");
+        assert_eq!(super::job_index(None, &input(None, None)), "");
+        assert_eq!(super::job_index(None, &input(None, Some("  "))), "");
     }
 
     #[test]

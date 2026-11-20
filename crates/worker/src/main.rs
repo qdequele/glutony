@@ -153,7 +153,8 @@ async fn main() -> anyhow::Result<()> {
     let source_activities = SourceActivities::new(config.control_plane_url.clone(), blob.clone())
         .with_control_plane_token(config.control_plane_token.clone())
         .with_security(connection_key.clone(), fetch_policy)
-        .with_default_index(default_index.clone());
+        .with_default_index(default_index.clone())
+        .with_lab_events(config.lab_events_enabled);
     // Archives route their files through the control plane like the gateway does, and
     // stage them in the same blob store; they need no fetch credential.
     // One archive expands at a time on this worker, holding at most

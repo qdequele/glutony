@@ -358,6 +358,7 @@ pub async fn submit_one(
         pipeline,
         input,
         context: ctx.clone(),
+        group: None,
     };
     let started = match state.temporal.start(&wf_input).await {
         Ok(started) => started,

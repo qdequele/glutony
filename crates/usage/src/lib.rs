@@ -92,7 +92,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, JobStatus, StepResult, UsageUnits};
+use meili_ingest_plugin_sdk::{INDEXER_PLUGIN, JobGroup, JobStatus, StepResult, UsageUnits};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -383,6 +383,14 @@ pub struct JobUsageInput {
     pub steps: Vec<StepResult>,
     /// Job-level error message, if any.
     pub error: Option<String>,
+    /// Why the job failed, as a Lab `reason` code, when the workflow knows it better
+    /// than the error text does (an invalid pipeline). `None`: derived from the failed
+    /// step ([`lab::failure_reason`]). Not part of the analytics rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The run this job belongs to (source run, archive). Lab events only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<JobGroup>,
 }
 
 /// Build every usage row for one finished job: one row per step (in execution order)
@@ -1117,6 +1125,8 @@ mod tests {
                 ),
             ],
             error: None,
+            reason: None,
+            group: None,
         }
     }
 

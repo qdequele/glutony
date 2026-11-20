@@ -1965,6 +1965,65 @@ mod tests {
         assert_eq!(events[1]["type"], "job.completed");
     }
 
+    async fn posted_lab_events(cp: &MockServer) -> Vec<serde_json::Value> {
+        let posted = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path() == "/internal/lab-events")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&posted.body).unwrap();
+        body["events"].as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_lab_job_posts_job_cancelled_as_its_lifecycle_event() {
+        let cp = control_plane_with_lab_events(202, 1).await;
+        let mut input = lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61");
+        input.status = JobStatus::Cancelled;
+        input.index_name = "movies".into();
+        input.group = Some(meili_ingest_plugin_sdk::JobGroup::archive(Uuid::nil()));
+        acts_with(&cp, true).report_usage(&input).await.unwrap();
+        let events = posted_lab_events(&cp).await;
+        assert_eq!(events[1]["type"], "job.cancelled");
+        assert_eq!(
+            events[1]["id"],
+            meili_ingest_usage::lab::lab_job_event_id(input.job_id).to_string()
+        );
+        assert_eq!(events[1]["data"]["index_uid"], "movies");
+        assert_eq!(events[1]["data"]["pipeline"], "builtin.json");
+        assert_eq!(events[1]["data"]["group"]["kind"], "archive");
+    }
+
+    #[tokio::test]
+    async fn a_failed_lab_job_posts_its_reason_and_step() {
+        let cp = control_plane_with_lab_events(202, 1).await;
+        let mut input = lab_usage_input("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61");
+        input.status = JobStatus::Failed;
+        input.index_name = "movies".into();
+        let message = "non-retryable: meili_indexer: add documents: unexpected HTTP 401 \
+                       from Meilisearch (no body); authentication failed";
+        input.error = Some(format!("step index (meili_indexer) failed: {message}"));
+        input.steps = vec![meili_ingest_plugin_sdk::StepResult {
+            step_id: "index".into(),
+            plugin: meili_ingest_plugin_sdk::INDEXER_PLUGIN.into(),
+            status: JobStatus::Failed,
+            document_count: 0,
+            branches: 1,
+            error: Some(message.into()),
+            duration_ms: 10,
+            input_bytes: 10,
+            usage: Default::default(),
+        }];
+        acts_with(&cp, true).report_usage(&input).await.unwrap();
+        let events = posted_lab_events(&cp).await;
+        assert_eq!(events[1]["type"], "job.failed");
+        assert_eq!(events[1]["data"]["reason"], "destination_auth");
+        assert_eq!(events[1]["data"]["step"], "index");
+        assert_eq!(events[1]["data"]["index_uid"], "movies");
+    }
+
     #[tokio::test]
     async fn no_event_without_the_flag_or_a_lab_tenant() {
         let cp = control_plane_with_lab_events(202, 0).await;

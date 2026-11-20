@@ -975,6 +975,8 @@ mod live {
                 step("enrich", "llm_enricher", UsageUnits::llm(400, 90)),
             ],
             error: None,
+            reason: None,
+            group: None,
         };
         let events = crate::events_for_job(&input);
         client.send(&events).await.expect("insert");
