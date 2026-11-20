@@ -7,6 +7,19 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
 ## [Unreleased]
 
 ### Added
+- Lab events tell more about how a job ended, for the Lab's emails (the vendored
+  `lab-events.schema.json` follows the Lab's). `job.failed` carries a `reason` code
+  (`invalid_config`, `invalid_input`, `insufficient_credits`,
+  `gateway_budget_exhausted`, `no_gateway`, `destination_auth`,
+  `destination_unreachable`, `destination_rejected`, `internal`), the failed `step`,
+  the `index_uid` and the `pipeline`. Every job event carries `pipeline` and, for the
+  jobs of a scheduled source run or the files of an archive, a `group` naming the run.
+  A scheduled source of a Lab account that starts failing or runs again after failing
+  sends `source.status_changed` (with a `reason` such as `source_auth`,
+  `source_not_found` or `source_unreachable`, and the failed runs in a row).
+  `POST /internal/source-runs` answers the change in `status_change`.
+  `PipelineWorkflowInput` (plugin SDK) gains an optional `group`. See
+  [Meilisearch Lab](docs/deployment/meilisearch-lab.mdx).
 - Archive uploads: a zip, tar, `.tar.gz` / `.tgz` or gzipped file sent to any ingest
   route (file, URL or object ref) starts an archive job that ingests every file inside
   it as its own job, each routed by its own type and name (or through the pipeline
@@ -66,6 +79,15 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   Unset keeps the wrapper-key rule.
 
 ### Fixed
+- `job.completed` sends the Meilisearch index the job wrote to as `index_uid`, not the
+  pipeline uid (now in `pipeline`); a job that names no index still sends the uid.
+- A cancelled job sends `job.cancelled` instead of a `job.failed` reading
+  `cancelled`, with the same lifecycle id.
+- A job whose pipeline does not validate when its workflow starts is reported: its
+  row turns `failed` and the Lab gets `job.failed` with `reason: invalid_config`.
+  It ended without any status write-back or Lab event before.
+- A scheduled source's fetch error keeps its kind in the run's error
+  (`retryable: fetch: GET …`, `retryable: dns: …`).
 - A batch item's `index` and `pipeline` are honoured. They were dropped without a
   word, so `{"items": [{"url": …, "index": "pdfs"}]}` wrote into the default index
   (`documents`, `datasets`, …) instead; the Lab's `pipelines_ingest_batch` tool

@@ -2,7 +2,7 @@
 //!
 //! Skips cleanly when `DATABASE_URL` is unset so the suite stays green without a server.
 
-use meili_ingest_control_plane::sources::{NewSource, RunRecord, SourceRepo};
+use meili_ingest_control_plane::sources::{NewSource, RunRecord, SourceHealth, SourceRepo};
 use meili_ingest_source::model::{IncrementalState, Location, RunOutcome};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -386,6 +386,82 @@ async fn runs_are_recorded_and_listed_newest_first() {
         .expect("exists");
     assert_eq!(got.last_status.as_deref(), Some("failed"));
     assert!(got.last_run_at.is_some());
+}
+
+#[tokio::test]
+async fn a_run_that_flips_the_source_reports_its_status_change_once_per_run() {
+    let Some(repo) = repo("tr-flip").await else {
+        return;
+    };
+    let new = new_source("tr-flip-1", Some("tenant-flip"), "movies");
+    let source_id = new.id;
+    repo.insert(&new).await.expect("insert");
+    let t0 = chrono::Utc::now();
+    let run = |minutes: i64, outcome: RunOutcome| RunRecord {
+        run_id: Uuid::new_v4(),
+        source_id,
+        started_at: t0 + chrono::Duration::minutes(minutes),
+        finished_at: Some(t0 + chrono::Duration::minutes(minutes)),
+        outcome,
+        items: 0,
+        job_ids: vec![],
+        error: (outcome == RunOutcome::Failed).then(|| "boom".to_string()),
+    };
+
+    let first = repo
+        .record_run(&run(0, RunOutcome::Ingested))
+        .await
+        .expect("record");
+    assert_eq!(first.status_change, None, "a source that works is no news");
+
+    let failing = run(1, RunOutcome::Failed);
+    let recorded = repo.record_run(&failing).await.expect("record");
+    let change = recorded.status_change.expect("ok -> failing");
+    assert_eq!(change.status, SourceHealth::Failing);
+    assert_eq!(change.consecutive_failures, 1);
+    assert_eq!(change.source_name, "source tr-flip-1");
+    assert_eq!(change.tenant_id.as_deref(), Some("tenant-flip"));
+    assert_eq!(change.pipeline_uid, "movies");
+    assert_eq!(recorded.run.run_id, failing.run_id);
+
+    // A retried recording of the same run is told the same change (same event id).
+    let again = repo.record_run(&failing).await.expect("record again");
+    assert_eq!(again.status_change, Some(change));
+
+    let still = repo
+        .record_run(&run(2, RunOutcome::Failed))
+        .await
+        .expect("record");
+    assert_eq!(still.status_change, None, "still failing: no news");
+
+    let back = repo
+        .record_run(&run(3, RunOutcome::Unchanged))
+        .await
+        .expect("record");
+    let change = back.status_change.expect("failing -> ok");
+    assert_eq!(change.status, SourceHealth::Ok);
+    assert_eq!(change.consecutive_failures, 0);
+
+    let quiet = repo
+        .record_run(&run(4, RunOutcome::Ingested))
+        .await
+        .expect("record");
+    assert_eq!(quiet.status_change, None);
+
+    // A source whose very first run fails is failing.
+    let new = new_source("tr-flip-2", None, "movies");
+    let source_id = new.id;
+    repo.insert(&new).await.expect("insert");
+    let mut first = run(0, RunOutcome::Failed);
+    first.source_id = source_id;
+    let change = repo
+        .record_run(&first)
+        .await
+        .expect("record")
+        .status_change
+        .expect("never ok -> failing");
+    assert_eq!(change.status, SourceHealth::Failing);
+    assert_eq!(change.tenant_id, None, "a global source");
 }
 
 #[tokio::test]

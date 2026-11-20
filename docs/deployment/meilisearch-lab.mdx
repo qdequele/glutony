@@ -112,10 +112,52 @@ cost:
 }
 ```
 
-Then `job.completed` (`{job_id, index_uid: <pipeline uid>, pages_crawled: 0,
-documents_indexed, duration_secs}`) for a succeeded job, or `job.failed` (`{job_id,
-error_message, pages_crawled: 0}`) for a failed or cancelled one, with id
-`<UUIDv5 of job:{job_id}:lifecycle>`.
+Then the job's one lifecycle event, with id `<UUIDv5 of job:{job_id}:lifecycle>`:
+
+- `job.completed` for a succeeded job: `{job_id, index_uid, pages_crawled: 0,
+  documents_indexed, duration_secs, pipeline, group?}`. `index_uid` is the Meilisearch
+  index the job wrote to (the one the indexer reported, else the one its steps name,
+  else the request's); a job that names none sends the pipeline uid there, as every
+  job did before `pipeline` existed.
+- `job.failed` for a failed job: `{job_id, error_message, pages_crawled: 0, reason,
+  step?, index_uid?, pipeline, group?}`. `step` is the id of the step that failed.
+  A pipeline that does not validate when the job starts is reported too, with
+  `reason: invalid_config`.
+- `job.cancelled` for a cancelled job: `{job_id, index_uid?, documents_indexed,
+  pipeline, group?}` (cancelled jobs were sent as `job.failed` with the message
+  `cancelled` before).
+
+`reason` is a code the Lab words for the user, read from the failed step's error:
+
+| `reason` | When |
+|---|---|
+| `invalid_config` | The pipeline does not validate, a step's config is invalid (`InvalidConfig`), or the indexer names a connection the tenant does not have. |
+| `invalid_input` | A step could not read its input (`InvalidInput`). |
+| `insufficient_credits` | The Lab credit check answered 402. |
+| `gateway_budget_exhausted` | The team's AI Gateway answered 402. |
+| `no_gateway` | An AI step had no Gateway to call (`no_gateway`, `token_required`). |
+| `destination_auth` | Meilisearch refused the key (401/403). |
+| `destination_unreachable` | Meilisearch did not answer (network error, timeout, 5xx). |
+| `destination_rejected` | Meilisearch refused the documents or the index (a failed task, a missing index, a document too large). |
+| `internal` | Anything else. |
+
+`group` names the run the job belongs to, so the Lab can tell one email about it:
+`{kind: "source_run", id: <run id>, name: <source name>}` for the jobs of a
+scheduled source run, `{kind: "archive", id: <archive job id>}` for the files of an
+uploaded archive. Other jobs have none.
+
+When a scheduled source of a Lab account starts failing or recovers, the worker also
+sends `source.status_changed`, with id `<UUIDv5 of source:{source_id}:run:{run_id}:status>`:
+`{source_id, source_name, status, run_id, pipeline, reason?, error_message?,
+consecutive_failures}`. `status` is `failing` on the first failed run after one that
+did not fail (or when the source's first run fails), and `ok` on the first run that
+fetched or found nothing new after a failed one; other runs send nothing. The control
+plane decides it when the run is recorded, from the runs that started before it, so a
+retried recording reports the same change once. `consecutive_failures` counts the
+failed runs in a row (0 when `ok`). `reason` is `source_auth` (the source answered
+401/403), `source_not_found` (404/410), `source_unreachable` (a network failure, a
+timeout or a 5xx that outlived the retries), `insufficient_credits` (402, or the Lab
+credit check), the failed job's reason when the run's jobs failed, or `internal`.
 
 - The Lab prices `documents`, `ocr_pages` and `provider_cost_micro_usd` (its
   `pricing.yml`); other units are stored and shown. glutony never computes credits.

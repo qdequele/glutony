@@ -17,13 +17,14 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use meili_ingest_blob::BlobStore;
 use meili_ingest_plugin_sdk::{
-    Blob, JobStatus, MeiliContext, PipelineDefinition, PipelineWorkflowInput, PluginError,
+    Blob, JobGroup, JobStatus, MeiliContext, PipelineDefinition, PipelineWorkflowInput, PluginError,
 };
 use meili_ingest_router::mime_to_default_index;
 use meili_ingest_source::{
     FetchAuth, HostPolicy, IncrementalState, Location, Resolution, ResolveRuntime, RunOutcome,
     SecretKey, SourceConnector, SourceDefinition, SourceError, UrlConnector, open_json,
 };
+use meili_ingest_usage::lab::{SourceStatus, SourceStatusChange, lab_source_status_event};
 use serde::{Deserialize, Serialize};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
@@ -52,6 +53,9 @@ pub struct SourceActivities {
     /// Bound on each control plane request ([`CONTROL_PLANE_TIMEOUT`] by default).
     /// Per request, not on `http`: archive activities fetch input refs with that client.
     pub control_plane_timeout: std::time::Duration,
+    /// Post `source.status_changed` to the control plane's Lab outbox
+    /// (`LAB_EVENTS_ENABLED`).
+    pub lab_events: bool,
 }
 
 impl SourceActivities {
@@ -66,7 +70,14 @@ impl SourceActivities {
             fetch_policy: HostPolicy::default(),
             default_index: "documents".into(),
             control_plane_timeout: CONTROL_PLANE_TIMEOUT,
+            lab_events: false,
         }
+    }
+
+    /// Post each Lab source's status changes to the control plane's Lab outbox.
+    pub fn with_lab_events(mut self, enabled: bool) -> Self {
+        self.lab_events = enabled;
+        self
     }
 
     /// Present `CONTROL_PLANE_TOKEN` on every control plane request.
@@ -212,7 +223,9 @@ const CONTROL_PLANE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 fn from_source_error(e: SourceError) -> PluginError {
     match e {
-        SourceError::Fetch(m) | SourceError::Dns(m) => PluginError::Retryable(m),
+        // The kind stays in the message (`fetch: …`, `dns: …`): the run's error is what
+        // tells the Lab the source was unreachable.
+        e @ (SourceError::Fetch(_) | SourceError::Dns(_)) => PluginError::Retryable(e.to_string()),
         other => PluginError::NonRetryable(other.to_string()),
     }
 }
@@ -295,6 +308,15 @@ impl SourceActivities {
         req: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<bool, PluginError> {
+        Ok(self.send_unless_gone(req, what).await?.is_some())
+    }
+
+    /// Like [`Self::send_json_unless_gone`], returning the successful response.
+    async fn send_unless_gone(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<Option<reqwest::Response>, PluginError> {
         // `send_json` delegates here, so this is the one place the token is attached.
         let req = crate::connection::authed(req, self.control_plane_token.as_deref());
         let resp = req
@@ -303,10 +325,10 @@ impl SourceActivities {
             .await
             .map_err(|e| PluginError::Retryable(format!("control plane unreachable: {e}")))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(false);
+            return Ok(None);
         }
         if resp.status().is_success() {
-            Ok(true)
+            Ok(Some(resp))
         } else {
             Err(PluginError::Retryable(format!(
                 "control plane returned {} for {what}",
@@ -487,6 +509,7 @@ impl SourceActivities {
                     pipeline: pipeline.clone(),
                     input: staged,
                     context,
+                    group: Some(JobGroup::source_run(input.run_id, d.name.clone())),
                 },
             });
         }
@@ -548,21 +571,32 @@ impl SourceActivities {
             "error": input.error,
         });
         let recorded = self
-            .send_json_unless_gone(
+            .send_unless_gone(
                 self.http
                     .post(self.url(&["internal", "source-runs"])?)
                     .json(&run),
                 "record run",
             )
             .await?;
-        if !recorded {
+        let Some(recorded) = recorded else {
             tracing::warn!(
                 source_id = %input.source_id,
                 run_id = %input.run_id,
                 "the source was deleted during its run; the run is not recorded"
             );
             return Ok(());
-        }
+        };
+        // A control plane that predates status changes answers without one.
+        let status_change = match recorded.json::<RecordedRunAnswer>().await {
+            Ok(answer) => answer.status_change,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %input.run_id,
+                    "unreadable answer recording the run, no status change reported: {e}"
+                );
+                None
+            }
+        };
         if let Some(state) = &input.state {
             self.send_json_unless_gone(
                 self.http
@@ -577,8 +611,83 @@ impl SourceActivities {
             )
             .await?;
         }
+        // Last, so a failing outbox cannot hold back the state: a retry of this
+        // activity records the same run again and is told the same change, whose event
+        // has the same id.
+        if let Some(change) = status_change {
+            self.post_status_change(input, change).await?;
+        }
         Ok(())
     }
+
+    /// Post a source's `source.status_changed` to the control plane's Lab outbox when
+    /// this worker sends Lab events and the source belongs to a Lab account.
+    async fn post_status_change(
+        &self,
+        input: &RecordRunInput,
+        change: StatusChangeAnswer,
+    ) -> Result<(), PluginError> {
+        if !self.lab_events {
+            return Ok(());
+        }
+        let change = SourceStatusChange {
+            source_id: input.source_id,
+            source_name: change.source_name,
+            tenant_id: change.tenant_id.unwrap_or_default(),
+            pipeline_uid: change.pipeline_uid,
+            run_id: input.run_id,
+            status: change.status,
+            error: input.error.clone(),
+            consecutive_failures: change.consecutive_failures,
+            occurred_at: input.finished_at,
+        };
+        let event = match lab_source_status_event(&change) {
+            Ok(event) => event,
+            Err(reason) => {
+                tracing::debug!(
+                    source_id = %input.source_id,
+                    reason = reason.as_str(),
+                    "no Lab event for this source"
+                );
+                return Ok(());
+            }
+        };
+        self.send_json(
+            self.http
+                .post(self.url(&["internal", "lab-events"])?)
+                .json(&serde_json::json!({ "events": [&event] })),
+            "lab events",
+        )
+        .await?;
+        tracing::info!(
+            source_id = %input.source_id,
+            run_id = %input.run_id,
+            status = ?change.status,
+            "source status change sent to the Lab outbox"
+        );
+        Ok(())
+    }
+}
+
+/// The part of `POST /internal/source-runs`'s answer this worker reads.
+#[derive(Debug, Deserialize)]
+struct RecordedRunAnswer {
+    #[serde(default)]
+    status_change: Option<StatusChangeAnswer>,
+}
+
+/// A run that flipped its source between ok and failing, as the control plane saw it.
+#[derive(Debug, Deserialize)]
+struct StatusChangeAnswer {
+    status: SourceStatus,
+    #[serde(default)]
+    consecutive_failures: u64,
+    #[serde(default)]
+    source_name: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    pipeline_uid: String,
 }
 
 #[activities]
@@ -845,6 +954,13 @@ mod tests {
             .expect("staged");
         assert_eq!(blob.mime, "text/html");
         assert_eq!(blob.charset.as_deref(), Some("windows-1252"));
+        // The job knows its run, so the Lab can report the run as one.
+        assert_eq!(
+            job.group,
+            Some(JobGroup::source_run(input().run_id, "tmdb")),
+            "{:?}",
+            job.group
+        );
     }
 
     fn only_job(out: ResolveSourceOutput) -> PipelineWorkflowInput {
@@ -1193,6 +1309,125 @@ mod tests {
         };
         a.record(&failed).await.expect("recorded without state");
         // `expect(1)` on the state PUT is verified when `cp` drops.
+    }
+
+    /// A control plane that records runs, answering `change` as the run's status change,
+    /// with a Lab outbox answering `outbox`.
+    async fn control_plane_recording(
+        change: Option<serde_json::Value>,
+        outbox: u16,
+        posts: u64,
+    ) -> MockServer {
+        let cp = MockServer::start().await;
+        let mut answer = serde_json::json!({
+            "run_id": Uuid::nil(), "source_id": Uuid::nil(), "started_at": Utc::now(),
+            "outcome": "failed", "items": 0, "job_ids": [],
+        });
+        if let Some(change) = change {
+            answer["status_change"] = change;
+        }
+        Mock::given(method("POST"))
+            .and(path("/internal/source-runs"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(answer))
+            .mount(&cp)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/internal/lab-events"))
+            .respond_with(
+                ResponseTemplate::new(outbox).set_body_json(serde_json::json!({"inserted": 1})),
+            )
+            .expect(posts)
+            .mount(&cp)
+            .await;
+        cp
+    }
+
+    fn failing_change(tenant: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "failing", "consecutive_failures": 1, "source_name": "tmdb",
+            "tenant_id": tenant, "pipeline_uid": "movies",
+        })
+    }
+
+    fn failed_run() -> RecordRunInput {
+        RecordRunInput {
+            run_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("uuid"),
+            source_id: input().source_id,
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            outcome: RunOutcome::Failed,
+            items: 0,
+            job_ids: vec![],
+            error: Some(
+                "non-retryable: fetch rejected: GET https://x/a: status 403 Forbidden".into(),
+            ),
+            state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lab_source_that_starts_failing_posts_a_status_change() {
+        let cp = control_plane_recording(Some(failing_change(LAB_ACCOUNT)), 202, 1).await;
+        let files = MockServer::start().await;
+        let run = failed_run();
+        activities(&cp, &files)
+            .with_lab_events(true)
+            .record(&run)
+            .await
+            .expect("recorded");
+        let posted = cp
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path() == "/internal/lab-events")
+            .expect("posted");
+        let body: serde_json::Value = serde_json::from_slice(&posted.body).unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e["type"], "source.status_changed");
+        assert_eq!(
+            e["id"],
+            meili_ingest_usage::lab::lab_source_status_event_id(run.source_id, run.run_id)
+                .to_string()
+        );
+        assert_eq!(e["account_id"], LAB_ACCOUNT);
+        assert_eq!(e["data"]["status"], "failing");
+        assert_eq!(e["data"]["reason"], "source_auth");
+        assert_eq!(e["data"]["source_name"], "tmdb");
+        assert_eq!(e["data"]["pipeline"], "movies");
+        assert_eq!(e["data"]["run_id"], run.run_id.to_string());
+        assert_eq!(e["data"]["consecutive_failures"], 1);
+    }
+
+    #[tokio::test]
+    async fn no_status_change_is_posted_without_the_flag_a_lab_tenant_or_a_change() {
+        let files = MockServer::start().await;
+        for (flag, change) in [
+            (false, Some(failing_change(LAB_ACCOUNT))),
+            (true, Some(failing_change("hackersearch"))),
+            (true, None),
+        ] {
+            let cp = control_plane_recording(change, 202, 0).await;
+            activities(&cp, &files)
+                .with_lab_events(flag)
+                .record(&failed_run())
+                .await
+                .expect("recorded");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_outbox_failure_retries_the_recording_not_the_run() {
+        let cp = control_plane_recording(Some(failing_change(LAB_ACCOUNT)), 500, 1).await;
+        let files = MockServer::start().await;
+        let err = activities(&cp, &files)
+            .with_lab_events(true)
+            .record(&failed_run())
+            .await
+            .expect_err("the event must not be lost");
+        assert!(err.is_retryable(), "{err:?}");
     }
 
     #[tokio::test]

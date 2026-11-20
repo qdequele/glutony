@@ -20,7 +20,7 @@ use chrono::Utc;
 use meili_ingest_archive::{ArchiveError, Event, Format, Limits};
 use meili_ingest_blob::{BlobError, BlobStore};
 use meili_ingest_plugin_sdk::{
-    ARCHIVE_ISSUES_KEPT, ArchiveFileIssue, Blob, ForcedPipeline, JobStatus, MeiliContext,
+    ARCHIVE_ISSUES_KEPT, ArchiveFileIssue, Blob, ForcedPipeline, JobGroup, JobStatus, MeiliContext,
     PipelineDefinition, PipelineWorkflowInput, PluginError, PluginInput,
 };
 use meili_ingest_router::{canonical_mime, detect_mime, mime_to_default_index};
@@ -654,6 +654,7 @@ impl ArchiveActivities {
                     pipeline,
                     input: entry.input.clone(),
                     context,
+                    group: Some(JobGroup::archive(input.job_id)),
                 },
             });
         }
@@ -1171,6 +1172,11 @@ mod tests {
             Some("contracts")
         );
         assert_eq!(job.workflow_input.context.tenant_id.as_deref(), Some("t1"));
+        assert_eq!(
+            job.workflow_input.group,
+            Some(JobGroup::archive(job_id)),
+            "a file job names its archive, so the Lab reports the archive as one"
+        );
         assert_eq!(out.skipped.len(), 1);
         assert_eq!(out.skipped[0].path, "tool.bin");
         assert_eq!(

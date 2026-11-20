@@ -1526,6 +1526,53 @@ pub struct PipelineWorkflowInput {
     pub input: PluginInput,
     /// Tenant context, carried end-to-end.
     pub context: MeiliContext,
+    /// The run this job belongs to (a scheduled source run, an uploaded archive), so
+    /// the Lab can report the run as one. `None` for a job of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<JobGroup>,
+}
+
+/// What kind of run groups several jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobGroupKind {
+    /// One run of a scheduled source: one job per fetched item.
+    SourceRun,
+    /// One uploaded archive: one job per file inside it.
+    Archive,
+}
+
+/// The run a job belongs to (the Lab contract's `jobGroup`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobGroup {
+    /// What kind of run.
+    pub kind: JobGroupKind,
+    /// The run id (source run) or the archive's job id.
+    pub id: String,
+    /// Display name: the source's name for a source run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl JobGroup {
+    /// The jobs of one scheduled source run.
+    pub fn source_run(run_id: Uuid, source_name: impl Into<String>) -> Self {
+        let name: String = source_name.into();
+        Self {
+            kind: JobGroupKind::SourceRun,
+            id: run_id.to_string(),
+            name: Some(name).filter(|n| !n.trim().is_empty()),
+        }
+    }
+
+    /// The file jobs of one archive upload.
+    pub fn archive(archive_job_id: Uuid) -> Self {
+        Self {
+            kind: JobGroupKind::Archive,
+            id: archive_job_id.to_string(),
+            name: None,
+        }
+    }
 }
 
 impl PipelineWorkflowInput {
@@ -2872,6 +2919,7 @@ steps:
             pipeline: pipeline_with(vec![StepDefinition::new("i", INDEXER_PLUGIN)]),
             input: PluginInput::Empty,
             context: ctx.clone(),
+            group: None,
         };
         assert!(!format!("{input:?}").contains("SECRET"));
         let config: IndexerConfig =
@@ -2994,6 +3042,7 @@ steps:
             pipeline: pipeline.clone(),
             input: PluginInput::Documents(vec![]),
             context: context.clone(),
+            group: None,
         };
         let back: PipelineWorkflowInput =
             serde_json::from_value(with_old_key(serde_json::to_value(&wf).unwrap())).unwrap();
