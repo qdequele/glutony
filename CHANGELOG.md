@@ -470,6 +470,8 @@ Releases are tagged `vX.Y.Z` and build `ghcr.io/qdequele/glutony:X.Y.Z`.
   `PARSER_MAX_DECODED_MB` holds for a single huge record too.
 
 ### Changed
+- The vendored `lab-events.schema.json` follows the Lab's: it adds `sync.health_changed`, an
+  event only Connect sends. Nothing glutony sends changes.
 - Document ids built from a filename keep its folders: `reports/eu/q3.pdf` gives
   `reports_eu_q3` instead of `q3`, so same-named files in different folders of an
   archive no longer overwrite each other. Plain filenames (every upload, URL and object
