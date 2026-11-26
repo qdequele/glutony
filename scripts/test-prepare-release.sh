@@ -19,12 +19,14 @@ fail() { echo "FAIL - $1" >&2; fails=$((fails + 1)); }
 
 crate="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version[ \t]*=/{gsub(/"/,"",$3); print $3; exit}' "$root/Cargo.toml")"
 
-# fixture NAME [empty]: a fresh copy of the release files at the current crate
-# version, committed in a new repository, with a CHANGELOG released at that
-# version whose [Unreleased] has one entry (none with `empty`). Prints its path.
+# fixture NAME [empty|large]: a fresh copy of the release files at the current
+# crate version, committed in a new repository, with a CHANGELOG released at
+# that version whose [Unreleased] has one entry (none with `empty`, ~240 KB of
+# them with `large`). Prints its path.
 fixture() {
   local dir="$work/$1" entry="- A change worth releasing."
   [ "${2:-}" = empty ] && entry=""
+  [ "${2:-}" = large ] && entry="$(for i in $(seq 4000); do echo "- Change $i, worth releasing, with a line long enough to fill pages."; done)"
   mkdir -p "$dir/scripts" "$dir/docs" "$dir/k8s"
   cp "$root/scripts/prepare-release.sh" "$dir/scripts/"
   cp "$root/Cargo.toml" "$root/Cargo.lock" "$dir/"
@@ -148,6 +150,20 @@ if grep -q "v$next is already prepared" "$work/out"; then pass "the re-run says 
   sed 's/^/     /' "$work/out" >&2
 fi
 expect_fail "a freshly released tree refuses the next release until [Unreleased] has entries" "$dir" "is empty" minor
+
+# A large [Unreleased] is not "empty". `unreleased_body | grep -q` under
+# pipefail failed when grep exited on its first match and awk took SIGPIPE on
+# the rest; it depends on timing, so run it a few times.
+dir="$(fixture large large)"
+large_ok=0
+for _ in $(seq 20); do
+  (cd "$dir" && git checkout -q -- . && RELEASE_DATE=2026-01-02 scripts/prepare-release.sh 9.8.7 >"$work/out" 2>&1) \
+    && large_ok=$((large_ok + 1))
+done
+if [ "$large_ok" = 20 ]; then pass "prepare accepts a large [Unreleased] (20/20 runs)"; else
+  fail "prepare accepts a large [Unreleased] ($large_ok/20 runs)"
+  sed 's/^/     /' "$work/out" >&2
+fi
 
 if [ "$fails" -gt 0 ]; then
   echo "$fails failure(s)" >&2

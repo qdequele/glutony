@@ -287,7 +287,7 @@ cmd_prepare() {
   if has_section "$target"; then
     # Already folded by an earlier run: only (re)sync the version copies.
     fold_changelog=false
-  elif ! unreleased_body | grep -q '[^[:space:]]'; then
+  elif ! grep -q '[^[:space:]]' <<<"$(unreleased_body)"; then
     die "the [Unreleased] section of $CHANGELOG is empty: add the release's entries first"
   fi
 
@@ -352,7 +352,7 @@ cmd_prepare() {
 
     # Verify the rewritten copies before touching the tree.
     grep -q "^version = \"$target\"" "$tmp/Cargo.toml" || die "could not set the version in $CARGO_TOML"
-    if CARGO_TOML="$tmp/Cargo.toml" path_dep_versions | awk -v ver="$target" '$2 != ver' | grep -q .; then
+    if [ -n "$(CARGO_TOML="$tmp/Cargo.toml" path_dep_versions | awk -v ver="$target" '$2 != ver')" ]; then
       die "could not set the path dependency versions in $CARGO_TOML"
     fi
     grep -q "^  version: $target\$" "$tmp/openapi.yaml" || die "could not set info.version in $OPENAPI"
@@ -360,7 +360,7 @@ cmd_prepare() {
     CHANGELOG="$tmp/CHANGELOG.md" has_section "$target" || die "could not fold [Unreleased] in $CHANGELOG"
     while read -r name _; do
       [ -n "$name" ] || continue
-      CARGO_LOCK="$tmp/Cargo.lock" lock_workspace_versions | grep -qx "$name $target" || die "could not set $name in $CARGO_LOCK"
+      grep -qx "$name $target" <<<"$(CARGO_LOCK="$tmp/Cargo.lock" lock_workspace_versions)" || die "could not set $name in $CARGO_LOCK"
     done <<EOF
 $(lock_workspace_versions)
 EOF
